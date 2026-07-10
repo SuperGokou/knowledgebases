@@ -15,15 +15,15 @@
   <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF Phase 1" src="https://img.shields.io/badge/OKF-v0.1%20Phase%201-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
   <a href="https://api-docs.deepseek.com/"><img alt="DeepSeek" src="https://img.shields.io/badge/AI-DeepSeek-536AF5?style=flat-square"></a>
   <a href="https://www.docker.com/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
-  <a href="https://knowledgebases.vercel.app/docs"><img alt="Vercel Demo" src="https://img.shields.io/badge/Demo-Vercel-000000?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
+  <a href="https://knowledgebases.vercel.app"><img alt="Vercel Demo" src="https://img.shields.io/badge/Demo-Vercel-000000?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
   <a href="https://github.com/SuperGokou/knowledgebases/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/SuperGokou/knowledgebases?style=flat-square"></a>
 </p>
 <p align="center">
   <a href="https://knowledgebases.vercel.app"><strong>Web Demo</strong></a>
   ·
-  <a href="https://knowledgebases.vercel.app/docs">API Demo</a>
+  <a href="https://knowledgebases-api.vercel.app/docs">API Demo</a>
   ·
-  <a href="https://knowledgebases.vercel.app/openapi.json">OpenAPI</a>
+  <a href="https://knowledgebases-api.vercel.app/openapi.json">OpenAPI</a>
   ·
   <a href="docs/ARCHITECTURE.zh-CN.md">架构设计</a>
   ·
@@ -58,10 +58,11 @@
 
 | 资源 | 地址 | 用途 |
 |---|---|---|
-| Swagger UI | [knowledgebases.vercel.app/docs](https://knowledgebases.vercel.app/docs) | 浏览并调用 API |
-| OpenAPI Schema | [knowledgebases.vercel.app/openapi.json](https://knowledgebases.vercel.app/openapi.json) | 生成 SDK 或导入 API 工具 |
-| Liveness | [knowledgebases.vercel.app/health/live](https://knowledgebases.vercel.app/health/live) | 检查应用进程是否可用 |
-| Readiness | [knowledgebases.vercel.app/health/ready](https://knowledgebases.vercel.app/health/ready) | 检查 PostgreSQL 与 Redis |
+| Web 工作台 | [knowledgebases.vercel.app](https://knowledgebases.vercel.app) | 登录、聊天与后台管理入口 |
+| Swagger UI | [knowledgebases-api.vercel.app/docs](https://knowledgebases-api.vercel.app/docs) | 浏览并调用 API |
+| OpenAPI Schema | [knowledgebases-api.vercel.app/openapi.json](https://knowledgebases-api.vercel.app/openapi.json) | 生成 SDK 或导入 API 工具 |
+| Liveness | [knowledgebases-api.vercel.app/health/live](https://knowledgebases-api.vercel.app/health/live) | 检查应用进程是否可用 |
+| Readiness | [knowledgebases-api.vercel.app/health/ready](https://knowledgebases-api.vercel.app/health/ready) | 检查 PostgreSQL 与 Redis |
 
 > Demo 的真实可用状态以 `/health/ready` 为准；生产密钥只保存在 Vercel Sensitive Environment Variables 中，不进入仓库。
 
@@ -363,8 +364,8 @@ npm run build
 
 生产使用同一 Git 仓库的两个 Vercel Project，避免框架检测、根路由和 BFF 回源发生冲突：
 
-- API Project：Root Directory 为仓库根目录，运行 FastAPI 与 Cron；
-- Web Project：Root Directory 为 `web/`，运行 Next.js，`FASTAPI_URL` 指向独立 API Origin。
+- API Project `knowledgebases-api`：Root Directory 为仓库根目录，运行 FastAPI 与 Cron；
+- Web Project `knowledgebases`：Root Directory 为 `web/`，运行 Next.js，`FASTAPI_URL` 指向 `https://knowledgebases-api.vercel.app`。
 
 文件继续由浏览器直传对象存储。生产环境至少需要：
 
