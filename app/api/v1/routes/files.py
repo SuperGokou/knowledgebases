@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
-from sqlalchemy import and_, exists, false, or_, select
+from sqlalchemy import and_, exists, false, or_, select, update
 
 from app.api.dependencies import DatabaseSession, get_storage_service, require_permission
 from app.api.errors import ApiError
@@ -18,6 +20,10 @@ from app.db.models import (
     KnowledgeBase,
     KnowledgeBaseAccessLevel,
     KnowledgeBaseRoleGrant,
+    KnowledgeEntry,
+    KnowledgeEntryPublicationStatus,
+    OkfConversionJob,
+    OkfConversionStatus,
     ReservationStatus,
     UploadSession,
     UploadSessionStatus,
@@ -28,6 +34,7 @@ from app.schemas.files import (
     CompleteUploadRequest,
     DownloadGrant,
     FileRead,
+    OkfConversionRead,
     PartUrl,
     PartUrlRequest,
     PartUrlResponse,
@@ -38,10 +45,17 @@ from app.schemas.files import (
 from app.services.access import AccessContext
 from app.services.audit import add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
+from app.services.okf_conversion import enqueue_okf_conversion
 from app.services.quota import QuotaService, QuotaSpec, daily_window_start, lifetime_window_start
 from app.services.storage import StorageService
 
 router = APIRouter()
+
+
+def _checksum_base64(checksum_hex: str | None) -> str | None:
+    if checksum_hex is None:
+        return None
+    return base64.b64encode(bytes.fromhex(checksum_hex)).decode("ascii")
 
 
 def _object_key(
@@ -217,6 +231,9 @@ async def initiate_upload(
                 upload_session_id=str(existing.id),
                 expected_size_bytes=existing.expected_size_bytes,
                 plan=plan,
+                expected_checksum_sha256_base64=_checksum_base64(
+                    existing_file.checksum_value
+                ),
             )
             return _initiate_response(
                 existing,
@@ -230,6 +247,15 @@ async def initiate_upload(
         multipart_threshold_bytes=settings.multipart_threshold_bytes,
         preferred_part_size=settings.multipart_part_size_bytes,
     )
+    if payload.checksum_sha256 is not None and plan.mode is UploadMode.MULTIPART:
+        raise ApiError(
+            status_code=422,
+            code="multipart_checksum_not_supported",
+            message=(
+                "Whole-object SHA-256 verification is currently supported only "
+                "for single-part uploads"
+            ),
+        )
     file_id = uuid4()
     upload_id = uuid4()
     expires_at = datetime.now(UTC) + timedelta(hours=settings.upload_session_hours)
@@ -244,7 +270,7 @@ async def initiate_upload(
         content_type=payload.content_type,
         size_bytes=validated.size_bytes,
         checksum_algorithm="SHA256" if payload.checksum_sha256 else None,
-        checksum_value=payload.checksum_sha256,
+        checksum_value=payload.checksum_sha256.lower() if payload.checksum_sha256 else None,
         custom_metadata=payload.custom_metadata,
         status=FileStatus.UPLOADING,
     )
@@ -289,6 +315,7 @@ async def initiate_upload(
         upload_session_id=str(upload.id),
         expected_size_bytes=upload.expected_size_bytes,
         plan=plan,
+        expected_checksum_sha256_base64=_checksum_base64(file.checksum_value),
     )
     upload.storage_upload_id = initiated.upload_id
     add_audit_event(
@@ -487,6 +514,36 @@ async def complete_upload(
             message="Stored object size differs from the declared size",
         )
 
+    if file.checksum_value is not None:
+        actual_checksum = stored.checksum_sha256
+        expected_checksum = _checksum_base64(file.checksum_value)
+        if actual_checksum is None or expected_checksum is None or not hmac.compare_digest(
+            actual_checksum,
+            expected_checksum,
+        ):
+            await storage.delete(key=file.object_key)
+            upload.status = UploadSessionStatus.FAILED
+            file.status = FileStatus.FAILED
+            await QuotaService().release_upload_reservations(
+                session,
+                upload_session_id=upload.id,
+                status=ReservationStatus.RELEASED,
+            )
+            add_audit_event(
+                session,
+                actor_id=access.user.id,
+                action="upload.rejected_checksum_mismatch",
+                resource_type="file",
+                resource_id=str(file.id),
+                request_id=getattr(request.state, "request_id", None),
+            )
+            await session.commit()
+            raise ApiError(
+                status_code=422,
+                code="uploaded_checksum_mismatch",
+                message="Stored object SHA-256 differs from the declared checksum",
+            )
+
     if file.object_key.startswith("staging/"):
         final_key = _final_object_key(file.object_key)
         stored = await storage.promote(
@@ -500,7 +557,7 @@ async def complete_upload(
     upload.completed_at = datetime.now(UTC)
     file.size_bytes = stored.size_bytes
     file.status = FileStatus.PROCESSING
-    if stored.checksum_sha256:
+    if stored.checksum_sha256 and file.checksum_value is None:
         file.checksum_algorithm = "SHA256"
         file.checksum_value = stored.checksum_sha256
     add_audit_event(
@@ -512,9 +569,111 @@ async def complete_upload(
         request_id=getattr(request.state, "request_id", None),
         details={"status": "processing"},
     )
+    conversion = await enqueue_okf_conversion(session, file)
+    if conversion is not None:
+        add_audit_event(
+            session,
+            actor_id=access.user.id,
+            action="okf.conversion_queued",
+            resource_type="okf_conversion_job",
+            resource_id=str(conversion.id),
+            request_id=getattr(request.state, "request_id", None),
+            details={"file_id": str(file.id), "prompt_version": conversion.prompt_version},
+        )
     await session.commit()
     await session.refresh(file)
     return file
+
+
+@router.get("/{file_id}/okf-conversion", response_model=OkfConversionRead)
+async def get_okf_conversion(
+    file_id: UUID,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("file:read"))],
+) -> OkfConversionJob:
+    row = (
+        await session.execute(
+            select(OkfConversionJob, File)
+            .join(File, File.id == OkfConversionJob.file_id)
+            .where(OkfConversionJob.file_id == file_id)
+            .order_by(OkfConversionJob.file_version.desc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if row is None:
+        raise ApiError(
+            status_code=404,
+            code="okf_conversion_not_found",
+            message="Conversion not found",
+        )
+    conversion = cast(OkfConversionJob, row[0])
+    file = cast(File, row[1])
+    if not access.allows("file:read:any"):
+        if file.knowledge_base_id is None:
+            if file.owner_id != access.user.id:
+                raise ApiError(
+                    status_code=404,
+                    code="okf_conversion_not_found",
+                    message="Conversion not found",
+                )
+        else:
+            await require_knowledge_base_access(session, access, file.knowledge_base_id)
+    return conversion
+
+
+@router.post("/{file_id}/okf-conversion/retry", response_model=OkfConversionRead)
+async def retry_okf_conversion(
+    file_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("file:approve"))],
+) -> OkfConversionJob:
+    conversion = await session.scalar(
+        select(OkfConversionJob)
+        .where(OkfConversionJob.file_id == file_id)
+        .order_by(OkfConversionJob.file_version.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if conversion is None:
+        raise ApiError(
+            status_code=404,
+            code="okf_conversion_not_found",
+            message="Conversion not found",
+        )
+    await require_knowledge_base_access(
+        session,
+        access,
+        conversion.knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.MANAGER,
+    )
+    if conversion.status not in {
+        OkfConversionStatus.FAILED,
+        OkfConversionStatus.UNSUPPORTED,
+    }:
+        raise ApiError(
+            status_code=409,
+            code="okf_conversion_state_conflict",
+            message="Only terminal failed conversions can be retried",
+        )
+    conversion.status = OkfConversionStatus.PENDING
+    conversion.attempts = 0
+    conversion.error_code = None
+    conversion.next_attempt_at = None
+    conversion.locked_at = None
+    conversion.lease_id = None
+    conversion.completed_at = None
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="okf.conversion_retried",
+        resource_type="okf_conversion_job",
+        resource_id=str(conversion.id),
+        request_id=getattr(request.state, "request_id", None),
+    )
+    await session.commit()
+    await session.refresh(conversion)
+    return conversion
 
 
 @router.delete("/uploads/{upload_session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -577,12 +736,33 @@ async def approve_processed_file(
     file = await session.scalar(select(File).where(File.id == file_id).with_for_update())
     if file is None:
         raise ApiError(status_code=404, code="file_not_found", message="File not found")
+    if file.knowledge_base_id is not None:
+        await require_knowledge_base_access(
+            session,
+            access,
+            file.knowledge_base_id,
+            minimum=KnowledgeBaseAccessLevel.MANAGER,
+        )
+    elif (
+        file.owner_id != access.user.id
+        and not access.user.is_superuser
+        and "file:approve:any" not in access.permissions
+    ):
+        raise ApiError(status_code=404, code="file_not_found", message="File not found")
     if file.status is not FileStatus.PROCESSING:
         raise ApiError(
             status_code=409, code="file_state_conflict", message="File is not awaiting approval"
         )
     file.status = FileStatus.AVAILABLE
     file.available_at = datetime.now(UTC)
+    await session.execute(
+        update(KnowledgeEntry)
+        .where(
+            KnowledgeEntry.source_file_id == file.id,
+            KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
+        )
+        .values(publication_status=KnowledgeEntryPublicationStatus.PUBLISHED)
+    )
     add_audit_event(
         session,
         actor_id=access.user.id,

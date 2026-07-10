@@ -6,14 +6,18 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.db.models import FileStatus, UploadSessionStatus
+from app.db.models import FileStatus, OkfConversionStatus, UploadSessionStatus
 
 
 class UploadInitiateRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=500)
     size_bytes: int = Field(gt=0)
     content_type: str = Field(default="application/octet-stream", max_length=255)
-    checksum_sha256: str | None = Field(default=None, min_length=44, max_length=64)
+    checksum_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Optional lowercase or uppercase hexadecimal SHA-256 for single-part uploads",
+    )
     custom_metadata: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str = Field(min_length=8, max_length=200)
     knowledge_base_id: UUID | None = None
@@ -98,3 +102,22 @@ class FileRead(BaseModel):
 class DownloadGrant(BaseModel):
     url: str
     expires_in: int
+
+
+class OkfConversionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    file_id: UUID
+    knowledge_base_id: UUID
+    file_version: int
+    status: OkfConversionStatus
+    attempts: int
+    model: str | None
+    prompt_version: str
+    output_entry_id: UUID | None
+    error_code: str | None
+    next_attempt_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime

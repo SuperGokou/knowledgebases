@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/v1/internal/maintenance",
-      "schedule": "17 3 * * *"
+      "schedule": "* * * * *"
     }
   ]
 }

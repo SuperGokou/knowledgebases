@@ -274,6 +274,17 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     assert refresh.status_code == 200, refresh.text
     assert refresh.headers["cache-control"] == "no-store"
 
+    logout = await api_harness.client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": refresh.json()["refresh_token"]},
+    )
+    assert logout.status_code == 204, logout.text
+    revoked_refresh = await api_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": refresh.json()["refresh_token"]},
+    )
+    assert revoked_refresh.status_code == 401
+
     role = await api_harness.client.post(
         "/api/v1/roles",
         headers=headers,
@@ -551,7 +562,7 @@ async def test_internal_maintenance_requires_cron_secret(api_harness: ApiHarness
     assert denied.status_code == 401
     assert wrong.status_code == 401
     assert accepted.status_code == 200
-    assert accepted.json() == {"cleaned": 0}
+    assert accepted.json() == {"cleaned": 0, "converted": 0}
 
 
 @pytest.mark.asyncio

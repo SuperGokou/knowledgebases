@@ -304,3 +304,42 @@ async def refresh_tokens(
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     return pair
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(
+    payload: RefreshRequest,
+    request: Request,
+    response: Response,
+    session: DatabaseSession,
+    tokens: Annotated[TokenService, Depends(get_token_service)],
+) -> None:
+    """Revoke one refresh-token family member without exposing token validity."""
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    try:
+        claims = tokens.decode(payload.refresh_token, expected_type="refresh")
+    except TokenError:
+        return
+
+    record = await session.scalar(
+        select(RefreshToken).where(RefreshToken.id == claims.token_id).with_for_update()
+    )
+    if record is None or not hmac.compare_digest(
+        record.token_hash,
+        tokens.fingerprint(payload.refresh_token),
+    ):
+        await session.rollback()
+        return
+
+    if record.revoked_at is None:
+        record.revoked_at = datetime.now(UTC)
+        add_audit_event(
+            session,
+            action="auth.logout.succeeded",
+            resource_type="user",
+            resource_id=str(record.user_id),
+            actor_id=record.user_id,
+            request_id=getattr(request.state, "request_id", None),
+        )
+        await session.commit()

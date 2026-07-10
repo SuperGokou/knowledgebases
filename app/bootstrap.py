@@ -24,6 +24,7 @@ PERMISSION_CATALOG: dict[str, tuple[str, str]] = {
     "file:read:any": ("Read all files", "Read files owned by any user"),
     "file:upload": ("Upload files", "Create and complete direct-upload sessions"),
     "file:approve": ("Approve files", "Approve a scanned or manually reviewed file"),
+    "file:approve:any": ("Approve any unscoped file", "Approve files outside a knowledge base"),
     "file:delete": ("Delete files", "Soft-delete knowledge-base files"),
     "user:manage": ("Manage users", "Create, disable, and update users"),
     "role:read": ("Read roles", "View roles, permissions, and limits"),

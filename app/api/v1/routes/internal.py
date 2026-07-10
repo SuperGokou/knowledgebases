@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from app.api.dependencies import DatabaseSession, get_storage_service
 from app.core.config import Settings, get_settings
 from app.maintenance import cleanup_expired_uploads
+from app.services.deepseek import DeepSeekClient
+from app.services.okf_conversion import process_okf_conversion_batch
 from app.services.storage import StorageService
 
 router = APIRouter()
@@ -40,4 +42,11 @@ async def run_maintenance(
         total += cleaned
         if cleaned < settings.maintenance_batch_size:
             break
-    return {"cleaned": total}
+    converted = await process_okf_conversion_batch(
+        session,
+        storage,
+        DeepSeekClient(settings),
+        settings,
+        batch_size=settings.okf_conversion_batch_size,
+    )
+    return {"cleaned": total, "converted": converted}

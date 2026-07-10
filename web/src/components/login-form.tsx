@@ -41,7 +41,7 @@ export function LoginForm() {
   return (
     <form className="login-form" onSubmit={submit}>
       <div className="form-heading">
-        <p className="eyebrow">欢迎回来</p>
+        <p className="eyebrow">江苏和熠光显有限公司</p>
         <h1>登录知识工作台</h1>
         <p>使用企业账号继续，所有令牌仅保存在服务端安全 Cookie 中。</p>
       </div>

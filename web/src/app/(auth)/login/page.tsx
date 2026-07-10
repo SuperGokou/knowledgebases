@@ -1,5 +1,6 @@
 import { Suspense } from "react";
 
+import { BrandIdentity } from "@/components/brand-identity";
 import { Icon } from "@/components/icon";
 import { LoginForm } from "@/components/login-form";
 
@@ -9,7 +10,7 @@ export default function LoginPage() {
   return (
     <main className="login-page">
       <section className="login-story">
-        <div className="brand light"><span className="brand-mark"><Icon name="spark" /></span><span><strong>Atlas</strong><small>企业知识中台</small></span></div>
+        <div className="brand light"><BrandIdentity variant="login" priority /></div>
         <div className="story-copy">
           <p className="eyebrow light-text">KNOWLEDGE, WITH CONTROL.</p>
           <h2>让组织知识可发现，<br />更让每一次访问可控。</h2>
@@ -20,7 +21,7 @@ export default function LoginPage() {
           <span><Icon name="shield" /><b>动态 RBAC</b><small>细粒度权限</small></span>
           <span><Icon name="lock" /><b>零令牌暴露</b><small>HttpOnly 会话</small></span>
         </div>
-        <p className="story-foot">Enterprise knowledge infrastructure · v0.1</p>
+        <p className="story-foot">江苏和熠光显有限公司 · Enterprise knowledge infrastructure · v0.1</p>
       </section>
       <section className="login-panel">
         <Suspense fallback={<div className="login-form"><span className="skeleton wide" /></div>}>

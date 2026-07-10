@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 
 import { AccessProvider } from "@/components/access-provider";
+import { BrandIdentity } from "@/components/brand-identity";
 import { Icon } from "@/components/icon";
 import { LogoutButton } from "@/components/logout-button";
 import { MobileNav } from "@/components/mobile-nav";
@@ -14,8 +15,7 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
       <div className="app-shell">
       <aside className="sidebar">
         <Link className="brand" href="/chat">
-          <span className="brand-mark"><Icon name="spark" /></span>
-          <span><strong>Atlas</strong><small>企业知识中台</small></span>
+          <BrandIdentity />
         </Link>
         <SideNav />
         <div className="sidebar-foot">
@@ -32,7 +32,7 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
       </aside>
       <div className="shell-main">
         <header className="topbar">
-          <div className="mobile-brand"><span className="brand-mark"><Icon name="spark" /></span><strong>Atlas</strong></div>
+          <div className="mobile-brand"><BrandIdentity variant="mobile" /></div>
           <div className="topbar-status"><span className="pulse" /> API 通过安全 BFF 连接</div>
           <div className="topbar-help"><kbd>⌘</kbd><kbd>K</kbd><span>快速搜索</span></div>
         </header>

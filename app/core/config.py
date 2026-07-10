@@ -25,8 +25,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("KB_SERVERLESS", "VERCEL"),
     )
     api_prefix: str = "/api/v1"
-    database_url: str = "postgresql+asyncpg://knowledge:knowledge@localhost:5432/knowledge"
-    redis_url: str = "redis://localhost:6379/0"
+    database_url: str = Field(
+        default="postgresql+asyncpg://knowledge:knowledge@localhost:5432/knowledge",
+        validation_alias=AliasChoices("KB_DATABASE_URL", "DATABASE_URL"),
+    )
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        validation_alias=AliasChoices("KB_REDIS_URL", "KV_URL", "REDIS_URL"),
+    )
 
     jwt_secret: SecretStr = SecretStr(
         "development-only-change-this-secret-before-production-0123456789"
@@ -85,6 +91,22 @@ class Settings(BaseSettings):
     maintenance_batch_size: int = Field(default=100, ge=1, le=500)
     maintenance_max_batches: int = Field(default=10, ge=1, le=100)
 
+    # Phase-one OKF compiler. The API key is optional so uploads keep working
+    # while the external processor is intentionally disabled.
+    deepseek_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KB_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"),
+    )
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_timeout_seconds: float = Field(default=45, ge=5, le=120)
+    deepseek_max_tokens: int = Field(default=4_096, ge=256, le=32_768)
+    okf_source_max_bytes: int = Field(default=1_000_000, ge=1_024, le=5_000_000)
+    okf_conversion_max_attempts: int = Field(default=4, ge=1, le=10)
+    okf_conversion_lease_seconds: int = Field(default=300, ge=60, le=3_600)
+    okf_conversion_batch_size: int = Field(default=5, ge=1, le=20)
+    okf_conversion_time_budget_seconds: float = Field(default=50, ge=5, le=300)
+
     bootstrap_admin_email: str = "admin@example.com"
     bootstrap_admin_password: SecretStr | None = None
 
@@ -94,6 +116,17 @@ class Settings(BaseSettings):
         return tuple(
             sorted({item.lower() if item.startswith(".") else f".{item.lower()}" for item in value})
         )
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_driver(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        if value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+psycopg://", 1)
+        if value.startswith("postgres://"):
+            return value.replace("postgres://", "postgresql+psycopg://", 1)
+        return value
 
     @field_validator("environment", mode="before")
     @classmethod
@@ -148,6 +181,9 @@ class Settings(BaseSettings):
                 raise ValueError("CRON_SECRET must contain at least 16 characters on serverless")
             if self.access_token_minutes > 60:
                 raise ValueError("access tokens must not exceed 60 minutes in production")
+            deepseek_url = urlparse(self.deepseek_base_url)
+            if deepseek_url.scheme != "https" or not deepseek_url.hostname:
+                raise ValueError("KB_DEEPSEEK_BASE_URL must be an absolute HTTPS URL in production")
         return self
 
 

@@ -82,3 +82,17 @@ def test_serverless_production_requires_cron_secret() -> None:
 def test_production_rejects_short_optional_bff_secret() -> None:
     with pytest.raises(ValidationError):
         production_settings(bff_shared_secret="too-short")
+
+
+def test_marketplace_and_existing_secret_aliases_are_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db.example.test/db")
+    monkeypatch.setenv("KV_URL", "rediss://default:pass@redis.example.test:6379/0")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret-value")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_url == "postgresql+psycopg://user:pass@db.example.test/db"
+    assert settings.redis_url.startswith("rediss://")
+    assert settings.deepseek_api_key is not None

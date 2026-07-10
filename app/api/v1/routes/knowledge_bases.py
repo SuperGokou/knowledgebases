@@ -15,6 +15,7 @@ from app.db.models import (
     KnowledgeBaseAccessLevel,
     KnowledgeBaseRoleGrant,
     KnowledgeEntry,
+    KnowledgeEntryPublicationStatus,
     Role,
 )
 from app.schemas.knowledge_bases import (
@@ -25,6 +26,7 @@ from app.schemas.knowledge_bases import (
     KnowledgeBaseUpdate,
     KnowledgeEntryCreate,
     KnowledgeEntryRead,
+    KnowledgeEntrySummary,
     KnowledgeEntryUpdate,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
@@ -57,6 +59,7 @@ def _knowledge_base_read(item: KnowledgeBaseAccess) -> KnowledgeBaseRead:
         owner_id=knowledge_base.owner_id,
         name=knowledge_base.name,
         description=knowledge_base.description,
+        external_llm_processing_enabled=knowledge_base.external_llm_processing_enabled,
         custom_metadata=knowledge_base.custom_metadata,
         access_level=item.level,
         created_at=knowledge_base.created_at,
@@ -96,6 +99,7 @@ async def create_knowledge_base(
         owner_id=access.user.id,
         name=payload.name.strip(),
         description=payload.description,
+        external_llm_processing_enabled=payload.external_llm_processing_enabled,
         custom_metadata=payload.custom_metadata,
     )
     session.add(knowledge_base)
@@ -249,7 +253,7 @@ async def replace_role_grants(
 
 @router.get(
     "/{knowledge_base_id}/entries",
-    response_model=list[KnowledgeEntryRead],
+    response_model=list[KnowledgeEntrySummary],
 )
 async def list_entries(
     knowledge_base_id: UUID,
@@ -257,10 +261,21 @@ async def list_entries(
     access: Annotated[AccessContext, Depends(require_permission("knowledge:read"))],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> list[KnowledgeEntry]:
-    await require_knowledge_base_access(session, access, knowledge_base_id)
+) -> list[KnowledgeEntrySummary]:
+    kb_access = await require_knowledge_base_access(session, access, knowledge_base_id)
     statement = (
-        select(KnowledgeEntry)
+        select(
+            KnowledgeEntry.id,
+            KnowledgeEntry.knowledge_base_id,
+            KnowledgeEntry.source_file_id,
+            KnowledgeEntry.entry_type,
+            KnowledgeEntry.title,
+            KnowledgeEntry.source_path,
+            KnowledgeEntry.format_version,
+            KnowledgeEntry.publication_status,
+            KnowledgeEntry.created_at,
+            KnowledgeEntry.updated_at,
+        )
         .where(
             KnowledgeEntry.knowledge_base_id == knowledge_base_id,
             KnowledgeEntry.deleted_at.is_(None),
@@ -269,7 +284,45 @@ async def list_entries(
         .limit(limit)
         .offset(offset)
     )
-    return list((await session.scalars(statement)).all())
+    if kb_access.level is not KnowledgeBaseAccessLevel.MANAGER:
+        statement = statement.where(
+            KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.PUBLISHED
+        )
+    rows = (await session.execute(statement)).mappings()
+    return [KnowledgeEntrySummary.model_validate(row) for row in rows]
+
+
+@router.get(
+    "/{knowledge_base_id}/entries/{entry_id}",
+    response_model=KnowledgeEntryRead,
+)
+async def get_entry(
+    knowledge_base_id: UUID,
+    entry_id: UUID,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:read"))],
+) -> KnowledgeEntry:
+    kb_access = await require_knowledge_base_access(session, access, knowledge_base_id)
+    visibility = []
+    if kb_access.level is not KnowledgeBaseAccessLevel.MANAGER:
+        visibility.append(
+            KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.PUBLISHED
+        )
+    entry = await session.scalar(
+        select(KnowledgeEntry).where(
+            KnowledgeEntry.id == entry_id,
+            KnowledgeEntry.knowledge_base_id == knowledge_base_id,
+            KnowledgeEntry.deleted_at.is_(None),
+            *visibility,
+        )
+    )
+    if entry is None:
+        raise ApiError(
+            status_code=404,
+            code="knowledge_entry_not_found",
+            message="Knowledge entry not found",
+        )
+    return entry
 
 
 @router.post(

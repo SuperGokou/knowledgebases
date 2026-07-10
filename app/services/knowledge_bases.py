@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import exists, false, or_, select
+from sqlalchemy import case, exists, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import ApiError
@@ -13,6 +14,7 @@ from app.db.models import (
     KnowledgeBaseAccessLevel,
     KnowledgeBaseRoleGrant,
     KnowledgeEntry,
+    KnowledgeEntryPublicationStatus,
 )
 from app.schemas.knowledge_bases import KnowledgeSearchHit
 from app.services.access import AccessContext
@@ -193,21 +195,46 @@ async def search_knowledge_entries(
                 KnowledgeEntry.content.ilike(pattern, escape="\\"),
             ]
         )
-    statement = select(KnowledgeEntry).where(
+    bind = session.get_bind()
+    if bind.dialect.name == "postgresql":
+        primary_term = terms[0]
+        match_position = func.strpos(func.lower(KnowledgeEntry.content), primary_term)
+        excerpt_start = case((match_position > 80, match_position - 80), else_=1)
+        excerpt_expression: Any = func.substr(
+            KnowledgeEntry.content, excerpt_start, 280
+        )
+    else:
+        # SQLite is limited to the integration-test harness. Production PostgreSQL
+        # projects a bounded snippet so multi-megabyte bodies never cross the wire.
+        excerpt_expression = KnowledgeEntry.content
+
+    statement = select(
+        KnowledgeEntry.id,
+        KnowledgeEntry.source_file_id,
+        KnowledgeEntry.title,
+        excerpt_expression.label("excerpt"),
+        KnowledgeEntry.source_path,
+        KnowledgeEntry.format_version,
+    ).where(
         KnowledgeEntry.knowledge_base_id == knowledge_base_id,
         KnowledgeEntry.deleted_at.is_(None),
+        KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.PUBLISHED,
         or_(*predicates),
     )
     statement = statement.order_by(KnowledgeEntry.updated_at.desc(), KnowledgeEntry.id).limit(limit)
-    entries = list((await session.scalars(statement)).all())
+    entries = (await session.execute(statement)).mappings().all()
     return [
         KnowledgeSearchHit(
-            entry_id=entry.id,
-            source_file_id=entry.source_file_id,
-            title=entry.title,
-            excerpt=_excerpt(entry.content, terms),
-            source_path=entry.source_path,
-            format_version=entry.format_version,
+            entry_id=entry["id"],
+            source_file_id=entry["source_file_id"],
+            title=entry["title"],
+            excerpt=(
+                entry["excerpt"].strip()
+                if bind.dialect.name == "postgresql"
+                else _excerpt(entry["excerpt"], terms)
+            ),
+            source_path=entry["source_path"],
+            format_version=entry["format_version"],
         )
         for entry in entries
     ]

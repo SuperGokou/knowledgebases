@@ -1,7 +1,8 @@
 <div align="center">
-  <h1>Atlas Enterprise Knowledge Base</h1>
+  <img src="web/public/brand/heyi-display-logo.webp" alt="和熠光显 EFD Logo" width="180">
+  <h1>江苏和熠光显有限公司 · 企业知识中台</h1>
   <p><strong>面向 10 TB+ 文档数据的企业知识库与安全问答工作台</strong></p>
-  <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、检索式聊天与 Serverless 控制面。</p>
+  <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、OKF 知识编译、检索式聊天与 Serverless 控制面。</p>
 </div>
 
 <p align="center">
@@ -11,13 +12,16 @@
   <a href="https://www.postgresql.org/"><img alt="PostgreSQL 17" src="https://img.shields.io/badge/PostgreSQL-17-4169E1?style=flat-square&amp;logo=postgresql&amp;logoColor=white"></a>
   <a href="https://redis.io/"><img alt="Redis 8" src="https://img.shields.io/badge/Redis-8-DC382D?style=flat-square&amp;logo=redis&amp;logoColor=white"></a>
   <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html"><img alt="S3 Compatible" src="https://img.shields.io/badge/Storage-S3%20Compatible-569A31?style=flat-square&amp;logo=amazons3&amp;logoColor=white"></a>
-  <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF Ready" src="https://img.shields.io/badge/OKF-v0.1%20Ready-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF Phase 1" src="https://img.shields.io/badge/OKF-v0.1%20Phase%201-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://api-docs.deepseek.com/"><img alt="DeepSeek" src="https://img.shields.io/badge/AI-DeepSeek-536AF5?style=flat-square"></a>
   <a href="https://www.docker.com/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
   <a href="https://knowledgebases.vercel.app/docs"><img alt="Vercel Demo" src="https://img.shields.io/badge/Demo-Vercel-000000?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
   <a href="https://github.com/SuperGokou/knowledgebases/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/SuperGokou/knowledgebases?style=flat-square"></a>
 </p>
 <p align="center">
-  <a href="https://knowledgebases.vercel.app/docs"><strong>API Demo</strong></a>
+  <a href="https://knowledgebases.vercel.app"><strong>Web Demo</strong></a>
+  ·
+  <a href="https://knowledgebases.vercel.app/docs">API Demo</a>
   ·
   <a href="https://knowledgebases.vercel.app/openapi.json">OpenAPI</a>
   ·
@@ -29,7 +33,7 @@
 </p>
 
 > [!IMPORTANT]
-> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传和可追溯的数据库文本检索 Demo。恶意软件扫描、Office/PDF 解析 Worker、向量检索和 LLM 生成仍是明确的后续阶段，检索式 Demo 不会冒充完整 RAG。
+> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传，以及第一阶段 OKF/DeepSeek 知识编译。自动转换仅处理管理员显式授权知识库中的 UTF-8 `.txt/.csv`，产物先进入草稿，源文件审批后才发布到检索；Office/PDF 沙箱解析、向量检索和生成式 RAG 仍属于后续阶段。
 
 ## 项目定位
 
@@ -81,6 +85,8 @@ flowchart LR
     PostgreSQL[("PostgreSQL / Supabase<br/>Users · RBAC · KB ACL · Entries · Audit")]
     Redis[("Upstash / Redis<br/>Atomic Rate Limits")]
     Storage[("COS / S3 / MinIO<br/>Private Objects")]
+    DeepSeek["DeepSeek API<br/>JSON Output · schema validation"]
+    OKFWorker["OKF Compiler<br/>durable job · lease · retry · draft"]
 
     Browser -->|"Same-origin HTTPS"| BFF
     BFF -->|"Bearer + signed client IP"| Middleware
@@ -89,6 +95,10 @@ flowchart LR
     Services -->|"Lua 原子限流"| Redis
     Services -->|"Multipart、HEAD、Copy、Abort"| Storage
     Browser -->|"短期预签名 PUT / GET<br/>文件字节不经过 BFF/API"| Storage
+    Cron -->|"time budget + reconciliation"| OKFWorker
+    OKFWorker -->|"bounded UTF-8 source"| Storage
+    OKFWorker -->|"explicit KB opt-in"| DeepSeek
+    OKFWorker -->|"draft / audit / token usage"| PostgreSQL
     Cron -->|"CRON_SECRET"| Middleware
     Ops -.->|"部署前一次性执行"| PostgreSQL
 ```
@@ -103,6 +113,8 @@ sequenceDiagram
     participant D as PostgreSQL
     participant R as Redis
     participant O as COS / S3 / MinIO
+    participant W as OKF Worker
+    participant L as DeepSeek
     participant M as 管理员
 
     C->>A: POST /api/v1/files/uploads
@@ -115,9 +127,16 @@ sequenceDiagram
     C->>A: POST /uploads/{id}/complete
     A->>O: Complete / HEAD / Promote
     A->>D: HELD → CONSUMED，File → PROCESSING
+    A->>D: 创建幂等 OKF 转换任务
+    Note over D: 仅管理员已开启外部模型处理时执行
+    W->>D: 带 lease_id 领取任务
+    W->>O: 有界读取 UTF-8 TXT/CSV
+    W->>L: JSON Output 请求
+    L-->>W: JSON 响应
+    W->>D: schema 校验后写入 DRAFT
     A-->>C: FileRead(status=processing)
     M->>A: POST /files/{id}/approve
-    A->>D: PROCESSING → AVAILABLE，写入审计
+    A->>D: PROCESSING → AVAILABLE，DRAFT → PUBLISHED，写入审计
     A-->>M: FileRead(status=available)
 ```
 
@@ -129,11 +148,13 @@ sequenceDiagram
 | 登录工作台 | Next.js 16、HttpOnly Cookie BFF、同源校验、规范路径白名单、安全响应头与刷新 single-flight |
 | 动态 RBAC | 自定义角色、权限目录、角色优先级、角色分配、通配权限与最后一个超级管理员保护 |
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
+| OKF Phase 1 | 上传后持久任务、DeepSeek JSON Output、严格 schema 校验、租约防竞态、指数退避、草稿/发布门禁 |
+| 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；审计只记录文档 ID、模型、策略版本与 token 用量，不记录正文 |
 | 知识问答 Demo | 在授权知识库内做数据库文本检索，回答携带知识条目 citation，明确标记 `mode=retrieval` |
 | 分级限额 | 每分钟请求数、单文件大小、每日上传字节、总存储字节、每日下载凭证 |
 | 大文件上传 | 单 PUT、S3 Multipart、最多 10,000 分片、分批签名、并发上传和客户端断点续传 |
 | 并发安全 | PostgreSQL `used + reserved` 配额模型、行锁、唯一约束与幂等键 |
-| 对象安全 | 私有 Bucket、短期预签名 URL、精确 `Content-Length`、staging/final key 隔离 |
+| 对象安全 | 私有 Bucket、短期预签名 URL、精确 `Content-Length`、单 PUT SHA-256 强校验、staging/final key 隔离 |
 | 恢复与维护 | 上传状态机、`FINALIZING` 对账、过期会话与 reservation 清理、Vercel Cron |
 | 审计 | 用户、角色、上传、审批和下载凭证等安全事件持久化 |
 | 部署 | Docker Compose 本地栈、Alembic、幂等 Bootstrap、Vercel Functions、腾讯 COS |
@@ -167,6 +188,7 @@ sequenceDiagram
 | 对象存储 | 腾讯 COS、AWS S3、MinIO | 私有文件、Multipart 与预签名访问 |
 | 本地编排 | Docker Compose | PostgreSQL、Redis、MinIO、迁移、Bootstrap 和 API |
 | Serverless | Vercel Functions + Cron | 无状态控制面与周期维护 |
+| 知识编译 | DeepSeek API、httpx、Pydantic | UTF-8 文本到 OKF v0.1 草稿、重试、审计与发布门禁 |
 | 工程质量 | uv、pytest、Ruff、mypy strict | 可复现依赖、测试、Lint 与静态类型检查 |
 
 ## 快速开始
@@ -229,6 +251,21 @@ KB_BOOTSTRAP_ADMIN_EMAIL
 KB_BOOTSTRAP_ADMIN_PASSWORD
 ```
 
+### 开启 DeepSeek → OKF 自动转换
+
+密钥只配置在 FastAPI/Worker 服务端，不得使用 `NEXT_PUBLIC_` 前缀：
+
+```text
+KB_DEEPSEEK_API_KEY=<Vercel Sensitive Environment Variable>
+KB_DEEPSEEK_BASE_URL=https://api.deepseek.com
+KB_DEEPSEEK_MODEL=deepseek-v4-flash
+KB_OKF_SOURCE_MAX_BYTES=1000000
+KB_OKF_CONVERSION_BATCH_SIZE=5
+KB_OKF_CONVERSION_TIME_BUDGET_SECONDS=50
+```
+
+随后由知识库 Manager 在“知识空间”中显式开启 **DeepSeek 自动转换**。第一阶段只读取不超过配置上限的 UTF-8 `.txt/.csv`；其他格式会安全标记为 `unsupported/parser_required`，等待后续隔离解析 Worker。任务使用数据库持久化、`lease_id` 所有权、有限重试与时间预算，转换成功只生成 `draft`，批准源文件后才发布。
+
 ## 上传文件
 
 内置 CLI 支持自动登录、单文件直传、并发分片、URL 刷新、SHA-256 计算和 checkpoint 断点续传：
@@ -256,7 +293,7 @@ Authorization: Bearer <access-token>
 
 | 能力 | 接口 |
 |---|---|
-| 登录与刷新 | `POST /api/v1/auth/token` · `POST /api/v1/auth/refresh` |
+| 登录、刷新与退出 | `POST /api/v1/auth/token` · `POST /api/v1/auth/refresh` · `POST /api/v1/auth/logout` |
 | 当前会话 | `GET /api/v1/auth/me` |
 | 用户管理 | `GET/POST /api/v1/users` · `PATCH /api/v1/users/{id}` · `PUT /api/v1/users/{id}/roles` |
 | 动态角色 | `GET/POST /api/v1/roles` · `PATCH /api/v1/roles/{id}` |
@@ -267,10 +304,11 @@ Authorization: Bearer <access-token>
 | 分片签名 | `POST /api/v1/files/uploads/{id}/parts` |
 | 完成或中止 | `POST /api/v1/files/uploads/{id}/complete` · `DELETE /api/v1/files/uploads/{id}` |
 | 审批文件 | `POST /api/v1/files/{id}/approve` |
+| OKF 转换状态 | `GET /api/v1/files/{id}/okf-conversion` · `POST .../okf-conversion/retry` |
 | 下载凭证 | `POST /api/v1/files/{id}/download` |
 | 知识库 | `GET/POST /api/v1/knowledge-bases` · `GET/PATCH /api/v1/knowledge-bases/{id}` |
 | 知识授权 | `GET/PUT /api/v1/knowledge-bases/{id}/role-grants` |
-| 知识条目 | `GET/POST /api/v1/knowledge-bases/{id}/entries` · `PATCH .../entries/{entry_id}` |
+| 知识条目 | `GET/POST /api/v1/knowledge-bases/{id}/entries` · `GET/PATCH .../entries/{entry_id}` |
 | 检索与聊天 | `POST /api/v1/knowledge-bases/{id}/search` · `POST /api/v1/chat/query` |
 
 下载限额统计的是“成功签发下载 URL 的次数”，不是对象存储确认完成的下载次数。若需要按真实传输次数或字节计费，应增加下载网关或 CDN 边缘鉴权。
@@ -317,8 +355,9 @@ npm run build
 - Ruff 的 `E/F/I/B/UP/SIM` 规则；
 - mypy strict；
 - Python 3.12 锁定依赖。
+- Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时的本地验收结果：**80 backend tests + 56 frontend security tests passed，Ruff clean，mypy strict passed，TypeScript/ESLint/Next.js build passed**。
+本 README 更新时的本地验收结果：**86 backend tests + 60 frontend tests passed，branch coverage ≥ 80%，Ruff clean，mypy strict passed，TypeScript/ESLint/Next.js production build passed**。
 
 ## 部署到 Vercel
 
@@ -334,6 +373,8 @@ npm run build
 3. 腾讯 COS 或其他 S3-compatible 私有 Bucket；
 4. 独立的 JWT 与 Cron Secret；
 5. 部署前执行 Alembic migration 和一次性管理员 Bootstrap。
+
+当前 `vercel.json` 以每分钟 Cron 驱动近实时 OKF Worker，因此 API Project 需要 Vercel Pro/Enterprise；Hobby 的 Cron 最短间隔为每天一次。Hobby 部署应把 schedule 调整为每日 reconciliation，并用 Upstash QStash、Vercel Queue 或独立 Worker 承担上传后的即时消费。
 
 完整变量映射、腾讯 COS virtual-host addressing、Supabase、Cron 和迁移顺序见：
 
@@ -352,6 +393,8 @@ npm run build
 - 动态权限实时解析、角色优先级与权限提升防护；
 - 请求体上限、Trusted Host、CORS、请求 ID 和安全错误响应；
 - 私有对象、短期签名、精确大小校验、不可复用最终写 key；
+- 单 PUT SHA-256 绑定签名并恒定时间校验，摘要不匹配时删除对象并释放配额；
+- OKF 草稿/发布门禁、知识库级外部模型 opt-in 与转换租约所有权；
 - PostgreSQL 原子配额预留与持久审计。
 
 正式对外前仍必须补齐：
@@ -372,11 +415,13 @@ npm run build
 - [x] 登录、聊天、知识库、账号、角色、权限与限额管理前端
 - [x] 知识库 Reader/Editor/Manager 动态 ACL 与撤权回归
 - [x] OKF v0.1 兼容字段与原始来源/派生知识分层
+- [x] DeepSeek 自动编译 UTF-8 TXT/CSV、持久任务、租约、重试、草稿审批发布
+- [x] PostgreSQL `pg_trgm` GIN 多语言检索索引与数据库侧有界摘要
 - [ ] 恶意软件扫描与隔离解析 Worker
 - [ ] Office/PDF/CSV 文本抽取与版本化分块
-- [ ] 全文检索、向量索引与 RAG
+- [ ] 混合向量索引与生成式 RAG
 - [ ] OKF Bundle 导入/导出、校验器与知识图谱视图
-- [ ] LLM-Wiki 异步编译、引用审阅与矛盾检测
+- [ ] LLM-Wiki 多文档引用审阅、矛盾检测与增量重编译
 - [ ] 企业 OIDC、MFA 与集中可观测性
 
 ## 文档
@@ -385,6 +430,7 @@ npm run build
 - [运维手册](docs/OPERATIONS.zh-CN.md)：部署、备份、恢复、扩容、告警与排障；
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
+- [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。
 
 ---
 

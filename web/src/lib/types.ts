@@ -112,6 +112,7 @@ export type KnowledgeBase = {
   name: string;
   description: string | null;
   custom_metadata: Record<string, unknown>;
+  external_llm_processing_enabled: boolean;
   access_level: "reader" | "editor" | "manager";
   created_at: string;
   updated_at: string;

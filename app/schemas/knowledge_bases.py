@@ -6,21 +6,23 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.db.models import KnowledgeBaseAccessLevel
+from app.db.models import KnowledgeBaseAccessLevel, KnowledgeEntryPublicationStatus
 
 
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=10_000)
+    external_llm_processing_enabled: bool = False
     custom_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeBaseUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=10_000)
+    external_llm_processing_enabled: bool | None = None
     custom_metadata: dict[str, Any] | None = None
 
-    @field_validator("name", "custom_metadata")
+    @field_validator("name", "custom_metadata", "external_llm_processing_enabled")
     @classmethod
     def non_nullable_fields(cls, value: object) -> object:
         if value is None:
@@ -35,6 +37,7 @@ class KnowledgeBaseRead(BaseModel):
     owner_id: UUID
     name: str
     description: str | None
+    external_llm_processing_enabled: bool
     custom_metadata: dict[str, Any]
     access_level: KnowledgeBaseAccessLevel
     created_at: datetime
@@ -107,7 +110,25 @@ class KnowledgeEntryRead(BaseModel):
     content: str
     source_path: str | None
     format_version: str | None
+    publication_status: KnowledgeEntryPublicationStatus
     custom_metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeEntrySummary(BaseModel):
+    """Bounded list representation; large entry bodies are fetched individually."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    knowledge_base_id: UUID
+    source_file_id: UUID | None
+    entry_type: str
+    title: str
+    source_path: str | None
+    format_version: str | None
+    publication_status: KnowledgeEntryPublicationStatus
     created_at: datetime
     updated_at: datetime
 

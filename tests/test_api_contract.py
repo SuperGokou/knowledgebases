@@ -20,6 +20,7 @@ def test_openapi_exposes_core_admin_and_file_flows() -> None:
     assert {
         "/api/v1/auth/token",
         "/api/v1/auth/refresh",
+        "/api/v1/auth/logout",
         "/api/v1/auth/me",
         "/api/v1/users",
         "/api/v1/roles",

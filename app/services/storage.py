@@ -48,6 +48,10 @@ class StorageService:
             "config": Config(
                 signature_version="s3v4",
                 s3={"addressing_style": settings.s3_addressing_style},
+                connect_timeout=5,
+                read_timeout=30,
+                max_pool_connections=20,
+                retries={"max_attempts": 3, "mode": "standard"},
             ),
             "use_ssl": settings.s3_use_ssl,
         }
@@ -68,6 +72,7 @@ class StorageService:
         upload_session_id: str,
         expected_size_bytes: int,
         plan: UploadPlan,
+        expected_checksum_sha256_base64: str | None = None,
     ) -> InitiatedStorageUpload:
         metadata = {"upload-session-id": upload_session_id}
         if plan.mode is UploadMode.SINGLE:
@@ -78,20 +83,25 @@ class StorageService:
                 "ContentLength": expected_size_bytes,
                 "Metadata": metadata,
             }
+            if expected_checksum_sha256_base64 is not None:
+                params["ChecksumSHA256"] = expected_checksum_sha256_base64
             url = self._presigner.generate_presigned_url(
                 "put_object",
                 Params=params,
                 ExpiresIn=self._settings.presigned_url_seconds,
                 HttpMethod="PUT",
             )
+            required_headers = {
+                "Content-Type": content_type,
+                "Content-Length": str(expected_size_bytes),
+                "x-amz-meta-upload-session-id": upload_session_id,
+            }
+            if expected_checksum_sha256_base64 is not None:
+                required_headers["x-amz-checksum-sha256"] = expected_checksum_sha256_base64
             return InitiatedStorageUpload(
                 upload_id=None,
                 url=url,
-                required_headers={
-                    "Content-Type": content_type,
-                    "Content-Length": str(expected_size_bytes),
-                    "x-amz-meta-upload-session-id": upload_session_id,
-                },
+                required_headers=required_headers,
             )
 
         response = await asyncio.to_thread(
@@ -212,6 +222,26 @@ class StorageService:
             Bucket=self._settings.s3_bucket,
             Key=key,
         )
+
+    async def read_bytes(self, *, key: str, max_bytes: int) -> bytes:
+        """Read a bounded object for text extraction without unbounded memory use."""
+
+        def read() -> bytes:
+            response = self._client.get_object(
+                Bucket=self._settings.s3_bucket,
+                Key=key,
+                Range=f"bytes=0-{max_bytes}",
+            )
+            body = response["Body"]
+            try:
+                return bytes(body.read(max_bytes + 1))
+            finally:
+                body.close()
+
+        data = await asyncio.to_thread(read)
+        if len(data) > max_bytes:
+            raise ValueError("object exceeds conversion input limit")
+        return data
 
     async def promote(self, *, source_key: str, destination_key: str) -> StoredObject:
         """Copy a verified staging object to a key never exposed by a write URL."""

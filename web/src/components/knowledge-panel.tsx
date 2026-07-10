@@ -15,6 +15,8 @@ export function KnowledgePanel() {
   const [unavailable, setUnavailable] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [externalProcessing, setExternalProcessing] = useState(false);
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
   const load = useCallback(async () => {
@@ -44,15 +46,40 @@ export function KnowledgePanel() {
     try {
       await apiRequest<KnowledgeBase>("/api/v1/knowledge-bases", {
         method: "POST",
-        body: JSON.stringify({ name: name.trim(), description: description.trim() || null }),
+        body: JSON.stringify({
+          name: name.trim(),
+          description: description.trim() || null,
+          external_llm_processing_enabled: externalProcessing,
+        }),
       });
       setName("");
       setDescription("");
+      setExternalProcessing(false);
       await load();
     } catch (reason) {
       setError(readableError(reason));
     } finally {
       setPending(false);
+    }
+  }
+
+  async function toggleExternalProcessing(item: KnowledgeBase) {
+    const enabled = !item.external_llm_processing_enabled;
+    if (enabled && !window.confirm("开启后，符合条件的 TXT/CSV 内容会发送给 DeepSeek 生成 OKF 草稿。确认该知识空间允许外部模型处理吗？")) {
+      return;
+    }
+    setUpdatingId(item.id);
+    setError("");
+    try {
+      await apiRequest<KnowledgeBase>(`/api/v1/knowledge-bases/${item.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ external_llm_processing_enabled: enabled }),
+      });
+      await load();
+    } catch (reason) {
+      setError(readableError(reason));
+    } finally {
+      setUpdatingId(null);
     }
   }
 
@@ -74,9 +101,24 @@ export function KnowledgePanel() {
         {items?.length ? (
           <div className="panel-body feature-list">
             {items.map((item) => (
-              <div className="feature-link" key={item.id}>
+              <div className="feature-link knowledge-space-row" key={item.id}>
                 <span><Icon name="book" /></span>
                 <span><strong>{item.name}</strong><small>{item.description || "暂无描述"}</small></span>
+                {item.access_level === "manager" && can("knowledge:update") ? (
+                  <button
+                    className="button secondary compact-button"
+                    type="button"
+                    disabled={updatingId === item.id}
+                    onClick={() => void toggleExternalProcessing(item)}
+                    aria-pressed={item.external_llm_processing_enabled}
+                  >
+                    {updatingId === item.id
+                      ? "保存中…"
+                      : item.external_llm_processing_enabled
+                        ? "DeepSeek 自动转换：已开启"
+                        : "DeepSeek 自动转换：未开启"}
+                  </button>
+                ) : null}
                 <StatusBadge tone={item.access_level === "manager" ? "success" : "neutral"}>
                   {item.access_level === "manager" ? "管理" : item.access_level === "editor" ? "编辑" : "只读"}
                 </StatusBadge>
@@ -98,6 +140,14 @@ export function KnowledgePanel() {
             <form className="form-grid" onSubmit={create}>
               <label>名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：产品与研发" required /></label>
               <label>描述<input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="这个空间收录什么？" /></label>
+              <label className="full consent-control">
+                <input
+                  type="checkbox"
+                  checked={externalProcessing}
+                  onChange={(event) => setExternalProcessing(event.target.checked)}
+                />
+                <span><strong>允许 DeepSeek 自动转换</strong><small>仅第一阶段支持 UTF-8 TXT/CSV；内容会发送到外部模型，默认关闭。</small></span>
+              </label>
               <div className="form-actions full"><button className="button primary" type="submit" disabled={pending || !name.trim()}>{pending ? "正在创建…" : "创建空间"}</button></div>
             </form>
           </details>

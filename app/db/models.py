@@ -64,6 +64,20 @@ class KnowledgeBaseAccessLevel(StrEnum):
     MANAGER = "manager"
 
 
+class OkfConversionStatus(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNSUPPORTED = "unsupported"
+
+
+class KnowledgeEntryPublicationStatus(StrEnum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -202,6 +216,9 @@ class KnowledgeBase(TimestampMixin, Base):
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
+    external_llm_processing_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
@@ -276,8 +293,48 @@ class KnowledgeEntry(TimestampMixin, Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source_path: Mapped[str | None] = mapped_column(String(1000))
     format_version: Mapped[str | None] = mapped_column(String(50))
+    publication_status: Mapped[KnowledgeEntryPublicationStatus] = mapped_column(
+        Enum(KnowledgeEntryPublicationStatus, name="knowledge_entry_publication_status"),
+        default=KnowledgeEntryPublicationStatus.PUBLISHED,
+        nullable=False,
+    )
     custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OkfConversionJob(TimestampMixin, Base):
+    """Durable, idempotent hand-off from immutable source files to OKF entries."""
+
+    __tablename__ = "okf_conversion_jobs"
+    __table_args__ = (
+        UniqueConstraint("file_id", "file_version", name="uq_okf_conversion_file_version"),
+        Index("ix_okf_conversion_claim", "status", "next_attempt_at", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    knowledge_base_id: Mapped[UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    file_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[OkfConversionStatus] = mapped_column(
+        Enum(OkfConversionStatus, name="okf_conversion_status"),
+        default=OkfConversionStatus.PENDING,
+        nullable=False,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    model: Mapped[str | None] = mapped_column(String(100))
+    prompt_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    output_entry_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("knowledge_entries.id", ondelete="SET NULL"), unique=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class UploadSession(Base):

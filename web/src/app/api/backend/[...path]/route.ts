@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { backendUrl, safeBackendFetch } from "@/lib/server/backend";
 import { isAllowedBackendPath } from "@/lib/server/backend-path";
+import { readBoundedBody, RequestBodyTooLargeError } from "@/lib/server/bounded-body";
 import { BffSigningConfigurationError, signedClientIpHeaders } from "@/lib/server/client-ip";
 import {
   hasSameOrigin,
@@ -13,6 +14,7 @@ import {
 } from "@/lib/server/session";
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const MAX_CONTROL_PLANE_BODY_BYTES = 1024 * 1024;
 type RefreshOutcome =
   | { kind: "refreshed"; pair: TokenPair }
   | { kind: "expired" }
@@ -79,7 +81,21 @@ async function handler(
     );
   }
 
-  const body = ["GET", "HEAD"].includes(request.method) ? undefined : await request.arrayBuffer();
+  let body: ArrayBuffer | undefined;
+  try {
+    body = await readBoundedBody(request, MAX_CONTROL_PLANE_BODY_BYTES);
+  } catch (error) {
+    if (!(error instanceof RequestBodyTooLargeError)) throw error;
+    return NextResponse.json(
+      {
+        error: {
+          code: "request_body_too_large",
+          message: "控制面请求不得超过 1 MiB；文件内容请使用对象存储直传。",
+        },
+      },
+      { status: 413 },
+    );
+  }
   const forward = async (access: string | undefined): Promise<Response> => {
     const headers = new Headers({ Accept: "application/json" });
     const contentType = request.headers.get("content-type");

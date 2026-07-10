@@ -7,10 +7,12 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.db.models import File, FileStatus, ReservationStatus, UploadSession, UploadSessionStatus
 from app.db.session import SessionFactory
 from app.services.audit import add_audit_event
+from app.services.deepseek import DeepSeekClient
+from app.services.okf_conversion import enqueue_okf_conversion, process_okf_conversion_batch
 from app.services.quota import QuotaService
 from app.services.storage import StorageService
 
@@ -60,6 +62,15 @@ async def cleanup_expired_uploads(
                     resource_id=str(file.id),
                     details={"status": "processing"},
                 )
+                conversion = await enqueue_okf_conversion(session, file)
+                if conversion is not None:
+                    add_audit_event(
+                        session,
+                        action="okf.conversion_queued",
+                        resource_type="okf_conversion_job",
+                        resource_id=str(conversion.id),
+                        details={"file_id": str(file.id)},
+                    )
                 continue
             if stored is not None:
                 await storage.delete(key=file.object_key)
@@ -89,14 +100,34 @@ async def cleanup_expired_uploads(
     return len(rows)
 
 
+async def run_maintenance_once(
+    session: AsyncSession,
+    storage: StorageService,
+    settings: Settings,
+) -> dict[str, int]:
+    cleaned = await cleanup_expired_uploads(
+        session, storage, batch_size=settings.maintenance_batch_size
+    )
+    converted = await process_okf_conversion_batch(
+        session,
+        storage,
+        DeepSeekClient(settings),
+        settings,
+        batch_size=settings.okf_conversion_batch_size,
+    )
+    return {"cleaned": cleaned, "converted": converted}
+
+
 async def run(*, once: bool, interval_seconds: int) -> None:
     settings = get_settings()
     storage = StorageService(settings)
     while True:
         async with SessionFactory() as session:
-            cleaned = await cleanup_expired_uploads(session, storage)
-            if cleaned:
-                print(f"Cleaned {cleaned} expired upload sessions")
+            result = await run_maintenance_once(session, storage, settings)
+            if result["cleaned"] or result["converted"]:
+                print(
+                    f"Maintenance cleaned={result['cleaned']} converted={result['converted']}"
+                )
         if once:
             return
         await asyncio.sleep(interval_seconds)
