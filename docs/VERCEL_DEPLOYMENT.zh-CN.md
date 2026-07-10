@@ -31,6 +31,7 @@
 | `KB_S3_SECRET_KEY` | 来自 `COS_SECRET_KEY` |
 | `KB_S3_BUCKET` | `COS_BUCKET`；若尚未包含 `-COS_APPID`，需要追加 |
 | `KB_S3_USE_SSL` | 固定为 `true` |
+| `KB_S3_ADDRESSING_STYLE` | 腾讯 COS 固定为 `virtual`；本地 MinIO 保持 `path` |
 | `KB_TRUSTED_HOSTS` | JSON：`["*.vercel.app"]`，有自定义域名时一并加入 |
 | `KB_CORS_ORIGINS` | 管理前端 Origin 的 JSON 数组；没有跨域前端时可为 `[]` |
 

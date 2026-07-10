@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     s3_secret_key: SecretStr = SecretStr("knowledge-secret")
     s3_bucket: str = "knowledge-base"
     s3_use_ssl: bool = False
+    s3_addressing_style: Literal["auto", "path", "virtual"] = "path"
     presigned_url_seconds: int = Field(default=900, ge=60, le=3_600)
     multipart_threshold_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
     multipart_part_size_bytes: int = Field(

@@ -42,3 +42,28 @@ def test_each_multipart_url_signs_its_expected_part_length() -> None:
     assert parts[2].size_bytes == 5
     assert "content-length" in signed_headers(parts[1].url)
     assert "content-length" in signed_headers(parts[2].url)
+
+
+@pytest.mark.asyncio
+async def test_cos_virtual_addressing_places_bucket_in_hostname() -> None:
+    service = StorageService(
+        Settings(
+            s3_endpoint_url="https://cos.ap-beijing.myqcloud.com",
+            s3_public_endpoint_url="https://cos.ap-beijing.myqcloud.com",
+            s3_bucket="example-1250000000",
+            s3_addressing_style="virtual",
+            s3_use_ssl=True,
+        )
+    )
+    initiated = await service.initiate(
+        key="staging/test.txt",
+        content_type="text/plain",
+        upload_session_id="session-cos",
+        expected_size_bytes=5,
+        plan=UploadPlan(mode=UploadMode.SINGLE, part_size_bytes=5, part_count=1),
+    )
+
+    assert initiated.url is not None
+    assert urlparse(initiated.url).hostname == (
+        "example-1250000000.cos.ap-beijing.myqcloud.com"
+    )
