@@ -131,3 +131,20 @@ def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
             environment="test",
             qwen_allowed_workspace_hosts=("*.maas.aliyuncs.com",),
         )
+
+
+def test_settings_validation_errors_hide_sensitive_input() -> None:
+    marker = "do-not-render-this-sensitive-configuration-value"
+
+    with pytest.raises(ValidationError) as captured:
+        Settings(
+            _env_file=None,
+            environment="production",
+            database_url="postgresql+psycopg://user:password@localhost:5432/knowledge",
+            jwt_secret=marker * 2,
+            llm_credentials_encryption_key=marker,
+        )
+
+    rendered = str(captured.value)
+    assert marker not in rendered
+    assert "input_value" not in rendered
