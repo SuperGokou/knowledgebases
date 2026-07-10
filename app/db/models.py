@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import StrEnum
+from typing import Any
+from uuid import UUID, uuid4
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class UserStatus(StrEnum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    LOCKED = "locked"
+
+
+class FileStatus(StrEnum):
+    PENDING = "pending"
+    UPLOADING = "uploading"
+    PROCESSING = "processing"
+    AVAILABLE = "available"
+    QUARANTINED = "quarantined"
+    FAILED = "failed"
+    DELETED = "deleted"
+
+
+class UploadSessionStatus(StrEnum):
+    INITIATED = "initiated"
+    FINALIZING = "finalizing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ABORTED = "aborted"
+    EXPIRED = "expired"
+
+
+class ReservationStatus(StrEnum):
+    HELD = "held"
+    CONSUMED = "consumed"
+    RELEASED = "released"
+    EXPIRED = "expired"
+
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class User(TimestampMixin, Base):
+    __tablename__ = "users"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[UserStatus] = mapped_column(
+        Enum(UserStatus, name="user_status"), default=UserStatus.ACTIVE, nullable=False
+    )
+    is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Role(TimestampMixin, Base):
+    __tablename__ = "roles"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    code: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class Permission(Base):
+    __tablename__ = "permissions"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    code: Mapped[str] = mapped_column(String(150), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    __table_args__ = (UniqueConstraint("user_id", "role_id", name="uq_user_roles_pair"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    role_id: Mapped[UUID] = mapped_column(
+        ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    assigned_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+    __table_args__ = (
+        UniqueConstraint("role_id", "permission_id", name="uq_role_permissions_pair"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    role_id: Mapped[UUID] = mapped_column(
+        ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    permission_id: Mapped[UUID] = mapped_column(
+        ForeignKey("permissions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+
+
+class LimitDefinition(Base):
+    __tablename__ = "limit_definitions"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    key: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    unit: Mapped[str] = mapped_column(String(50), nullable=False)
+    window: Mapped[str] = mapped_column(String(30), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RoleLimit(Base):
+    __tablename__ = "role_limits"
+    __table_args__ = (
+        UniqueConstraint("role_id", "limit_definition_id", name="uq_role_limits_pair"),
+        CheckConstraint("value IS NULL OR value >= 0", name="non_negative_value"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    role_id: Mapped[UUID] = mapped_column(
+        ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    limit_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("limit_definitions.id", ondelete="CASCADE"), nullable=False
+    )
+    value: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class UserLimitOverride(Base):
+    __tablename__ = "user_limit_overrides"
+    __table_args__ = (
+        UniqueConstraint("user_id", "limit_definition_id", name="uq_user_limit_overrides_pair"),
+        CheckConstraint("value IS NULL OR value >= 0", name="non_negative_value"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    limit_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("limit_definitions.id", ondelete="CASCADE"), nullable=False
+    )
+    value: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class File(TimestampMixin, Base):
+    __tablename__ = "files"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
+    original_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    extension: Mapped[str] = mapped_column(String(20), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    checksum_algorithm: Mapped[str | None] = mapped_column(String(50))
+    checksum_value: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[FileStatus] = mapped_column(
+        Enum(FileStatus, name="file_status"), default=FileStatus.PENDING, nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UploadSession(Base):
+    __tablename__ = "upload_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_upload_sessions_idempotency"),
+        Index("ix_upload_sessions_status_expires_at", "status", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    file_id: Mapped[UUID] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    storage_upload_id: Mapped[str | None] = mapped_column(Text)
+    part_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    part_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[UploadSessionStatus] = mapped_column(
+        Enum(UploadSessionStatus, name="upload_session_status"),
+        default=UploadSessionStatus.INITIATED,
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class QuotaCounter(Base):
+    __tablename__ = "quota_counters"
+    __table_args__ = (
+        UniqueConstraint("user_id", "limit_key", "window_start", name="uq_quota_counter_window"),
+        CheckConstraint("used_value >= 0", name="non_negative_used"),
+        CheckConstraint("reserved_value >= 0", name="non_negative_reserved"),
+        Index("ix_quota_counters_lookup", "user_id", "limit_key", "window_start"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    limit_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_value: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    reserved_value: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class QuotaReservation(Base):
+    __tablename__ = "quota_reservations"
+    __table_args__ = (
+        UniqueConstraint("upload_session_id", "limit_key", name="uq_quota_reservation_metric"),
+        CheckConstraint("amount >= 0", name="non_negative_amount"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    upload_session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("upload_sessions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    limit_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[ReservationStatus] = mapped_column(
+        Enum(ReservationStatus, name="reservation_status"),
+        default=ReservationStatus.HELD,
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    __table_args__ = (Index("ix_audit_logs_resource", "resource_type", "resource_id"),)
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    actor_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(150), index=True, nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    resource_id: Mapped[str | None] = mapped_column(String(255))
+    request_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True, nullable=False
+    )
