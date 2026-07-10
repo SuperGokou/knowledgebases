@@ -58,6 +58,12 @@ class ReservationStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class KnowledgeBaseAccessLevel(StrEnum):
+    READER = "reader"
+    EDITOR = "editor"
+    MANAGER = "manager"
+
+
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -186,12 +192,54 @@ class UserLimitOverride(Base):
     value: Mapped[int | None] = mapped_column(BigInteger)
 
 
+class KnowledgeBase(TimestampMixin, Base):
+    __tablename__ = "knowledge_bases"
+    __table_args__ = (Index("ix_knowledge_bases_owner_updated", "owner_id", "updated_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class KnowledgeBaseRoleGrant(TimestampMixin, Base):
+    __tablename__ = "knowledge_base_role_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "knowledge_base_id",
+            "role_id",
+            name="uq_knowledge_base_role_grants_pair",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    role_id: Mapped[UUID] = mapped_column(
+        ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    access_level: Mapped[KnowledgeBaseAccessLevel] = mapped_column(
+        Enum(KnowledgeBaseAccessLevel, name="knowledge_base_access_level"),
+        nullable=False,
+    )
+    granted_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+
+
 class File(TimestampMixin, Base):
     __tablename__ = "files"
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     owner_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    knowledge_base_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="SET NULL"), index=True
     )
     bucket: Mapped[str] = mapped_column(String(255), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
@@ -207,6 +255,28 @@ class File(TimestampMixin, Base):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class KnowledgeEntry(TimestampMixin, Base):
+    __tablename__ = "knowledge_entries"
+    __table_args__ = (
+        Index("ix_knowledge_entries_kb_updated", "knowledge_base_id", "updated_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    knowledge_base_id: Mapped[UUID] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    source_file_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("files.id", ondelete="CASCADE"), index=True
+    )
+    entry_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_path: Mapped[str | None] = mapped_column(String(1000))
+    format_version: Mapped[str | None] = mapped_column(String(50))
+    custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 

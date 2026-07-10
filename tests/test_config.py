@@ -77,3 +77,8 @@ def test_vercel_environment_enables_serverless_mode(monkeypatch: pytest.MonkeyPa
 def test_serverless_production_requires_cron_secret() -> None:
     with pytest.raises(ValidationError):
         production_settings(serverless=True, cron_secret=None)
+
+
+def test_production_rejects_short_optional_bff_secret() -> None:
+    with pytest.raises(ValidationError):
+        production_settings(bff_shared_secret="too-short")

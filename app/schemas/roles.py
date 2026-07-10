@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807
+RoleLimitValue = Annotated[int, Field(ge=0, le=POSTGRES_BIGINT_MAX)] | None
 
 
 class RoleCreate(BaseModel):
@@ -12,14 +16,7 @@ class RoleCreate(BaseModel):
     description: str | None = None
     priority: int = Field(default=0, ge=-10_000, le=10_000)
     permission_codes: list[str] = Field(default_factory=list, max_length=200)
-    limits: dict[str, int | None] = Field(default_factory=dict)
-
-    @field_validator("limits")
-    @classmethod
-    def validate_limits(cls, value: dict[str, int | None]) -> dict[str, int | None]:
-        if any(item is not None and item < 0 for item in value.values()):
-            raise ValueError("limit values cannot be negative")
-        return value
+    limits: dict[str, RoleLimitValue] = Field(default_factory=dict)
 
 
 class RoleUpdate(BaseModel):
@@ -47,7 +44,7 @@ class RoleRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     permission_codes: list[str] = Field(default_factory=list)
-    limits: dict[str, int | None] = Field(default_factory=dict)
+    limits: dict[str, RoleLimitValue] = Field(default_factory=dict)
 
 
 class PermissionRead(BaseModel):
@@ -75,11 +72,9 @@ class PermissionSet(BaseModel):
 
 
 class LimitSet(BaseModel):
-    limits: dict[str, int | None]
+    limits: dict[str, RoleLimitValue]
 
-    @field_validator("limits")
-    @classmethod
-    def validate_limits(cls, value: dict[str, int | None]) -> dict[str, int | None]:
-        if any(item is not None and item < 0 for item in value.values()):
-            raise ValueError("limit values cannot be negative")
-        return value
+
+class RolePolicySet(BaseModel):
+    permission_codes: list[str] = Field(max_length=200)
+    limits: dict[str, RoleLimitValue]

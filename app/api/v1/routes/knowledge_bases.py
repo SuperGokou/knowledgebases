@@ -1,0 +1,407 @@
+from __future__ import annotations
+
+import json
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Query, Request, Response
+from sqlalchemy import delete, select
+
+from app.api.dependencies import DatabaseSession, require_any_permission, require_permission
+from app.api.errors import ApiError
+from app.db.models import (
+    File,
+    KnowledgeBase,
+    KnowledgeBaseAccessLevel,
+    KnowledgeBaseRoleGrant,
+    KnowledgeEntry,
+    Role,
+)
+from app.schemas.knowledge_bases import (
+    KnowledgeBaseCreate,
+    KnowledgeBaseRead,
+    KnowledgeBaseRoleGrantRead,
+    KnowledgeBaseRoleGrantSet,
+    KnowledgeBaseUpdate,
+    KnowledgeEntryCreate,
+    KnowledgeEntryRead,
+    KnowledgeEntryUpdate,
+    KnowledgeSearchRequest,
+    KnowledgeSearchResponse,
+)
+from app.services.access import AccessContext
+from app.services.audit import add_audit_event
+from app.services.knowledge_bases import (
+    KnowledgeBaseAccess,
+    list_accessible_knowledge_bases,
+    require_knowledge_base_access,
+    search_knowledge_entries,
+)
+
+router = APIRouter()
+
+
+def _ensure_metadata_size(value: dict[str, object]) -> None:
+    if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > 16_384:
+        raise ApiError(
+            status_code=422,
+            code="metadata_too_large",
+            message="Custom metadata must not exceed 16 KiB",
+        )
+
+
+def _knowledge_base_read(item: KnowledgeBaseAccess) -> KnowledgeBaseRead:
+    knowledge_base = item.knowledge_base
+    return KnowledgeBaseRead(
+        id=knowledge_base.id,
+        owner_id=knowledge_base.owner_id,
+        name=knowledge_base.name,
+        description=knowledge_base.description,
+        custom_metadata=knowledge_base.custom_metadata,
+        access_level=item.level,
+        created_at=knowledge_base.created_at,
+        updated_at=knowledge_base.updated_at,
+    )
+
+
+@router.get("", response_model=list[KnowledgeBaseRead])
+async def list_knowledge_bases(
+    session: DatabaseSession,
+    access: Annotated[
+        AccessContext,
+        Depends(require_any_permission("knowledge:read", "chat:query", "file:upload")),
+    ],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[KnowledgeBaseRead]:
+    rows = await list_accessible_knowledge_bases(
+        session,
+        access,
+        limit=limit,
+        offset=offset,
+    )
+    return [_knowledge_base_read(item) for item in rows]
+
+
+@router.post("", response_model=KnowledgeBaseRead, status_code=201)
+async def create_knowledge_base(
+    payload: KnowledgeBaseCreate,
+    request: Request,
+    response: Response,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:create"))],
+) -> KnowledgeBaseRead:
+    _ensure_metadata_size(payload.custom_metadata)
+    knowledge_base = KnowledgeBase(
+        owner_id=access.user.id,
+        name=payload.name.strip(),
+        description=payload.description,
+        custom_metadata=payload.custom_metadata,
+    )
+    session.add(knowledge_base)
+    await session.flush()
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="knowledge_base.created",
+        resource_type="knowledge_base",
+        resource_id=str(knowledge_base.id),
+        request_id=getattr(request.state, "request_id", None),
+    )
+    await session.commit()
+    await session.refresh(knowledge_base)
+    response.headers["Location"] = f"/api/v1/knowledge-bases/{knowledge_base.id}"
+    return _knowledge_base_read(
+        KnowledgeBaseAccess(knowledge_base, KnowledgeBaseAccessLevel.MANAGER)
+    )
+
+
+@router.get("/{knowledge_base_id}", response_model=KnowledgeBaseRead)
+async def get_knowledge_base(
+    knowledge_base_id: UUID,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:read"))],
+) -> KnowledgeBaseRead:
+    item = await require_knowledge_base_access(session, access, knowledge_base_id)
+    return _knowledge_base_read(item)
+
+
+@router.patch("/{knowledge_base_id}", response_model=KnowledgeBaseRead)
+async def update_knowledge_base(
+    knowledge_base_id: UUID,
+    payload: KnowledgeBaseUpdate,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:update"))],
+) -> KnowledgeBaseRead:
+    item = await require_knowledge_base_access(
+        session,
+        access,
+        knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.MANAGER,
+        lock=True,
+    )
+    changes = payload.model_dump(exclude_unset=True)
+    if "custom_metadata" in changes:
+        _ensure_metadata_size(changes["custom_metadata"])
+    if "name" in changes:
+        changes["name"] = changes["name"].strip()
+    for key, value in changes.items():
+        setattr(item.knowledge_base, key, value)
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="knowledge_base.updated",
+        resource_type="knowledge_base",
+        resource_id=str(knowledge_base_id),
+        request_id=getattr(request.state, "request_id", None),
+        details={"fields": sorted(changes)},
+    )
+    await session.commit()
+    await session.refresh(item.knowledge_base)
+    return _knowledge_base_read(item)
+
+
+@router.get(
+    "/{knowledge_base_id}/role-grants",
+    response_model=list[KnowledgeBaseRoleGrantRead],
+)
+async def list_role_grants(
+    knowledge_base_id: UUID,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:grant"))],
+) -> list[KnowledgeBaseRoleGrant]:
+    await require_knowledge_base_access(
+        session,
+        access,
+        knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.MANAGER,
+    )
+    return list(
+        (
+            await session.scalars(
+                select(KnowledgeBaseRoleGrant)
+                .where(KnowledgeBaseRoleGrant.knowledge_base_id == knowledge_base_id)
+                .order_by(KnowledgeBaseRoleGrant.role_id)
+            )
+        ).all()
+    )
+
+
+@router.put(
+    "/{knowledge_base_id}/role-grants",
+    response_model=list[KnowledgeBaseRoleGrantRead],
+)
+async def replace_role_grants(
+    knowledge_base_id: UUID,
+    payload: KnowledgeBaseRoleGrantSet,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:grant"))],
+) -> list[KnowledgeBaseRoleGrant]:
+    await require_knowledge_base_access(
+        session,
+        access,
+        knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.MANAGER,
+        lock=True,
+    )
+    role_ids = {item.role_id for item in payload.grants}
+    if role_ids:
+        existing = set(
+            (await session.scalars(select(Role.id).where(Role.id.in_(role_ids)))).all()
+        )
+        if existing != role_ids:
+            raise ApiError(
+                status_code=422,
+                code="unknown_role",
+                message="One or more roles do not exist",
+            )
+    await session.execute(
+        delete(KnowledgeBaseRoleGrant).where(
+            KnowledgeBaseRoleGrant.knowledge_base_id == knowledge_base_id
+        )
+    )
+    grants = [
+        KnowledgeBaseRoleGrant(
+            knowledge_base_id=knowledge_base_id,
+            role_id=item.role_id,
+            access_level=item.access_level,
+            granted_by=access.user.id,
+        )
+        for item in payload.grants
+    ]
+    session.add_all(grants)
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="knowledge_base.role_grants_replaced",
+        resource_type="knowledge_base",
+        resource_id=str(knowledge_base_id),
+        request_id=getattr(request.state, "request_id", None),
+        details={"role_ids": sorted(str(item) for item in role_ids)},
+    )
+    await session.commit()
+    for grant in grants:
+        await session.refresh(grant)
+    return sorted(grants, key=lambda item: str(item.role_id))
+
+
+@router.get(
+    "/{knowledge_base_id}/entries",
+    response_model=list[KnowledgeEntryRead],
+)
+async def list_entries(
+    knowledge_base_id: UUID,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:read"))],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[KnowledgeEntry]:
+    await require_knowledge_base_access(session, access, knowledge_base_id)
+    statement = (
+        select(KnowledgeEntry)
+        .where(
+            KnowledgeEntry.knowledge_base_id == knowledge_base_id,
+            KnowledgeEntry.deleted_at.is_(None),
+        )
+        .order_by(KnowledgeEntry.updated_at.desc(), KnowledgeEntry.id)
+        .limit(limit)
+        .offset(offset)
+    )
+    return list((await session.scalars(statement)).all())
+
+
+@router.post(
+    "/{knowledge_base_id}/entries",
+    response_model=KnowledgeEntryRead,
+    status_code=201,
+)
+async def create_entry(
+    knowledge_base_id: UUID,
+    payload: KnowledgeEntryCreate,
+    request: Request,
+    response: Response,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:update"))],
+) -> KnowledgeEntry:
+    await require_knowledge_base_access(
+        session,
+        access,
+        knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.EDITOR,
+    )
+    _ensure_metadata_size(payload.custom_metadata)
+    if payload.source_file_id is not None:
+        source_file = await session.scalar(
+            select(File).where(
+                File.id == payload.source_file_id,
+                File.knowledge_base_id == knowledge_base_id,
+                File.deleted_at.is_(None),
+            )
+        )
+        if source_file is None:
+            raise ApiError(
+                status_code=422,
+                code="invalid_source_file",
+                message="Source file does not belong to this knowledge base",
+            )
+    entry = KnowledgeEntry(
+        knowledge_base_id=knowledge_base_id,
+        source_file_id=payload.source_file_id,
+        entry_type=payload.entry_type.strip(),
+        title=payload.title.strip(),
+        content=payload.content,
+        source_path=payload.source_path,
+        format_version=payload.format_version,
+        custom_metadata=payload.custom_metadata,
+    )
+    session.add(entry)
+    await session.flush()
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="knowledge_entry.created",
+        resource_type="knowledge_entry",
+        resource_id=str(entry.id),
+        request_id=getattr(request.state, "request_id", None),
+        details={"knowledge_base_id": str(knowledge_base_id)},
+    )
+    await session.commit()
+    await session.refresh(entry)
+    response.headers["Location"] = (
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries/{entry.id}"
+    )
+    return entry
+
+
+@router.patch(
+    "/{knowledge_base_id}/entries/{entry_id}",
+    response_model=KnowledgeEntryRead,
+)
+async def update_entry(
+    knowledge_base_id: UUID,
+    entry_id: UUID,
+    payload: KnowledgeEntryUpdate,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:update"))],
+) -> KnowledgeEntry:
+    await require_knowledge_base_access(
+        session,
+        access,
+        knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.EDITOR,
+    )
+    entry = await session.scalar(
+        select(KnowledgeEntry)
+        .where(
+            KnowledgeEntry.id == entry_id,
+            KnowledgeEntry.knowledge_base_id == knowledge_base_id,
+            KnowledgeEntry.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if entry is None:
+        raise ApiError(
+            status_code=404,
+            code="knowledge_entry_not_found",
+            message="Knowledge entry not found",
+        )
+    changes = payload.model_dump(exclude_unset=True)
+    if "custom_metadata" in changes:
+        _ensure_metadata_size(changes["custom_metadata"])
+    for key, value in changes.items():
+        setattr(entry, key, value)
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="knowledge_entry.updated",
+        resource_type="knowledge_entry",
+        resource_id=str(entry.id),
+        request_id=getattr(request.state, "request_id", None),
+        details={"fields": sorted(changes)},
+    )
+    await session.commit()
+    await session.refresh(entry)
+    return entry
+
+
+@router.post(
+    "/{knowledge_base_id}/search",
+    response_model=KnowledgeSearchResponse,
+)
+async def search_entries(
+    knowledge_base_id: UUID,
+    payload: KnowledgeSearchRequest,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("knowledge:read"))],
+) -> KnowledgeSearchResponse:
+    await require_knowledge_base_access(session, access, knowledge_base_id)
+    items = await search_knowledge_entries(
+        session,
+        knowledge_base_id,
+        query=payload.query,
+        limit=payload.limit,
+    )
+    return KnowledgeSearchResponse(query=payload.query, items=items)

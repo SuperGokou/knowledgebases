@@ -20,15 +20,24 @@ def test_openapi_exposes_core_admin_and_file_flows() -> None:
     assert {
         "/api/v1/auth/token",
         "/api/v1/auth/refresh",
+        "/api/v1/auth/me",
         "/api/v1/users",
         "/api/v1/roles",
         "/api/v1/roles/{role_id}",
+        "/api/v1/roles/{role_id}/policy",
         "/api/v1/limits",
         "/api/v1/files",
         "/api/v1/files/uploads",
         "/api/v1/files/uploads/{upload_session_id}/parts",
         "/api/v1/files/uploads/{upload_session_id}/complete",
         "/api/v1/files/{file_id}/download",
+        "/api/v1/knowledge-bases",
+        "/api/v1/knowledge-bases/{knowledge_base_id}",
+        "/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        "/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+        "/api/v1/knowledge-bases/{knowledge_base_id}/entries/{entry_id}",
+        "/api/v1/knowledge-bases/{knowledge_base_id}/search",
+        "/api/v1/chat/query",
     } <= paths
 
 

@@ -31,6 +31,11 @@ PERMISSION_CATALOG: dict[str, tuple[str, str]] = {
     "role:assign": ("Assign roles", "Assign grantable roles to users"),
     "quota:manage": ("Manage quotas", "Manage limit definitions and overrides"),
     "audit:read": ("Read audit log", "Read security and administration audit events"),
+    "knowledge:create": ("Create knowledge bases", "Create owned knowledge bases"),
+    "knowledge:read": ("Read knowledge bases", "Read granted knowledge bases and entries"),
+    "knowledge:update": ("Update knowledge bases", "Update granted knowledge and entries"),
+    "knowledge:grant": ("Grant knowledge access", "Manage role grants on knowledge bases"),
+    "chat:query": ("Query knowledge chat", "Query chat over an authorized knowledge base"),
 }
 
 LIMIT_CATALOG: dict[str, tuple[str, str, str, str]] = {

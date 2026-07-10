@@ -15,6 +15,7 @@ from app.schemas.roles import (
     PermissionRead,
     PermissionSet,
     RoleCreate,
+    RolePolicySet,
     RoleRead,
     RoleUpdate,
 )
@@ -305,6 +306,54 @@ async def replace_limits(
         resource_id=str(role.id),
         request_id=getattr(request.state, "request_id", None),
         details={"limits": payload.limits},
+    )
+    await session.commit()
+    await session.refresh(role)
+    return await _role_read(session, role)
+
+
+@router.put("/{role_id}/policy", response_model=RoleRead)
+async def replace_policy(
+    role_id: UUID,
+    payload: RolePolicySet,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("role:manage"))],
+) -> RoleRead:
+    role = await session.scalar(select(Role).where(Role.id == role_id).with_for_update())
+    if role is None:
+        raise ApiError(status_code=404, code="role_not_found", message="Role not found")
+    _ensure_role_mutable(access, role)
+    _ensure_policy_grantable(
+        access,
+        permission_codes=payload.permission_codes,
+        limits=payload.limits,
+    )
+    permissions = await _resolve_permissions(session, payload.permission_codes)
+    limits = await _resolve_limits(session, payload.limits)
+
+    await session.execute(delete(RolePermission).where(RolePermission.role_id == role_id))
+    await session.execute(delete(RoleLimit).where(RoleLimit.role_id == role_id))
+    session.add_all(
+        [RolePermission(role_id=role_id, permission_id=item.id) for item in permissions]
+    )
+    session.add_all(
+        [
+            RoleLimit(role_id=role_id, limit_definition_id=item.id, value=value)
+            for item, value in limits
+        ]
+    )
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="role.policy.replaced",
+        resource_type="role",
+        resource_id=str(role.id),
+        request_id=getattr(request.state, "request_id", None),
+        details={
+            "permissions": payload.permission_codes,
+            "limits": payload.limits,
+        },
     )
     await session.commit()
     await session.refresh(role)

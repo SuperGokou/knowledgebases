@@ -90,6 +90,38 @@ async def get_access_context(
     return await AccessService().resolve(session, user)
 
 
+async def _enforce_access_rate_limit(
+    response: Response,
+    access: AccessContext,
+    redis: Redis,
+    settings: Settings,
+) -> None:
+    rate_limit = access.limits.get("requests_per_minute", settings.default_requests_per_minute)
+    if rate_limit is None:
+        return
+    try:
+        decision = await RateLimiter(redis).check(
+            key=f"rate:user:{access.user.id}",
+            limit=rate_limit,
+        )
+    except Exception as error:
+        raise ApiError(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="rate_limiter_unavailable",
+            message="Rate limiting service is temporarily unavailable",
+        ) from error
+    response.headers["X-RateLimit-Limit"] = str(decision.limit)
+    response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+    if not decision.allowed:
+        raise ApiError(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code="rate_limit_exceeded",
+            message="Request rate limit exceeded",
+            details={"retry_after_seconds": decision.retry_after_seconds},
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
+
+
 def require_permission(permission: str) -> Callable[..., object]:
     async def dependency(
         response: Response,
@@ -103,30 +135,29 @@ def require_permission(permission: str) -> Callable[..., object]:
                 code="permission_denied",
                 message=f"Permission required: {permission}",
             )
+        await _enforce_access_rate_limit(response, access, redis, settings)
+        return access
 
-        rate_limit = access.limits.get("requests_per_minute", settings.default_requests_per_minute)
-        if rate_limit is not None:
-            try:
-                decision = await RateLimiter(redis).check(
-                    key=f"rate:user:{access.user.id}",
-                    limit=rate_limit,
-                )
-            except Exception as error:
-                raise ApiError(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    code="rate_limiter_unavailable",
-                    message="Rate limiting service is temporarily unavailable",
-                ) from error
-            response.headers["X-RateLimit-Limit"] = str(decision.limit)
-            response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
-            if not decision.allowed:
-                raise ApiError(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    code="rate_limit_exceeded",
-                    message="Request rate limit exceeded",
-                    details={"retry_after_seconds": decision.retry_after_seconds},
-                    headers={"Retry-After": str(decision.retry_after_seconds)},
-                )
+    return dependency
+
+
+def require_any_permission(*permissions: str) -> Callable[..., object]:
+    if not permissions:
+        raise ValueError("at least one permission is required")
+
+    async def dependency(
+        response: Response,
+        access: Annotated[AccessContext, Depends(get_access_context)],
+        redis: Annotated[Redis, Depends(redis_dependency)],
+        settings: Annotated[Settings, Depends(get_settings)],
+    ) -> AccessContext:
+        if not any(access.allows(permission) for permission in permissions):
+            raise ApiError(
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="permission_denied",
+                message=f"One permission required: {', '.join(permissions)}",
+            )
+        await _enforce_access_rate_limit(response, access, redis, settings)
         return access
 
     return dependency

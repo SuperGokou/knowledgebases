@@ -16,6 +16,7 @@ class UploadInitiateRequest(BaseModel):
     checksum_sha256: str | None = Field(default=None, min_length=44, max_length=64)
     custom_metadata: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str = Field(min_length=8, max_length=200)
+    knowledge_base_id: UUID | None = None
 
 
 class UploadInitiateResponse(BaseModel):
@@ -80,6 +81,7 @@ class FileRead(BaseModel):
 
     id: UUID
     owner_id: UUID
+    knowledge_base_id: UUID | None
     original_name: str
     extension: str
     content_type: str

@@ -6,13 +6,22 @@ from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
-from sqlalchemy import select
+from sqlalchemy import and_, exists, false, or_, select
 
 from app.api.dependencies import DatabaseSession, get_storage_service, require_permission
 from app.api.errors import ApiError
 from app.core.config import Settings, get_settings
 from app.core.time import as_utc
-from app.db.models import File, FileStatus, ReservationStatus, UploadSession, UploadSessionStatus
+from app.db.models import (
+    File,
+    FileStatus,
+    KnowledgeBase,
+    KnowledgeBaseAccessLevel,
+    KnowledgeBaseRoleGrant,
+    ReservationStatus,
+    UploadSession,
+    UploadSessionStatus,
+)
 from app.domain.errors import FilePolicyViolation
 from app.domain.files import UploadMode, plan_upload, validate_upload
 from app.schemas.files import (
@@ -28,6 +37,7 @@ from app.schemas.files import (
 )
 from app.services.access import AccessContext
 from app.services.audit import add_audit_event
+from app.services.knowledge_bases import require_knowledge_base_access
 from app.services.quota import QuotaService, QuotaSpec, daily_window_start, lifetime_window_start
 from app.services.storage import StorageService
 
@@ -98,7 +108,28 @@ async def list_files(
 ) -> list[File]:
     statement = select(File).where(File.deleted_at.is_(None))
     if not access.allows("file:read:any"):
-        statement = statement.where(File.owner_id == access.user.id)
+        owned_knowledge_base = exists().where(
+            KnowledgeBase.id == File.knowledge_base_id,
+            KnowledgeBase.owner_id == access.user.id,
+        )
+        role_grant = (
+            exists().where(
+                KnowledgeBaseRoleGrant.knowledge_base_id == File.knowledge_base_id,
+                KnowledgeBaseRoleGrant.role_id.in_(access.role_ids),
+            )
+            if access.role_ids
+            else false()
+        )
+        statement = statement.where(
+            or_(
+                and_(
+                    File.knowledge_base_id.is_(None),
+                    File.owner_id == access.user.id,
+                ),
+                owned_knowledge_base,
+                role_grant,
+            )
+        )
     statement = statement.order_by(File.created_at.desc(), File.id).limit(limit).offset(offset)
     return list((await session.scalars(statement)).all())
 
@@ -120,6 +151,14 @@ async def initiate_upload(
             status_code=422,
             code="metadata_too_large",
             message="Custom metadata must not exceed 16 KiB",
+        )
+
+    if payload.knowledge_base_id is not None:
+        await require_knowledge_base_access(
+            session,
+            access,
+            payload.knowledge_base_id,
+            minimum=KnowledgeBaseAccessLevel.EDITOR,
         )
 
     maximum = access.limits.get("max_upload_bytes", 0)
@@ -151,6 +190,7 @@ async def initiate_upload(
         if (
             existing_file.original_name != validated.filename
             or existing.expected_size_bytes != validated.size_bytes
+            or existing_file.knowledge_base_id != payload.knowledge_base_id
         ):
             raise ApiError(
                 status_code=409,
@@ -196,6 +236,7 @@ async def initiate_upload(
     file = File(
         id=file_id,
         owner_id=access.user.id,
+        knowledge_base_id=payload.knowledge_base_id,
         bucket=settings.s3_bucket,
         object_key=_object_key(access.user.id, file_id, validated.extension, plan.mode),
         original_name=validated.filename,
@@ -257,7 +298,13 @@ async def initiate_upload(
         resource_type="file",
         resource_id=str(file.id),
         request_id=getattr(request.state, "request_id", None),
-        details={"size_bytes": file.size_bytes, "mode": plan.mode.value},
+        details={
+            "size_bytes": file.size_bytes,
+            "mode": plan.mode.value,
+            "knowledge_base_id": str(file.knowledge_base_id)
+            if file.knowledge_base_id
+            else None,
+        },
     )
     try:
         await session.commit()
@@ -288,6 +335,13 @@ async def create_part_urls(
     upload, file = await _owned_upload(
         session, upload_session_id=upload_session_id, user_id=access.user.id
     )
+    if file.knowledge_base_id is not None:
+        await require_knowledge_base_access(
+            session,
+            access,
+            file.knowledge_base_id,
+            minimum=KnowledgeBaseAccessLevel.EDITOR,
+        )
     if upload.mode != UploadMode.MULTIPART.value or not upload.storage_upload_id:
         raise ApiError(status_code=409, code="not_multipart", message="Upload is not multipart")
     if upload.status is not UploadSessionStatus.INITIATED:
@@ -336,6 +390,13 @@ async def complete_upload(
         user_id=access.user.id,
         lock=True,
     )
+    if file.knowledge_base_id is not None:
+        await require_knowledge_base_access(
+            session,
+            access,
+            file.knowledge_base_id,
+            minimum=KnowledgeBaseAccessLevel.EDITOR,
+        )
     if upload.status is UploadSessionStatus.COMPLETED:
         return file
     if upload.status not in {
@@ -548,8 +609,15 @@ async def create_download_grant(
     file = await session.scalar(select(File).where(File.id == file_id, File.deleted_at.is_(None)))
     if file is None:
         raise ApiError(status_code=404, code="file_not_found", message="File not found")
-    if file.owner_id != access.user.id and not access.allows("file:read:any"):
-        raise ApiError(status_code=403, code="permission_denied", message="File access denied")
+    if not access.allows("file:read:any"):
+        if file.knowledge_base_id is not None:
+            await require_knowledge_base_access(session, access, file.knowledge_base_id)
+        elif file.owner_id != access.user.id:
+            raise ApiError(
+                status_code=403,
+                code="permission_denied",
+                message="File access denied",
+            )
     if file.status is not FileStatus.AVAILABLE:
         raise ApiError(
             status_code=409, code="file_not_available", message="File is not available for download"

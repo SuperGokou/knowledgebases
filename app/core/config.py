@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     jwt_audience: str = "knowledge-base-api"
     access_token_minutes: int = Field(default=15, ge=1, le=1_440)
     refresh_token_days: int = Field(default=7, ge=1, le=90)
+    bff_shared_secret: SecretStr | None = None
 
     s3_endpoint_url: str = "http://localhost:9000"
     s3_public_endpoint_url: str = "http://localhost:9000"
@@ -120,6 +121,12 @@ class Settings(BaseSettings):
                 or any(marker in admin_password.lower() for marker in placeholder_markers)
             ):
                 raise ValueError("KB_BOOTSTRAP_ADMIN_PASSWORD must be changed in production")
+            if self.bff_shared_secret is not None:
+                bff_secret = self.bff_shared_secret.get_secret_value()
+                if bff_secret and len(bff_secret) < 32:
+                    raise ValueError(
+                        "KB_BFF_SHARED_SECRET must contain at least 32 characters when configured"
+                    )
             if self.debug:
                 raise ValueError("KB_DEBUG must be false in production")
             for variable, endpoint in (

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -8,6 +11,7 @@ from uuid import UUID
 import httpx
 import pytest
 import pytest_asyncio
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -144,6 +148,16 @@ class ApiHarness:
         return response.json()
 
 
+def _signed_bff_headers(*, secret: str, client_ip: str, timestamp: int) -> dict[str, str]:
+    canonical = f"v1\n{timestamp}\n{client_ip}".encode()
+    signature = hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest()
+    return {
+        "X-KB-Client-IP": client_ip,
+        "X-KB-Client-Timestamp": str(timestamp),
+        "X-KB-Client-Signature": signature,
+    }
+
+
 @pytest_asyncio.fixture
 async def api_harness() -> ApiHarness:
     engine = create_async_engine(
@@ -166,6 +180,11 @@ async def api_harness() -> ApiHarness:
                 "role:read",
                 "role:manage",
                 "role:assign",
+                "knowledge:create",
+                "knowledge:read",
+                "knowledge:update",
+                "knowledge:grant",
+                "chat:query",
             )
         ]
         limits = [
@@ -786,3 +805,717 @@ async def test_readiness_uses_database_and_redis(api_harness: ApiHarness) -> Non
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+@pytest.mark.asyncio
+async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarness) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    created = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=admin_headers,
+        json={
+            "name": "Engineering Handbook",
+            "description": "Internal engineering knowledge",
+            "custom_metadata": {"default_format": "okf"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    knowledge_base = created.json()
+    knowledge_base_id = knowledge_base["id"]
+    assert knowledge_base["access_level"] == "manager"
+
+    updated = await api_harness.client.patch(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}",
+        headers=admin_headers,
+        json={"description": "Curated engineering knowledge"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["description"] == "Curated engineering knowledge"
+
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=admin_headers,
+        json={
+            "filename": "password-reset.txt",
+            "size_bytes": 25,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "knowledge-file-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    source_file_id = initiated.json()["file_id"]
+
+    entry = await api_harness.client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+        headers=admin_headers,
+        json={
+            "source_file_id": source_file_id,
+            "entry_type": "article",
+            "title": "Reset a password",
+            "content": "To reset a password, open Settings and choose Reset password.",
+            "source_path": "index.md",
+            "format_version": "0.1",
+            "custom_metadata": {"type": "article", "owner": "identity-team"},
+        },
+    )
+    assert entry.status_code == 201, entry.text
+    entry_body = entry.json()
+    assert entry_body["source_file_id"] == source_file_id
+    assert entry_body["format_version"] == "0.1"
+    assert entry_body["custom_metadata"] == {"type": "article", "owner": "identity-team"}
+
+    viewer_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "knowledge_viewer",
+            "name": "Knowledge Viewer",
+            "permission_codes": ["knowledge:read", "chat:query", "file:read"],
+        },
+    )
+    assert viewer_role.status_code == 201, viewer_role.text
+    viewer_role_id = viewer_role.json()["id"]
+    outsider_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "knowledge_outsider",
+            "name": "Knowledge Outsider",
+            "permission_codes": [
+                "knowledge:read",
+                "chat:query",
+                "file:read",
+                "file:upload",
+            ],
+        },
+    )
+    assert outsider_role.status_code == 201, outsider_role.text
+
+    grants = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=admin_headers,
+        json={"grants": [{"role_id": viewer_role_id, "access_level": "reader"}]},
+    )
+    assert grants.status_code == 200, grants.text
+    assert grants.json()[0]["role_id"] == viewer_role_id
+
+    viewer = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "viewer@example.com",
+            "password": "Viewer-password-123!",
+            "role_ids": [viewer_role_id],
+        },
+    )
+    assert viewer.status_code == 201, viewer.text
+    outsider = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "outsider@example.com",
+            "password": "Outsider-password-123!",
+            "role_ids": [outsider_role.json()["id"]],
+        },
+    )
+    assert outsider.status_code == 201, outsider.text
+
+    viewer_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "viewer@example.com", "password": "Viewer-password-123!"},
+    )
+    viewer_headers = {
+        "Authorization": f"Bearer {viewer_login.json()['access_token']}"
+    }
+    me = await api_harness.client.get("/api/v1/auth/me", headers=viewer_headers)
+    assert me.status_code == 200, me.text
+    assert set(me.json()["permission_codes"]) == {"knowledge:read", "chat:query", "file:read"}
+    assert me.json()["role_ids"] == [viewer_role_id]
+
+    visible = await api_harness.client.get("/api/v1/knowledge-bases", headers=viewer_headers)
+    assert visible.status_code == 200
+    assert [item["id"] for item in visible.json()] == [knowledge_base_id]
+    assert visible.json()[0]["access_level"] == "reader"
+
+    entries = await api_harness.client.get(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries", headers=viewer_headers
+    )
+    assert entries.status_code == 200
+    assert entries.json()[0]["id"] == entry_body["id"]
+
+    search = await api_harness.client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/search",
+        headers=viewer_headers,
+        json={"query": "password", "limit": 5},
+    )
+    assert search.status_code == 200, search.text
+    assert search.json()["items"][0]["entry_id"] == entry_body["id"]
+    assert search.json()["items"][0]["source_path"] == "index.md"
+
+    chat = await api_harness.client.post(
+        "/api/v1/chat/query",
+        headers=viewer_headers,
+        json={
+            "knowledge_base_id": knowledge_base_id,
+            "message": "How do I reset my password?",
+            "limit": 5,
+        },
+    )
+    assert chat.status_code == 200, chat.text
+    assert chat.json()["mode"] == "retrieval"
+    assert chat.json()["citations"][0]["entry_id"] == entry_body["id"]
+
+    viewer_files = await api_harness.client.get("/api/v1/files", headers=viewer_headers)
+    assert viewer_files.status_code == 200
+    assert viewer_files.json()[0]["knowledge_base_id"] == knowledge_base_id
+    denied_update = await api_harness.client.patch(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}",
+        headers=viewer_headers,
+        json={"name": "Escalated"},
+    )
+    assert denied_update.status_code == 403
+
+    outsider_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "outsider@example.com", "password": "Outsider-password-123!"},
+    )
+    outsider_headers = {
+        "Authorization": f"Bearer {outsider_login.json()['access_token']}"
+    }
+    hidden = await api_harness.client.get("/api/v1/knowledge-bases", headers=outsider_headers)
+    assert hidden.status_code == 200
+    assert hidden.json() == []
+    denied_chat = await api_harness.client.post(
+        "/api/v1/chat/query",
+        headers=outsider_headers,
+        json={"knowledge_base_id": knowledge_base_id, "message": "password"},
+    )
+    assert denied_chat.status_code == 404
+    denied_upload = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=outsider_headers,
+        json={
+            "filename": "forbidden.txt",
+            "size_bytes": 1,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "forbidden-knowledge-file-001",
+        },
+    )
+    assert denied_upload.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_revoked_knowledge_grant_removes_file_and_upload_access(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=admin_headers,
+        json={"name": "Revocation Test"},
+    )
+    knowledge_base_id = knowledge_base.json()["id"]
+
+    editor_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "knowledge_editor",
+            "name": "Knowledge Editor",
+            "permission_codes": [
+                "knowledge:read",
+                "knowledge:update",
+                "file:read",
+                "file:upload",
+            ],
+            "limits": {
+                "requests_per_minute": 1000,
+                "max_upload_bytes": 2_000_000_000,
+                "daily_upload_bytes": 2_000_000_000,
+                "storage_bytes": 2_000_000_000,
+                "daily_downloads": 100,
+            },
+        },
+    )
+    editor_role_id = editor_role.json()["id"]
+    assert (
+        await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"grants": [{"role_id": editor_role_id, "access_level": "editor"}]},
+        )
+    ).status_code == 200
+    assert (
+        await api_harness.client.post(
+            "/api/v1/users",
+            headers=admin_headers,
+            json={
+                "email": "editor@example.com",
+                "password": "Editor-password-123!",
+                "role_ids": [editor_role_id],
+            },
+        )
+    ).status_code == 201
+    editor_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "editor@example.com", "password": "Editor-password-123!"},
+    )
+    editor_headers = {
+        "Authorization": f"Bearer {editor_login.json()['access_token']}"
+    }
+
+    api_harness.storage.head_size = 1
+    completed_upload = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=editor_headers,
+        json={
+            "filename": "completed.txt",
+            "size_bytes": 1,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "revoked-completed-001",
+        },
+    )
+    completed_file_id = completed_upload.json()["file_id"]
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/files/uploads/{completed_upload.json()['upload_session_id']}/complete",
+            headers=editor_headers,
+            json={"parts": []},
+        )
+    ).status_code == 200
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/files/{completed_file_id}/approve", headers=admin_headers
+        )
+    ).status_code == 200
+
+    multipart_size = get_settings().multipart_threshold_bytes + 1
+    api_harness.storage.head_size = multipart_size
+    active_upload = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=editor_headers,
+        json={
+            "filename": "active.pdf",
+            "size_bytes": multipart_size,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "revoked-active-001",
+        },
+    )
+    active_upload_id = active_upload.json()["upload_session_id"]
+
+    assert (
+        await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"grants": []},
+        )
+    ).status_code == 200
+
+    listed = await api_harness.client.get("/api/v1/files", headers=editor_headers)
+    assert listed.status_code == 200
+    assert listed.json() == []
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/files/{completed_file_id}/download", headers=editor_headers
+        )
+    ).status_code == 404
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/files/uploads/{active_upload_id}/parts",
+            headers=editor_headers,
+            json={"part_numbers": [1]},
+        )
+    ).status_code == 404
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/files/uploads/{active_upload_id}/complete",
+            headers=editor_headers,
+            json={"parts": []},
+        )
+    ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_punctuation_only_search_never_falls_back_to_all_entries(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=headers, json={"name": "Search Boundary"}
+    )
+    knowledge_base_id = knowledge_base.json()["id"]
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+            headers=headers,
+            json={"entry_type": "note", "title": "Visible", "content": "ordinary content"},
+        )
+    ).status_code == 201
+
+    search = await api_harness.client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/search",
+        headers=headers,
+        json={"query": "!!!", "limit": 10},
+    )
+    assert search.status_code == 200
+    assert search.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_bff_signed_client_ip_requires_valid_fresh_hmac(api_harness: ApiHarness) -> None:
+    secret = "bff-shared-secret-value-32-characters"
+    settings = get_settings().model_copy(update={"bff_shared_secret": SecretStr(secret)})
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        now = int(time.time())
+        valid_ip = "203.0.113.10"
+        valid = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers=_signed_bff_headers(secret=secret, client_ip=valid_ip, timestamp=now),
+            data={"username": "missing-valid@example.com", "password": "Wrong-password-123!"},
+        )
+        assert valid.status_code == 401
+        assert f"auth:login:ip:{valid_ip}" in api_harness.redis.counters
+
+        api_harness.redis.counters.clear()
+        forged_ip = "203.0.113.11"
+        forged_headers = _signed_bff_headers(
+            secret=secret, client_ip=forged_ip, timestamp=now
+        )
+        forged_headers["X-KB-Client-Signature"] = "0" * 64
+        forged = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers=forged_headers,
+            data={"username": "missing-forged@example.com", "password": "Wrong-password-123!"},
+        )
+        assert forged.status_code == 400
+        assert forged.json()["error"]["code"] == "invalid_bff_signature"
+        assert f"auth:login:ip:{forged_ip}" not in api_harness.redis.counters
+        assert api_harness.redis.counters == {}
+
+        api_harness.redis.counters.clear()
+        expired_ip = "203.0.113.12"
+        expired = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers=_signed_bff_headers(
+                secret=secret,
+                client_ip=expired_ip,
+                timestamp=now - 120,
+            ),
+            data={"username": "missing-expired@example.com", "password": "Wrong-password-123!"},
+        )
+        assert expired.status_code == 400
+        assert expired.json()["error"]["code"] == "invalid_bff_signature"
+        assert f"auth:login:ip:{expired_ip}" not in api_harness.redis.counters
+        assert api_harness.redis.counters == {}
+
+        login_ip = "203.0.113.13"
+        authenticated = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers=_signed_bff_headers(secret=secret, client_ip=login_ip, timestamp=now),
+            data={"username": "admin@example.com", "password": "Admin-password-123!"},
+        )
+        assert authenticated.status_code == 200
+        api_harness.redis.counters.clear()
+        refresh_ip = "203.0.113.14"
+        refreshed = await api_harness.client.post(
+            "/api/v1/auth/refresh",
+            headers=_signed_bff_headers(secret=secret, client_ip=refresh_ip, timestamp=now),
+            json={"refresh_token": authenticated.json()["refresh_token"]},
+        )
+        assert refreshed.status_code == 200
+        assert f"auth:refresh:ip:{refresh_ip}" in api_harness.redis.counters
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
+async def test_unsigned_forwarded_ip_is_trusted_only_on_vercel(api_harness: ApiHarness) -> None:
+    forwarded_ip = "198.51.100.20"
+    serverless = get_settings().model_copy(update={"serverless": True})
+    app.dependency_overrides[get_settings] = lambda: serverless
+    try:
+        response = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers={
+                "X-KB-Client-IP": "203.0.113.250",
+                "X-Vercel-Forwarded-For": forwarded_ip,
+            },
+            data={"username": "missing-vercel@example.com", "password": "Wrong-password-123!"},
+        )
+        assert response.status_code == 401
+        assert f"auth:login:ip:{forwarded_ip}" in api_harness.redis.counters
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    api_harness.redis.counters.clear()
+    local = get_settings().model_copy(update={"serverless": False})
+    app.dependency_overrides[get_settings] = lambda: local
+    try:
+        response = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers={"X-Vercel-Forwarded-For": forwarded_ip},
+            data={"username": "missing-local@example.com", "password": "Wrong-password-123!"},
+        )
+        assert response.status_code == 401
+        assert f"auth:login:ip:{forwarded_ip}" not in api_harness.redis.counters
+        assert "auth:login:ip:127.0.0.1" in api_harness.redis.counters
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
+async def test_chat_only_role_can_select_and_query_but_not_browse_entries(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=admin_headers, json={"name": "Chat Only"}
+    )
+    knowledge_base_id = knowledge_base.json()["id"]
+    role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "chat_only",
+            "name": "Chat Only",
+            "permission_codes": ["chat:query"],
+        },
+    )
+    role_id = role.json()["id"]
+    assert (
+        await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"grants": [{"role_id": role_id, "access_level": "reader"}]},
+        )
+    ).status_code == 200
+    assert (
+        await api_harness.client.post(
+            "/api/v1/users",
+            headers=admin_headers,
+            json={
+                "email": "chat-only@example.com",
+                "password": "Chat-only-password-123!",
+                "role_ids": [role_id],
+            },
+        )
+    ).status_code == 201
+    login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "chat-only@example.com", "password": "Chat-only-password-123!"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    listed = await api_harness.client.get("/api/v1/knowledge-bases", headers=headers)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [knowledge_base_id]
+    chat = await api_harness.client.post(
+        "/api/v1/chat/query",
+        headers=headers,
+        json={"knowledge_base_id": knowledge_base_id, "message": "hello"},
+    )
+    assert chat.status_code == 200
+    assert chat.json()["citations"] == []
+    assert (
+        await api_harness.client.get(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries", headers=headers
+        )
+    ).status_code == 403
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/search",
+            headers=headers,
+            json={"query": "hello"},
+        )
+    ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_create_user_with_roles_requires_role_assign(api_harness: ApiHarness) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    target_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={"code": "assignment_target", "name": "Assignment Target", "priority": -1},
+    )
+    manager_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "user_manager_only",
+            "name": "User Manager Only",
+            "priority": 0,
+            "permission_codes": ["user:manage"],
+        },
+    )
+    assert (
+        await api_harness.client.post(
+            "/api/v1/users",
+            headers=admin_headers,
+            json={
+                "email": "user-manager@example.com",
+                "password": "User-manager-password-123!",
+                "role_ids": [manager_role.json()["id"]],
+            },
+        )
+    ).status_code == 201
+    login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": "user-manager@example.com",
+            "password": "User-manager-password-123!",
+        },
+    )
+    manager_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    without_roles = await api_harness.client.post(
+        "/api/v1/users",
+        headers=manager_headers,
+        json={"email": "plain-user@example.com", "password": "Plain-user-password-123!"},
+    )
+    assert without_roles.status_code == 201
+    with_roles = await api_harness.client.post(
+        "/api/v1/users",
+        headers=manager_headers,
+        json={
+            "email": "assigned-user@example.com",
+            "password": "Assigned-user-password-123!",
+            "role_ids": [target_role.json()["id"]],
+        },
+    )
+    assert with_roles.status_code == 403
+    assert with_roles.json()["error"]["code"] == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_atomic_role_policy_replaces_both_halves_or_neither(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=headers,
+        json={
+            "code": "atomic_policy",
+            "name": "Atomic Policy",
+            "permission_codes": ["file:read"],
+            "limits": {"max_upload_bytes": 10},
+        },
+    )
+    role_id = role.json()["id"]
+
+    replaced = await api_harness.client.put(
+        f"/api/v1/roles/{role_id}/policy",
+        headers=headers,
+        json={
+            "permission_codes": ["file:upload"],
+            "limits": {"max_upload_bytes": 20, "daily_upload_bytes": 30},
+        },
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["permission_codes"] == ["file:upload"]
+    assert replaced.json()["limits"] == {
+        "daily_upload_bytes": 30,
+        "max_upload_bytes": 20,
+    }
+
+    rejected = await api_harness.client.put(
+        f"/api/v1/roles/{role_id}/policy",
+        headers=headers,
+        json={
+            "permission_codes": ["file:read"],
+            "limits": {"not_in_catalog": 0},
+        },
+    )
+    assert rejected.status_code == 422
+    unchanged = await api_harness.client.get(f"/api/v1/roles/{role_id}", headers=headers)
+    assert unchanged.json()["permission_codes"] == ["file:upload"]
+    assert unchanged.json()["limits"] == {
+        "daily_upload_bytes": 30,
+        "max_upload_bytes": 20,
+    }
+
+
+@pytest.mark.asyncio
+async def test_upload_only_role_can_select_editor_knowledge_base(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=admin_headers, json={"name": "Upload Target"}
+    )
+    knowledge_base_id = knowledge_base.json()["id"]
+    role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "upload_only",
+            "name": "Upload Only",
+            "permission_codes": ["file:upload"],
+            "limits": {
+                "max_upload_bytes": 1000,
+                "daily_upload_bytes": 1000,
+                "storage_bytes": 1000,
+            },
+        },
+    )
+    role_id = role.json()["id"]
+    assert (
+        await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"grants": [{"role_id": role_id, "access_level": "editor"}]},
+        )
+    ).status_code == 200
+    assert (
+        await api_harness.client.post(
+            "/api/v1/users",
+            headers=admin_headers,
+            json={
+                "email": "upload-only@example.com",
+                "password": "Upload-only-password-123!",
+                "role_ids": [role_id],
+            },
+        )
+    ).status_code == 201
+    login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "upload-only@example.com", "password": "Upload-only-password-123!"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    listed = await api_harness.client.get("/api/v1/knowledge-bases", headers=headers)
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [knowledge_base_id]
+    uploaded = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "upload-only.txt",
+            "size_bytes": 1,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "upload-only-file-001",
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    assert (
+        await api_harness.client.get(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries", headers=headers
+        )
+    ).status_code == 403
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/search",
+            headers=headers,
+            json={"query": "hello"},
+        )
+    ).status_code == 403

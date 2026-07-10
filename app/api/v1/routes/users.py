@@ -159,6 +159,12 @@ async def create_user(
         raise ApiError(status_code=409, code="email_exists", message="Email already exists")
 
     role_ids = set(payload.role_ids)
+    if role_ids and not access.allows("role:assign"):
+        raise ApiError(
+            status_code=403,
+            code="permission_denied",
+            message="Permission required: role:assign",
+        )
     if role_ids:
         roles = list((await session.scalars(select(Role).where(Role.id.in_(role_ids)))).all())
         existing_ids = {role.id for role in roles}
