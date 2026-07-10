@@ -9,7 +9,7 @@ import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import type { KnowledgeBase } from "@/lib/types";
 
 export function KnowledgePanel() {
-  const { can } = useAccess();
+  const { can, canAny, loading: accessLoading } = useAccess();
   const [items, setItems] = useState<KnowledgeBase[] | null>(null);
   const [error, setError] = useState("");
   const [unavailable, setUnavailable] = useState(false);
@@ -20,7 +20,12 @@ export function KnowledgePanel() {
   const [pending, setPending] = useState(false);
 
   const load = useCallback(async () => {
+    if (accessLoading) return;
     setError("");
+    if (!canAny(["knowledge:read", "chat:query", "file:upload"])) {
+      setItems([]);
+      return;
+    }
     try {
       setItems(await apiRequest<KnowledgeBase[]>("/api/v1/knowledge-bases"));
       setUnavailable(false);
@@ -32,7 +37,7 @@ export function KnowledgePanel() {
         setError(readableError(reason));
       }
     }
-  }, []);
+  }, [accessLoading, canAny]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void load(), 0);
@@ -44,7 +49,7 @@ export function KnowledgePanel() {
     setPending(true);
     setError("");
     try {
-      await apiRequest<KnowledgeBase>("/api/v1/knowledge-bases", {
+      const created = await apiRequest<KnowledgeBase>("/api/v1/knowledge-bases", {
         method: "POST",
         body: JSON.stringify({
           name: name.trim(),
@@ -55,7 +60,8 @@ export function KnowledgePanel() {
       setName("");
       setDescription("");
       setExternalProcessing(false);
-      await load();
+      if (canAny(["knowledge:read", "chat:query", "file:upload"])) await load();
+      else setItems((current) => [...(current ?? []), created]);
     } catch (reason) {
       setError(readableError(reason));
     } finally {

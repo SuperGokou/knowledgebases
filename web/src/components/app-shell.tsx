@@ -7,6 +7,7 @@ import { Icon } from "@/components/icon";
 import { LogoutButton } from "@/components/logout-button";
 import { MobileNav } from "@/components/mobile-nav";
 import { SideNav } from "@/components/side-nav";
+import { WorkspaceAccessBoundary } from "@/components/workspace-access-boundary";
 
 export function AppShell({ children, email }: { children: ReactNode; email?: string }) {
   const initial = (email?.[0] ?? "K").toUpperCase();
@@ -14,7 +15,7 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
     <AccessProvider>
       <div className="app-shell">
       <aside className="sidebar">
-        <Link className="brand" href="/chat">
+        <Link className="brand" href="/">
           <BrandIdentity />
         </Link>
         <SideNav />
@@ -36,7 +37,7 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
           <div className="topbar-status"><span className="pulse" /> API 通过安全 BFF 连接</div>
           <div className="topbar-help"><kbd>⌘</kbd><kbd>K</kbd><span>快速搜索</span></div>
         </header>
-        <main className="content">{children}</main>
+        <main className="content"><WorkspaceAccessBoundary>{children}</WorkspaceAccessBoundary></main>
         <MobileNav />
       </div>
       </div>

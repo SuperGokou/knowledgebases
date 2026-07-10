@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { safeNextPath } from "../src/lib/safe-next-path";
+import { safeNextPath, safeNextPathOrNull } from "../src/lib/safe-next-path";
 
 const ORIGIN = "https://knowledge.example";
 
@@ -14,6 +14,7 @@ describe("safeNextPath", () => {
     "/admin/roles",
     "/admin/accounts",
     "/admin/api-models",
+    "/access-pending",
   ])("allows the canonical application route %s", (path) => {
     expect(safeNextPath(path, ORIGIN)).toBe(path);
   });
@@ -45,5 +46,13 @@ describe("safeNextPath", () => {
 
   it("fails closed when the trusted origin is malformed", () => {
     expect(safeNextPath("/admin", "not an origin")).toBe("/chat");
+  });
+
+  it("exposes a nullable parser so callers can apply a role-aware fallback", () => {
+    expect(safeNextPathOrNull("/admin/files?status=available", ORIGIN)).toBe(
+      "/admin/files?status=available",
+    );
+    expect(safeNextPathOrNull("https://evil.example/", ORIGIN)).toBeNull();
+    expect(safeNextPathOrNull(null, ORIGIN)).toBeNull();
   });
 });

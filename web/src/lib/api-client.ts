@@ -1,5 +1,19 @@
 import type { ApiProblem } from "@/lib/types";
 
+export const PERMISSIONS_STALE_EVENT = "kb:permissions-stale";
+
+/**
+ * Explicitly request an access-profile refresh after a known role or grant
+ * mutation. A generic resource-level 403 must never call this function: a
+ * user can be authenticated and correctly scoped while being denied one
+ * particular object.
+ */
+export function signalPermissionsStale(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(PERMISSIONS_STALE_EVENT));
+  }
+}
+
 export class ApiClientError extends Error {
   constructor(
     message: string,

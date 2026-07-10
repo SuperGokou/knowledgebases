@@ -1,11 +1,10 @@
-import { createHash } from "node:crypto";
-
 import { NextRequest, NextResponse } from "next/server";
 
 import { backendUrl, safeBackendFetch } from "@/lib/server/backend";
 import { isAllowedBackendPath } from "@/lib/server/backend-path";
 import { readBoundedBody, RequestBodyTooLargeError } from "@/lib/server/bounded-body";
-import { BffSigningConfigurationError, signedClientIpHeaders } from "@/lib/server/client-ip";
+import { BffSigningConfigurationError } from "@/lib/server/client-ip";
+import { refreshSessionOnce } from "@/lib/server/session-refresh";
 import {
   hasSameOrigin,
   requestTokens,
@@ -15,33 +14,6 @@ import {
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const MAX_CONTROL_PLANE_BODY_BYTES = 1024 * 1024;
-type RefreshOutcome =
-  | { kind: "refreshed"; pair: TokenPair }
-  | { kind: "expired" }
-  | { kind: "unavailable"; status: number };
-const refreshFlights = new Map<string, Promise<RefreshOutcome>>();
-
-async function refreshSession(refreshToken: string, request: NextRequest): Promise<RefreshOutcome> {
-  const response = await safeBackendFetch(backendUrl("/api/v1/auth/refresh"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", ...signedClientIpHeaders(request) },
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  });
-  if (response.ok) return { kind: "refreshed", pair: (await response.json()) as TokenPair };
-  if (response.status === 401) return { kind: "expired" };
-  return { kind: "unavailable", status: response.status };
-}
-
-function refreshSessionOnce(refreshToken: string, request: NextRequest): Promise<RefreshOutcome> {
-  const fingerprint = createHash("sha256").update(refreshToken).digest("hex");
-  const current = refreshFlights.get(fingerprint);
-  if (current) return current;
-  const pending = refreshSession(refreshToken, request).finally(() => {
-    if (refreshFlights.get(fingerprint) === pending) refreshFlights.delete(fingerprint);
-  });
-  refreshFlights.set(fingerprint, pending);
-  return pending;
-}
 
 async function handler(
   request: NextRequest,

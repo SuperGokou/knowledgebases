@@ -65,13 +65,18 @@ export function FilesPanel() {
   const [dragging, setDragging] = useState(false);
 
   const load = useCallback(async () => {
+    if (accessLoading) return;
     setError("");
+    if (!can("file:read")) {
+      setFiles([]);
+      return;
+    }
     try {
       setFiles(await apiRequest<FileRecord[]>("/api/v1/files?limit=100&offset=0"));
     } catch (reason) {
       setError(readableError(reason));
     }
-  }, []);
+  }, [accessLoading, can]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void load(), 0);
@@ -198,11 +203,14 @@ export function FilesPanel() {
     }
   }
 
+  const canReadFiles = !accessLoading && can("file:read");
+  const canUploadFiles = !accessLoading && can("file:upload");
+
   return (
     <div className="page-stack">
       {error ? <ErrorState message={error} onRetry={() => void load()} /> : null}
       <section className="panel-grid">
-        {!accessLoading && can("file:upload") ? <article className="panel span-4">
+        {canUploadFiles ? <article className={`panel ${canReadFiles ? "span-4" : "span-12"}`}>
           <div className="panel-header"><div><h2>上传文件</h2><p>文件字节直接进入对象存储</p></div><Icon name="upload" /></div>
           <div className="panel-body">
             <label>目标知识库
@@ -243,7 +251,7 @@ export function FilesPanel() {
             </button>
           </div>
         </article> : null}
-        <article className={`panel ${!accessLoading && can("file:upload") ? "span-8" : "span-12"}`}>
+        {canReadFiles ? <article className={`panel ${canUploadFiles ? "span-8" : "span-12"}`}>
           <div className="panel-header">
             <div><h2>文件中心</h2><p>查看上传、处理、隔离和可用状态</p></div>
             <div className="toolbar"><div className="search-box"><Icon name="search" /><input aria-label="搜索文件名" placeholder="搜索文件名" value={query} onChange={(event) => setQuery(event.target.value)} /></div><button className="button ghost small" type="button" onClick={() => void load()}><Icon name="refresh" />刷新</button></div>
@@ -272,7 +280,7 @@ export function FilesPanel() {
               {filtered.length === 0 ? <EmptyState compact icon="search" title="没有匹配文件" description="尝试更换搜索关键词。" /> : null}
             </div>
           ) : null}
-        </article>
+        </article> : null}
       </section>
     </div>
   );

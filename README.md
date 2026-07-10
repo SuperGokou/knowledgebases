@@ -149,7 +149,7 @@ sequenceDiagram
 | 领域 | 已实现能力 |
 |---|---|
 | 身份认证 | OAuth2 密码登录、Argon2 哈希、短期 JWT、一次性 Refresh Token 轮换、`token_version` 撤销 |
-| 登录工作台 | Next.js 16、HttpOnly Cookie BFF、同源校验、规范路径白名单、安全响应头与刷新 single-flight |
+| 统一登录工作台 | 单一登录入口、RSC 输出前 `/auth/me` 会话与权限守卫、管理员/编辑者/问答用户自动落地、HttpOnly Cookie BFF 与刷新 single-flight |
 | 动态 RBAC | 自定义角色、权限目录、角色优先级、角色分配、通配权限与最后一个超级管理员保护 |
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
 | OKF Phase 1 | 上传后持久任务、DeepSeek JSON Output、严格 schema 校验、租约防竞态、指数退避、草稿/发布门禁 |

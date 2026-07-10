@@ -21,6 +21,16 @@ export type TokenPair = {
 const secure = process.env.NODE_ENV === "production";
 const refreshMaxAge = Number(process.env.SESSION_REFRESH_MAX_AGE_SECONDS ?? 604_800);
 
+export function setIdentityCookie(response: NextResponse, email: string): void {
+  response.cookies.set(IDENTITY_COOKIE, email, {
+    httpOnly: true,
+    secure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: Number.isFinite(refreshMaxAge) ? refreshMaxAge : 604_800,
+  });
+}
+
 export function sessionMarker(refreshToken: string): string {
   return createHash("sha256").update(refreshToken).digest("hex");
 }
@@ -53,13 +63,7 @@ export function setSessionCookies(
     maxAge: Number.isFinite(refreshMaxAge) ? refreshMaxAge : 604_800,
   });
   if (email) {
-    response.cookies.set(IDENTITY_COOKIE, email, {
-      httpOnly: true,
-      secure,
-      sameSite: "lax",
-      path: "/",
-      maxAge: Number.isFinite(refreshMaxAge) ? refreshMaxAge : 604_800,
-    });
+    setIdentityCookie(response, email);
   }
   if (options.resetFence) {
     response.cookies.set(SESSION_FENCE_COOKIE, "", {

@@ -1,5 +1,5 @@
 const FALLBACK_PATH = "/chat";
-const ALLOWED_PATH = /^\/(?:chat|admin(?:\/(?:knowledge|files|users|roles|accounts|api-models))?)$/;
+const ALLOWED_PATH = /^\/(?:chat|access-pending|admin(?:\/(?:knowledge|files|users|roles|accounts|api-models))?)$/;
 const UNSAFE_CHARACTER = /[\\\u0000-\u001f\u007f]/;
 
 function hasDotPathSegment(path: string): boolean {
@@ -35,13 +35,16 @@ function hasUnsafeDecodedPath(rawPath: string): boolean {
   }
 }
 
-export function safeNextPath(value: string | null, origin: string): string {
+export function safeNextPathOrNull(
+  value: string | null | undefined,
+  origin: string,
+): string | null {
   if (!value || !value.startsWith("/") || value.startsWith("//") || value.includes("#")) {
-    return FALLBACK_PATH;
+    return null;
   }
 
   const rawPath = value.split("?", 1)[0] ?? "";
-  if (hasUnsafeDecodedPath(rawPath)) return FALLBACK_PATH;
+  if (hasUnsafeDecodedPath(rawPath)) return null;
 
   try {
     const trustedOrigin = new URL(origin).origin;
@@ -53,10 +56,14 @@ export function safeNextPath(value: string | null, origin: string): string {
       || target.hash
       || !ALLOWED_PATH.test(target.pathname)
     ) {
-      return FALLBACK_PATH;
+      return null;
     }
     return `${target.pathname}${target.search}`;
   } catch {
-    return FALLBACK_PATH;
+    return null;
   }
+}
+
+export function safeNextPath(value: string | null, origin: string): string {
+  return safeNextPathOrNull(value, origin) ?? FALLBACK_PATH;
 }

@@ -1,12 +1,16 @@
 import { Suspense } from "react";
+import { redirect } from "next/navigation";
 
 import { BrandIdentity } from "@/components/brand-identity";
 import { Icon } from "@/components/icon";
 import { LoginForm } from "@/components/login-form";
+import { sessionView } from "@/lib/server/session";
 
 export const metadata = { title: "登录" };
 
-export default function LoginPage() {
+export default async function LoginPage() {
+  const session = await sessionView();
+  if (session.authenticated) redirect("/");
   return (
     <main className="login-page">
       <section className="login-story">

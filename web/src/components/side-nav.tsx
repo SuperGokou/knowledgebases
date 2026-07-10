@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 
 import { useAccess } from "@/components/access-provider";
 import { Icon, type IconName } from "@/components/icon";
+import { canAccessPath } from "@/lib/access-routing";
 
 const groups: Array<{
   label: string;
@@ -13,12 +14,11 @@ const groups: Array<{
     label: string;
     icon: IconName;
     exact?: boolean;
-    permissions: string[];
   }>;
 }> = [
   {
     label: "工作空间",
-    items: [{ href: "/chat", label: "知识问答", icon: "chat", permissions: ["chat:query"] }],
+    items: [{ href: "/chat", label: "知识问答", icon: "chat" }],
   },
   {
     label: "管理控制台",
@@ -28,24 +28,25 @@ const groups: Array<{
         label: "总览",
         icon: "grid",
         exact: true,
-        permissions: ["knowledge:read", "file:read", "user:manage", "role:read", "api-key:manage", "llm:manage"],
       },
-      { href: "/admin/knowledge", label: "知识库", icon: "book", permissions: ["knowledge:read"] },
-      { href: "/admin/files", label: "文件中心", icon: "file", permissions: ["file:read"] },
-      { href: "/admin/users", label: "账号管理", icon: "users", permissions: ["user:manage"] },
-      { href: "/admin/roles", label: "角色与权限", icon: "shield", permissions: ["role:read"] },
-      { href: "/admin/api-models", label: "API 与模型", icon: "spark", permissions: ["api-key:manage", "llm:manage"] },
+      { href: "/admin/knowledge", label: "知识库", icon: "book" },
+      { href: "/admin/files", label: "文件中心", icon: "file" },
+      { href: "/admin/users", label: "账号管理", icon: "users" },
+      { href: "/admin/roles", label: "角色与权限", icon: "shield" },
+      { href: "/admin/api-models", label: "API 与模型", icon: "spark" },
     ],
   },
 ];
 
 export function SideNav() {
   const pathname = usePathname();
-  const { canAny, loading } = useAccess();
+  const { me, loading } = useAccess();
   return (
     <nav className="side-nav" aria-label="主要导航">
       {groups.map((group) => {
-        const items = loading ? [] : group.items.filter((item) => canAny(item.permissions));
+        const items = loading || !me
+          ? []
+          : group.items.filter((item) => canAccessPath(item.href, me));
         if (!items.length) return null;
         return (
           <div className="nav-group" key={group.label}>
