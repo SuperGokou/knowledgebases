@@ -13,6 +13,7 @@ describe("safeNextPath", () => {
     "/admin/users",
     "/admin/roles",
     "/admin/accounts",
+    "/admin/api-models",
   ])("allows the canonical application route %s", (path) => {
     expect(safeNextPath(path, ORIGIN)).toBe(path);
   });

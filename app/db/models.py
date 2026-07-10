@@ -20,6 +20,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -454,4 +455,65 @@ class AuditLog(Base):
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True, nullable=False
+    )
+
+
+class ApiKey(Base):
+    """A revocable service credential whose cleartext is never persisted."""
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        CheckConstraint(
+            "requests_per_minute >= 1 AND requests_per_minute <= 10000",
+            name="api_key_rpm_range",
+        ),
+        Index("ix_api_keys_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    created_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(24), index=True, nullable=False)
+    permission_codes: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    knowledge_base_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    requests_per_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class LlmProviderConfig(TimestampMixin, Base):
+    """Runtime provider selection and encrypted server-side credentials."""
+
+    __tablename__ = "llm_provider_configs"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('deepseek', 'qwen', 'minimax')",
+            name="supported_llm_provider",
+        ),
+        Index(
+            "uq_llm_provider_configs_default",
+            "is_default",
+            unique=True,
+            postgresql_where=text("is_default"),
+            sqlite_where=text("is_default = 1"),
+        ),
+    )
+
+    provider: Mapped[str] = mapped_column(String(30), primary_key=True)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    api_key_ciphertext: Mapped[str | None] = mapped_column(Text)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
     )

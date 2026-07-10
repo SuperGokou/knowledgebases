@@ -21,6 +21,8 @@ def test_enterprise_metadata_tables_are_registered() -> None:
         "knowledge_bases",
         "knowledge_base_role_grants",
         "knowledge_entries",
+        "api_keys",
+        "llm_provider_configs",
     }
 
     assert expected <= set(Base.metadata.tables)
@@ -65,3 +67,23 @@ def test_knowledge_files_and_entries_keep_source_and_derived_data_separate() -> 
     assert entries.c.knowledge_base_id.index
     assert entries.c.source_file_id.index
     assert {"format_version", "custom_metadata", "content"} <= set(entries.c.keys())
+
+
+def test_api_keys_are_hashed_scoped_and_llm_default_is_unique() -> None:
+    api_keys = Base.metadata.tables["api_keys"]
+    assert "key_hash" in api_keys.c
+    assert "key_prefix" in api_keys.c
+    assert "knowledge_base_ids" in api_keys.c
+    assert "permission_codes" in api_keys.c
+    assert "key" not in api_keys.c
+
+    providers = Base.metadata.tables["llm_provider_configs"]
+    default_indexes = [
+        index
+        for index in providers.indexes
+        if index.name == "uq_llm_provider_configs_default"
+    ]
+    assert len(default_indexes) == 1
+    assert default_indexes[0].unique
+    assert default_indexes[0].dialect_options["postgresql"]["where"] is not None
+    assert default_indexes[0].dialect_options["sqlite"]["where"] is not None

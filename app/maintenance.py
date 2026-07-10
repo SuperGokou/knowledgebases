@@ -11,7 +11,7 @@ from app.core.config import Settings, get_settings
 from app.db.models import File, FileStatus, ReservationStatus, UploadSession, UploadSessionStatus
 from app.db.session import SessionFactory
 from app.services.audit import add_audit_event
-from app.services.deepseek import DeepSeekClient
+from app.services.llm_settings import resolve_provider_client
 from app.services.okf_conversion import enqueue_okf_conversion, process_okf_conversion_batch
 from app.services.quota import QuotaService
 from app.services.storage import StorageService
@@ -111,7 +111,7 @@ async def run_maintenance_once(
     converted = await process_okf_conversion_batch(
         session,
         storage,
-        DeepSeekClient(settings),
+        await resolve_provider_client(session, settings),
         settings,
         batch_size=settings.okf_conversion_batch_size,
     )

@@ -1,5 +1,5 @@
 const FALLBACK_PATH = "/chat";
-const ALLOWED_PATH = /^\/(?:chat|admin(?:\/(?:knowledge|files|users|roles|accounts))?)$/;
+const ALLOWED_PATH = /^\/(?:chat|admin(?:\/(?:knowledge|files|users|roles|accounts|api-models))?)$/;
 const UNSAFE_CHARACTER = /[\\\u0000-\u001f\u007f]/;
 
 function hasDotPathSegment(path: string): boolean {

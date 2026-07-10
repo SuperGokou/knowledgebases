@@ -52,9 +52,10 @@ class SuccessfulClient:
                 tags=["revenue", "refunds"],
                 body_markdown="# Policy\n\nRefunds require approval.",
             ),
-            model="deepseek-v4-flash",
+            model="qwen-plus",
             prompt_tokens=20,
             completion_tokens=30,
+            provider="qwen",
         )
 
 
@@ -110,6 +111,8 @@ async def test_conversion_creates_valid_okf_entry_and_is_idempotent() -> None:
         assert entry.custom_metadata["okf_version"] == "0.1"
         assert entry.custom_metadata["resource"] == f"kb-file://{file.id}"
         assert entry.custom_metadata["generator"]["prompt_version"] == PROMPT_VERSION
+        assert entry.custom_metadata["generator"]["provider"] == "qwen"
+        assert entry.custom_metadata["generator"]["model"] == "qwen-plus"
         assert entry.publication_status.value == "draft"
         assert await search_knowledge_entries(
             session, kb.id, query="refund", limit=5

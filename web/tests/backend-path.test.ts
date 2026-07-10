@@ -11,6 +11,8 @@ describe("isAllowedBackendPath", () => {
     "limits",
     "knowledge-bases",
     "chat",
+    "api-keys",
+    "llm",
   ])("allows the canonical %s API root", (root) => {
     const parts = ["api", "v1", root, "resource_01"];
     expect(isAllowedBackendPath(parts, "GET", `/api/backend/${parts.join("/")}`)).toBe(true);

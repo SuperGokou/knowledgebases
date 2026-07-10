@@ -53,7 +53,7 @@ def test_vercel_configuration_and_ignore_file_are_safe() -> None:
 
     assert pyproject["tool"]["vercel"]["entrypoint"] == "app.main:app"
     assert config["crons"] == [
-        {"path": "/api/v1/internal/maintenance", "schedule": "* * * * *"}
+        {"path": "/api/v1/internal/maintenance", "schedule": "17 3 * * *"}
     ]
     assert ".env" in ignored
     assert ".env.*" in ignored

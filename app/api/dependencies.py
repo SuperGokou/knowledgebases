@@ -5,7 +5,7 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, Response, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,10 +17,12 @@ from app.db.models import User, UserStatus
 from app.db.session import get_db
 from app.infra.redis import get_redis
 from app.services.access import AccessContext, AccessService
+from app.services.api_keys import ApiKeyAccess, authenticate_api_key
 from app.services.rate_limit import RateLimiter
 from app.services.storage import StorageService
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 @lru_cache
@@ -118,7 +120,11 @@ async def _enforce_access_rate_limit(
             code="rate_limit_exceeded",
             message="Request rate limit exceeded",
             details={"retry_after_seconds": decision.retry_after_seconds},
-            headers={"Retry-After": str(decision.retry_after_seconds)},
+            headers={
+                "Retry-After": str(decision.retry_after_seconds),
+                "X-RateLimit-Limit": str(decision.limit),
+                "X-RateLimit-Remaining": "0",
+            },
         )
 
 
@@ -159,6 +165,59 @@ def require_any_permission(*permissions: str) -> Callable[..., object]:
             )
         await _enforce_access_rate_limit(response, access, redis, settings)
         return access
+
+    return dependency
+
+
+async def get_api_key_access(
+    cleartext: Annotated[str | None, Depends(api_key_header)],
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> ApiKeyAccess:
+    return await authenticate_api_key(session, cleartext)
+
+
+def require_api_key_permission(permission: str) -> Callable[..., object]:
+    async def dependency(
+        response: Response,
+        key_access: Annotated[ApiKeyAccess, Depends(get_api_key_access)],
+        redis: Annotated[Redis, Depends(redis_dependency)],
+        settings: Annotated[Settings, Depends(get_settings)],
+    ) -> ApiKeyAccess:
+        if not key_access.access.allows(permission):
+            raise ApiError(
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="api_key_scope_denied",
+                message=f"API key permission required: {permission}",
+            )
+
+        # Retain the account-wide limit so issuing multiple keys cannot bypass RBAC quotas.
+        await _enforce_access_rate_limit(response, key_access.access, redis, settings)
+        try:
+            decision = await RateLimiter(redis).check(
+                key=f"rate:api-key:{key_access.api_key.id}",
+                limit=key_access.api_key.requests_per_minute,
+            )
+        except Exception as error:
+            raise ApiError(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                code="rate_limiter_unavailable",
+                message="Rate limiting service is temporarily unavailable",
+            ) from error
+        response.headers["X-RateLimit-Limit"] = str(decision.limit)
+        response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+        if not decision.allowed:
+            raise ApiError(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                code="rate_limit_exceeded",
+                message="API key request rate limit exceeded",
+                details={"retry_after_seconds": decision.retry_after_seconds},
+                headers={
+                    "Retry-After": str(decision.retry_after_seconds),
+                    "X-RateLimit-Limit": str(decision.limit),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+        return key_access
 
     return dependency
 

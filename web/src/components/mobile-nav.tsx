@@ -8,7 +8,7 @@ import { Icon } from "@/components/icon";
 export function MobileNav() {
   const { can, canAny, loading } = useAccess();
   if (loading) return null;
-  const hasAdmin = canAny(["knowledge:read", "file:read", "user:manage", "role:read"]);
+  const hasAdmin = canAny(["knowledge:read", "file:read", "user:manage", "role:read", "api-key:manage", "llm:manage"]);
   return (
     <nav className="mobile-nav" aria-label="移动导航">
       {can("chat:query") ? <Link href="/chat"><Icon name="chat" /><span>问答</span></Link> : null}

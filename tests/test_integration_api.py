@@ -6,13 +6,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 import pytest_asyncio
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -21,9 +21,11 @@ from app.core.config import Settings, get_settings
 from app.core.security import PasswordService
 from app.db.base import Base
 from app.db.models import (
+    ApiKey,
     File,
     FileStatus,
     LimitDefinition,
+    LlmProviderConfig,
     Permission,
     QuotaReservation,
     ReservationStatus,
@@ -34,10 +36,12 @@ from app.db.models import (
     UploadSessionStatus,
     User,
     UserRole,
+    UserStatus,
 )
 from app.db.session import get_db
 from app.main import app
 from app.maintenance import cleanup_expired_uploads
+from app.services.llm_provider import LlmChatResult
 from app.services.storage import InitiatedStorageUpload, PresignedPart, StoredObject
 
 
@@ -185,6 +189,8 @@ async def api_harness() -> ApiHarness:
                 "knowledge:update",
                 "knowledge:grant",
                 "chat:query",
+                "api-key:manage",
+                "llm:manage",
             )
         ]
         limits = [
@@ -1530,3 +1536,498 @@ async def test_upload_only_role_can_select_editor_knowledge_base(
             json={"query": "hello"},
         )
     ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_scoped_api_key_lifecycle_and_public_endpoints(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=headers, json={"name": "Partner API"}
+    )
+    assert knowledge_base.status_code == 201
+    knowledge_base_id = knowledge_base.json()["id"]
+    entry = await api_harness.client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+        headers=headers,
+        json={
+            "entry_type": "policy",
+            "title": "Refund Policy",
+            "content": "Refunds need approval.",
+        },
+    )
+    assert entry.status_code == 201, entry.text
+
+    created = await api_harness.client.post(
+        "/api/v1/api-keys",
+        headers=headers,
+        json={
+            "name": "Partner integration",
+            "permission_codes": ["chat:query", "knowledge:read"],
+            "knowledge_base_ids": [knowledge_base_id],
+            "requests_per_minute": 20,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.headers["cache-control"] == "no-store"
+    cleartext = created.json()["key"]
+    api_key_id = created.json()["id"]
+    assert cleartext.startswith("kb_live_")
+    assert "key_hash" not in created.json()
+
+    listed = await api_harness.client.get("/api/v1/api-keys", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()[0]["key_prefix"] == cleartext[:20]
+    assert "key" not in listed.json()[0]
+    async with api_harness.session_factory() as session:
+        stored = await session.get(ApiKey, UUID(api_key_id))
+        assert stored is not None
+        assert stored.key_hash != cleartext
+        assert len(stored.key_hash) == 64
+
+    api_headers = {"X-API-Key": cleartext}
+    searched = await api_harness.client.post(
+        f"/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
+        headers=api_headers,
+        json={"query": "refund"},
+    )
+    assert searched.status_code == 200, searched.text
+    assert searched.json()["mode"] == "retrieval"
+    assert searched.json()["items"][0]["title"] == "Refund Policy"
+    chatted = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers=api_headers,
+        json={"knowledge_base_id": knowledge_base_id, "message": "refund"},
+    )
+    assert chatted.status_code == 200, chatted.text
+    assert chatted.json()["mode"] == "retrieval"
+    used = await api_harness.client.get("/api/v1/api-keys", headers=headers)
+    assert used.json()[0]["last_used_at"] is not None
+
+    async with api_harness.session_factory() as session:
+        chat_permission_id = await session.scalar(
+            select(Permission.id).where(Permission.code == "chat:query")
+        )
+        assert chat_permission_id is not None
+        await session.execute(
+            delete(RolePermission).where(
+                RolePermission.permission_id == chat_permission_id
+            )
+        )
+        await session.commit()
+    permission_removed = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers=api_headers,
+        json={"knowledge_base_id": knowledge_base_id, "message": "refund"},
+    )
+    assert permission_removed.status_code == 403
+
+    out_of_scope = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=headers, json={"name": "Not in key scope"}
+    )
+    denied = await api_harness.client.post(
+        f"/api/v1/public/knowledge-bases/{out_of_scope.json()['id']}/search",
+        headers=api_headers,
+        json={"query": "anything"},
+    )
+    assert denied.status_code == 404
+
+    revoked = await api_harness.client.delete(
+        f"/api/v1/api-keys/{api_key_id}", headers=headers
+    )
+    assert revoked.status_code == 204
+    rejected = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers=api_headers,
+        json={"knowledge_base_id": knowledge_base_id, "message": "refund"},
+    )
+    assert rejected.status_code == 401
+
+    limited = await api_harness.client.post(
+        "/api/v1/api-keys",
+        headers=headers,
+        json={
+            "name": "One request per minute",
+            "permission_codes": ["knowledge:read"],
+            "knowledge_base_ids": [knowledge_base_id],
+            "requests_per_minute": 1,
+        },
+    )
+    assert limited.status_code == 201
+    limited_headers = {"X-API-Key": limited.json()["key"]}
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
+            headers=limited_headers,
+            json={"query": "refund"},
+        )
+    ).status_code == 200
+    rate_limited = await api_harness.client.post(
+        f"/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
+        headers=limited_headers,
+        json={"query": "refund"},
+    )
+    assert rate_limited.status_code == 429
+    assert int(rate_limited.headers["retry-after"]) >= 1
+    assert rate_limited.headers["x-ratelimit-limit"] == "1"
+    assert rate_limited.headers["x-ratelimit-remaining"] == "0"
+
+    async with api_harness.session_factory() as session:
+        expiring = await session.get(ApiKey, UUID(limited.json()["id"]))
+        assert expiring is not None
+        expiring.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
+            headers=limited_headers,
+            json={"query": "refund"},
+        )
+    ).status_code == 401
+
+    active = await api_harness.client.post(
+        "/api/v1/api-keys",
+        headers=headers,
+        json={
+            "name": "Disabled user test",
+            "permission_codes": ["knowledge:read"],
+            "knowledge_base_ids": [knowledge_base_id],
+        },
+    )
+    assert active.status_code == 201
+    async with api_harness.session_factory() as session:
+        target = await session.get(User, UUID(active.json()["user_id"]))
+        assert target is not None
+        target.status = UserStatus.DISABLED
+        await session.commit()
+    disabled_user = await api_harness.client.post(
+        f"/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
+        headers={"X-API-Key": active.json()["key"]},
+        json={"query": "refund"},
+    )
+    assert disabled_user.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_non_superuser_cannot_issue_api_key_for_another_account(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    key_manager_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "api_key_manager_without_impersonation",
+            "name": "API Key Manager",
+            "permission_codes": ["api-key:manage"],
+        },
+    )
+    assert key_manager_role.status_code == 201, key_manager_role.text
+    target_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "api_key_target",
+            "name": "API Key Target",
+            "permission_codes": ["chat:query"],
+        },
+    )
+    assert target_role.status_code == 201, target_role.text
+    manager = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "api-key-manager@example.com",
+            "password": "API-key-manager-password-123!",
+            "role_ids": [key_manager_role.json()["id"]],
+        },
+    )
+    target = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "api-key-target@example.com",
+            "password": "API-key-target-password-123!",
+            "role_ids": [target_role.json()["id"]],
+        },
+    )
+    assert manager.status_code == 201, manager.text
+    assert target.status_code == 201, target.text
+    manager_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": "api-key-manager@example.com",
+            "password": "API-key-manager-password-123!",
+        },
+    )
+    manager_headers = {
+        "Authorization": f"Bearer {manager_login.json()['access_token']}"
+    }
+    denied = await api_harness.client.post(
+        "/api/v1/api-keys",
+        headers=manager_headers,
+        json={
+            "name": "Cross-account credential",
+            "user_id": target.json()["id"],
+            "permission_codes": ["chat:query"],
+            "knowledge_base_ids": [str(uuid4())],
+            "requests_per_minute": 10,
+        },
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "api_key_escalation_denied"
+
+
+@pytest.mark.asyncio
+async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    providers = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
+    assert providers.status_code == 200, providers.text
+    assert {item["provider"] for item in providers.json()["providers"]} == {
+        "deepseek",
+        "qwen",
+        "minimax",
+    }
+    assert all("api_key" not in item for item in providers.json()["providers"])
+
+    blocked = await api_harness.client.patch(
+        "/api/v1/llm/providers/qwen",
+        headers=headers,
+        json={"base_url": "https://attacker.example/v1"},
+    )
+    assert blocked.status_code == 422
+    unconfigured_settings = get_settings().model_copy(update={"qwen_api_key": None})
+    app.dependency_overrides[get_settings] = lambda: unconfigured_settings
+    try:
+        unconfigured_default = await api_harness.client.patch(
+            "/api/v1/llm/providers/qwen",
+            headers=headers,
+            json={"make_default": True},
+        )
+        assert unconfigured_default.status_code == 422
+        assert unconfigured_default.json()["error"]["code"] == "llm_provider_not_configured"
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+    no_encryption_key = await api_harness.client.patch(
+        "/api/v1/llm/providers/qwen",
+        headers=headers,
+        json={"api_key": "qwen-secret-api-key"},
+    )
+    assert no_encryption_key.status_code == 503
+
+    settings = get_settings().model_copy(
+        update={
+            "llm_credentials_encryption_key": SecretStr(
+                "test-only-provider-encryption-key-1234567890"
+            )
+        }
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        updated = await api_harness.client.patch(
+            "/api/v1/llm/providers/qwen",
+            headers=headers,
+            json={
+                "model": "qwen-plus",
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "api_key": "qwen-secret-api-key",
+                "make_default": True,
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["is_default"] is True
+        assert updated.json()["configured"] is True
+        assert updated.json()["credential_source"] == "database"
+        assert "api_key" not in updated.json()
+
+        refreshed = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
+        assert refreshed.json()["default_provider"] == "qwen"
+        assert "qwen-secret-api-key" not in refreshed.text
+        async with api_harness.session_factory() as session:
+            stored = await session.get(LlmProviderConfig, "qwen")
+            assert stored is not None
+            assert stored.api_key_ciphertext
+            assert stored.api_key_ciphertext != "qwen-secret-api-key"
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
+async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=headers, json={"name": "LLM Consent"}
+    )
+    knowledge_base_id = knowledge_base.json()["id"]
+    assert (
+        await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+            headers=headers,
+            json={
+                "entry_type": "policy",
+                "title": "Travel Policy",
+                "content": "Travel expenses require manager approval.",
+            },
+        )
+    ).status_code == 201
+
+    calls: list[list[dict[str, str]]] = []
+
+    class FakeClient:
+        provider = "qwen"
+        model = "qwen-plus"
+        configured = True
+
+        async def complete_chat(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            temperature: float = 0.2,
+            max_tokens: int | None = None,
+        ) -> LlmChatResult:
+            del temperature, max_tokens
+            calls.append(messages)
+            return LlmChatResult(
+                content="Manager approval is required [1].",
+                provider=self.provider,
+                model=self.model,
+                prompt_tokens=10,
+                completion_tokens=8,
+            )
+
+    async def fake_resolve(*_args: object, **_kwargs: object) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_resolve)
+    payload = {"knowledge_base_id": knowledge_base_id, "message": "travel approval"}
+    without_consent = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert without_consent.status_code == 200
+    assert without_consent.json()["mode"] == "retrieval"
+    assert calls == []
+
+    opted_in = await api_harness.client.patch(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}",
+        headers=headers,
+        json={"external_llm_processing_enabled": True},
+    )
+    assert opted_in.status_code == 200
+    generated = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert generated.status_code == 200, generated.text
+    assert generated.json()["mode"] == "rag"
+    assert generated.json()["provider"] == "qwen"
+    assert generated.json()["model"] == "qwen-plus"
+    assert generated.json()["answer"] == "Manager approval is required [1]."
+    assert len(calls) == 1
+    assert "KNOWLEDGE_CONTEXT_START" in calls[0][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key(
+    api_harness: ApiHarness,
+) -> None:
+    admin_tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {admin_tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases", headers=admin_headers, json={"name": "Tenant Isolation"}
+    )
+    knowledge_base_id = knowledge_base.json()["id"]
+
+    operator_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "api_key_operator",
+            "name": "API Key Operator",
+            "permission_codes": ["api-key:manage", "knowledge:read"],
+        },
+    )
+    assert operator_role.status_code == 201, operator_role.text
+    role_id = operator_role.json()["id"]
+    assert (
+        await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"grants": [{"role_id": role_id, "access_level": "reader"}]},
+        )
+    ).status_code == 200
+    operator = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "key-operator@example.com",
+            "password": "Key-operator-password-123!",
+            "role_ids": [role_id],
+        },
+    )
+    assert operator.status_code == 201, operator.text
+    operator_id = operator.json()["id"]
+    operator_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": "key-operator@example.com",
+            "password": "Key-operator-password-123!",
+        },
+    )
+    assert operator_login.status_code == 200
+    operator_headers = {
+        "Authorization": f"Bearer {operator_login.json()['access_token']}"
+    }
+    issued = await api_harness.client.post(
+        "/api/v1/api-keys",
+        headers=operator_headers,
+        json={
+            "name": "Operator-owned key",
+            "permission_codes": ["knowledge:read"],
+            "knowledge_base_ids": [knowledge_base_id],
+        },
+    )
+    assert issued.status_code == 201, issued.text
+
+    own_list = await api_harness.client.get("/api/v1/api-keys", headers=operator_headers)
+    assert [item["id"] for item in own_list.json()] == [issued.json()["id"]]
+    concealed = await api_harness.client.get("/api/v1/api-keys", headers=admin_headers)
+    assert concealed.status_code == 200
+    assert concealed.json() == []
+    concealed_with_filter = await api_harness.client.get(
+        f"/api/v1/api-keys?user_id={operator_id}", headers=admin_headers
+    )
+    assert concealed_with_filter.status_code == 200
+    assert concealed_with_filter.json() == []
+
+    cross_issue = await api_harness.client.post(
+        "/api/v1/api-keys",
+        headers=admin_headers,
+        json={
+            "name": "Forbidden cross-account key",
+            "user_id": operator_id,
+            "permission_codes": ["knowledge:read"],
+            "knowledge_base_ids": [knowledge_base_id],
+        },
+    )
+    assert cross_issue.status_code == 403
+    denied_revoke = await api_harness.client.delete(
+        f"/api/v1/api-keys/{issued.json()['id']}", headers=admin_headers
+    )
+    assert denied_revoke.status_code == 404
+
+    still_usable = await api_harness.client.post(
+        f"/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
+        headers={"X-API-Key": issued.json()["key"]},
+        json={"query": "tenant"},
+    )
+    assert still_usable.status_code == 200, still_usable.text

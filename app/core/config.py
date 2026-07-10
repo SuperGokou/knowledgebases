@@ -99,6 +99,41 @@ class Settings(BaseSettings):
     )
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
+    qwen_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KB_QWEN_API_KEY", "QWEN_API_KEY"),
+    )
+    qwen_base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        validation_alias=AliasChoices("KB_QWEN_BASE_URL", "QWEN_BASE_URL"),
+    )
+    qwen_model: str = Field(
+        default="qwen-plus",
+        validation_alias=AliasChoices("KB_QWEN_MODEL", "QWEN_MODEL_NAME", "QWEN_MODEL"),
+    )
+    qwen_allowed_workspace_hosts: tuple[str, ...] = ()
+    minimax_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("KB_MINIMAX_API_KEY", "MINIMAX_API_KEY"),
+    )
+    minimax_base_url: str = Field(
+        default="https://api.minimax.io/v1",
+        validation_alias=AliasChoices("KB_MINIMAX_BASE_URL", "MINIMAX_BASE_URL"),
+    )
+    minimax_model: str = Field(
+        default="MiniMax-M2.7",
+        validation_alias=AliasChoices(
+            "KB_MINIMAX_MODEL", "MINIMAX_MODEL_NAME", "MINIMAX_MODEL"
+        ),
+    )
+    llm_default_provider: Literal["deepseek", "qwen", "minimax"] = "deepseek"
+    llm_credentials_encryption_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "KB_LLM_CREDENTIAL_ENCRYPTION_KEY",
+            "KB_LLM_CREDENTIALS_ENCRYPTION_KEY",
+        ),
+    )
     deepseek_timeout_seconds: float = Field(default=45, ge=5, le=120)
     deepseek_max_tokens: int = Field(default=4_096, ge=256, le=32_768)
     okf_source_max_bytes: int = Field(default=1_000_000, ge=1_024, le=5_000_000)
@@ -116,6 +151,27 @@ class Settings(BaseSettings):
         return tuple(
             sorted({item.lower() if item.startswith(".") else f".{item.lower()}" for item in value})
         )
+
+    @field_validator("qwen_allowed_workspace_hosts")
+    @classmethod
+    def normalize_qwen_workspace_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: set[str] = set()
+        for item in value:
+            hostname = item.strip().lower().rstrip(".")
+            if (
+                not hostname
+                or "*" in hostname
+                or "://" in hostname
+                or "/" in hostname
+                or hostname == "maas.aliyuncs.com"
+                or not hostname.endswith(".maas.aliyuncs.com")
+            ):
+                raise ValueError(
+                    "KB_QWEN_ALLOWED_WORKSPACE_HOSTS must contain exact *.maas.aliyuncs.com "
+                    "hostnames without schemes, paths, ports, or wildcards"
+                )
+            normalized.add(hostname)
+        return tuple(sorted(normalized))
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -181,9 +237,20 @@ class Settings(BaseSettings):
                 raise ValueError("CRON_SECRET must contain at least 16 characters on serverless")
             if self.access_token_minutes > 60:
                 raise ValueError("access tokens must not exceed 60 minutes in production")
-            deepseek_url = urlparse(self.deepseek_base_url)
-            if deepseek_url.scheme != "https" or not deepseek_url.hostname:
-                raise ValueError("KB_DEEPSEEK_BASE_URL must be an absolute HTTPS URL in production")
+            for variable, endpoint in (
+                ("KB_DEEPSEEK_BASE_URL", self.deepseek_base_url),
+                ("KB_QWEN_BASE_URL", self.qwen_base_url),
+                ("KB_MINIMAX_BASE_URL", self.minimax_base_url),
+            ):
+                parsed_llm_url = urlparse(endpoint)
+                if parsed_llm_url.scheme != "https" or not parsed_llm_url.hostname:
+                    raise ValueError(f"{variable} must be an absolute HTTPS URL in production")
+            if self.llm_credentials_encryption_key is not None and len(
+                self.llm_credentials_encryption_key.get_secret_value()
+            ) < 32:
+                raise ValueError(
+                    "KB_LLM_CREDENTIALS_ENCRYPTION_KEY must contain at least 32 characters"
+                )
         return self
 
 

@@ -30,6 +30,8 @@
   <a href="docs/OPERATIONS.zh-CN.md">运维手册</a>
   ·
   <a href="docs/VERCEL_DEPLOYMENT.zh-CN.md">Vercel 部署</a>
+  ·
+  <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
 </p>
 
 > [!IMPORTANT]
@@ -252,20 +254,31 @@ KB_BOOTSTRAP_ADMIN_EMAIL
 KB_BOOTSTRAP_ADMIN_PASSWORD
 ```
 
-### 开启 DeepSeek → OKF 自动转换
+### 配置 DeepSeek / Qwen / MiniMax
 
-密钥只配置在 FastAPI/Worker 服务端，不得使用 `NEXT_PUBLIC_` 前缀：
+供应商密钥只配置在 FastAPI/Worker 服务端，或由管理员在“API 与模型”页面加密保存；不得使用 `NEXT_PUBLIC_` 前缀：
 
 ```text
+KB_LLM_DEFAULT_PROVIDER=deepseek
+KB_LLM_CREDENTIAL_ENCRYPTION_KEY=<独立随机主密钥>
 KB_DEEPSEEK_API_KEY=<Vercel Sensitive Environment Variable>
 KB_DEEPSEEK_BASE_URL=https://api.deepseek.com
 KB_DEEPSEEK_MODEL=deepseek-v4-flash
+KB_QWEN_API_KEY=<optional>
+KB_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+KB_QWEN_MODEL=qwen-plus
+KB_QWEN_ALLOWED_WORKSPACE_HOSTS=[]
+KB_MINIMAX_API_KEY=<optional>
+KB_MINIMAX_BASE_URL=https://api.minimax.io/v1
+KB_MINIMAX_MODEL=MiniMax-M2.7
 KB_OKF_SOURCE_MAX_BYTES=1000000
 KB_OKF_CONVERSION_BATCH_SIZE=5
 KB_OKF_CONVERSION_TIME_BUDGET_SECONDS=50
 ```
 
-随后由知识库 Manager 在“知识空间”中显式开启 **DeepSeek 自动转换**。第一阶段只读取不超过配置上限的 UTF-8 `.txt/.csv`；其他格式会安全标记为 `unsupported/parser_required`，等待后续隔离解析 Worker。任务使用数据库持久化、`lease_id` 所有权、有限重试与时间预算，转换成功只生成 `draft`，批准源文件后才发布。
+后台可在三家供应商间切换默认模型；新聊天和 OKF 转换任务会使用该选择。随后仍须由知识库 Manager 在“知识空间”中显式开启外部 LLM 处理，未授权的知识库不会把正文发送给第三方。第一阶段只读取不超过配置上限的 UTF-8 `.txt/.csv`；其他格式会安全标记为 `unsupported/parser_required`，等待后续隔离解析 Worker。任务使用数据库持久化、`lease_id` 所有权、有限重试与时间预算，转换成功只生成 `draft`，批准源文件后才发布。
+
+如使用 Qwen 工作空间专属地址，必须把精确主机名加入 `KB_QWEN_ALLOWED_WORKSPACE_HOSTS` JSON 数组；通配符、协议、路径和端口都会被拒绝，防止供应商密钥被发送到非预期主机。
 
 ## 上传文件
 
@@ -311,6 +324,9 @@ Authorization: Bearer <access-token>
 | 知识授权 | `GET/PUT /api/v1/knowledge-bases/{id}/role-grants` |
 | 知识条目 | `GET/POST /api/v1/knowledge-bases/{id}/entries` · `GET/PATCH .../entries/{entry_id}` |
 | 检索与聊天 | `POST /api/v1/knowledge-bases/{id}/search` · `POST /api/v1/chat/query` |
+| API Key 管理 | `GET/POST /api/v1/api-keys` · `DELETE /api/v1/api-keys/{id}` |
+| 模型供应商 | `GET /api/v1/llm/providers` · `PATCH /api/v1/llm/providers/{provider}` |
+| 外部知识 API | `POST /api/v1/public/chat/query` · `POST /api/v1/public/knowledge-bases/{id}/search` |
 
 下载限额统计的是“成功签发下载 URL 的次数”，不是对象存储确认完成的下载次数。若需要按真实传输次数或字节计费，应增加下载网关或 CDN 边缘鉴权。
 
@@ -430,6 +446,7 @@ npm run build
 - [架构设计](docs/ARCHITECTURE.zh-CN.md)：系统边界、数据库模式、RBAC、配额、状态机与 10 TB+ 拓扑；
 - [运维手册](docs/OPERATIONS.zh-CN.md)：部署、备份、恢复、扩容、告警与排障；
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
+- [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
 - [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。
 

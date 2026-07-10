@@ -7,6 +7,8 @@ const ALLOWED_ROOTS = new Set([
   "auth",
   "knowledge-bases",
   "chat",
+  "api-keys",
+  "llm",
 ]);
 
 const CANONICAL_SEGMENT = /^[A-Za-z0-9:_-]+$/;

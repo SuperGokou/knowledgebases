@@ -142,6 +142,8 @@ export type ChatReply = {
   knowledge_base_id: string;
   answer: string;
   mode: string;
+  provider?: string | null;
+  model?: string | null;
   citations: ChatCitation[];
 };
 
@@ -152,4 +154,36 @@ export type ChatMessage = {
   createdAt: string;
   pending?: boolean;
   failed?: boolean;
+};
+
+export type ManagedApiKey = {
+  id: string;
+  user_id: string;
+  created_by: string | null;
+  name: string;
+  key_prefix: string;
+  permission_codes: string[];
+  knowledge_base_ids: string[];
+  requests_per_minute: number;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+};
+
+export type LlmProviderName = "deepseek" | "qwen" | "minimax";
+
+export type LlmProviderSettings = {
+  provider: LlmProviderName;
+  model: string;
+  base_url: string;
+  is_default: boolean;
+  configured: boolean;
+  credential_source: "database" | "environment" | "none";
+  updated_at: string | null;
+};
+
+export type LlmProvidersResponse = {
+  default_provider: LlmProviderName;
+  providers: LlmProviderSettings[];
 };

@@ -11,6 +11,7 @@ const features: Array<{ href: string; icon: IconName; title: string; detail: str
   { href: "/admin/files", icon: "file", title: "文件中心", detail: "直传、审核与状态追踪", permissions: ["file:read"] },
   { href: "/admin/users", icon: "users", title: "账号管理", detail: "成员状态与角色分配", permissions: ["user:manage"] },
   { href: "/admin/roles", icon: "shield", title: "角色与权限", detail: "动态 RBAC 与资源限额", permissions: ["role:read"] },
+  { href: "/admin/api-models", icon: "spark", title: "API 与模型", detail: "生成调用凭证并切换大模型", permissions: ["api-key:manage", "llm:manage"] },
 ];
 
 export function AdminFeatureList() {

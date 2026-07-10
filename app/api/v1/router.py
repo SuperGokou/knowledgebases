@@ -1,6 +1,17 @@
 from fastapi import APIRouter
 
-from app.api.v1.routes import auth, chat, files, internal, knowledge_bases, roles, users
+from app.api.v1.routes import (
+    api_keys,
+    auth,
+    chat,
+    files,
+    internal,
+    knowledge_bases,
+    llm,
+    public_api,
+    roles,
+    users,
+)
 
 router = APIRouter()
 router.include_router(auth.router, prefix="/auth", tags=["authentication"])
@@ -15,4 +26,7 @@ router.include_router(
     tags=["knowledge-bases"],
 )
 router.include_router(chat.router, prefix="/chat", tags=["chat"])
+router.include_router(api_keys.router, prefix="/api-keys", tags=["api-keys"])
+router.include_router(llm.router, prefix="/llm/providers", tags=["llm-providers"])
+router.include_router(public_api.router, prefix="/public", tags=["public-api"])
 router.include_router(internal.router, prefix="/internal", tags=["internal"])

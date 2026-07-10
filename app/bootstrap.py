@@ -37,6 +37,8 @@ PERMISSION_CATALOG: dict[str, tuple[str, str]] = {
     "knowledge:update": ("Update knowledge bases", "Update granted knowledge and entries"),
     "knowledge:grant": ("Grant knowledge access", "Manage role grants on knowledge bases"),
     "chat:query": ("Query knowledge chat", "Query chat over an authorized knowledge base"),
+    "api-key:manage": ("Manage API keys", "Issue, inspect, and revoke scoped API keys"),
+    "llm:manage": ("Manage LLM providers", "Configure and select approved LLM providers"),
 }
 
 LIMIT_CATALOG: dict[str, tuple[str, str, str, str]] = {

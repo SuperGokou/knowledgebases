@@ -25,4 +25,6 @@ class ChatQueryResponse(BaseModel):
     knowledge_base_id: UUID
     answer: str
     mode: str = "retrieval"
+    provider: str | None = None
+    model: str | None = None
     citations: list[KnowledgeSearchHit]

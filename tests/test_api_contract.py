@@ -39,7 +39,20 @@ def test_openapi_exposes_core_admin_and_file_flows() -> None:
         "/api/v1/knowledge-bases/{knowledge_base_id}/entries/{entry_id}",
         "/api/v1/knowledge-bases/{knowledge_base_id}/search",
         "/api/v1/chat/query",
+        "/api/v1/api-keys",
+        "/api/v1/api-keys/{api_key_id}",
+        "/api/v1/llm/providers",
+        "/api/v1/llm/providers/{provider}",
+        "/api/v1/public/chat/query",
+        "/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
     } <= paths
+
+    security_schemes = schema["components"]["securitySchemes"]
+    assert security_schemes["APIKeyHeader"] == {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+    }
 
 
 def test_large_control_plane_request_is_rejected_before_parsing() -> None:

@@ -44,6 +44,11 @@ knowledgebases     / Root=web/    -> Next.js、HttpOnly BFF、登录与管理 UI
 | `KB_S3_ADDRESSING_STYLE` | 腾讯 COS 固定为 `virtual`；本地 MinIO 保持 `path` |
 | `KB_TRUSTED_HOSTS` | 可省略并使用安全默认值；覆盖时必须是严格 JSON，例如 `["*.vercel.app"]` |
 | `KB_CORS_ORIGINS` | BFF 同源模式可为 `[]`；只有浏览器直连 API 时才加入精确 Web Origin |
+| `KB_LLM_CREDENTIAL_ENCRYPTION_KEY` | 独立生成的至少 32 字符随机主密钥；用于加密后台录入的模型供应商凭据 |
+| `KB_LLM_DEFAULT_PROVIDER` | `deepseek`、`qwen` 或 `minimax`；数据库尚未设置默认值时使用 |
+| `KB_DEEPSEEK_API_KEY` | 可选的 DeepSeek 环境凭据；只配置在 API Project |
+| `KB_QWEN_API_KEY` | 可选的 Qwen/Model Studio 环境凭据；只配置在 API Project |
+| `KB_MINIMAX_API_KEY` | 可选的 MiniMax 环境凭据；只配置在 API Project |
 
 当前应用不使用 `SUPABASE_SERVICE_ROLE_KEY` 和 `COS_ENABLE_CI`。Service Role Key 不能替代 PostgreSQL DSN，也绝不能暴露给浏览器。
 

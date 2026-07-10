@@ -96,3 +96,38 @@ def test_marketplace_and_existing_secret_aliases_are_supported(
     assert settings.database_url == "postgresql+psycopg://user:pass@db.example.test/db"
     assert settings.redis_url.startswith("rediss://")
     assert settings.deepseek_api_key is not None
+
+
+def test_existing_qwen_and_minimax_environment_names_are_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QWEN_BASE_URL", "https://dashscope-us.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setenv("QWEN_MODEL_NAME", "qwen-plus")
+    monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+    monkeypatch.setenv("MINIMAX_MODEL_NAME", "MiniMax-M2.7")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.qwen_base_url.startswith("https://dashscope-us.aliyuncs.com/")
+    assert settings.qwen_model == "qwen-plus"
+    assert settings.minimax_base_url == "https://api.minimax.io/v1"
+    assert settings.minimax_model == "MiniMax-M2.7"
+
+
+def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
+    settings = Settings(
+        environment="test",
+        qwen_allowed_workspace_hosts=(
+            "Tenant.US-East-1.maas.aliyuncs.com.",
+            "tenant.us-east-1.maas.aliyuncs.com",
+        ),
+    )
+    assert settings.qwen_allowed_workspace_hosts == (
+        "tenant.us-east-1.maas.aliyuncs.com",
+    )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            environment="test",
+            qwen_allowed_workspace_hosts=("*.maas.aliyuncs.com",),
+        )

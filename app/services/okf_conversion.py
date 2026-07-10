@@ -20,7 +20,7 @@ from app.db.models import (
     OkfConversionStatus,
 )
 from app.services.audit import add_audit_event
-from app.services.deepseek import DeepSeekClient, DeepSeekConversionError, DeepSeekResult
+from app.services.llm_provider import LlmProviderError, LlmResult, OpenAICompatibleClient
 from app.services.storage import StorageService
 
 PROMPT_VERSION = "okf-phase1-v1"
@@ -55,7 +55,7 @@ async def enqueue_okf_conversion(session: AsyncSession, file: File) -> OkfConver
 async def process_okf_conversion_batch(
     session: AsyncSession,
     storage: StorageService,
-    client: DeepSeekClient,
+    client: OpenAICompatibleClient,
     settings: Settings,
     *,
     batch_size: int,
@@ -138,7 +138,7 @@ async def _claim_job(session: AsyncSession, settings: Settings) -> OkfConversion
 async def _process_claimed_job(
     session: AsyncSession,
     storage: StorageService,
-    client: DeepSeekClient,
+    client: OpenAICompatibleClient,
     settings: Settings,
     job_id: UUID,
     lease_id: UUID,
@@ -197,7 +197,7 @@ async def _process_claimed_job(
 
     try:
         result = await client.compile_okf(source_text, user_id=f"kb_{job.knowledge_base_id.hex}")
-    except DeepSeekConversionError as error:
+    except LlmProviderError as error:
         await _mark_failure(
             session,
             job_id,
@@ -215,7 +215,7 @@ async def _persist_result(
     job_id: UUID,
     lease_id: UUID,
     file: File,
-    result: DeepSeekResult,
+    result: LlmResult,
 ) -> None:
     # A recovered lease may race a prior worker. Lock and re-check before insert.
     locked = await session.scalar(
@@ -256,7 +256,7 @@ async def _persist_result(
             "tags": result.draft.tags,
             "timestamp": now.isoformat().replace("+00:00", "Z"),
             "generator": {
-                "provider": "deepseek",
+                "provider": result.provider,
                 "model": result.model,
                 "prompt_version": locked.prompt_version,
             },

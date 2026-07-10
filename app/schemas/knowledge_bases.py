@@ -158,3 +158,6 @@ class KnowledgeSearchHit(BaseModel):
 class KnowledgeSearchResponse(BaseModel):
     query: str
     items: list[KnowledgeSearchHit]
+    mode: str = "retrieval"
+    provider: str | None = None
+    model: str | None = None
