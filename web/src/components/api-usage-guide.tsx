@@ -89,6 +89,19 @@ export function ApiUsageGuide() {
         <div className="api-origin-row">
           <span>API Origin</span><code>{PUBLIC_API_ORIGIN}</code>
         </div>
+        {operation === "chat" ? (
+          <div className="notice api-security-notice">
+            <Icon name="book" />
+            <div>
+              <strong>回答来源协议</strong>
+              <p>
+                每个成功回答都会返回正文来源脚注、结构化 <code>citations</code> 与
+                <code> source_status</code>。请用稳定 <code>entry_id</code> 核验来源；
+                <code>retrieval_fallback</code> 表示模型回答已被安全检索结果替代。
+              </p>
+            </div>
+          </div>
+        ) : null}
         <div className="notice api-security-notice">
           <Icon name="lock" />
           <div><strong>生产安全提示</strong><p>API Key 仅用于服务端调用。请按应用隔离凭证、定期轮换；一旦疑似泄露，立即在上方撤销并生成新 Key。</p></div>

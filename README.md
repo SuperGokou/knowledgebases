@@ -2,7 +2,7 @@
   <img src="web/public/brand/heyi-display-logo.webp" alt="和熠光显 EFD Logo" width="180">
   <h1>江苏和熠光显有限公司 · 企业知识中台</h1>
   <p><strong>面向 10 TB+ 文档数据的企业知识库与安全问答工作台</strong></p>
-  <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、OKF 知识编译、检索式聊天与 Serverless 控制面。</p>
+  <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、OKF 知识编译、强制来源问答与 Serverless 控制面。</p>
 </div>
 
 <p align="center">
@@ -35,7 +35,7 @@
 </p>
 
 > [!IMPORTANT]
-> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传，以及第一阶段 OKF/DeepSeek 知识编译。自动转换仅处理管理员显式授权知识库中的 UTF-8 `.txt/.csv`，产物先进入草稿，源文件审批后才发布到检索；Office/PDF 沙箱解析、向量检索和生成式 RAG 仍属于后续阶段。
+> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传、第一阶段 OKF 知识编译，以及基于授权文本检索的生成式问答。每个成功回答都返回服务端编号的结构化来源；模型漏引、越界引用或自行伪造来源区块时会丢弃模型文本并降级为确定性检索回答。自动转换目前仅处理管理员显式授权知识库中的 UTF-8 `.txt/.csv`，产物先进入草稿，源文件审批后才发布；Office/PDF 沙箱解析和混合向量检索仍属于后续阶段。
 
 ## 项目定位
 
@@ -88,7 +88,7 @@ flowchart LR
     PostgreSQL[("PostgreSQL / Supabase<br/>Users · RBAC · KB ACL · Entries · Audit")]
     Redis[("Upstash / Redis<br/>Atomic Rate Limits")]
     Storage[("COS / S3 / MinIO<br/>Private Objects")]
-    DeepSeek["DeepSeek API<br/>JSON Output · schema validation"]
+    LLM["DeepSeek / Qwen / MiniMax<br/>RAG · JSON Output · server-side keys"]
     OKFWorker["OKF Compiler<br/>durable job · lease · retry · draft"]
 
     Browser -->|"Same-origin HTTPS"| BFF
@@ -97,10 +97,11 @@ flowchart LR
     Services -->|"事务、行锁、状态机"| PostgreSQL
     Services -->|"Lua 原子限流"| Redis
     Services -->|"Multipart、HEAD、Copy、Abort"| Storage
+    Services -->|"KB opt-in · bounded evidence · citations"| LLM
     Browser -->|"短期预签名 PUT / GET<br/>文件字节不经过 BFF/API"| Storage
     Cron -->|"time budget + reconciliation"| OKFWorker
     OKFWorker -->|"bounded UTF-8 source"| Storage
-    OKFWorker -->|"explicit KB opt-in"| DeepSeek
+    OKFWorker -->|"explicit KB opt-in"| LLM
     OKFWorker -->|"draft / audit / token usage"| PostgreSQL
     Cron -->|"CRON_SECRET"| Middleware
     Ops -.->|"部署前一次性执行"| PostgreSQL
@@ -117,7 +118,7 @@ sequenceDiagram
     participant R as Redis
     participant O as COS / S3 / MinIO
     participant W as OKF Worker
-    participant L as DeepSeek
+    participant L as 已选择的 LLM Provider
     participant M as 管理员
 
     C->>A: POST /api/v1/files/uploads
@@ -153,7 +154,7 @@ sequenceDiagram
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
 | OKF Phase 1 | 上传后持久任务、DeepSeek JSON Output、严格 schema 校验、租约防竞态、指数退避、草稿/发布门禁 |
 | 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；审计只记录文档 ID、模型、策略版本与 token 用量，不记录正文 |
-| 知识问答 Demo | 在授权知识库内做数据库文本检索，回答携带知识条目 citation，明确标记 `mode=retrieval` |
+| 强制来源问答 | 授权检索与可选 RAG；每个成功回答带正文来源脚注、结构化 `citations` 与 `source_status`，无效模型引用自动降级 |
 | 分级限额 | 每分钟请求数、单文件大小、每日上传字节、总存储字节、每日下载凭证 |
 | 大文件上传 | 单 PUT、S3 Multipart、最多 10,000 分片、分批签名、并发上传和客户端断点续传 |
 | 并发安全 | PostgreSQL `used + reserved` 配额模型、行锁、唯一约束与幂等键 |
@@ -436,7 +437,8 @@ npm run build
 - [x] PostgreSQL `pg_trgm` GIN 多语言检索索引与数据库侧有界摘要
 - [ ] 恶意软件扫描与隔离解析 Worker
 - [ ] Office/PDF/CSV 文本抽取与版本化分块
-- [ ] 混合向量索引与生成式 RAG
+- [x] 授权全文检索、可选生成式 RAG、强制来源协议与确定性降级
+- [ ] 混合向量索引、重排与引用语义蕴含评估
 - [ ] OKF Bundle 导入/导出、校验器与知识图谱视图
 - [ ] LLM-Wiki 多文档引用审阅、矛盾检测与增量重编译
 - [ ] 企业 OIDC、MFA 与集中可观测性

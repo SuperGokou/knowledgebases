@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -41,7 +42,8 @@ from app.db.models import (
 from app.db.session import get_db
 from app.main import app
 from app.maintenance import cleanup_expired_uploads
-from app.services.llm_provider import LlmChatResult
+from app.services.llm_provider import LlmChatResult, LlmProviderError
+from app.services.llm_settings import LlmConfigurationError
 from app.services.storage import InitiatedStorageUpload, PresignedPart, StoredObject
 
 
@@ -983,6 +985,19 @@ async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarne
     assert chat.status_code == 200, chat.text
     assert chat.json()["mode"] == "retrieval"
     assert chat.json()["citations"][0]["entry_id"] == entry_body["id"]
+    assert chat.json()["citations"][0]["citation_number"] == 1
+    assert chat.json()["citations"][0]["marker"] == "[1]"
+    assert chat.json()["source_status"] == {
+        "status": "grounded",
+        "strategy": "retrieval",
+        "reason": "external_processing_disabled",
+        "citation_count": 1,
+    }
+    chat_entry_id = chat.json()["citations"][0]["entry_id"]
+    assert chat.json()["answer"].endswith(
+        "答案来源（知识库）：\n"
+        f"[1] Reset a password（entry:{chat_entry_id} · path:index.md）"
+    )
 
     viewer_files = await api_harness.client.get("/api/v1/files", headers=viewer_headers)
     assert viewer_files.status_code == 200
@@ -1339,6 +1354,13 @@ async def test_chat_only_role_can_select_and_query_but_not_browse_entries(
     )
     assert chat.status_code == 200
     assert chat.json()["citations"] == []
+    assert chat.json()["source_status"] == {
+        "status": "no_results",
+        "strategy": "retrieval",
+        "reason": "no_matching_content",
+        "citation_count": 0,
+    }
+    assert chat.json()["answer"].endswith("答案来源：当前知识库未检索到可引用内容。")
     assert (
         await api_harness.client.get(
             f"/api/v1/knowledge-bases/{knowledge_base_id}/entries", headers=headers
@@ -1859,10 +1881,21 @@ async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
         app.dependency_overrides.pop(get_settings, None)
 
 
+@pytest.mark.parametrize(
+    "fabricated_source_block",
+    [
+        "**Sources:**\n- https://fabricated.example/policy [1]",
+        "- Sources:\n- https://fabricated.example/policy [1]",
+        "> Sources:\n- https://fabricated.example/policy [1]",
+        "**Sources:** https://fabricated.example/policy [1]",
+        "- 来源：https://fabricated.example/policy [1]",
+    ],
+)
 @pytest.mark.asyncio
 async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
     api_harness: ApiHarness,
     monkeypatch: pytest.MonkeyPatch,
+    fabricated_source_block: str,
 ) -> None:
     tokens = await api_harness.login()
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
@@ -1883,6 +1916,7 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
     ).status_code == 201
 
     calls: list[list[dict[str, str]]] = []
+    model_answer = "Manager approval is required [1]."
 
     class FakeClient:
         provider = "qwen"
@@ -1899,7 +1933,7 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
             del temperature, max_tokens
             calls.append(messages)
             return LlmChatResult(
-                content="Manager approval is required [1].",
+                content=model_answer,
                 provider=self.provider,
                 model=self.model,
                 prompt_tokens=10,
@@ -1931,9 +1965,142 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
     assert generated.json()["mode"] == "rag"
     assert generated.json()["provider"] == "qwen"
     assert generated.json()["model"] == "qwen-plus"
-    assert generated.json()["answer"] == "Manager approval is required [1]."
+    assert generated.json()["answer"].startswith("Manager approval is required [1].")
+    generated_entry_id = generated.json()["citations"][0]["entry_id"]
+    assert generated.json()["answer"].endswith(
+        f"答案来源（知识库）：\n[1] Travel Policy（entry:{generated_entry_id}）"
+    )
+    assert generated.json()["citations"][0]["citation_number"] == 1
+    assert generated.json()["citations"][0]["marker"] == "[1]"
+    assert generated.json()["source_status"] == {
+        "status": "grounded",
+        "strategy": "rag",
+        "reason": "llm_generated",
+        "citation_count": 1,
+    }
     assert len(calls) == 1
-    assert "KNOWLEDGE_CONTEXT_START" in calls[0][1]["content"]
+    llm_payload = json.loads(calls[0][1]["content"])
+    assert llm_payload == {
+        "question": "travel approval",
+        "knowledge_context": [
+            {
+                "citation_number": 1,
+                "title": "Travel Policy",
+                "excerpt": "Travel expenses require manager approval.",
+            }
+        ],
+    }
+    assert "KNOWLEDGE_CONTEXT_START" not in calls[0][1]["content"]
+
+    model_answer = "This answer cites a source that was never retrieved [99]."
+    invalid_citation = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert invalid_citation.status_code == 200, invalid_citation.text
+    assert invalid_citation.json()["mode"] == "retrieval"
+    assert invalid_citation.json()["source_status"] == {
+        "status": "grounded",
+        "strategy": "retrieval_fallback",
+        "reason": "invalid_model_citations",
+        "citation_count": 1,
+    }
+    assert "never retrieved" not in invalid_citation.json()["answer"]
+
+    model_answer = "This answer contains no source marker."
+    missing_citation = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert missing_citation.status_code == 200, missing_citation.text
+    assert missing_citation.json()["mode"] == "retrieval"
+    assert missing_citation.json()["source_status"]["reason"] == "missing_model_citations"
+    assert "no source marker" not in missing_citation.json()["answer"]
+
+    model_answer = "The first paragraph is grounded [1].\n\nThe second paragraph is not."
+    partially_cited = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert partially_cited.status_code == 200, partially_cited.text
+    assert partially_cited.json()["mode"] == "retrieval"
+    assert partially_cited.json()["source_status"]["reason"] == "missing_model_citations"
+    assert "second paragraph" not in partially_cited.json()["answer"]
+
+    model_answer = (
+        "Manager approval is required [1].\n\n"
+        f"{fabricated_source_block}"
+    )
+    fabricated_sources = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert fabricated_sources.status_code == 200, fabricated_sources.text
+    assert fabricated_sources.json()["mode"] == "retrieval"
+    assert fabricated_sources.json()["source_status"]["reason"] == "invalid_model_citations"
+    assert "fabricated.example" not in fabricated_sources.json()["answer"]
+
+    class UnconfiguredClient:
+        provider = "qwen"
+        model = "qwen-plus"
+        configured = False
+
+    async def fake_unconfigured_resolve(
+        *_args: object, **_kwargs: object
+    ) -> UnconfiguredClient:
+        return UnconfiguredClient()
+
+    monkeypatch.setattr(
+        "app.services.chat.resolve_provider_client", fake_unconfigured_resolve
+    )
+    unconfigured = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert unconfigured.status_code == 200, unconfigured.text
+    assert unconfigured.json()["source_status"] == {
+        "status": "grounded",
+        "strategy": "retrieval_fallback",
+        "reason": "provider_unconfigured",
+        "citation_count": 1,
+    }
+
+    async def fake_invalid_config_resolve(*_args: object, **_kwargs: object) -> None:
+        raise LlmConfigurationError("credential_encryption_key_missing")
+
+    monkeypatch.setattr(
+        "app.services.chat.resolve_provider_client", fake_invalid_config_resolve
+    )
+    invalid_config = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert invalid_config.status_code == 200, invalid_config.text
+    assert invalid_config.json()["source_status"]["reason"] == "provider_configuration_error"
+
+    class FailingClient:
+        provider = "qwen"
+        model = "qwen-plus"
+        configured = True
+
+        async def complete_chat(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            temperature: float = 0.2,
+            max_tokens: int | None = None,
+        ) -> LlmChatResult:
+            del messages, temperature, max_tokens
+            raise LlmProviderError(
+                "llm_upstream_error",
+                provider=self.provider,
+                retryable=True,
+                upstream_status=503,
+            )
+
+    async def fake_failing_resolve(*_args: object, **_kwargs: object) -> FailingClient:
+        return FailingClient()
+
+    monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_failing_resolve)
+    provider_unavailable = await api_harness.client.post(
+        "/api/v1/chat/query", headers=headers, json=payload
+    )
+    assert provider_unavailable.status_code == 200, provider_unavailable.text
+    assert provider_unavailable.json()["source_status"]["reason"] == "provider_unavailable"
 
 
 @pytest.mark.asyncio

@@ -110,7 +110,50 @@ if (!response.ok) throw new Error(`Knowledge API failed: ${response.status}`);
 console.log(await response.json());
 ```
 
-问答响应包含答案、检索引用、执行模式，以及实际使用的供应商和模型。供应商不可用时接口返回明确的 `502` 或 `503`，不会伪造模型回答。
+每个成功的问答响应都包含服务端生成的来源脚注、结构化引用、来源状态、执行模式，以及实际使用的供应商和模型：
+
+```json
+{
+  "knowledge_base_id": "00000000-0000-0000-0000-000000000000",
+  "answer": "质检异常必须先登记并提交复核。[1]\n\n答案来源（知识库）：\n[1] 质检流程（entry:11111111-1111-1111-1111-111111111111 · path:policies/quality.md）",
+  "mode": "rag",
+  "provider": "qwen",
+  "model": "qwen-plus",
+  "citations": [
+    {
+      "entry_id": "11111111-1111-1111-1111-111111111111",
+      "source_file_id": "22222222-2222-2222-2222-222222222222",
+      "title": "质检流程",
+      "excerpt": "发现异常后登记批次并提交质量负责人复核。",
+      "source_path": "policies/quality.md",
+      "format_version": "0.1",
+      "citation_number": 1,
+      "marker": "[1]"
+    }
+  ],
+  "source_status": {
+    "status": "grounded",
+    "strategy": "rag",
+    "reason": "llm_generated",
+    "citation_count": 1
+  }
+}
+```
+
+`citation_number` 与 `marker` 由服务端分配，稳定 `entry_id` 是核验来源身份的主定位符，`title` 与 `source_path` 只用于可读展示。模型回答缺少合法引用、任一事实段漏引、出现越界编号或自行生成 `Sources` / `References` /“答案来源”区块时，平台会丢弃该模型文本，返回 `200` 的确定性检索结果，并把 `source_status.strategy` 标为 `retrieval_fallback`。供应商未配置、配置错误或请求失败也使用同一安全降级路径，不会伪造模型回答。
+
+未检索到匹配内容时，`citations` 为空，`source_status.status` 为 `no_results`，`answer` 会明确注明“当前知识库未检索到可引用内容”。`grounded` 表示回答具有可追溯引用，不代表平台已经完成逐句语义蕴含或业务事实审计；高风险结论仍应打开对应知识条目人工核验。
+
+| `source_status.reason` | 含义 |
+|---|---|
+| `llm_generated` | 模型回答通过服务端引用结构校验 |
+| `external_processing_disabled` | 知识库未授权外部模型，直接返回本地检索回答 |
+| `provider_unconfigured` | 当前供应商未配置，已降级到本地检索 |
+| `provider_configuration_error` | 供应商配置不可用，已降级到本地检索 |
+| `provider_unavailable` | 上游模型调用失败，已降级到本地检索 |
+| `missing_model_citations` | 模型漏引，模型文本已丢弃 |
+| `invalid_model_citations` | 模型引用越界或伪造来源区块，模型文本已丢弃 |
+| `no_matching_content` | 当前授权知识库没有可引用的匹配条目 |
 
 ### 纯知识检索
 
@@ -131,14 +174,14 @@ POST /api/v1/public/knowledge-bases/{knowledge_base_id}/search
 
 | 状态码 | 含义 | 处理建议 |
 |---|---|---|
-| `200` | 请求成功 | 读取响应中的 `answer`、`items` 或 `citations` |
+| `200` | 请求成功；聊天也可能是安全检索降级 | 同时读取 `answer`、`citations` 与 `source_status`，不要只依赖 `mode` |
 | `401` | Key 缺失、格式错误、过期或已撤销 | 替换 Key；不要自动无限重试 |
 | `403` | Key 权限或知识库范围不足 | 由管理员调整 Key 范围或用户 RBAC |
 | `404` | 资源不存在或为防止枚举而隐藏 | 检查知识库 ID 与授权 |
 | `422` | 请求字段不合法 | 根据 `error.details` 修正参数 |
 | `429` | 超过 Key 请求频率 | 遵循 `Retry-After` 并使用指数退避 |
-| `502` | 模型供应商返回异常 | 短暂退避后重试，保留请求 ID |
-| `503` | 数据库、Redis、模型凭据或上游暂不可用 | 检查 `/health/ready` 与服务配置 |
+| `502` | 非聊天接口的上游服务返回异常 | 短暂退避后重试，保留请求 ID；聊天 Provider 异常通常返回带来源的检索降级结果 |
+| `503` | 数据库、Redis 或其他必需基础依赖不可用 | 检查 `/health/ready` 与服务配置；聊天 Provider 配置异常通常不会触发 503 |
 
 所有错误均使用统一结构：
 

@@ -136,6 +136,23 @@ export type ChatCitation = {
   excerpt: string;
   source_path: string | null;
   format_version: string | null;
+  citation_number: number;
+  marker: string;
+};
+
+export type ChatSourceStatus = {
+  status: "grounded" | "no_results";
+  strategy: "rag" | "retrieval" | "retrieval_fallback";
+  reason:
+    | "llm_generated"
+    | "external_processing_disabled"
+    | "provider_unconfigured"
+    | "provider_configuration_error"
+    | "provider_unavailable"
+    | "missing_model_citations"
+    | "invalid_model_citations"
+    | "no_matching_content";
+  citation_count: number;
 };
 
 export type ChatReply = {
@@ -145,6 +162,7 @@ export type ChatReply = {
   provider?: string | null;
   model?: string | null;
   citations: ChatCitation[];
+  source_status: ChatSourceStatus;
 };
 
 export type ChatMessage = {
@@ -154,6 +172,10 @@ export type ChatMessage = {
   createdAt: string;
   pending?: boolean;
   failed?: boolean;
+  citations?: ChatCitation[];
+  sourceStatus?: ChatSourceStatus;
+  provider?: string | null;
+  model?: string | null;
 };
 
 export type ManagedApiKey = {

@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { AnswerSources } from "@/components/answer-sources";
 import { Icon } from "@/components/icon";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
+import { answerWithoutEmbeddedSources } from "@/lib/chat-sources";
 import type { ChatMessage, ChatReply, KnowledgeBase } from "@/lib/types";
 
 const suggestions = [
@@ -64,12 +66,18 @@ export function ChatWorkspace() {
         method: "POST",
         body: JSON.stringify({ knowledge_base_id: knowledgeBaseId, message: content, limit: 5 }),
       });
-      const sources = reply.citations.length
-        ? `\n\n来源：\n${reply.citations.map((item, index) => `${index + 1}. ${item.title}${item.source_path ? ` · ${item.source_path}` : ""}`).join("\n")}`
-        : "";
       setMessages((current) => [
         ...current,
-        { id: crypto.randomUUID(), role: "assistant", content: `${reply.answer}${sources}`, createdAt: new Date().toISOString() },
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: answerWithoutEmbeddedSources(reply.answer),
+          createdAt: new Date().toISOString(),
+          citations: reply.citations,
+          sourceStatus: reply.source_status,
+          provider: reply.provider,
+          model: reply.model,
+        },
       ]);
       setServiceHint("知识检索已连接");
     } catch (reason) {
@@ -140,7 +148,19 @@ export function ChatWorkspace() {
               {messages.map((message) => (
                 <article className={`message ${message.role}${message.failed ? " failed" : ""}`} key={message.id}>
                   <span className="message-avatar"><Icon name={message.role === "user" ? "users" : "spark"} /></span>
-                  <div className="message-bubble">{message.content}</div>
+                  <div className="message-bubble">
+                    <div className="message-content">{message.content}</div>
+                    {message.role === "assistant" ? (
+                      <AnswerSources
+                        citations={message.citations}
+                        failed={message.failed}
+                        headingId={`answer-sources-${message.id}`}
+                        model={message.model}
+                        provider={message.provider}
+                        sourceStatus={message.sourceStatus}
+                      />
+                    ) : null}
+                  </div>
                 </article>
               ))}
               {pending ? (
