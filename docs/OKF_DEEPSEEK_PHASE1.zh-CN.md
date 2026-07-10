@@ -46,9 +46,9 @@ API Key 只允许配置在后端/Worker 环境，不能使用 `NEXT_PUBLIC_` 前
 
 任务状态：`pending → processing → succeeded`，可重试错误进入 `retry_wait`，超过次数进入 `failed`，缺少解析器或文本不合格进入 `unsupported`。
 
-Vercel Cron 每分钟调用 `/api/v1/internal/maintenance`。每次调用受批量上限与时间预算双重限制；单任务的意外异常会被隔离、审计并退避重试，不会使整个批次返回 500。
+当前 Hobby 兼容配置每天调用一次 `/api/v1/internal/maintenance` 做漏单对账。每次调用受批量上限与时间预算双重限制；单任务的意外异常会被隔离、审计并退避重试，不会使整个批次返回 500。
 
-> 每分钟 Cron 需要 Vercel Pro/Enterprise。Hobby 计划只允许每天一次；若需要“上传后尽快转换”，请使用 Upstash QStash、Vercel Queue 或独立 Worker 触发消费，保留每日 Cron 仅用于漏单对账。
+> 每分钟 Cron 需要 Vercel Pro/Enterprise。Hobby 计划只允许每天一次；若需要“上传后尽快转换”，请使用 Upstash QStash、Vercel Queue 或独立 Worker 触发消费，保留当前每日 Cron 仅用于漏单对账。
 
 管理 API：
 

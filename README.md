@@ -374,7 +374,7 @@ npm run build
 4. 独立的 JWT 与 Cron Secret；
 5. 部署前执行 Alembic migration 和一次性管理员 Bootstrap。
 
-当前 `vercel.json` 以每分钟 Cron 驱动近实时 OKF Worker，因此 API Project 需要 Vercel Pro/Enterprise；Hobby 的 Cron 最短间隔为每天一次。Hobby 部署应把 schedule 调整为每日 reconciliation，并用 Upstash QStash、Vercel Queue 或独立 Worker 承担上传后的即时消费。
+当前 Vercel 项目使用 Hobby 兼容的每日 Cron 做 OKF 漏单对账。若要求上传后近实时转换，应升级 Pro/Enterprise 后使用每分钟 Cron，或用 Upstash QStash、Vercel Queue、独立 Worker 承担即时消费。
 
 完整变量映射、腾讯 COS virtual-host addressing、Supabase、Cron 和迁移顺序见：
 
