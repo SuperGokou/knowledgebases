@@ -3,7 +3,7 @@ name = "enterprise-knowledge-base"
 version = "0.1.0"
 description = "Enterprise knowledge-base backend with dynamic RBAC and S3-compatible storage"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "~=3.12.0"
 dependencies = [
   "alembic>=1.16,<2",
   "asyncpg>=0.30,<1",
