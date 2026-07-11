@@ -34,6 +34,8 @@
   ·
   <a href="docs/VERCEL_DEPLOYMENT.zh-CN.md">Vercel 部署</a>
   ·
+  <a href="docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md">腾讯云共享部署</a>
+  ·
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
   ·
   <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">商业版审计报告</a>
@@ -462,6 +464,7 @@ npm run build
 - [架构设计](docs/ARCHITECTURE.zh-CN.md)：系统边界、数据库模式、RBAC、配额、状态机与 10 TB+ 拓扑；
 - [运维手册](docs/OPERATIONS.zh-CN.md)：部署、备份、恢复、扩容、告警与排障；
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
+- [腾讯云共享服务器应用部署基线](docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)：跨应用隔离、端口登记、国内构建、最小权限、上线检查与回滚。
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
 - [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。

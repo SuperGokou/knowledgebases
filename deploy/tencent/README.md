@@ -2,6 +2,8 @@
 
 本目录用于将知识库部署到共享的腾讯云主机。生产编排只运行 Web、API、维护任务和反向代理；数据库、Redis 与对象存储继续使用受管服务。
 
+同一台服务器继续部署其他应用前，必须先阅读并填写[腾讯云共享服务器应用部署基线](../../docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)中的资源登记、预检与回滚清单。本应用已经占用 Compose 项目名 `heyi-kb-prod`、目录 `/srv/heyi-knowledgebases` 和 `18443/tcp`，其他应用不得复用。
+
 ## 隔离边界
 
 - 固定使用独立 Compose 项目名 `heyi-kb-prod`。
