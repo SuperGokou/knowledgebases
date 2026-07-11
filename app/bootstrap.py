@@ -20,57 +20,57 @@ from app.db.models import (
 from app.db.session import SessionFactory
 
 PERMISSION_CATALOG: dict[str, tuple[str, str]] = {
-    "file:read": ("Read own files", "List, inspect, and download files owned by the user"),
-    "file:read:any": ("Read all files", "Read files owned by any user"),
-    "file:upload": ("Upload files", "Create and complete direct-upload sessions"),
-    "file:approve": ("Approve files", "Approve a scanned or manually reviewed file"),
-    "file:approve:any": ("Approve any unscoped file", "Approve files outside a knowledge base"),
-    "file:delete": ("Delete files", "Soft-delete knowledge-base files"),
-    "user:manage": ("Manage users", "Create, disable, and update users"),
-    "role:read": ("Read roles", "View roles, permissions, and limits"),
-    "role:manage": ("Manage roles", "Create and update grantable roles"),
-    "role:assign": ("Assign roles", "Assign grantable roles to users"),
-    "quota:manage": ("Manage quotas", "Manage limit definitions and overrides"),
-    "audit:read": ("Read audit log", "Read security and administration audit events"),
-    "knowledge:create": ("Create knowledge bases", "Create owned knowledge bases"),
-    "knowledge:read": ("Read knowledge bases", "Read granted knowledge bases and entries"),
-    "knowledge:update": ("Update knowledge bases", "Update granted knowledge and entries"),
-    "knowledge:grant": ("Grant knowledge access", "Manage role grants on knowledge bases"),
-    "chat:query": ("Query knowledge chat", "Query chat over an authorized knowledge base"),
-    "api-key:manage": ("Manage API keys", "Issue, inspect, and revoke scoped API keys"),
-    "llm:manage": ("Manage LLM providers", "Configure and select approved LLM providers"),
+    "file:read": ("查看本人文件", "查看本人拥有的文件列表、详情并获取下载链接"),
+    "file:read:any": ("查看全部文件", "查看所有用户拥有的文件，不受文件所有者限制"),
+    "file:upload": ("上传文件", "创建并完成文件直传任务，将资料加入知识库"),
+    "file:approve": ("审核文件", "批准已完成安全扫描或人工复核的文件"),
+    "file:approve:any": ("审核未归属文件", "审核尚未绑定到具体知识库的文件"),
+    "file:delete": ("删除文件", "从知识库中软删除文件并保留审计记录"),
+    "user:manage": ("管理账号", "创建、更新、禁用或恢复后台登录账号"),
+    "role:read": ("查看角色", "查看角色列表、权限能力和资源访问限额"),
+    "role:manage": ("管理角色", "创建角色并修改允许授权的角色策略"),
+    "role:assign": ("分配角色", "为用户分配或调整允许授予的角色"),
+    "quota:manage": ("管理资源额度", "管理限额定义以及用户级别的额度覆盖规则"),
+    "audit:read": ("查看审计日志", "查看安全事件和后台管理操作的审计记录"),
+    "knowledge:create": ("创建知识库", "创建由当前用户负责管理的企业知识库"),
+    "knowledge:read": ("查看知识库", "查看已获授权的知识库、条目和相关资料"),
+    "knowledge:update": ("编辑知识库", "更新已获授权的知识库设置和知识条目"),
+    "knowledge:grant": ("管理知识库授权", "配置角色对知识库的阅读、编辑或管理等级"),
+    "chat:query": ("使用知识问答", "在已获授权的知识库中发起带来源引用的问答"),
+    "api-key:manage": ("管理 API 密钥", "签发、查看和吊销限定范围的 API 访问密钥"),
+    "llm:manage": ("管理大模型配置", "配置并切换系统允许使用的大模型服务商"),
 }
 
 LIMIT_CATALOG: dict[str, tuple[str, str, str, str]] = {
     "requests_per_minute": (
-        "Requests per minute",
+        "每分钟请求次数",
         "requests",
         "minute",
-        "Distributed API rate limit",
+        "每个固定分钟窗口内允许调用受保护接口的次数",
     ),
     "max_upload_bytes": (
-        "Maximum object size",
+        "单个文件大小上限",
         "bytes",
         "request",
-        "Maximum declared size of one uploaded object",
+        "一次上传任务允许声明的最大文件大小",
     ),
     "daily_upload_bytes": (
-        "Daily uploaded bytes",
+        "每日上传总量",
         "bytes",
         "day",
-        "Total bytes that can be initiated per UTC day",
+        "每个 UTC 自然日可发起上传的文件总字节数",
     ),
     "storage_bytes": (
-        "Stored bytes",
+        "累计存储写入量",
         "bytes",
         "lifetime",
-        "Total persistent object storage allowance",
+        "生命周期内累计成功上传的字节数；当前删除文件不会返还额度",
     ),
     "daily_downloads": (
-        "Daily download grants",
+        "每日下载授权次数",
         "grants",
         "day",
-        "Number of short-lived download grants issued per UTC day",
+        "每个 UTC 自然日可签发短期文件下载链接的次数",
     ),
 }
 
@@ -116,8 +116,8 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
     if role is None:
         role = Role(
             code="system_admin",
-            name="System Administrator",
-            description="Bootstrap role with every catalog permission and unlimited quotas",
+            name="系统管理员",
+            description="拥有全部系统权限且所有资源限额均为无限制的系统角色",
             priority=10_000,
             is_system=True,
         )
@@ -127,6 +127,9 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
         raise RuntimeError(
             "Refusing to reuse a non-system or unexpected-priority role named system_admin"
         )
+    else:
+        role.name = "系统管理员"
+        role.description = "拥有全部系统权限且所有资源限额均为无限制的系统角色"
 
     existing_permission_ids = set(
         (

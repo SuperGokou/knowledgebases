@@ -14,6 +14,15 @@ def test_non_nullable_patch_fields_reject_explicit_null() -> None:
         UserUpdate(status=None)
 
 
+def test_role_create_strips_whitespace_and_rejects_blank_name() -> None:
+    role = RoleCreate(code="  uploader  ", name="  知识上传员  ")
+    assert role.code == "uploader"
+    assert role.name == "知识上传员"
+
+    with pytest.raises(ValidationError):
+        RoleCreate(code="uploader", name="   ")
+
+
 @pytest.mark.parametrize("schema", [RoleCreate, LimitSet, RolePolicySet])
 def test_role_limit_values_fit_postgresql_bigint(schema: type[object]) -> None:
     maximum = 9_223_372_036_854_775_807

@@ -48,12 +48,20 @@ export function EmptyState({
   );
 }
 
-export function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
+export function ErrorState({
+  message,
+  onRetry,
+  title = "暂时无法加载",
+}: {
+  message: string;
+  onRetry?: () => void;
+  title?: string;
+}) {
   return (
     <div className="notice error-notice" role="alert">
       <Icon name="warning" />
       <div>
-        <strong>暂时无法加载</strong>
+        <strong>{title}</strong>
         <p>{message}</p>
       </div>
       {onRetry ? (

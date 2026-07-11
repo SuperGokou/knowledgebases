@@ -11,6 +11,8 @@ RoleLimitValue = Annotated[int, Field(ge=0, le=POSTGRES_BIGINT_MAX)] | None
 
 
 class RoleCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     code: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,99}$")
     name: str = Field(min_length=1, max_length=200)
     description: str | None = None

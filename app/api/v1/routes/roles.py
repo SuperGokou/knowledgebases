@@ -28,13 +28,17 @@ limit_router = APIRouter()
 
 
 def _ensure_role_mutable(access: AccessContext, role: Role) -> None:
-    if access.user.is_superuser:
-        return
-    if role.is_system or role.priority > access.max_role_priority:
+    if role.is_system:
+        raise ApiError(
+            status_code=403,
+            code="system_role",
+            message="System roles are immutable",
+        )
+    if not access.user.is_superuser and role.priority > access.max_role_priority:
         raise ApiError(
             status_code=403,
             code="role_escalation_denied",
-            message="You cannot modify a system role or a role above your own priority",
+            message="You cannot modify a role above your own priority",
         )
 
 
