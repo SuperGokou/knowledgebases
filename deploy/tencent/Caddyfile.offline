@@ -14,7 +14,6 @@ https://{$KB_PUBLIC_HOST}:8443 {
 		format json
 	}
 }
-
 https://{$KB_PUBLIC_HOST}:9443 {
 	tls internal
 	reverse_proxy minio:9000
@@ -24,4 +23,3 @@ https://{$KB_PUBLIC_HOST}:9443 {
 		format json
 	}
 }
-

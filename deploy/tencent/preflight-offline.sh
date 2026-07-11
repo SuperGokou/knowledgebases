@@ -85,4 +85,3 @@ docker compose \
   config --quiet
 
 echo "preflight: offline deployment requirements satisfied"
-
