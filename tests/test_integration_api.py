@@ -25,8 +25,13 @@ from app.db.models import (
     ApiKey,
     File,
     FileStatus,
+    KnowledgeBase,
+    KnowledgeEntry,
+    KnowledgeEntryPublicationStatus,
     LimitDefinition,
     LlmProviderConfig,
+    OkfConversionJob,
+    OkfConversionStatus,
     Permission,
     QuotaReservation,
     ReservationStatus,
@@ -416,6 +421,201 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
     listed = await api_harness.client.get("/api/v1/files", headers=headers)
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == file_id
+
+
+@pytest.mark.parametrize(
+    ("latest_status", "expected_status_code"),
+    [
+        (OkfConversionStatus.PENDING, 409),
+        (OkfConversionStatus.PROCESSING, 409),
+        (OkfConversionStatus.RETRY_WAIT, 409),
+        (OkfConversionStatus.SUCCEEDED, 200),
+        (OkfConversionStatus.FAILED, 200),
+        (OkfConversionStatus.UNSUPPORTED, 200),
+    ],
+)
+@pytest.mark.asyncio
+async def test_file_approval_follows_latest_okf_job_state(
+    api_harness: ApiHarness,
+    latest_status: OkfConversionStatus,
+    expected_status_code: int,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    async with api_harness.session_factory() as session:
+        owner = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert owner is not None
+        knowledge_base = KnowledgeBase(owner_id=owner.id, name=f"Approval {latest_status.value}")
+        session.add(knowledge_base)
+        await session.flush()
+        file = File(
+            owner_id=owner.id,
+            knowledge_base_id=knowledge_base.id,
+            bucket="kb",
+            object_key=f"objects/approval-{uuid4()}.txt",
+            original_name="approval.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=1,
+            status=FileStatus.PROCESSING,
+            version=2,
+        )
+        session.add(file)
+        await session.flush()
+
+        previous_entry = KnowledgeEntry(
+            knowledge_base_id=knowledge_base.id,
+            source_file_id=file.id,
+            entry_type="previous",
+            title="Previous conversion",
+            content="Previous draft must remain unpublished.",
+            publication_status=KnowledgeEntryPublicationStatus.DRAFT,
+        )
+        session.add(previous_entry)
+        await session.flush()
+        session.add(
+            OkfConversionJob(
+                file_id=file.id,
+                knowledge_base_id=knowledge_base.id,
+                file_version=1,
+                prompt_version="test-v1",
+                status=OkfConversionStatus.SUCCEEDED,
+                output_entry_id=previous_entry.id,
+            )
+        )
+
+        latest_entry: KnowledgeEntry | None = None
+        if latest_status is OkfConversionStatus.SUCCEEDED:
+            latest_entry = KnowledgeEntry(
+                knowledge_base_id=knowledge_base.id,
+                source_file_id=file.id,
+                entry_type="latest",
+                title="Latest conversion",
+                content="Latest approved draft.",
+                publication_status=KnowledgeEntryPublicationStatus.DRAFT,
+            )
+            session.add(latest_entry)
+            await session.flush()
+        latest_job = OkfConversionJob(
+            file_id=file.id,
+            knowledge_base_id=knowledge_base.id,
+            file_version=2,
+            prompt_version="test-v2",
+            status=latest_status,
+            output_entry_id=latest_entry.id if latest_entry is not None else None,
+            error_code=(
+                "test_terminal_failure"
+                if latest_status in {OkfConversionStatus.FAILED, OkfConversionStatus.UNSUPPORTED}
+                else None
+            ),
+        )
+        session.add(latest_job)
+        await session.commit()
+        file_id = file.id
+        previous_entry_id = previous_entry.id
+        latest_entry_id = latest_entry.id if latest_entry is not None else None
+
+    response = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/approve",
+        headers=headers,
+    )
+    assert response.status_code == expected_status_code, response.text
+
+    async with api_harness.session_factory() as session:
+        persisted_file = await session.get(File, file_id)
+        persisted_previous = await session.get(KnowledgeEntry, previous_entry_id)
+        assert persisted_file is not None
+        assert persisted_previous is not None
+        assert persisted_previous.publication_status is KnowledgeEntryPublicationStatus.DRAFT
+        if expected_status_code == 409:
+            assert response.json()["error"]["code"] == "okf_conversion_in_progress"
+            assert persisted_file.status is FileStatus.PROCESSING
+        else:
+            assert persisted_file.status is FileStatus.AVAILABLE
+        if latest_entry_id is not None:
+            persisted_latest = await session.get(KnowledgeEntry, latest_entry_id)
+            assert persisted_latest is not None
+            assert (
+                persisted_latest.publication_status
+                is KnowledgeEntryPublicationStatus.PUBLISHED
+            )
+
+
+@pytest.mark.parametrize(
+    ("conversion_status", "file_status", "expected_status_code"),
+    [
+        (OkfConversionStatus.FAILED, FileStatus.AVAILABLE, 409),
+        (OkfConversionStatus.UNSUPPORTED, FileStatus.AVAILABLE, 409),
+        (OkfConversionStatus.FAILED, FileStatus.PROCESSING, 200),
+        (OkfConversionStatus.UNSUPPORTED, FileStatus.PROCESSING, 200),
+    ],
+)
+@pytest.mark.asyncio
+async def test_okf_retry_requires_file_to_remain_in_processing(
+    api_harness: ApiHarness,
+    conversion_status: OkfConversionStatus,
+    file_status: FileStatus,
+    expected_status_code: int,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    async with api_harness.session_factory() as session:
+        owner = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert owner is not None
+        knowledge_base = KnowledgeBase(
+            owner_id=owner.id,
+            name=f"Retry {conversion_status.value} {file_status.value}",
+        )
+        session.add(knowledge_base)
+        await session.flush()
+        file = File(
+            owner_id=owner.id,
+            knowledge_base_id=knowledge_base.id,
+            bucket="kb",
+            object_key=f"objects/retry-{uuid4()}.txt",
+            original_name="retry.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=1,
+            status=file_status,
+            available_at=datetime.now(UTC) if file_status is FileStatus.AVAILABLE else None,
+        )
+        session.add(file)
+        await session.flush()
+        conversion = OkfConversionJob(
+            file_id=file.id,
+            knowledge_base_id=knowledge_base.id,
+            file_version=1,
+            prompt_version="test-retry-v1",
+            status=conversion_status,
+            attempts=4,
+            error_code="test_terminal_failure",
+            completed_at=datetime.now(UTC),
+        )
+        session.add(conversion)
+        await session.commit()
+        file_id = file.id
+        conversion_id = conversion.id
+
+    response = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/okf-conversion/retry",
+        headers=headers,
+    )
+    assert response.status_code == expected_status_code, response.text
+
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(OkfConversionJob, conversion_id)
+        assert persisted is not None
+        if expected_status_code == 409:
+            assert response.json()["error"]["code"] == "okf_retry_file_state_conflict"
+            assert persisted.status is conversion_status
+            assert persisted.error_code == "test_terminal_failure"
+        else:
+            assert persisted.status is OkfConversionStatus.PENDING
+            assert persisted.attempts == 0
+            assert persisted.error_code is None
 
 
 @pytest.mark.asyncio
@@ -1118,6 +1318,14 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
             json={"parts": []},
         )
     ).status_code == 200
+    async with api_harness.session_factory() as session:
+        conversion = await session.scalar(
+            select(OkfConversionJob).where(OkfConversionJob.file_id == UUID(completed_file_id))
+        )
+        assert conversion is not None
+        conversion.status = OkfConversionStatus.UNSUPPORTED
+        conversion.error_code = "parser_required"
+        await session.commit()
     assert (
         await api_harness.client.post(
             f"/api/v1/files/{completed_file_id}/approve", headers=admin_headers

@@ -6,6 +6,8 @@
 </div>
 
 <p align="center">
+  <a href="https://github.com/SuperGokou/knowledgebases/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/SuperGokou/knowledgebases/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md"><img alt="Readiness: Internal Beta" src="https://img.shields.io/badge/Readiness-Internal%20Beta-F59E0B?style=flat-square"></a>
   <a href="https://www.python.org/"><img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white"></a>
   <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI 0.116+" src="https://img.shields.io/badge/FastAPI-0.116%2B-009688?style=flat-square&amp;logo=fastapi&amp;logoColor=white"></a>
   <a href="https://nextjs.org/"><img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-000000?style=flat-square&amp;logo=nextdotjs&amp;logoColor=white"></a>
@@ -33,6 +35,10 @@
   <a href="docs/VERCEL_DEPLOYMENT.zh-CN.md">Vercel 部署</a>
   ·
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
+  ·
+  <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">商业版审计报告</a>
+  ·
+  <a href="SECURITY.md">安全报告策略</a>
 </p>
 
 > [!IMPORTANT]
@@ -379,7 +385,7 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时的本地验收结果：**113 backend tests + 113 frontend tests passed，branch coverage 83.94%，Ruff clean，mypy strict passed，TypeScript/ESLint/Next.js production build passed**。
+本 README 更新时的本地验收结果：**130 backend tests + 142 frontend tests passed，branch coverage 84.47%，Ruff clean，mypy strict passed，npm audit 0 vulnerabilities，TypeScript/ESLint/Next.js production build passed**。同一组门禁已写入 GitHub Actions，并额外在 PostgreSQL 17 与 Redis 8 service 上验证 Alembic 能升级到唯一 head。
 
 ## 部署到 Vercel
 
@@ -459,6 +465,8 @@ npm run build
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
 - [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。
+- [商业版代码审计与交付报告](docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md)：发布判定、已关闭问题、P1 商用门槛与验收标准。
+- [安全策略](SECURITY.md)：漏洞私密报告渠道、响应目标、安全港边界与凭据处理要求。
 
 ---
 

@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
+from app.schemas.auth import RefreshRequest
 from app.schemas.roles import LimitSet, RoleCreate, RolePolicySet, RoleUpdate
 from app.schemas.users import UserUpdate
 
@@ -43,3 +44,10 @@ def test_role_limit_values_fit_postgresql_bigint(schema: type[object]) -> None:
     schema(**valid_payload)
     with pytest.raises(ValidationError):
         schema(**invalid_payload)
+
+
+def test_refresh_token_has_a_bounded_request_size() -> None:
+    RefreshRequest(refresh_token="x" * 20)
+
+    with pytest.raises(ValidationError):
+        RefreshRequest(refresh_token="x" * 4_097)

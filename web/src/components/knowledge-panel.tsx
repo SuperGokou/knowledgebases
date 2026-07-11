@@ -71,7 +71,7 @@ export function KnowledgePanel() {
 
   async function toggleExternalProcessing(item: KnowledgeBase) {
     const enabled = !item.external_llm_processing_enabled;
-    if (enabled && !window.confirm("开启后，符合条件的 TXT/CSV 内容会发送给 DeepSeek 生成 OKF 草稿。确认该知识空间允许外部模型处理吗？")) {
+    if (enabled && !window.confirm("开启后，符合条件的 TXT/CSV 内容会发送给当前启用的外部模型生成 OKF 草稿。确认该知识空间允许外部模型处理吗？")) {
       return;
     }
     setUpdatingId(item.id);
@@ -121,8 +121,8 @@ export function KnowledgePanel() {
                     {updatingId === item.id
                       ? "保存中…"
                       : item.external_llm_processing_enabled
-                        ? "DeepSeek 自动转换：已开启"
-                        : "DeepSeek 自动转换：未开启"}
+                        ? "外部模型自动转换：已开启"
+                        : "外部模型自动转换：未开启"}
                   </button>
                 ) : null}
                 <StatusBadge tone={item.access_level === "manager" ? "success" : "neutral"}>
@@ -152,7 +152,7 @@ export function KnowledgePanel() {
                   checked={externalProcessing}
                   onChange={(event) => setExternalProcessing(event.target.checked)}
                 />
-                <span><strong>允许 DeepSeek 自动转换</strong><small>仅第一阶段支持 UTF-8 TXT/CSV；内容会发送到外部模型，默认关闭。</small></span>
+                <span><strong>允许当前外部模型自动转换</strong><small>仅第一阶段支持 UTF-8 TXT/CSV；内容会发送到后台选定的 DeepSeek、Qwen 或 MiniMax，默认关闭。</small></span>
               </label>
               <div className="form-actions full"><button className="button primary" type="submit" disabled={pending || !name.trim()}>{pending ? "正在创建…" : "创建空间"}</button></div>
             </form>

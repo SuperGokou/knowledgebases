@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.db.models import (
     File,
-    FileStatus,
     KnowledgeBase,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
@@ -244,11 +243,9 @@ async def _persist_result(
         content=result.draft.body_markdown,
         source_path=f"generated/{file.id}/{_slug(result.draft.title)}.md",
         format_version="okf/0.1",
-        publication_status=(
-            KnowledgeEntryPublicationStatus.PUBLISHED
-            if locked_file.status is FileStatus.AVAILABLE
-            else KnowledgeEntryPublicationStatus.DRAFT
-        ),
+        # Model-derived knowledge always requires an explicit approval transition.
+        # The source file's state must never implicitly publish content generated later.
+        publication_status=KnowledgeEntryPublicationStatus.DRAFT,
         custom_metadata={
             "okf_version": "0.1",
             "description": result.draft.description,

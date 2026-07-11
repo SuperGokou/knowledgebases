@@ -6,8 +6,14 @@ import { useAccess } from "@/components/access-provider";
 import { AnswerSources } from "@/components/answer-sources";
 import { Icon } from "@/components/icon";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
+import { parseChatReply } from "@/lib/chat-contract";
 import { answerWithoutEmbeddedSources } from "@/lib/chat-sources";
-import type { ChatMessage, ChatReply, KnowledgeBase } from "@/lib/types";
+import { scrollIntoViewIfSupported } from "@/lib/dom";
+import { createRequestDeadline, type RequestDeadline } from "@/lib/request-deadline";
+import type { ChatMessage, KnowledgeBase } from "@/lib/types";
+
+const CHAT_MESSAGE_MAX_LENGTH = 2_000;
+const CHAT_REQUEST_TIMEOUT_MS = 70_000;
 
 const suggestions = [
   "帮我总结这个知识库中的主要制度。",
@@ -26,6 +32,7 @@ export function ChatWorkspace() {
   const [loadError, setLoadError] = useState("");
   const [serviceHint, setServiceHint] = useState("正在连接知识检索");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const activeRequestRef = useRef<RequestDeadline | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -47,11 +54,36 @@ export function ChatWorkspace() {
     return () => { active = false; };
   }, []);
 
-  useEffect(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), [messages]);
+  useEffect(() => {
+    scrollIntoViewIfSupported(bottomRef.current, { behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => () => {
+    const activeRequest = activeRequestRef.current;
+    activeRequestRef.current = null;
+    activeRequest?.cancel();
+  }, []);
+
+  function startNewConversation() {
+    const activeRequest = activeRequestRef.current;
+    activeRequestRef.current = null;
+    activeRequest?.cancel();
+    setPending(false);
+    setMessages([]);
+  }
 
   async function send() {
     const content = input.trim();
-    if (!content || !knowledgeBaseId || pending || !can("chat:query")) return;
+    if (
+      !content
+      || content.length > CHAT_MESSAGE_MAX_LENGTH
+      || !knowledgeBaseId
+      || pending
+      || activeRequestRef.current
+      || !can("chat:query")
+    ) return;
+    const deadline = createRequestDeadline(CHAT_REQUEST_TIMEOUT_MS);
+    activeRequestRef.current = deadline;
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -62,10 +94,14 @@ export function ChatWorkspace() {
     setInput("");
     setPending(true);
     try {
-      const reply = await apiRequest<ChatReply>("/api/v1/chat/query", {
-        method: "POST",
-        body: JSON.stringify({ knowledge_base_id: knowledgeBaseId, message: content, limit: 5 }),
-      });
+      const reply = parseChatReply(
+        await apiRequest<unknown>("/api/v1/chat/query", {
+          method: "POST",
+          body: JSON.stringify({ knowledge_base_id: knowledgeBaseId, message: content, limit: 5 }),
+          signal: deadline.signal,
+        }),
+      );
+      if (activeRequestRef.current !== deadline) return;
       setMessages((current) => [
         ...current,
         {
@@ -81,20 +117,33 @@ export function ChatWorkspace() {
       ]);
       setServiceHint("知识检索已连接");
     } catch (reason) {
+      if (
+        activeRequestRef.current !== deadline
+        || (deadline.signal.aborted && !deadline.timedOut)
+      ) return;
+      const timedOut = deadline.timedOut;
       const unavailable = reason instanceof ApiClientError && [404, 501].includes(reason.status);
       setMessages((current) => [
         ...current,
         {
           id: crypto.randomUUID(),
           role: "assistant",
-          content: unavailable ? "聊天 API 尚未接入，请稍后再试。" : readableError(reason),
+          content: timedOut
+            ? "问答请求超时，请稍后重试。"
+            : unavailable
+              ? "聊天 API 尚未接入，请稍后再试。"
+              : readableError(reason),
           createdAt: new Date().toISOString(),
           failed: true,
         },
       ]);
-      setServiceHint(unavailable ? "问答服务尚未接入" : "连接异常");
+      setServiceHint(timedOut ? "请求超时" : unavailable ? "问答服务尚未接入" : "连接异常");
     } finally {
-      setPending(false);
+      deadline.dispose();
+      if (activeRequestRef.current === deadline) {
+        activeRequestRef.current = null;
+        setPending(false);
+      }
     }
   }
 
@@ -117,7 +166,7 @@ export function ChatWorkspace() {
               value={knowledgeBaseId}
               onChange={(event) => {
                 setKnowledgeBaseId(event.target.value);
-                setMessages([]);
+                startNewConversation();
               }}
               disabled={!knowledgeBases?.length || pending}
             >
@@ -125,7 +174,7 @@ export function ChatWorkspace() {
               {knowledgeBases?.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
             </select>
             <span className="chat-status"><span />{serviceHint}</span>
-            <button className="button secondary small" type="button" onClick={() => setMessages([])}>
+            <button className="button secondary small" type="button" onClick={startNewConversation}>
               <Icon name="plus" /> 新对话
             </button>
           </div>
@@ -181,6 +230,7 @@ export function ChatWorkspace() {
               placeholder={ready ? "输入问题，按 Enter 发送…" : "请选择一个可访问的知识库"}
               value={input}
               disabled={!ready}
+              maxLength={CHAT_MESSAGE_MAX_LENGTH}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {

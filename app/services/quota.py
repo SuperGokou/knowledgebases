@@ -137,16 +137,13 @@ class QuotaService:
             limit_key=key,
             window_start=window_start,
         )
-        calculation = check_and_calculate_reservation(
+        check_and_calculate_reservation(
             used=counter.used_value,
             reserved=counter.reserved_value,
             requested=amount,
             limit=limit,
         )
         counter.used_value += amount
-        if limit is not None and calculation.remaining_after_reservation is not None:
-            # The domain calculation is deliberately reused for the same bound check.
-            assert counter.used_value + counter.reserved_value <= limit  # noqa: S101
 
     async def _locked_counter(
         self,

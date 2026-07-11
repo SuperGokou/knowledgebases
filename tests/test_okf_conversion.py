@@ -256,6 +256,58 @@ async def test_stale_lease_cannot_publish_result() -> None:
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_available_file_cannot_make_model_result_auto_publish() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with factory() as session:
+        user = User(email="published-source@example.com", password_hash="hash")
+        session.add(user)
+        await session.flush()
+        kb = KnowledgeBase(owner_id=user.id, name="Published source")
+        session.add(kb)
+        await session.flush()
+        file = File(
+            owner_id=user.id,
+            knowledge_base_id=kb.id,
+            bucket="kb",
+            object_key="objects/source.txt",
+            original_name="source.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=1,
+            status=FileStatus.AVAILABLE,
+        )
+        session.add(file)
+        await session.flush()
+        lease_id = uuid4()
+        job = OkfConversionJob(
+            file_id=file.id,
+            knowledge_base_id=kb.id,
+            file_version=1,
+            prompt_version=PROMPT_VERSION,
+            status=OkfConversionStatus.PROCESSING,
+            lease_id=lease_id,
+        )
+        session.add(job)
+        await session.commit()
+
+        result = await SuccessfulClient().compile_okf(
+            "Revenue policy: refunds require approval.", user_id=f"kb_{kb.id.hex}"
+        )
+        await _persist_result(session, job.id, lease_id, file, result)
+
+        await session.refresh(job)
+        assert job.status is OkfConversionStatus.SUCCEEDED
+        assert job.output_entry_id is not None
+        entry = await session.get(KnowledgeEntry, job.output_entry_id)
+        assert entry is not None
+        assert entry.publication_status.value == "draft"
+    await engine.dispose()
+
+
 def test_okf_draft_rejects_unknown_model_fields() -> None:
     with pytest.raises(ValueError):
         OkfConceptDraft.model_validate(

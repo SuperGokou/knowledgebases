@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     )
     api_prefix: str = "/api/v1"
     database_url: str = Field(
-        default="postgresql+asyncpg://knowledge:knowledge@localhost:5432/knowledge",
+        default=(
+            "postgresql+asyncpg://knowledge:knowledge@"  # pragma: allowlist secret
+            "localhost:5432/knowledge"
+        ),
         validation_alias=AliasChoices("KB_DATABASE_URL", "DATABASE_URL"),
     )
     redis_url: str = Field(
@@ -36,7 +39,8 @@ class Settings(BaseSettings):
     )
 
     jwt_secret: SecretStr = SecretStr(
-        "development-only-change-this-secret-before-production-0123456789"
+        "development-only-change-this-secret-before-production-"  # pragma: allowlist secret
+        "0123456789"
     )
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "enterprise-knowledge-base"
@@ -225,6 +229,19 @@ class Settings(BaseSettings):
             ):
                 if urlparse(endpoint).hostname in {None, "localhost", "127.0.0.1", "::1"}:
                     raise ValueError(f"{variable} must reference an external production service")
+            if urlparse(self.redis_url).scheme != "rediss":
+                raise ValueError("KB_REDIS_URL must use TLS (rediss://) in production")
+            if "*" in self.cors_origins or "null" in {
+                origin.strip().lower() for origin in self.cors_origins
+            }:
+                raise ValueError(
+                    "KB_CORS_ORIGINS must contain exact trusted origins in production"
+                )
+            if (
+                self.s3_access_key.get_secret_value() == "knowledge"
+                or self.s3_secret_key.get_secret_value() == "knowledge-secret"
+            ):
+                raise ValueError("S3 example credentials must be changed in production")
             if not self.s3_endpoint_url.lower().startswith("https://"):
                 raise ValueError("KB_S3_ENDPOINT_URL must use HTTPS in production")
             if not self.s3_public_endpoint_url.lower().startswith("https://"):

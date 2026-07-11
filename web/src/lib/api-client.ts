@@ -20,6 +20,7 @@ export class ApiClientError extends Error {
     readonly status: number,
     readonly code?: string,
     readonly details?: unknown,
+    readonly requestId?: string,
   ) {
     super(message);
     this.name = "ApiClientError";
@@ -44,11 +45,16 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
 
   if (!response.ok) {
     const problem = payload as ApiProblem | null;
+    const headerRequestId = response.headers.get("x-request-id")?.trim() || undefined;
+    const payloadRequestId = typeof problem?.request_id === "string"
+      ? problem.request_id.trim() || undefined
+      : undefined;
     throw new ApiClientError(
       problem?.error?.message ?? problem?.message ?? "请求未能完成，请稍后再试。",
       response.status,
       problem?.error?.code,
       problem?.error?.details,
+      headerRequestId ?? payloadRequestId,
     );
   }
 

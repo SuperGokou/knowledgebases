@@ -39,4 +39,26 @@ describe("permission refresh signaling", () => {
 
     expect(listener).toHaveBeenCalledTimes(1);
   });
+
+  it("preserves the response request ID on API failures", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({
+        request_id: "payload-request-id",
+        error: { code: "service_error", message: "Failed" },
+      }),
+      {
+        status: 503,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Request-Id": "header-request-id",
+        },
+      },
+    )));
+
+    await expect(apiRequest("/api/v1/failure")).rejects.toMatchObject({
+      requestId: "header-request-id",
+      status: 503,
+      code: "service_error",
+    });
+  });
 });

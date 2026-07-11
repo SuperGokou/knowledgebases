@@ -1,9 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { backendUrl, safeBackendFetch } from "@/lib/server/backend";
+import {
+  BackendConfigurationError,
+  backendUrl,
+  safeBackendFetch,
+} from "@/lib/server/backend";
 import { isAllowedBackendPath } from "@/lib/server/backend-path";
 import { readBoundedBody, RequestBodyTooLargeError } from "@/lib/server/bounded-body";
-import { BffSigningConfigurationError } from "@/lib/server/client-ip";
+import {
+  BffSigningConfigurationError,
+  signedClientIpHeaders,
+} from "@/lib/server/client-ip";
 import { refreshSessionOnce } from "@/lib/server/session-refresh";
 import {
   hasSameOrigin,
@@ -15,7 +22,7 @@ import {
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const MAX_CONTROL_PLANE_BODY_BYTES = 1024 * 1024;
 
-async function handler(
+async function handleBackendRequest(
   request: NextRequest,
   context: { params: Promise<{ path: string[] }> },
 ): Promise<NextResponse> {
@@ -75,6 +82,9 @@ async function handler(
     if (contentType) headers.set("Content-Type", contentType);
     if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
     if (access) headers.set("Authorization", `Bearer ${access}`);
+    for (const [name, value] of Object.entries(signedClientIpHeaders(request))) {
+      headers.set(name, value);
+    }
     const target = backendUrl(`/${path.join("/")}`, request.nextUrl.search);
     if (target.pathname !== `/${path.join("/")}`) {
       return new Response(JSON.stringify({ error: { code: "route_not_allowed", message: "后台路径不是规范路径。" } }), {
@@ -86,6 +96,7 @@ async function handler(
       method: request.method,
       headers,
       body,
+      signal: request.signal,
     });
   };
 
@@ -144,6 +155,52 @@ async function handler(
 
   if (replacement) setSessionCookies(response, replacement, tokens.email);
   return response;
+}
+
+async function handler(
+  request: NextRequest,
+  context: { params: Promise<{ path: string[] }> },
+): Promise<NextResponse> {
+  try {
+    return await handleBackendRequest(request, context);
+  } catch (error) {
+    const diagnostic = {
+      method: request.method,
+      request_path: request.nextUrl.pathname,
+      error_name: error instanceof Error ? error.name : "UnknownError",
+    };
+    if (error instanceof BackendConfigurationError) {
+      console.error("[bff_configuration]", {
+        event: "bff_backend_configuration_error",
+        ...diagnostic,
+      });
+      return NextResponse.json(
+        {
+          error: {
+            code: "backend_configuration_error",
+            message: "后台服务配置暂不可用，请联系系统管理员。",
+          },
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    if (error instanceof BffSigningConfigurationError) {
+      console.error("[bff_configuration]", {
+        event: "bff_signing_configuration_error",
+        ...diagnostic,
+      });
+      return NextResponse.json(
+        {
+          error: {
+            code: "bff_signing_misconfigured",
+            message: "请求签名服务配置暂不可用，请联系系统管理员。",
+          },
+        },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    throw error;
+  }
 }
 
 export const GET = handler;

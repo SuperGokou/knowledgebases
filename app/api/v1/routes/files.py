@@ -8,7 +8,7 @@ from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
-from sqlalchemy import and_, exists, false, or_, select, update
+from sqlalchemy import and_, exists, false, or_, select
 
 from app.api.dependencies import DatabaseSession, get_storage_service, require_permission
 from app.api.errors import ApiError
@@ -628,25 +628,36 @@ async def retry_okf_conversion(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("file:approve"))],
 ) -> OkfConversionJob:
-    conversion = await session.scalar(
-        select(OkfConversionJob)
-        .where(OkfConversionJob.file_id == file_id)
-        .order_by(OkfConversionJob.file_version.desc())
-        .limit(1)
-        .with_for_update()
-    )
-    if conversion is None:
+    row = (
+        await session.execute(
+            select(OkfConversionJob, File)
+            .join(File, File.id == OkfConversionJob.file_id)
+            .where(OkfConversionJob.file_id == file_id)
+            .order_by(OkfConversionJob.file_version.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
         raise ApiError(
             status_code=404,
             code="okf_conversion_not_found",
             message="Conversion not found",
         )
+    conversion = cast(OkfConversionJob, row[0])
+    file = cast(File, row[1])
     await require_knowledge_base_access(
         session,
         access,
         conversion.knowledge_base_id,
         minimum=KnowledgeBaseAccessLevel.MANAGER,
     )
+    if file.status is not FileStatus.PROCESSING:
+        raise ApiError(
+            status_code=409,
+            code="okf_retry_file_state_conflict",
+            message="Only files awaiting approval can retry an OKF conversion",
+        )
     if conversion.status not in {
         OkfConversionStatus.FAILED,
         OkfConversionStatus.UNSUPPORTED,
@@ -753,16 +764,53 @@ async def approve_processed_file(
         raise ApiError(
             status_code=409, code="file_state_conflict", message="File is not awaiting approval"
         )
+
+    latest_conversion = await session.scalar(
+        select(OkfConversionJob)
+        .where(OkfConversionJob.file_id == file.id)
+        .order_by(OkfConversionJob.file_version.desc())
+        .limit(1)
+    )
+    if latest_conversion is not None and latest_conversion.status in {
+        OkfConversionStatus.PENDING,
+        OkfConversionStatus.PROCESSING,
+        OkfConversionStatus.RETRY_WAIT,
+    }:
+        raise ApiError(
+            status_code=409,
+            code="okf_conversion_in_progress",
+            message="The latest OKF conversion must finish before this file can be approved",
+            details={"status": latest_conversion.status.value},
+        )
+
+    generated_entry: KnowledgeEntry | None = None
+    if latest_conversion is not None and latest_conversion.status is OkfConversionStatus.SUCCEEDED:
+        if latest_conversion.output_entry_id is None:
+            raise ApiError(
+                status_code=409,
+                code="okf_conversion_result_missing",
+                message="The completed OKF conversion has no generated draft to approve",
+            )
+        generated_entry = await session.scalar(
+            select(KnowledgeEntry)
+            .where(
+                KnowledgeEntry.id == latest_conversion.output_entry_id,
+                KnowledgeEntry.source_file_id == file.id,
+                KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
+            )
+            .with_for_update()
+        )
+        if generated_entry is None:
+            raise ApiError(
+                status_code=409,
+                code="okf_conversion_result_missing",
+                message="The completed OKF conversion draft is unavailable for approval",
+            )
+
     file.status = FileStatus.AVAILABLE
     file.available_at = datetime.now(UTC)
-    await session.execute(
-        update(KnowledgeEntry)
-        .where(
-            KnowledgeEntry.source_file_id == file.id,
-            KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
-        )
-        .values(publication_status=KnowledgeEntryPublicationStatus.PUBLISHED)
-    )
+    if generated_entry is not None:
+        generated_entry.publication_status = KnowledgeEntryPublicationStatus.PUBLISHED
     add_audit_event(
         session,
         actor_id=access.user.id,
