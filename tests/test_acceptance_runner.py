@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from scripts.acceptance import (
     AcceptanceGate,
@@ -10,7 +13,9 @@ from scripts.acceptance import (
     CommandOutcome,
     build_profile,
     calculate_verdict,
+    execute_command,
     redact_output,
+    resolve_command,
     run_gate,
     write_reports,
 )
@@ -104,6 +109,49 @@ def test_timeout_is_failed_without_leaking_command_output() -> None:
 
     assert outcome.status == "failed"
     assert outcome.summary == "command timed out after 1 seconds"
+
+
+def test_missing_executable_is_a_controlled_gate_failure() -> None:
+    gate = AcceptanceGate(
+        gate_id="TOOL-P0-001",
+        severity="P0",
+        command=("missing-tool",),
+        cwd=".",
+        timeout_seconds=1,
+    )
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        raise FileNotFoundError("sensitive local path")
+
+    outcome = run_gate(gate, executor=executor)
+
+    assert outcome.status == "failed"
+    assert outcome.summary == "command executable was not found"
+
+
+def test_platform_command_shim_is_resolved_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _value: "C:/tools/npm.CMD")
+
+    assert resolve_command(("npm", "test")) == ("C:/tools/npm.CMD", "test")
+
+
+def test_command_capture_uses_explicit_fault_tolerant_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=["tool"], returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    gate = AcceptanceGate("CODE-P0-001", "P0", ("tool",), ".", 10)
+
+    assert execute_command(gate).returncode == 0
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
 
 
 def test_local_profile_contains_required_deterministic_gates() -> None:

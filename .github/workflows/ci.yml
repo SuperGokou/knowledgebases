@@ -160,3 +160,56 @@ jobs:
           --cov-report=term-missing
           --cov-report=xml
           --cov-fail-under=80
+
+  acceptance:
+    name: Enterprise acceptance gate
+    needs:
+      - frontend
+      - backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CI: "true"
+      KB_ENVIRONMENT: test
+      NEXT_TELEMETRY_DISABLED: "1"
+      UV_NO_PROGRESS: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.15"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install locked dependencies
+        run: |
+          uv sync --frozen --extra dev
+          npm ci --prefix web --no-audit --no-fund
+
+      - name: Run enterprise acceptance profile
+        run: >-
+          uv run --frozen python scripts/acceptance.py
+          --profile ci
+          --report-dir artifacts/acceptance
+
+      - name: Publish redacted acceptance summary
+        if: always() && hashFiles('artifacts/acceptance/acceptance.md') != ''
+        run: cat artifacts/acceptance/acceptance.md >> "$GITHUB_STEP_SUMMARY"

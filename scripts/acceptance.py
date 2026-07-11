@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -72,14 +73,22 @@ def redact_output(value: str) -> str:
     return _PRESIGNED_QUERY.sub(r"\g<origin>?[REDACTED]", redacted)
 
 
-def _execute(gate: AcceptanceGate) -> CommandOutcome:
+def resolve_command(command: tuple[str, ...]) -> tuple[str, ...]:
+    if not command:
+        return command
+    executable = shutil.which(command[0]) or command[0]
+    return (executable, *command[1:])
+
+
+def execute_command(gate: AcceptanceGate) -> CommandOutcome:
     completed = subprocess.run(  # noqa: S603
-        list(gate.command),
+        list(resolve_command(gate.command)),
         cwd=gate.cwd,
         capture_output=True,
         check=False,
+        encoding="utf-8",
+        errors="replace",
         shell=False,
-        text=True,
         timeout=gate.timeout_seconds,
     )
     return CommandOutcome(
@@ -92,7 +101,7 @@ def _execute(gate: AcceptanceGate) -> CommandOutcome:
 def run_gate(
     gate: AcceptanceGate,
     *,
-    executor: GateExecutor = _execute,
+    executor: GateExecutor = execute_command,
 ) -> AcceptanceResult:
     started = time.monotonic()
     if gate.blocked_reason is not None:
@@ -105,6 +114,14 @@ def run_gate(
         )
     try:
         outcome = executor(gate)
+    except FileNotFoundError:
+        return AcceptanceResult(
+            gate_id=gate.gate_id,
+            severity=gate.severity,
+            status="failed",
+            duration_seconds=time.monotonic() - started,
+            summary="command executable was not found",
+        )
     except subprocess.TimeoutExpired:
         return AcceptanceResult(
             gate_id=gate.gate_id,
