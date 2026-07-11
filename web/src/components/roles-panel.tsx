@@ -231,63 +231,73 @@ export function RolesPanel() {
                   <div><h2>{selectedCopy?.name}</h2><p>{selectedCopy?.description}</p></div>
                   <StatusBadge tone={selected.is_system ? "info" : "neutral"}>{selected.is_system ? "系统角色" : `优先级 ${selected.priority}`}</StatusBadge>
                 </div>
-                <section className="detail-section">
-                  <h3>权限能力</h3>
-                  <p className="section-intro">权限名称与用途均使用中文；技术标识仅用于 API 配置、排障和审计追踪。</p>
-                  {policyLoading ? <p className="field-hint" aria-live="polite">正在载入角色策略…</p> : null}
-                  <div className="checkbox-grid">
-                    {permissions.map((permission) => {
-                      const copy = permissionCopy(permission);
-                      return (
-                        <label className="check-option" key={permission.code}>
-                          <input type="checkbox" disabled={!mutable || pending || policyLoading || !policyReady} checked={permissionCodes.includes(permission.code)} onChange={() => togglePermission(permission.code)} />
-                          <span><strong>{copy.name}</strong><small>{copy.description}</small><code>技术标识：{permission.code}</code></span>
-                        </label>
-                      );
-                    })}
+                <details className="detail-section policy-disclosure" key={`permissions-${selected.id}`}>
+                  <summary className="policy-disclosure-summary">
+                    <span className="policy-disclosure-title"><strong>权限能力</strong><small>{policyLoading ? "正在载入角色策略…" : `${permissionCodes.length} 项已启用 · 共 ${permissions.length} 项`}</small></span>
+                    <span className="policy-disclosure-action" aria-hidden="true"><span className="when-closed">展开配置</span><span className="when-open">收起配置</span><Icon name="arrow" /></span>
+                  </summary>
+                  <div className="policy-disclosure-body">
+                    <p className="section-intro">权限名称与用途均使用中文；技术标识仅用于 API 配置、排障和审计追踪。</p>
+                    {policyLoading ? <p className="field-hint" aria-live="polite">正在载入角色策略…</p> : null}
+                    <div className="checkbox-grid">
+                      {permissions.map((permission) => {
+                        const copy = permissionCopy(permission);
+                        return (
+                          <label className="check-option" key={permission.code}>
+                            <input type="checkbox" disabled={!mutable || pending || policyLoading || !policyReady} checked={permissionCodes.includes(permission.code)} onChange={() => togglePermission(permission.code)} />
+                            <span><strong>{copy.name}</strong><small>{copy.description}</small><code>技术标识：{permission.code}</code></span>
+                          </label>
+                        );
+                      })}
+                    </div>
                   </div>
-                </section>
-                <section className="detail-section">
-                  <h3>资源与访问限额</h3>
-                  <div className="limit-legend">
-                    <span><b>未设置</b><small>该角色不参与此项额度合并</small></span>
-                    <span><b>有限制</b><small>按填写的数字限制；0 表示禁止</small></span>
-                    <span><b>无限制</b><small>该角色不为此项设置上限</small></span>
+                </details>
+                <details className="detail-section policy-disclosure" key={`limits-${selected.id}`}>
+                  <summary className="policy-disclosure-summary">
+                    <span className="policy-disclosure-title"><strong>资源与访问限额</strong><small>{policyLoading ? "正在载入角色策略…" : `${Object.keys(selected.limits).length} 项已配置 · 共 ${definitions.length} 项`}</small></span>
+                    <span className="policy-disclosure-action" aria-hidden="true"><span className="when-closed">展开配置</span><span className="when-open">收起配置</span><Icon name="arrow" /></span>
+                  </summary>
+                  <div className="policy-disclosure-body">
+                    <div className="limit-legend">
+                      <span><b>未设置</b><small>该角色不参与此项额度合并</small></span>
+                      <span><b>有限制</b><small>按填写的数字限制；0 表示禁止</small></span>
+                      <span><b>无限制</b><small>该角色不为此项设置上限</small></span>
+                    </div>
+                    <div className="limit-grid">
+                      {definitions.map((definition) => {
+                        const copy = limitCopy(definition);
+                        const mode = limitMode(limitValues[definition.key]);
+                        const storedValue = selected.limits[definition.key];
+                        return (
+                          <article className="limit-card" key={definition.key}>
+                            <div className="limit-copy"><strong>{copy.name}</strong><p>{copy.description}</p><small>{copy.window} · {copy.unit}</small></div>
+                            {mutable ? (
+                              <div className="limit-editor">
+                                <select aria-label={`${copy.name}设置方式`} value={mode} onChange={(event) => changeLimitMode(definition.key, event.target.value as LimitMode)} disabled={pending || policyLoading || !policyReady}>
+                                  <option value="unset">未设置</option>
+                                  <option value="limited">有限制</option>
+                                  <option value="unlimited">无限制</option>
+                                </select>
+                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "此角色不设置上限" : "不参与角色额度合并"}</small>}
+                              </div>
+                            ) : (
+                              <div className="limit-readout"><strong>{displayLimit(definition, storedValue)}</strong><small>{storedValue === undefined ? "该角色未配置" : storedValue === null ? "此角色不设置上限" : "该角色的数值上限"}</small></div>
+                            )}
+                          </article>
+                        );
+                      })}
+                    </div>
+                    <div className="limit-policy-note"><strong>最终额度如何计算</strong><p>用户拥有多个角色时，数值取最大值；任一角色为“无限制”，角色合并结果就是无限制；用户级覆盖值最后生效。若所有角色都未设置，请求频率使用系统默认值，其余上传、累计存储写入与下载额度按 0 处理。每日限额按 UTC 00:00 重置。</p></div>
+                    {mutable ? <p className="field-hint">容量类限额请输入原始字节数，保存后会自动换算为 KB、MB、GB 或 TB 显示。非超级管理员不能授予高于自身的额度。</p> : null}
                   </div>
-                  <div className="limit-grid">
-                    {definitions.map((definition) => {
-                      const copy = limitCopy(definition);
-                      const mode = limitMode(limitValues[definition.key]);
-                      const storedValue = selected.limits[definition.key];
-                      return (
-                        <article className="limit-card" key={definition.key}>
-                          <div className="limit-copy"><strong>{copy.name}</strong><p>{copy.description}</p><small>{copy.window} · {copy.unit}</small></div>
-                          {mutable ? (
-                            <div className="limit-editor">
-                              <select aria-label={`${copy.name}设置方式`} value={mode} onChange={(event) => changeLimitMode(definition.key, event.target.value as LimitMode)} disabled={pending || policyLoading || !policyReady}>
-                                <option value="unset">未设置</option>
-                                <option value="limited">有限制</option>
-                                <option value="unlimited">无限制</option>
-                              </select>
-                              {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "此角色不设置上限" : "不参与角色额度合并"}</small>}
-                            </div>
-                          ) : (
-                            <div className="limit-readout"><strong>{displayLimit(definition, storedValue)}</strong><small>{storedValue === undefined ? "该角色未配置" : storedValue === null ? "此角色不设置上限" : "该角色的数值上限"}</small></div>
-                          )}
-                        </article>
-                      );
-                    })}
-                  </div>
-                  <div className="limit-policy-note"><strong>最终额度如何计算</strong><p>用户拥有多个角色时，数值取最大值；任一角色为“无限制”，角色合并结果就是无限制；用户级覆盖值最后生效。若所有角色都未设置，请求频率使用系统默认值，其余上传、累计存储写入与下载额度按 0 处理。每日限额按 UTC 00:00 重置。</p></div>
-                  {mutable ? <p className="field-hint">容量类限额请输入原始字节数，保存后会自动换算为 KB、MB、GB 或 TB 显示。非超级管理员不能授予高于自身的额度。</p> : null}
-                </section>
+                </details>
                 {mutable ? <div className="form-actions"><button className="button primary" type="button" disabled={pending || policyLoading || !policyReady} onClick={() => void savePolicy()}>{pending ? "正在保存…" : policyLoading ? "正在载入…" : "保存权限与限额"}</button></div> : <p className="field-hint">系统角色始终只读；其他角色也不能被授予高于当前管理员自身的权限或额度。</p>}
               </div>
             ) : null}
           </div>
         ) : null}
         {can("role:manage") ? (
-          <details className="drawer-form">
+          <details className="drawer-form role-create-drawer">
             <summary>＋ 新建自定义角色</summary>
             <form className="form-grid" onSubmit={createRole}>
               <label>角色标识（可选）<input value={code} onChange={(event) => setCode(event.target.value)} onBlur={() => setCode(normalizeRoleCode(code))} placeholder="例如 knowledge_editor" maxLength={100} /><small className="input-help">留空将自动生成；可输入英文字母、数字、下划线或短横线。</small></label>
