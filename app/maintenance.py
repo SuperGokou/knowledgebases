@@ -108,13 +108,15 @@ async def run_maintenance_once(
     cleaned = await cleanup_expired_uploads(
         session, storage, batch_size=settings.maintenance_batch_size
     )
-    converted = await process_okf_conversion_batch(
-        session,
-        storage,
-        await resolve_provider_client(session, settings),
-        settings,
-        batch_size=settings.okf_conversion_batch_size,
-    )
+    converted = 0
+    if settings.external_llm_enabled:
+        converted = await process_okf_conversion_batch(
+            session,
+            storage,
+            await resolve_provider_client(session, settings),
+            settings,
+            batch_size=settings.okf_conversion_batch_size,
+        )
     return {"cleaned": cleaned, "converted": converted}
 
 
