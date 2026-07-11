@@ -27,7 +27,8 @@ services:
     profiles: [ops]
     restart: "no"
     env_file:
-      - ${KB_API_ENV_FILE:?KB_API_ENV_FILE is required}
+      - path: ${KB_API_ENV_FILE:?KB_API_ENV_FILE is required}
+        format: raw
     command: ["alembic", "upgrade", "head"]
     <<: *runtime-security
     mem_limit: 512m
@@ -43,7 +44,8 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - ${KB_API_ENV_FILE:?KB_API_ENV_FILE is required}
+      - path: ${KB_API_ENV_FILE:?KB_API_ENV_FILE is required}
+        format: raw
     healthcheck:
       test:
         - CMD
@@ -67,7 +69,8 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - ${KB_API_ENV_FILE:?KB_API_ENV_FILE is required}
+      - path: ${KB_API_ENV_FILE:?KB_API_ENV_FILE is required}
+        format: raw
     command: ["python", "-m", "app.maintenance", "--interval", "60"]
     depends_on:
       api:
@@ -89,7 +92,8 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - ${KB_WEB_ENV_FILE:?KB_WEB_ENV_FILE is required}
+      - path: ${KB_WEB_ENV_FILE:?KB_WEB_ENV_FILE is required}
+        format: raw
     depends_on:
       api:
         condition: service_healthy

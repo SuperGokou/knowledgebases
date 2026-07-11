@@ -1,6 +1,6 @@
-ARG PYTHON_IMAGE=python:3.12.11-slim-bookworm
+ARG PYTHON_IMAGE=python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
 
-FROM ghcr.io/astral-sh/uv:0.11.15 AS uv
+FROM ghcr.io/astral-sh/uv:0.11.15@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3 AS uv
 
 FROM ${PYTHON_IMAGE} AS builder
 

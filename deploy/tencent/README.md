@@ -15,11 +15,13 @@
 ```text
 /srv/heyi-knowledgebases/
 ├── releases/<git-sha>/
+│   └── deploy.env
 └── shared/
     ├── api.env
-    ├── web.env
-    └── compose.env
+    └── web.env
 ```
+
+`deploy.env` 随发布版本保存固定的 Git SHA 镜像引用和共享密钥文件路径。回滚时必须使用目标发布目录自己的 `deploy.env`，不得使用其他版本的镜像引用。
 
 ## 常用操作
 
@@ -28,12 +30,14 @@
 ```bash
 sudo docker compose \
   --project-name heyi-kb-prod \
-  --env-file /srv/heyi-knowledgebases/shared/compose.env \
+  --env-file /srv/heyi-knowledgebases/releases/<git-sha>/deploy.env \
   --file /srv/heyi-knowledgebases/releases/<git-sha>/deploy/tencent/compose.yml \
   ps
 ```
 
 查看本项目日志时同样使用上述前缀并追加 `logs --tail=200 api web proxy maintenance`。禁止执行全局 `docker system prune`，也不要对不属于 `heyi-kb-prod` 的容器、网络或卷执行停止、删除操作。
+
+首次在空机部署时可顺序构建 API 与 Web 镜像。共享主机开始承载其他应用后，应由 CI 构建带 Git SHA 的不可变镜像，服务器只执行 `pull` 和项目限定的 `up -d`，避免现场构建抢占其他应用的 CPU 与内存。
 
 ## HTTPS 说明
 
