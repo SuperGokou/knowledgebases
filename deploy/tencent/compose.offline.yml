@@ -10,7 +10,7 @@ x-api-environment: &api-environment
   KB_DEPLOYMENT_PROFILE: isolated
   KB_EXTERNAL_LLM_ENABLED: "false"
   KB_DEBUG: "false"
-  KB_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
+  KB_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:?required}:${POSTGRES_APP_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
   KB_REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379/0
   KB_JWT_SECRET: ${KB_JWT_SECRET:?required}
   KB_BFF_SHARED_SECRET: ${KB_BFF_SHARED_SECRET:?required}
@@ -51,6 +51,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?required}
       POSTGRES_USER: ${POSTGRES_USER:?required}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:?required}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?required}
       PGDATA: /var/lib/postgresql/data/pgdata
     command:
       - postgres
@@ -72,6 +74,7 @@ services:
       - type: bind
         source: ${KB_DATA_ROOT:?required}/postgres
         target: /var/lib/postgresql/data
+      - ../../docker/postgres/init-runtime-role.sh:/docker-entrypoint-initdb.d/10-runtime-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
@@ -213,7 +216,9 @@ services:
     build: *api-build
     profiles: [ops]
     restart: "no"
-    environment: *api-environment
+    environment:
+      <<: *api-environment
+      KB_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
     command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:

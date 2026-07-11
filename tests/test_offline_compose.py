@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -51,3 +52,41 @@ def test_offline_data_services_do_not_publish_host_ports() -> None:
         assert not config["services"][service].get("ports"), service
     assert config["networks"]["backend"]["internal"] is True
     assert config["networks"]["frontend"]["internal"] is True
+
+
+def test_offline_api_uses_a_distinct_non_admin_database_identity() -> None:
+    config = offline_compose_config()
+    api_database = urlparse(config["services"]["api"]["environment"]["KB_DATABASE_URL"])
+    migration_database = urlparse(
+        config["services"]["migrate"]["environment"]["KB_DATABASE_URL"]
+    )
+
+    assert api_database.username == "knowledge-runtime"
+    assert migration_database.username == "knowledge"
+    assert api_database.username != migration_database.username
+
+
+def test_runtime_database_role_is_initialized_without_cluster_privileges() -> None:
+    script = (REPOSITORY / "docker/postgres/init-runtime-role.sh").read_text(
+        encoding="utf-8"
+    )
+
+    for restriction in (
+        "NOSUPERUSER",
+        "NOCREATEDB",
+        "NOCREATEROLE",
+        "NOREPLICATION",
+        "NOBYPASSRLS",
+    ):
+        assert restriction in script
+    assert "ALTER DEFAULT PRIVILEGES" in script
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE" in script
+
+
+def test_offline_preflight_rejects_shared_database_identity() -> None:
+    script = (REPOSITORY / "deploy/tencent/preflight-offline.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '[ "$POSTGRES_USER" != "$POSTGRES_APP_USER" ]' in script
+    assert "database owner and runtime role must be different" in script

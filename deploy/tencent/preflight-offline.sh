@@ -30,6 +30,22 @@ set +a
 : "${KB_PUBLIC_HOST:?required}"
 : "${KB_HTTPS_PORT:?required}"
 : "${KB_OBJECTS_HTTPS_PORT:?required}"
+: "${POSTGRES_USER:?required}"
+: "${POSTGRES_APP_USER:?required}"
+
+for database_role in "$POSTGRES_USER" "$POSTGRES_APP_USER"; do
+  case "$database_role" in
+    ""|*[!a-zA-Z0-9_-]*)
+      echo "preflight: database role names may contain only letters, numbers, underscore and hyphen" >&2
+      exit 65
+      ;;
+  esac
+done
+
+if ! [ "$POSTGRES_USER" != "$POSTGRES_APP_USER" ]; then
+  echo "preflight: database owner and runtime role must be different" >&2
+  exit 65
+fi
 
 if [ "$COMPOSE_PROJECT_NAME" != "heyi-kb-offline" ]; then
   echo "preflight: COMPOSE_PROJECT_NAME must be heyi-kb-offline" >&2
