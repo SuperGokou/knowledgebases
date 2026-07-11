@@ -1,21 +1,24 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { Icon } from "@/components/icon";
 
 export function LogoutButton() {
-  const router = useRouter();
   const [pending, setPending] = useState(false);
 
   async function logout() {
     setPending(true);
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+      });
     } finally {
-      router.replace("/login");
-      router.refresh();
+      // A full navigation guarantees that Set-Cookie deletions are committed
+      // before the workspace proxy evaluates the next request.
+      window.location.replace("/login");
     }
   }
 

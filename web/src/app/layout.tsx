@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 
+import { DEFAULT_THEME, THEME_STORAGE_KEY } from "@/lib/theme";
+
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -9,9 +11,12 @@ export const metadata: Metadata = {
   applicationName: "和熠光显企业知识中台",
 };
 
+const themeBootScript = `(() => { try { const value = localStorage.getItem(${JSON.stringify(THEME_STORAGE_KEY)}); if (["obsidian-stage", "evidence-editorial", "prism-lab"].includes(value ?? "")) document.documentElement.dataset.theme = value; } catch {} })();`;
+
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   return (
-    <html lang="zh-CN">
+    <html lang="zh-CN" data-theme={DEFAULT_THEME} suppressHydrationWarning>
+      <head><script dangerouslySetInnerHTML={{ __html: themeBootScript }} /></head>
       <body>{children}</body>
     </html>
   );

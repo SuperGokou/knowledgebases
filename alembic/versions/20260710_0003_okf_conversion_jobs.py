@@ -8,6 +8,7 @@ Create Date: 2026-07-10 00:00:00
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -27,11 +28,13 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
-    publication_status = sa.Enum(
+    publication_status = postgresql.ENUM(
         "DRAFT",
         "PUBLISHED",
         name="knowledge_entry_publication_status",
+        create_type=False,
     )
+    publication_status.create(op.get_bind(), checkfirst=True)
     op.add_column(
         "knowledge_entries",
         sa.Column(

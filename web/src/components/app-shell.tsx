@@ -7,6 +7,7 @@ import { Icon } from "@/components/icon";
 import { LogoutButton } from "@/components/logout-button";
 import { MobileNav } from "@/components/mobile-nav";
 import { SideNav } from "@/components/side-nav";
+import { ThemeSelector } from "@/components/theme-selector";
 import { WorkspaceAccessBoundary } from "@/components/workspace-access-boundary";
 
 export function AppShell({ children, email }: { children: ReactNode; email?: string }) {
@@ -15,27 +16,28 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
     <AccessProvider>
       <div className="app-shell">
       <aside className="sidebar">
-        <Link className="brand" href="/">
-          <BrandIdentity />
-        </Link>
         <SideNav />
         <div className="sidebar-foot">
-          <div className="secure-chip"><Icon name="lock" /><span>HttpOnly 安全会话</span></div>
-          <div className="account-card">
-            <span className="avatar">{initial}</span>
-            <span className="account-copy">
-              <strong>{email ?? "已登录账号"}</strong>
-              <small>企业工作区</small>
-            </span>
-            <LogoutButton />
-          </div>
+          <div className="secure-chip"><Icon name="lock" /><span>安全会话</span></div>
         </div>
       </aside>
       <div className="shell-main">
         <header className="topbar">
-          <div className="mobile-brand"><BrandIdentity variant="mobile" /></div>
-          <div className="topbar-status"><span className="pulse" /> API 通过安全 BFF 连接</div>
-          <div className="topbar-help"><kbd>⌘</kbd><kbd>K</kbd><span>快速搜索</span></div>
+          <Link className="topbar-brand" href="/">
+            <BrandIdentity variant="workspace" priority />
+          </Link>
+          <ThemeSelector />
+          <div className="topbar-actions">
+            <div className="topbar-status"><span className="pulse" /> 安全连接</div>
+            <div className="topbar-account">
+              <span className="avatar">{initial}</span>
+              <span className="account-copy">
+                <strong>{email ?? "已登录账号"}</strong>
+                <small>企业工作区</small>
+              </span>
+              <LogoutButton />
+            </div>
+          </div>
         </header>
         <main className="content"><WorkspaceAccessBoundary>{children}</WorkspaceAccessBoundary></main>
         <MobileNav />

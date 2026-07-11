@@ -137,7 +137,9 @@ class UserRole(Base):
     role_id: Mapped[UUID] = mapped_column(
         ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    assigned_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    assigned_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -185,7 +187,7 @@ class RoleLimit(Base):
         ForeignKey("roles.id", ondelete="CASCADE"), index=True, nullable=False
     )
     limit_definition_id: Mapped[UUID] = mapped_column(
-        ForeignKey("limit_definitions.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("limit_definitions.id", ondelete="CASCADE"), index=True, nullable=False
     )
     value: Mapped[int | None] = mapped_column(BigInteger)
 
@@ -202,7 +204,7 @@ class UserLimitOverride(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
     limit_definition_id: Mapped[UUID] = mapped_column(
-        ForeignKey("limit_definitions.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("limit_definitions.id", ondelete="CASCADE"), index=True, nullable=False
     )
     value: Mapped[int | None] = mapped_column(BigInteger)
 

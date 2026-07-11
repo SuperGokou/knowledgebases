@@ -1,7 +1,7 @@
 import Image from "next/image";
 
 type BrandIdentityProps = {
-  variant?: "sidebar" | "login" | "mobile";
+  variant?: "sidebar" | "workspace" | "login" | "mobile";
   priority?: boolean;
 };
 
@@ -14,7 +14,7 @@ export function BrandIdentity({ variant = "sidebar", priority = false }: BrandId
           src="/brand/heyi-display-logo.webp"
           width={544}
           height={544}
-          sizes={variant === "login" ? "96px" : variant === "mobile" ? "38px" : "52px"}
+          sizes={variant === "login" ? "96px" : variant === "workspace" ? "72px" : variant === "mobile" ? "38px" : "52px"}
           alt=""
           priority={priority}
         />

@@ -18,14 +18,36 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     # Trigram search preserves substring matching for Chinese and mixed-language
     # documents while avoiding a sequential scan for every chat query.
-    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    op.execute("CREATE SCHEMA IF NOT EXISTS extensions")
+    op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions")
+    # CREATE EXTENSION ... IF NOT EXISTS does not relocate an extension that a
+    # platform image already installed in public. Move it before resolving the
+    # schema-qualified operator class so a greenfield upgrade is deterministic.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM pg_extension AS extension
+                JOIN pg_namespace AS namespace
+                  ON namespace.oid = extension.extnamespace
+                WHERE extension.extname = 'pg_trgm'
+                  AND namespace.nspname <> 'extensions'
+            ) THEN
+                ALTER EXTENSION pg_trgm SET SCHEMA extensions;
+            END IF;
+        END
+        $$
+        """
+    )
     op.execute(
         "CREATE INDEX ix_knowledge_entries_title_trgm "
-        "ON knowledge_entries USING gin (title gin_trgm_ops)"
+        "ON knowledge_entries USING gin (title extensions.gin_trgm_ops)"
     )
     op.execute(
         "CREATE INDEX ix_knowledge_entries_content_trgm "
-        "ON knowledge_entries USING gin (content gin_trgm_ops)"
+        "ON knowledge_entries USING gin (content extensions.gin_trgm_ops)"
     )
 
 

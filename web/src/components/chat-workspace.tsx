@@ -17,7 +17,7 @@ const suggestions = [
 ];
 
 export function ChatWorkspace() {
-  const { can, loading: accessLoading } = useAccess();
+  const { can, loading: accessLoading, me } = useAccess();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [knowledgeBaseId, setKnowledgeBaseId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -100,19 +100,17 @@ export function ChatWorkspace() {
 
   const canQuery = !accessLoading && can("chat:query");
   const ready = canQuery && Boolean(knowledgeBaseId);
+  const displayName = me?.display_name?.trim() || me?.email.split("@")[0] || "您好";
 
   return (
     <section className="chat-layout">
-      <aside className="conversation-rail">
-        <button className="button secondary" type="button" onClick={() => setMessages([])}>
-          <Icon name="plus" /> 新对话
-        </button>
-        <p className="conversation-title">当前范围</p>
-        <div className="conversation-empty">每次回答只检索当前选中的知识库，并由 FastAPI 校验真实访问权限。</div>
-      </aside>
       <div className="chat-main">
         <header className="chat-head">
-          <div><strong>企业知识问答</strong><small>答案仅基于您有权访问的知识范围</small></div>
+          <div className="chat-heading">
+            <p>知识问答 · Enterprise Intelligence</p>
+            <h1>{displayName}，您好</h1>
+            <span>有什么可以帮您？每个回答都会附上可核验的答案来源。</span>
+          </div>
           <div className="chat-controls">
             <select
               aria-label="选择知识库"
@@ -127,6 +125,9 @@ export function ChatWorkspace() {
               {knowledgeBases?.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
             </select>
             <span className="chat-status"><span />{serviceHint}</span>
+            <button className="button secondary small" type="button" onClick={() => setMessages([])}>
+              <Icon name="plus" /> 新对话
+            </button>
           </div>
         </header>
         <div className="message-area" aria-live="polite" aria-busy={pending}>

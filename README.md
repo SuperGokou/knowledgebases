@@ -15,6 +15,7 @@
   <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF Phase 1" src="https://img.shields.io/badge/OKF-v0.1%20Phase%201-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
   <a href="https://api-docs.deepseek.com/"><img alt="DeepSeek" src="https://img.shields.io/badge/AI-DeepSeek-536AF5?style=flat-square"></a>
   <a href="https://www.docker.com/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
+  <a href="https://vercel.com/docs/regions"><img alt="Vercel Singapore Region" src="https://img.shields.io/badge/Region-Singapore%20sin1-0F766E?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
   <a href="https://knowledgebases.vercel.app"><img alt="Vercel Demo" src="https://img.shields.io/badge/Demo-Vercel-000000?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
   <a href="https://github.com/SuperGokou/knowledgebases/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/SuperGokou/knowledgebases?style=flat-square"></a>
 </p>
@@ -67,6 +68,9 @@
 | Readiness | [knowledgebases-api.vercel.app/health/ready](https://knowledgebases-api.vercel.app/health/ready) | 检查 PostgreSQL 与 Redis |
 
 > Demo 的真实可用状态以 `/health/ready` 为准；生产密钥只保存在 Vercel Sensitive Environment Variables 中，不进入仓库。
+
+> [!NOTE]
+> Web 与 API 的 Vercel Functions 已固定到新加坡 `sin1`。继续使用 Vercel 时，PostgreSQL 与 Redis 也应部署在新加坡并通过迁移切换，避免控制面跨太平洋访问数据层；腾讯 COS 仍由浏览器直传，不经过 Vercel Function。
 
 ## 系统架构
 
@@ -375,7 +379,7 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时的本地验收结果：**86 backend tests + 60 frontend tests passed，branch coverage ≥ 80%，Ruff clean，mypy strict passed，TypeScript/ESLint/Next.js production build passed**。
+本 README 更新时的本地验收结果：**113 backend tests + 113 frontend tests passed，branch coverage 83.94%，Ruff clean，mypy strict passed，TypeScript/ESLint/Next.js production build passed**。
 
 ## 部署到 Vercel
 
@@ -383,6 +387,7 @@ npm run build
 
 - API Project `knowledgebases-api`：Root Directory 为仓库根目录，运行 FastAPI 与 Cron；
 - Web Project `knowledgebases`：Root Directory 为 `web/`，运行 Next.js，`FASTAPI_URL` 指向 `https://knowledgebases-api.vercel.app`。
+- 两个 Project 的 Functions 均由仓库配置固定到新加坡 `sin1`，并在 Vercel Project Settings 中使用相同默认区域。
 
 文件继续由浏览器直传对象存储。生产环境至少需要：
 
@@ -393,6 +398,9 @@ npm run build
 5. 部署前执行 Alembic migration 和一次性管理员 Bootstrap。
 
 当前 Vercel 项目使用 Hobby 兼容的每日 Cron 做 OKF 漏单对账。若要求上传后近实时转换，应升级 Pro/Enterprise 后使用每分钟 Cron，或用 Upstash QStash、Vercel Queue、独立 Worker 承担即时消费。
+
+> [!WARNING]
+> `sin1` 是新加坡海外节点，不是中国大陆节点，也不提供中国大陆 ICP 备案能力。它适合当前演示和海外 Serverless 架构；若系统要作为中国大陆公司正式生产服务，应同时评估大陆云部署、ICP 备案、数据跨境与等保要求。Vercel Hobby 仅适合非商业用途，公司正式生产需要使用合适的付费计划。
 
 完整变量映射、腾讯 COS virtual-host addressing、Supabase、Cron 和迁移顺序见：
 
