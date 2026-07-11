@@ -44,6 +44,8 @@
   ·
   <a href="docs/ENTERPRISE_ACCEPTANCE_STANDARD.zh-CN.md">企业验收标准</a>
   ·
+  <a href="docs/acceptance-reports/2026-07-11-local-self-test.zh-CN.md">最新自测报告</a>
+  ·
   <a href="SECURITY.md">安全报告策略</a>
 </p>
 
