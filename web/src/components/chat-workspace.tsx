@@ -32,6 +32,7 @@ export function ChatWorkspace() {
   const [pending, setPending] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [serviceHint, setServiceHint] = useState("正在连接知识检索");
+  const [serviceState, setServiceState] = useState<"connected" | "warning">("warning");
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeRequestRef = useRef<RequestDeadline | null>(null);
 
@@ -44,11 +45,13 @@ export function ChatWorkspace() {
         setKnowledgeBases(items);
         setKnowledgeBaseId((current) => current || items[0]?.id || "");
         setServiceHint(items.length ? "知识检索已连接" : "暂无可访问知识库");
+        setServiceState(items.length ? "connected" : "warning");
       } catch (reason) {
         if (!active) return;
         setKnowledgeBases([]);
         setLoadError(readableError(reason));
         setServiceHint(reason instanceof ApiClientError && [404, 501].includes(reason.status) ? "问答服务尚未接入" : "连接异常");
+        setServiceState("warning");
       }
     }
     void loadKnowledgeBases();
@@ -119,6 +122,7 @@ export function ChatWorkspace() {
         },
       ]);
       setServiceHint("知识检索已连接");
+      setServiceState("connected");
     } catch (reason) {
       if (
         activeRequestRef.current !== deadline
@@ -141,6 +145,7 @@ export function ChatWorkspace() {
         },
       ]);
       setServiceHint(timedOut ? "请求超时" : unavailable ? "问答服务尚未接入" : "连接异常");
+      setServiceState("warning");
     } finally {
       deadline.dispose();
       if (activeRequestRef.current === deadline) {
@@ -176,7 +181,7 @@ export function ChatWorkspace() {
               {!knowledgeBases?.length ? <option value="">暂无可访问知识库</option> : null}
               {knowledgeBases?.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
             </select>
-            <span className="chat-status"><span />{serviceHint}</span>
+            <span className="chat-status" data-state={serviceState} aria-live="polite"><span />{serviceHint}</span>
             <button className="button secondary small" type="button" onClick={startNewConversation}>
               <Icon name="plus" /> 新对话
             </button>

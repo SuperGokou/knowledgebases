@@ -320,7 +320,9 @@ tbody tr:hover { background: #fbfbfd; }
 .chat-heading > span { display: block; margin-top: 8px; color: var(--muted); font-size: 14px; }
 .chat-controls { min-width: 220px; display: flex; align-items: flex-end; flex-direction: column; gap: 9px; }
 .chat-controls select { min-width: 220px; height: 36px; padding: 0 30px 0 11px; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; font-size: 10px; }
-.chat-status { display: flex; align-items: center; gap: 6px; color: #8d94a3; font-size: 9px; }.chat-status span { width: 6px; height: 6px; border-radius: 50%; background: #d6a350; }
+.chat-status { display: flex; align-items: center; gap: 6px; color: #8d94a3; font-size: 9px; }.chat-status > span { width: 6px; height: 6px; border-radius: 50%; }
+.chat-status[data-state="connected"] > span { background: var(--green); }
+.chat-status[data-state="warning"] > span { background: #d6a350; }
 .message-area { flex: 1; overflow-y: auto; padding: 34px clamp(28px, 5vw, 72px); }
 .chat-welcome { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .chat-orb { width: 58px; height: 58px; display: grid; place-items: center; margin-bottom: 18px; color: white; border-radius: 18px; background: var(--blue); box-shadow: 0 15px 35px rgba(210,33,45,.2); }
