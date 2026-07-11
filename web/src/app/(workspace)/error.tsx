@@ -11,7 +11,6 @@ import {
 
 export default function WorkspaceError({
   error,
-  reset,
 }: {
   error: DigestError;
   reset: () => void;
@@ -25,8 +24,8 @@ export default function WorkspaceError({
   return (
     <div className="page-stack">
       <ErrorState
-        message={`页面渲染时遇到问题，请重试。错误编号：${errorCode}`}
-        onRetry={reset}
+        message={`页面渲染时遇到问题，请重新加载最新版。错误编号：${errorCode}`}
+        onRetry={() => window.location.reload()}
       />
     </div>
   );

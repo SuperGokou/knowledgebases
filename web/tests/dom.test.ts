@@ -16,4 +16,13 @@ describe("scrollIntoViewIfSupported", () => {
     expect(scrollIntoViewIfSupported({})).toBeUndefined();
     expect(scrollIntoViewIfSupported(null)).toBeUndefined();
   });
+
+  it("contains errors thrown by an extension-patched method", () => {
+    const scrollIntoView = vi.fn(() => {
+      throw new TypeError("extension wrapper failed");
+    });
+
+    expect(() => scrollIntoViewIfSupported({ scrollIntoView })).not.toThrow();
+    expect(scrollIntoView).toHaveBeenCalledOnce();
+  });
 });

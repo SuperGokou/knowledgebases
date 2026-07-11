@@ -12,6 +12,12 @@ export function scrollIntoViewIfSupported(
   options?: ScrollIntoViewOptions,
 ): void {
   if (typeof target?.scrollIntoView === "function") {
-    target.scrollIntoView(options);
+    try {
+      target.scrollIntoView(options);
+    } catch {
+      // Scrolling is progressive enhancement. Browser extensions and older
+      // WebViews may replace this DOM method with an implementation that throws;
+      // a failed auto-scroll must never take down the chat workspace.
+    }
   }
 }
