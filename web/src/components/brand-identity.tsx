@@ -21,7 +21,7 @@ export function BrandIdentity({ variant = "sidebar", priority = false }: BrandId
       </span>
       <span className="brand-wordmark">
         <strong>江苏和熠光显有限公司</strong>
-        <small>企业知识中台 · ATLAS</small>
+        <small>企业知识中台</small>
       </span>
     </span>
   );
