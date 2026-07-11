@@ -31,3 +31,4 @@ Thumbs.db
 # Local logs and temporary files
 *.log
 tmp/
+artifacts/acceptance/
