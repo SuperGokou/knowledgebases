@@ -90,3 +90,12 @@ def test_offline_preflight_rejects_shared_database_identity() -> None:
 
     assert '[ "$POSTGRES_USER" != "$POSTGRES_APP_USER" ]' in script
     assert "database owner and runtime role must be different" in script
+
+
+def test_offline_object_proxy_does_not_log_presigned_request_uris() -> None:
+    caddyfile = (REPOSITORY / "deploy/tencent/Caddyfile.offline").read_text(
+        encoding="utf-8"
+    )
+    object_server = caddyfile.split("https://{$KB_PUBLIC_HOST}:9443", maxsplit=1)[1]
+
+    assert "\n\tlog {" not in object_server

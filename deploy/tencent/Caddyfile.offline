@@ -17,9 +17,4 @@ https://{$KB_PUBLIC_HOST}:8443 {
 https://{$KB_PUBLIC_HOST}:9443 {
 	tls internal
 	reverse_proxy minio:9000
-
-	log {
-		output stdout
-		format json
-	}
 }
