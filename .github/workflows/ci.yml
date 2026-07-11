@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    env:
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+  backend:
+    name: Backend quality and migration gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KB_ENVIRONMENT: test
+      PYTHONUNBUFFERED: "1"
+      UV_NO_PROGRESS: "1"
+
+    services:
+      postgres:
+        image: postgres:17.5-bookworm
+        env:
+          POSTGRES_DB: knowledge_test
+          POSTGRES_USER: knowledge
+          POSTGRES_PASSWORD: ci-only-postgres-password # pragma: allowlist secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U knowledge -d knowledge_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:8.0.3-bookworm
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.15"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install backend dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Lint backend
+        run: uv run --frozen ruff check .
+
+      - name: Type-check backend
+        run: uv run --frozen mypy app scripts
+
+      - name: Audit backend dependencies
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/requirements.txt"
+          uv tool run --from pip-audit==2.10.1 pip-audit --requirement "$RUNNER_TEMP/requirements.txt"
+
+      - name: Verify Redis connectivity
+        env:
+          KB_REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          uv run --frozen python - <<'PY'
+          import asyncio
+          import os
+
+          from redis.asyncio import Redis
+
+
+          async def main() -> None:
+              client = Redis.from_url(os.environ["KB_REDIS_URL"])
+              try:
+                  if not await client.ping():
+                      raise RuntimeError("Redis PING did not succeed")
+              finally:
+                  await client.aclose()
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Upgrade PostgreSQL schema
+        env:
+          KB_DATABASE_URL: postgresql+psycopg://knowledge:ci-only-postgres-password@127.0.0.1:5432/knowledge_test # pragma: allowlist secret
+        run: uv run --frozen alembic upgrade head
+
+      - name: Verify PostgreSQL is at every Alembic head
+        env:
+          KB_DATABASE_URL: postgresql+psycopg://knowledge:ci-only-postgres-password@127.0.0.1:5432/knowledge_test # pragma: allowlist secret
+        run: uv run --frozen alembic current --check-heads
+
+      - name: Test backend with coverage
+        run: >-
+          uv run --frozen pytest
+          --cov=app
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=80
