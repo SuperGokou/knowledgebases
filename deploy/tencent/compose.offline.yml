@@ -118,6 +118,10 @@ services:
     pids_limit: 128
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     logging: *default-logging
