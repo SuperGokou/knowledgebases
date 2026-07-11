@@ -9,16 +9,16 @@ knowledgebases     / Root=web/    -> Next.js、HttpOnly BFF、登录与管理 UI
 
 两个项目必须拥有不同 Origin。`FASTAPI_URL` 必须指向 API Project，不能指向 Web Project 自身。
 
-## 亚洲部署拓扑
+## 美国部署拓扑
 
-当前 Web 与 API 两个 Vercel Project 均将默认 Function 区域设置为新加坡 `sin1`，仓库中的 `vercel.json` 与 `web/vercel.json` 也显式固定该区域，避免后续 Git 部署回落到美国默认区域。
+当前 Web 与 API 两个 Vercel Project 均将默认 Function 区域设置为美国华盛顿特区 `iad1`，仓库中的 `vercel.json` 与 `web/vercel.json` 也显式固定该区域，确保后续 Production 与 Preview 部署保持一致。静态 HTML、CSS、JavaScript 等资源仍由 Vercel 全球 CDN 就近分发。
 
 ```text
 中国大陆用户
-    -> Vercel Web / BFF (sin1, Singapore)
-    -> Vercel FastAPI (sin1, Singapore)
-       -> Supabase PostgreSQL (ap-southeast-1, Singapore)
-       -> Upstash Redis primary (ap-southeast-1, Singapore)
+    -> Vercel Web / BFF (iad1, Washington D.C., USA)
+    -> Vercel FastAPI (iad1, Washington D.C., USA)
+       -> Supabase PostgreSQL (建议 us-east-1 或邻近区域)
+       -> Upstash Redis primary (建议 us-east-1 或邻近区域)
 
 浏览器
     -> 腾讯 COS 私有 Bucket（预签名直传，文件字节不经过 Vercel）
@@ -26,14 +26,17 @@ knowledgebases     / Root=web/    -> Next.js、HttpOnly BFF、登录与管理 UI
 
 同区部署原则：
 
-- Vercel Web、BFF 与 FastAPI 固定为 `sin1`；
-- Supabase 新项目选择 Singapore，运行时使用该项目的 Transaction Pooler；
-- Upstash 新数据库选择 `ap-southeast-1` 主区域；
+- Vercel Web、BFF 与 FastAPI 固定为 `iad1`；
+- Supabase 新项目优先选择美国东部或邻近区域，运行时使用该项目的 Transaction Pooler；
+- Upstash 新数据库优先选择 `us-east-1` 或邻近主区域；
 - 切换前保留旧数据库，完成 migration、数据校验、健康检查和登录回归后再决定是否下线；
 - Supabase 已建项目不能原地修改区域，需要创建新项目后迁移；Upstash 主区域也不应通过删除/新增只读区域来伪装迁移。
 
 > [!WARNING]
-> Vercel `sin1` 仍是中国大陆以外的新加坡节点。Vercel 不提供中国大陆节点或 ICP 备案，因此大陆访问质量不能等同于境内部署。当前拓扑适合演示和海外 Serverless 服务；公司正式面向中国大陆生产时，应另行评估腾讯云/阿里云大陆区域、ICP备案、等保和数据跨境要求。Vercel Hobby 仅限非商业用途，企业正式生产应升级到适用的商业计划。
+> Vercel `iad1` 是中国大陆以外的美国节点。Vercel 不提供中国大陆节点或 ICP 备案，因此大陆访问质量不能等同于境内部署。当前拓扑适合演示和海外 Serverless 服务；公司正式面向中国大陆生产时，应继续使用隔离的腾讯云境内部署，并评估 ICP 备案、等保和数据跨境要求。Vercel Hobby 仅限非商业用途，企业正式生产应升级到适用的商业计划。
+
+> [!IMPORTANT]
+> 本次区域变更只作用于 Vercel Web/BFF 与 FastAPI Functions，不修改腾讯云 Compose、镜像、端口、发布目录或运行中的容器。若现有 Supabase/Upstash 仍位于新加坡，函数迁到美国后会增加数据层往返延迟；数据库迁移必须单独规划、备份和验证，不能把删除旧实例作为本次发布步骤。
 
 ## 已完成的 Vercel 适配
 
@@ -44,7 +47,7 @@ knowledgebases     / Root=web/    -> Next.js、HttpOnly BFF、登录与管理 UI
 - `*.vercel.app` 已加入可信 Host；
 - `/api/v1/internal/maintenance` 使用 `CRON_SECRET` Bearer 验证；
 - `vercel.json` 每天 03:17 UTC 运行一次有界、幂等的过期上传清理；
-- 根目录与 `web/` 的 Vercel 配置都固定 `regions: ["sin1"]`；
+- 根目录与 `web/` 的 Vercel 配置都固定 `regions: ["iad1"]`；
 - `.vercelignore` 明确排除 `.env`、虚拟环境、测试、Docker 和本地脚本。
 - Next.js BFF 使用 Host-only `Secure + HttpOnly + SameSite=Lax` Cookie，不把 JWT 暴露给浏览器脚本；
 - BFF 用共享 HMAC 密钥签名 Vercel 提供的终端 IP，FastAPI 验证后再执行登录/刷新限流。
@@ -172,7 +175,7 @@ npx --yes vercel@50.28.0 logs --since 1h --level error
 - Vercel Function 请求体有限制，所以文件内容不能经过 FastAPI；当前直传设计符合这一要求。
 - Hobby 套餐 Cron 最多每天一次，因此当前配置使用每日调度。更高频清理需 Pro Cron 或外部 worker。
 - Hobby 仅适用于非商业项目；公司正式生产部署必须选择适用的商业计划。
-- 新加坡 `sin1` 不是中国大陆区域，不能替代境内部署、ICP备案或数据合规评估。
+- 美国华盛顿特区 `iad1` 不是中国大陆区域，不能替代境内部署、ICP备案或数据合规评估。
 - Alembic/bootstrap 必须在部署前单独执行，不能放在 Function 冷启动或 Vercel Build 中。
 - 生产仍需 COS 病毒扫描/内容检测流水线；人工 `approve` 不是恶意软件扫描。
 
