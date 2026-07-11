@@ -1,9 +1,9 @@
 export const THEME_STORAGE_KEY = "efdkb-workspace-theme";
 
 export const THEME_OPTIONS = [
-  { id: "obsidian-stage", label: "赤曜光幕 / Obsidian Stage" },
-  { id: "evidence-editorial", label: "证据出版物 / Evidence Editorial" },
-  { id: "prism-lab", label: "棱镜实验台 / Prism Lab" },
+  { id: "obsidian-stage", label: "深曜商务" },
+  { id: "evidence-editorial", label: "典雅公文" },
+  { id: "prism-lab", label: "和熠智汇" },
 ] as const;
 
 export type ThemeId = (typeof THEME_OPTIONS)[number]["id"];
