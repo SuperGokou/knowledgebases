@@ -51,10 +51,12 @@ export function EmptyState({
 export function ErrorState({
   message,
   onRetry,
+  retryLabel = "重试",
   title = "暂时无法加载",
 }: {
   message: string;
   onRetry?: () => void;
+  retryLabel?: string;
   title?: string;
 }) {
   return (
@@ -66,7 +68,7 @@ export function ErrorState({
       </div>
       {onRetry ? (
         <button className="button ghost small" type="button" onClick={onRetry}>
-          <Icon name="refresh" /> 重试
+          <Icon name="refresh" /> {retryLabel}
         </button>
       ) : null}
     </div>

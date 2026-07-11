@@ -26,6 +26,7 @@ export default function WorkspaceError({
       <ErrorState
         message={`页面渲染时遇到问题，请重新加载最新版。错误编号：${errorCode}`}
         onRetry={() => window.location.reload()}
+        retryLabel="重新加载"
       />
     </div>
   );
