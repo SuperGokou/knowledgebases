@@ -36,6 +36,8 @@
   ·
   <a href="docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md">腾讯云共享部署</a>
   ·
+  <a href="docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md">腾讯云离线企业部署</a>
+  ·
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
   ·
   <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">商业版审计报告</a>

@@ -25,6 +25,8 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("KB_SERVERLESS", "VERCEL"),
     )
+    deployment_profile: Literal["standard", "isolated"] = "standard"
+    external_llm_enabled: bool = True
     api_prefix: str = "/api/v1"
     database_url: str = Field(
         default=(
@@ -223,14 +225,42 @@ class Settings(BaseSettings):
                     )
             if self.debug:
                 raise ValueError("KB_DEBUG must be false in production")
-            for variable, endpoint in (
-                ("KB_DATABASE_URL", self.database_url),
-                ("KB_REDIS_URL", self.redis_url),
-            ):
-                if urlparse(endpoint).hostname in {None, "localhost", "127.0.0.1", "::1"}:
-                    raise ValueError(f"{variable} must reference an external production service")
-            if urlparse(self.redis_url).scheme != "rediss":
-                raise ValueError("KB_REDIS_URL must use TLS (rediss://) in production")
+            if self.deployment_profile == "isolated":
+                isolated_services = (
+                    ("KB_DATABASE_URL", self.database_url, {"postgresql+asyncpg"}, "postgres"),
+                    ("KB_REDIS_URL", self.redis_url, {"redis"}, "redis"),
+                    ("KB_S3_ENDPOINT_URL", self.s3_endpoint_url, {"http"}, "minio"),
+                )
+                for variable, endpoint, allowed_schemes, required_host in isolated_services:
+                    parsed_endpoint = urlparse(endpoint)
+                    if (
+                        parsed_endpoint.scheme not in allowed_schemes
+                        or parsed_endpoint.hostname != required_host
+                    ):
+                        raise ValueError(
+                            f"{variable} must reference the isolated Compose service "
+                            f"{required_host!r}"
+                        )
+                if self.external_llm_enabled:
+                    raise ValueError(
+                        "KB_EXTERNAL_LLM_ENABLED must be false in isolated deployments"
+                    )
+            else:
+                for variable, endpoint in (
+                    ("KB_DATABASE_URL", self.database_url),
+                    ("KB_REDIS_URL", self.redis_url),
+                ):
+                    if urlparse(endpoint).hostname in {
+                        None,
+                        "localhost",
+                        "127.0.0.1",
+                        "::1",
+                    }:
+                        raise ValueError(
+                            f"{variable} must reference an external production service"
+                        )
+                if urlparse(self.redis_url).scheme != "rediss":
+                    raise ValueError("KB_REDIS_URL must use TLS (rediss://) in production")
             if "*" in self.cors_origins or "null" in {
                 origin.strip().lower() for origin in self.cors_origins
             }:
@@ -242,7 +272,10 @@ class Settings(BaseSettings):
                 or self.s3_secret_key.get_secret_value() == "knowledge-secret"
             ):
                 raise ValueError("S3 example credentials must be changed in production")
-            if not self.s3_endpoint_url.lower().startswith("https://"):
+            if (
+                self.deployment_profile != "isolated"
+                and not self.s3_endpoint_url.lower().startswith("https://")
+            ):
                 raise ValueError("KB_S3_ENDPOINT_URL must use HTTPS in production")
             if not self.s3_public_endpoint_url.lower().startswith("https://"):
                 raise ValueError("KB_S3_PUBLIC_ENDPOINT_URL must use HTTPS in production")
@@ -255,14 +288,17 @@ class Settings(BaseSettings):
                 raise ValueError("CRON_SECRET must contain at least 16 characters on serverless")
             if self.access_token_minutes > 60:
                 raise ValueError("access tokens must not exceed 60 minutes in production")
-            for variable, endpoint in (
-                ("KB_DEEPSEEK_BASE_URL", self.deepseek_base_url),
-                ("KB_QWEN_BASE_URL", self.qwen_base_url),
-                ("KB_MINIMAX_BASE_URL", self.minimax_base_url),
-            ):
-                parsed_llm_url = urlparse(endpoint)
-                if parsed_llm_url.scheme != "https" or not parsed_llm_url.hostname:
-                    raise ValueError(f"{variable} must be an absolute HTTPS URL in production")
+            if self.external_llm_enabled:
+                for variable, endpoint in (
+                    ("KB_DEEPSEEK_BASE_URL", self.deepseek_base_url),
+                    ("KB_QWEN_BASE_URL", self.qwen_base_url),
+                    ("KB_MINIMAX_BASE_URL", self.minimax_base_url),
+                ):
+                    parsed_llm_url = urlparse(endpoint)
+                    if parsed_llm_url.scheme != "https" or not parsed_llm_url.hostname:
+                        raise ValueError(
+                            f"{variable} must be an absolute HTTPS URL in production"
+                        )
             if self.llm_credentials_encryption_key is not None and len(
                 self.llm_credentials_encryption_key.get_secret_value()
             ) < 32:

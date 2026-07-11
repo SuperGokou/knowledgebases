@@ -90,6 +90,59 @@ def test_production_accepts_explicit_secure_values() -> None:
     assert settings.environment == "production"
 
 
+def test_isolated_production_accepts_only_compose_local_data_services() -> None:
+    settings = production_settings(
+        deployment_profile="isolated",
+        external_llm_enabled=False,
+        database_url=(
+            "postgresql+asyncpg://knowledge:password@postgres:5432/knowledge"
+        ),
+        redis_url="redis://:password@redis:6379/0",
+        s3_endpoint_url="http://minio:9000",
+        s3_public_endpoint_url="https://knowledge.internal:19444",
+    )
+
+    assert settings.deployment_profile == "isolated"
+    assert settings.external_llm_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("database_url", "postgresql+asyncpg://user:pass@db.example.com/knowledge"),
+        ("redis_url", "redis://:pass@cache.example.com:6379/0"),
+        ("s3_endpoint_url", "http://objects.example.com:9000"),
+    ],
+)
+def test_isolated_production_rejects_nonlocal_data_services(
+    field: str,
+    value: str,
+) -> None:
+    overrides: dict[str, object] = {
+        "deployment_profile": "isolated",
+        "external_llm_enabled": False,
+        "database_url": "postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+        "redis_url": "redis://:pass@redis:6379/0",
+        "s3_endpoint_url": "http://minio:9000",
+        "s3_public_endpoint_url": "https://knowledge.internal:19444",
+        field: value,
+    }
+    with pytest.raises(ValidationError):
+        production_settings(**overrides)
+
+
+def test_isolated_production_fails_closed_when_external_llm_is_enabled() -> None:
+    with pytest.raises(ValidationError):
+        production_settings(
+            deployment_profile="isolated",
+            external_llm_enabled=True,
+            database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+            redis_url="redis://:pass@redis:6379/0",
+            s3_endpoint_url="http://minio:9000",
+            s3_public_endpoint_url="https://knowledge.internal:19444",
+        )
+
+
 def test_multipart_threshold_can_be_lowered_for_integration_testing() -> None:
     settings = Settings(multipart_threshold_bytes=1)
 

@@ -1,5 +1,12 @@
 # 腾讯云隔离部署运行手册
 
+本目录提供两套互不覆盖的编排：
+
+- `compose.yml`：现有共享主机部署，数据层使用受管服务；
+- `compose.offline.yml`：8 核 16G、300 GB SSD 的单机离线模拟环境，PostgreSQL、Redis 与 MinIO 全部部署在本机，运行时禁止公网模型调用。
+
+离线企业方案必须先阅读[腾讯云 8 核 16G 离线企业部署](../../docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。它使用独立项目名 `heyi-kb-offline`、独立端口 `19443/19444` 和独立数据目录，不会修改当前 `heyi-kb-prod` 或其他应用。
+
 本目录用于将知识库部署到共享的腾讯云主机。生产编排只运行 Web、API、维护任务和反向代理；数据库、Redis 与对象存储继续使用受管服务。
 
 同一台服务器继续部署其他应用前，必须先阅读并填写[腾讯云共享服务器应用部署基线](../../docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)中的资源登记、预检与回滚清单。本应用已经占用 Compose 项目名 `heyi-kb-prod`、目录 `/srv/heyi-knowledgebases` 和 `18443/tcp`，其他应用不得复用。

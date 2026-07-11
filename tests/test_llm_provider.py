@@ -238,3 +238,16 @@ async def test_provider_resolution_without_rows_is_read_only() -> None:
         assert client.configured is True
         assert await session.scalar(select(func.count()).select_from(LlmProviderConfig)) == 0
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_resolution_is_disabled_by_isolated_egress_policy() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(environment="test", external_llm_enabled=False)
+
+    async with factory() as session:
+        with pytest.raises(LlmConfigurationError, match="external_llm_disabled"):
+            await resolve_provider_client(session, settings)
+
+    await engine.dispose()

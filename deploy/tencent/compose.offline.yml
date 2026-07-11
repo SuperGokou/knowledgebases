@@ -1,0 +1,366 @@
+name: ${COMPOSE_PROJECT_NAME:-heyi-kb-offline}
+
+x-api-build: &api-build
+  context: ../..
+  dockerfile: Dockerfile
+  target: runtime
+
+x-api-environment: &api-environment
+  KB_ENVIRONMENT: production
+  KB_DEPLOYMENT_PROFILE: isolated
+  KB_EXTERNAL_LLM_ENABLED: "false"
+  KB_DEBUG: "false"
+  KB_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
+  KB_REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379/0
+  KB_JWT_SECRET: ${KB_JWT_SECRET:?required}
+  KB_BFF_SHARED_SECRET: ${KB_BFF_SHARED_SECRET:?required}
+  KB_LLM_CREDENTIAL_ENCRYPTION_KEY: ${KB_LLM_CREDENTIAL_ENCRYPTION_KEY:?required}
+  KB_S3_ENDPOINT_URL: http://minio:9000
+  KB_S3_PUBLIC_ENDPOINT_URL: https://${KB_PUBLIC_HOST:?required}:${KB_OBJECTS_HTTPS_PORT:-19444}
+  KB_S3_REGION: ${MINIO_REGION:-us-east-1}
+  KB_S3_ACCESS_KEY: ${MINIO_APP_USER:?required}
+  KB_S3_SECRET_KEY: ${MINIO_APP_PASSWORD:?required}
+  KB_S3_BUCKET: ${MINIO_BUCKET:-knowledge-base}
+  KB_S3_USE_SSL: "true"
+  KB_S3_ADDRESSING_STYLE: path
+  KB_TRUSTED_HOSTS: ${KB_TRUSTED_HOSTS:?required}
+  KB_CORS_ORIGINS: ${KB_CORS_ORIGINS:-[]}
+  KB_MULTIPART_THRESHOLD_BYTES: ${KB_MULTIPART_THRESHOLD_BYTES:-104857600}
+
+x-runtime-security: &runtime-security
+  read_only: true
+  tmpfs:
+    - /tmp:size=128m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: 20m
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:17.5-bookworm
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - wal_compression=on
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/postgres
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    mem_limit: 4g
+    cpus: 2.00
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - backend
+
+  redis:
+    image: redis:8.0.3-bookworm
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?required}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${REDIS_PASSWORD:?required}
+    volumes:
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/redis
+        target: /data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    mem_limit: 1536m
+    cpus: 0.75
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - backend
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_REGION_NAME: ${MINIO_REGION:-us-east-1}
+      MINIO_API_CORS_ALLOW_ORIGIN: https://${KB_PUBLIC_HOST:?required}:${KB_HTTPS_PORT:-19443}
+    volumes:
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/minio
+        target: /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    mem_limit: 2g
+    cpus: 1.25
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - backend
+      - frontend
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_APP_USER: ${MINIO_APP_USER:?required}
+      MINIO_APP_PASSWORD: ${MINIO_APP_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:-knowledge-base}
+    entrypoint: ["/bin/sh", "/opt/minio/init.sh"]
+    volumes:
+      - ../../docker/minio/init.sh:/opt/minio/init.sh:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - backend
+
+  minio-multipart-gc:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: unless-stopped
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:-knowledge-base}
+      MINIO_MULTIPART_MAX_AGE: ${MINIO_MULTIPART_MAX_AGE:-2d}
+      MINIO_MULTIPART_CLEANUP_INTERVAL_SECONDS: ${MINIO_MULTIPART_CLEANUP_INTERVAL_SECONDS:-86400}
+    entrypoint: ["/bin/sh", "/opt/minio/cleanup-multipart.sh"]
+    volumes:
+      - ../../docker/minio/cleanup-multipart.sh:/opt/minio/cleanup-multipart.sh:ro
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    mem_limit: 256m
+    cpus: 0.20
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - backend
+
+  migrate:
+    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
+    build: *api-build
+    profiles: [ops]
+    restart: "no"
+    environment: *api-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    <<: *runtime-security
+    mem_limit: 768m
+    cpus: 0.75
+    pids_limit: 128
+    logging: *default-logging
+    networks:
+      - backend
+
+  bootstrap:
+    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
+    profiles: [ops]
+    restart: "no"
+    environment:
+      <<: *api-environment
+      KB_BOOTSTRAP_ADMIN_EMAIL: ${KB_BOOTSTRAP_ADMIN_EMAIL:?required}
+      KB_BOOTSTRAP_ADMIN_PASSWORD: ${KB_BOOTSTRAP_ADMIN_PASSWORD:-}
+    command: ["python", "-m", "app.bootstrap"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    <<: *runtime-security
+    mem_limit: 768m
+    cpus: 0.75
+    pids_limit: 128
+    logging: *default-logging
+    networks:
+      - backend
+
+  api:
+    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
+    build: *api-build
+    restart: unless-stopped
+    init: true
+    environment: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    <<: *runtime-security
+    mem_limit: 2g
+    cpus: 2.00
+    pids_limit: 256
+    logging: *default-logging
+    networks:
+      - backend
+      - frontend
+
+  maintenance:
+    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
+    restart: unless-stopped
+    init: true
+    environment: *api-environment
+    command: ["python", "-m", "app.maintenance", "--interval", "60"]
+    depends_on:
+      api:
+        condition: service_healthy
+    <<: *runtime-security
+    mem_limit: 768m
+    cpus: 0.50
+    pids_limit: 128
+    logging: *default-logging
+    networks:
+      - backend
+
+  web:
+    image: ${KB_WEB_IMAGE:-heyi-kb-offline-web:local}
+    build:
+      context: ../../web
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    init: true
+    environment:
+      FASTAPI_URL: http://api:8000
+      FASTAPI_BFF_SHARED_SECRET: ${KB_BFF_SHARED_SECRET:?required}
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/.next/cache:size=128m,uid=1000,gid=1000,mode=0755
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.00
+    pids_limit: 256
+    logging: *default-logging
+    networks:
+      - frontend
+
+  proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      KB_PUBLIC_HOST: ${KB_PUBLIC_HOST:?required}
+    ports:
+      - "${KB_BIND_ADDRESS:-0.0.0.0}:${KB_HTTPS_PORT:-19443}:8443"
+      - "${KB_BIND_ADDRESS:-0.0.0.0}:${KB_OBJECTS_HTTPS_PORT:-19444}:9443"
+    volumes:
+      - ./Caddyfile.offline:/etc/caddy/Caddyfile:ro
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/caddy-data
+        target: /data
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/caddy-config
+        target: /config
+    depends_on:
+      web:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    logging: *default-logging
+    networks:
+      - frontend
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+  frontend:
+    driver: bridge
+    internal: true

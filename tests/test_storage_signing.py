@@ -67,3 +67,36 @@ async def test_cos_virtual_addressing_places_bucket_in_hostname() -> None:
     assert urlparse(initiated.url).hostname == (
         "example-1250000000.cos.ap-beijing.myqcloud.com"
     )
+
+
+@pytest.mark.asyncio
+async def test_isolated_storage_signs_the_internal_tls_proxy_origin() -> None:
+    service = StorageService(
+        Settings(
+            environment="production",
+            deployment_profile="isolated",
+            external_llm_enabled=False,
+            jwt_secret="4f" * 32,
+            database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+            redis_url="redis://:pass@redis:6379/0",
+            s3_endpoint_url="http://minio:9000",
+            s3_public_endpoint_url="https://knowledge.internal:19444",
+            s3_access_key="offline-access-key",
+            s3_secret_key="offline-secret-key",
+            s3_use_ssl=True,
+            trusted_hosts=("knowledge.internal",),
+        )
+    )
+    initiated = await service.initiate(
+        key="staging/offline.txt",
+        content_type="text/plain",
+        upload_session_id="session-offline",
+        expected_size_bytes=7,
+        plan=UploadPlan(mode=UploadMode.SINGLE, part_size_bytes=7, part_count=1),
+    )
+
+    assert initiated.url is not None
+    parsed = urlparse(initiated.url)
+    assert parsed.scheme == "https"
+    assert parsed.hostname == "knowledge.internal"
+    assert parsed.port == 19444

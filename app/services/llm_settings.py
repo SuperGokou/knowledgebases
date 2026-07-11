@@ -159,6 +159,8 @@ async def resolve_provider_client(
     *,
     provider: LlmProviderName | None = None,
 ) -> OpenAICompatibleClient:
+    if not settings.external_llm_enabled:
+        raise LlmConfigurationError("external_llm_disabled")
     if provider is None:
         row = await session.scalar(
             select(LlmProviderConfig).where(LlmProviderConfig.is_default.is_(True))
