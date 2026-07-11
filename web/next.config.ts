@@ -3,6 +3,7 @@ import type { NextConfig } from "next";
 const connectSources = process.env.NODE_ENV === "production" ? "'self' https:" : "'self' https: http:";
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   poweredByHeader: false,
   reactStrictMode: true,
   async headers() {
