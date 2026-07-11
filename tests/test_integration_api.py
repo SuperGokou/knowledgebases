@@ -13,7 +13,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from pydantic import SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -44,6 +44,7 @@ from app.db.models import (
     UserRole,
     UserStatus,
 )
+from app.db.schema_version import EXPECTED_ALEMBIC_HEADS
 from app.db.session import get_db
 from app.main import app
 from app.maintenance import cleanup_expired_uploads
@@ -178,6 +179,13 @@ async def api_harness() -> ApiHarness:
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            text("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)")
+        )
+        await connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": next(iter(EXPECTED_ALEMBIC_HEADS))},
+        )
 
     async with session_factory() as session:
         permissions = [

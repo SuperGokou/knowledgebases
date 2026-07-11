@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from app.api.dependencies import DatabaseSession, redis_dependency
 from app.api.errors import ApiError
+from app.db.schema_version import assert_database_schema_current
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -25,6 +26,7 @@ async def readiness(
 ) -> dict[str, str]:
     try:
         await session.execute(text("SELECT 1"))
+        await assert_database_schema_current(session)
         await cast(Awaitable[Any], redis.ping())
     except Exception as error:
         raise ApiError(

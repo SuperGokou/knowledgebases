@@ -1,7 +1,12 @@
+from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.errors import ApiError
+from app.api.health import readiness
 from app.api.middleware import RequestBodyLimitMiddleware
+from app.db.schema_version import DatabaseSchemaDriftError
 from app.main import app
 
 
@@ -11,6 +16,30 @@ def test_liveness_endpoint_does_not_require_dependencies() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_readiness_rejects_database_schema_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSession:
+        async def execute(self, _statement: Any) -> None:
+            return None
+
+    class FakeRedis:
+        async def ping(self) -> bool:
+            return True
+
+    async def reject_drift(_session: Any) -> None:
+        raise DatabaseSchemaDriftError("stale schema")
+
+    monkeypatch.setattr("app.api.health.assert_database_schema_current", reject_drift)
+
+    with pytest.raises(ApiError) as captured:
+        await readiness(FakeSession(), FakeRedis())  # type: ignore[arg-type]
+
+    assert captured.value.status_code == 503
+    assert captured.value.code == "dependency_unavailable"
 
 
 def test_openapi_exposes_core_admin_and_file_flows() -> None:

@@ -1,5 +1,18 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
 from app.db import models  # noqa: F401
 from app.db.base import Base
+from app.db.schema_version import (
+    EXPECTED_ALEMBIC_HEADS,
+    DatabaseSchemaDriftError,
+    assert_database_schema_current,
+)
 
 
 def test_enterprise_metadata_tables_are_registered() -> None:
@@ -87,3 +100,43 @@ def test_api_keys_are_hashed_scoped_and_llm_default_is_unique() -> None:
     assert default_indexes[0].unique
     assert default_indexes[0].dialect_options["postgresql"]["where"] is not None
     assert default_indexes[0].dialect_options["sqlite"]["where"] is not None
+
+
+def test_expected_database_heads_match_the_alembic_graph() -> None:
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+
+    assert frozenset(script.get_heads()) == EXPECTED_ALEMBIC_HEADS
+
+
+class FakeRevisionResult:
+    def __init__(self, revisions: set[str]) -> None:
+        self._revisions = revisions
+
+    def scalars(self) -> FakeRevisionResult:
+        return self
+
+    def all(self) -> list[str]:
+        return sorted(self._revisions)
+
+
+class FakeRevisionSession:
+    def __init__(self, revisions: set[str]) -> None:
+        self.revisions = revisions
+
+    async def execute(self, _statement: Any) -> FakeRevisionResult:
+        return FakeRevisionResult(self.revisions)
+
+
+@pytest.mark.asyncio
+async def test_database_schema_drift_is_rejected() -> None:
+    session = FakeRevisionSession({"20260709_0001"})
+
+    with pytest.raises(DatabaseSchemaDriftError):
+        await assert_database_schema_current(session)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_current_database_schema_is_accepted() -> None:
+    session = FakeRevisionSession(set(EXPECTED_ALEMBIC_HEADS))
+
+    await assert_database_schema_current(session)  # type: ignore[arg-type]
