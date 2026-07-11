@@ -13,6 +13,7 @@ const reasonDescriptions: Record<ChatSourceStatus["reason"], string> = {
   provider_unavailable: "模型服务暂不可用，回答已回退到本地检索。",
   missing_model_citations: "模型未提供有效引用，回答已回退到可验证的检索结果。",
   invalid_model_citations: "模型引用未通过校验，回答已回退到可验证的检索结果。",
+  invalid_model_response: "模型回答格式未通过校验，已改用可验证的检索结果。",
   no_matching_content: "当前知识库未检索到可引用内容。",
 };
 

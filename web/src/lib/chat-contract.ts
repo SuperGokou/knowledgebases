@@ -15,6 +15,7 @@ const SOURCE_REASONS = new Set<ChatSourceStatus["reason"]>([
   "provider_unavailable",
   "missing_model_citations",
   "invalid_model_citations",
+  "invalid_model_response",
   "no_matching_content",
 ]);
 
@@ -53,8 +54,25 @@ function isSourceStatus(value: unknown): value is ChatSourceStatus {
   );
 }
 
+function isChatTable(value: unknown, citationNumbers: Set<number>): boolean {
+  if (!isRecord(value) || typeof value.title !== "string" || !value.title.trim()) return false;
+  const columns = value.columns;
+  const rows = value.rows;
+  const tableCitations = value.citation_numbers;
+  if (!Array.isArray(columns) || columns.length < 1 || columns.length > 8) return false;
+  if (!columns.every((column) => typeof column === "string" && column.trim().length > 0 && column.length <= 80)) return false;
+  if (!Array.isArray(rows) || rows.length < 1 || rows.length > 50) return false;
+  if (!rows.every((row) => Array.isArray(row) && row.length === columns.length && row.every((cell) => typeof cell === "string" && cell.length <= 1_000))) return false;
+  if (!Array.isArray(tableCitations) || tableCitations.length < 1 || tableCitations.length > 20) return false;
+  return tableCitations.every((number) => Number.isInteger(number) && citationNumbers.has(Number(number)));
+}
+
 /** Validate the BFF response before untrusted JSON reaches React render functions. */
 export function parseChatReply(value: unknown): ChatReply {
+  const citations = isRecord(value) && Array.isArray(value.citations) ? value.citations : [];
+  const citationNumbers = new Set(
+    citations.filter(isCitation).map((citation) => citation.citation_number),
+  );
   if (
     !isRecord(value) ||
     typeof value.knowledge_base_id !== "string" ||
@@ -64,6 +82,7 @@ export function parseChatReply(value: unknown): ChatReply {
     !(value.model === undefined || isNullableString(value.model)) ||
     !Array.isArray(value.citations) ||
     !value.citations.every(isCitation) ||
+    !(value.table === undefined || value.table === null || isChatTable(value.table, citationNumbers)) ||
     !isSourceStatus(value.source_status) ||
     value.source_status.citation_count !== value.citations.length
   ) {

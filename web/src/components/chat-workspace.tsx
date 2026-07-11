@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
 import { AnswerSources } from "@/components/answer-sources";
+import { ChatDataTable } from "@/components/chat-data-table";
 import { Icon } from "@/components/icon";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import { parseChatReply } from "@/lib/chat-contract";
@@ -113,6 +114,7 @@ export function ChatWorkspace() {
           sourceStatus: reply.source_status,
           provider: reply.provider,
           model: reply.model,
+          table: reply.table,
         },
       ]);
       setServiceHint("知识检索已连接");
@@ -199,7 +201,10 @@ export function ChatWorkspace() {
                 <article className={`message ${message.role}${message.failed ? " failed" : ""}`} key={message.id}>
                   <span className="message-avatar"><Icon name={message.role === "user" ? "users" : "spark"} /></span>
                   <div className="message-bubble">
-                    <div className="message-content">{message.content}</div>
+                    <div className="answer-response">
+                      <div className="message-content">{message.content}</div>
+                      {message.role === "assistant" && message.table ? <ChatDataTable table={message.table} /> : null}
+                    </div>
                     {message.role === "assistant" ? (
                       <AnswerSources
                         citations={message.citations}

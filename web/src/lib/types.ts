@@ -151,8 +151,16 @@ export type ChatSourceStatus = {
     | "provider_unavailable"
     | "missing_model_citations"
     | "invalid_model_citations"
+    | "invalid_model_response"
     | "no_matching_content";
   citation_count: number;
+};
+
+export type ChatDataTable = {
+  title: string;
+  columns: string[];
+  rows: string[][];
+  citation_numbers: number[];
 };
 
 export type ChatReply = {
@@ -161,6 +169,7 @@ export type ChatReply = {
   mode: string;
   provider?: string | null;
   model?: string | null;
+  table?: ChatDataTable | null;
   citations: ChatCitation[];
   source_status: ChatSourceStatus;
 };
@@ -176,6 +185,7 @@ export type ChatMessage = {
   sourceStatus?: ChatSourceStatus;
   provider?: string | null;
   model?: string | null;
+  table?: ChatDataTable | null;
 };
 
 export type ManagedApiKey = {

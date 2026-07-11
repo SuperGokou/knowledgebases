@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import case, exists, false, func, or_, select
+from sqlalchemy import case, exists, false, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.api.errors import ApiError
 from app.db.models import (
@@ -161,9 +163,11 @@ def _query_terms(query: str) -> list[str]:
             if len(sequence) <= 2:
                 terms.append(sequence)
             else:
-                # PostgreSQL ILIKE does not tokenize Chinese. Overlapping bigrams
-                # keep ordinary Chinese questions searchable without requiring an
-                # external tokenizer in the phase-one retrieval path.
+                # Preserve specific intent before adding broad overlapping terms.
+                terms.append(sequence)
+                terms.extend(
+                    sequence[index : index + 3] for index in range(len(sequence) - 2)
+                )
                 terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
         non_cjk = re.sub(r"[\u3400-\u4dbf\u4e00-\u9fff]+", " ", item)
         terms.extend(
@@ -177,7 +181,18 @@ def _query_terms(query: str) -> list[str]:
         for item in terms
         if len(item) >= 3 or bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", item))
     ]
-    return list(dict.fromkeys(meaningful or terms))[:12]
+    return list(dict.fromkeys(meaningful or terms))[:20]
+
+
+def _term_weight(term: str) -> int:
+    cjk_length = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", term))
+    if cjk_length >= 4:
+        return 8
+    if cjk_length == 3:
+        return 4
+    if cjk_length == 2:
+        return 1
+    return 4 if len(term) >= 5 else 2
 
 
 def _escape_like(value: str) -> str:
@@ -186,9 +201,15 @@ def _escape_like(value: str) -> str:
 
 def _excerpt(content: str, terms: list[str], *, maximum: int = 280) -> str:
     lowered = content.casefold()
-    positions = [lowered.find(term) for term in terms]
-    matches = [position for position in positions if position >= 0]
-    start = max(0, min(matches, default=0) - 80)
+    matches = [
+        (_term_weight(term), len(term), lowered.find(term.casefold()))
+        for term in terms
+        if lowered.find(term.casefold()) >= 0
+    ]
+    best_position = max(
+        matches, default=(0, 0, 0), key=lambda item: (item[0], item[1], -item[2])
+    )[2]
+    start = max(0, best_position - 80)
     excerpt = content[start : start + maximum].strip()
     if start:
         excerpt = f"…{excerpt}"
@@ -206,18 +227,33 @@ async def search_knowledge_entries(
 ) -> list[KnowledgeSearchHit]:
     terms = _query_terms(query)
     predicates = []
+    relevance_expression: ColumnElement[int] = literal(0)
     for term in terms:
         pattern = f"%{_escape_like(term)}%"
+        title_match = KnowledgeEntry.title.ilike(pattern, escape="\\")
+        content_match = KnowledgeEntry.content.ilike(pattern, escape="\\")
         predicates.extend(
             [
-                KnowledgeEntry.title.ilike(pattern, escape="\\"),
-                KnowledgeEntry.content.ilike(pattern, escape="\\"),
+                title_match,
+                content_match,
             ]
         )
+        weight = _term_weight(term)
+        relevance_expression += case((title_match, weight * 2), else_=0)
+        relevance_expression += case((content_match, weight), else_=0)
     bind = session.get_bind()
     if bind.dialect.name == "postgresql":
-        primary_term = terms[0]
-        match_position = func.strpos(func.lower(KnowledgeEntry.content), primary_term)
+        prioritized_terms = sorted(
+            terms, key=lambda item: (_term_weight(item), len(item)), reverse=True
+        )
+        positions = [
+            func.strpos(func.lower(KnowledgeEntry.content), term.casefold())
+            for term in prioritized_terms
+        ]
+        match_position = case(
+            *((position > 0, position) for position in positions),
+            else_=1,
+        )
         excerpt_start = case((match_position > 80, match_position - 80), else_=1)
         excerpt_expression: Any = func.substr(
             KnowledgeEntry.content, excerpt_start, 280
@@ -234,14 +270,24 @@ async def search_knowledge_entries(
         excerpt_expression.label("excerpt"),
         KnowledgeEntry.source_path,
         KnowledgeEntry.format_version,
+        relevance_expression.label("relevance_score"),
     ).where(
         KnowledgeEntry.knowledge_base_id == knowledge_base_id,
         KnowledgeEntry.deleted_at.is_(None),
         KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.PUBLISHED,
         or_(*predicates),
     )
-    statement = statement.order_by(KnowledgeEntry.updated_at.desc(), KnowledgeEntry.id).limit(limit)
+    statement = statement.order_by(
+        relevance_expression.desc(), KnowledgeEntry.updated_at.desc(), KnowledgeEntry.id
+    ).limit(min(limit * 3, 60))
     entries = (await session.execute(statement)).mappings().all()
+    if not entries:
+        return []
+    maximum_score = int(entries[0]["relevance_score"])
+    minimum_score = max(1, math.ceil(maximum_score * 0.45))
+    entries = [
+        entry for entry in entries if int(entry["relevance_score"]) >= minimum_score
+    ][:limit]
     return [
         KnowledgeSearchHit(
             entry_id=entry["id"],

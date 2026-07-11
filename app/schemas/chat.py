@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.knowledge_bases import KnowledgeSearchHit
 
@@ -42,9 +42,49 @@ class ChatSourceStatus(BaseModel):
         "provider_unavailable",
         "missing_model_citations",
         "invalid_model_citations",
+        "invalid_model_response",
         "no_matching_content",
     ]
     citation_count: int = Field(ge=0)
+
+
+class ChatDataTable(BaseModel):
+    """A bounded, source-linked table safe for direct UI rendering."""
+
+    title: str = Field(min_length=1, max_length=200)
+    columns: list[str] = Field(min_length=1, max_length=8)
+    rows: list[list[str]] = Field(min_length=1, max_length=50)
+    citation_numbers: list[int] = Field(min_length=1, max_length=20)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("columns")
+    @classmethod
+    def validate_columns(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item or len(item) > 80 for item in normalized):
+            raise ValueError("table columns must contain 1 to 80 characters")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("table columns must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_rows_and_sources(self) -> ChatDataTable:
+        width = len(self.columns)
+        for row in self.rows:
+            if len(row) != width:
+                raise ValueError("every table row must match the column count")
+            if any(not isinstance(cell, str) or len(cell.strip()) > 1_000 for cell in row):
+                raise ValueError("table cells must be strings of at most 1000 characters")
+        if any(number < 1 for number in self.citation_numbers):
+            raise ValueError("table citation numbers must be positive")
+        if len(set(self.citation_numbers)) != len(self.citation_numbers):
+            raise ValueError("table citation numbers must be unique")
+        self.rows = [[cell.strip() for cell in row] for row in self.rows]
+        return self
 
 
 class ChatQueryResponse(BaseModel):
@@ -53,5 +93,6 @@ class ChatQueryResponse(BaseModel):
     mode: str = "retrieval"
     provider: str | None = None
     model: str | None = None
+    table: ChatDataTable | None = None
     citations: list[ChatCitation]
     source_status: ChatSourceStatus
