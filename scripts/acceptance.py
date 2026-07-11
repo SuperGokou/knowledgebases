@@ -80,6 +80,13 @@ def resolve_command(command: tuple[str, ...]) -> tuple[str, ...]:
     return (executable, *command[1:])
 
 
+def _bounded_summary(value: str) -> str:
+    if len(value) <= _SUMMARY_LIMIT:
+        return value
+    marker = "[...earlier output truncated...]\n"
+    return marker + value[-(_SUMMARY_LIMIT - len(marker)) :]
+
+
 def execute_command(gate: AcceptanceGate) -> CommandOutcome:
     completed = subprocess.run(  # noqa: S603
         list(resolve_command(gate.command)),
@@ -131,7 +138,9 @@ def run_gate(
             summary=f"command timed out after {gate.timeout_seconds} seconds",
         )
     combined = "\n".join(part for part in (outcome.stdout, outcome.stderr) if part).strip()
-    summary = redact_output(combined or f"command exited {outcome.returncode}")[:_SUMMARY_LIMIT]
+    summary = _bounded_summary(
+        redact_output(combined or f"command exited {outcome.returncode}")
+    )
     return AcceptanceResult(
         gate_id=gate.gate_id,
         severity=gate.severity,

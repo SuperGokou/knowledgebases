@@ -93,6 +93,23 @@ def test_nonzero_exit_is_failed_and_summary_is_bounded() -> None:
     assert len(outcome.summary) <= 4_096
 
 
+def test_long_command_summary_preserves_the_trailing_verdict() -> None:
+    gate = AcceptanceGate("BACKEND-P0-001", "P0", ("pytest",), ".", 30)
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        return CommandOutcome(
+            returncode=0,
+            stdout=("test output\n" * 1_000) + "TOTAL 84.40%\n146 passed",
+            stderr="",
+        )
+
+    outcome = run_gate(gate, executor=executor)
+
+    assert len(outcome.summary) <= 4_096
+    assert "TOTAL 84.40%" in outcome.summary
+    assert outcome.summary.endswith("146 passed")
+
+
 def test_timeout_is_failed_without_leaking_command_output() -> None:
     gate = AcceptanceGate(
         gate_id="BUILD-P0-001",
