@@ -16,6 +16,9 @@ const SOURCE_REASONS = new Set<ChatSourceStatus["reason"]>([
   "missing_model_citations",
   "invalid_model_citations",
   "invalid_model_response",
+  "answer_review_rejected",
+  "answer_review_unavailable",
+  "answer_review_invalid",
   "no_matching_content",
 ]);
 
@@ -67,6 +70,18 @@ function isChatTable(value: unknown, citationNumbers: Set<number>): boolean {
   return tableCitations.every((number) => Number.isInteger(number) && citationNumbers.has(Number(number)));
 }
 
+function isAnswerReview(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.status === "passed") return value.reason === "semantic_verified";
+  if (value.status !== "fallback") return false;
+  return new Set([
+    "retrieval_only",
+    "answer_review_rejected",
+    "answer_review_unavailable",
+    "answer_review_invalid",
+  ]).has(String(value.reason));
+}
+
 /** Validate the BFF response before untrusted JSON reaches React render functions. */
 export function parseChatReply(value: unknown): ChatReply {
   const citations = isRecord(value) && Array.isArray(value.citations) ? value.citations : [];
@@ -83,6 +98,7 @@ export function parseChatReply(value: unknown): ChatReply {
     !Array.isArray(value.citations) ||
     !value.citations.every(isCitation) ||
     !(value.table === undefined || value.table === null || isChatTable(value.table, citationNumbers)) ||
+    !isAnswerReview(value.answer_review) ||
     !isSourceStatus(value.source_status) ||
     value.source_status.citation_count !== value.citations.length
   ) {

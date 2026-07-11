@@ -14,6 +14,9 @@ const reasonDescriptions: Record<ChatSourceStatus["reason"], string> = {
   missing_model_citations: "模型未提供有效引用，回答已回退到可验证的检索结果。",
   invalid_model_citations: "模型引用未通过校验，回答已回退到可验证的检索结果。",
   invalid_model_response: "模型回答格式未通过校验，已改用可验证的检索结果。",
+  answer_review_rejected: "回答内容未通过语义审核，已改用可验证的检索结果。",
+  answer_review_unavailable: "回答审核服务不可用，已按安全策略改用检索结果。",
+  answer_review_invalid: "回答审核结果无效，已按安全策略改用检索结果。",
   no_matching_content: "当前知识库未检索到可引用内容。",
 };
 

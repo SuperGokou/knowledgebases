@@ -152,8 +152,21 @@ export type ChatSourceStatus = {
     | "missing_model_citations"
     | "invalid_model_citations"
     | "invalid_model_response"
+    | "answer_review_rejected"
+    | "answer_review_unavailable"
+    | "answer_review_invalid"
     | "no_matching_content";
   citation_count: number;
+};
+
+export type ChatAnswerReview = {
+  status: "passed" | "fallback";
+  reason:
+    | "semantic_verified"
+    | "retrieval_only"
+    | "answer_review_rejected"
+    | "answer_review_unavailable"
+    | "answer_review_invalid";
 };
 
 export type ChatDataTable = {
@@ -170,6 +183,7 @@ export type ChatReply = {
   provider?: string | null;
   model?: string | null;
   table?: ChatDataTable | null;
+  answer_review: ChatAnswerReview;
   citations: ChatCitation[];
   source_status: ChatSourceStatus;
 };
@@ -186,6 +200,7 @@ export type ChatMessage = {
   provider?: string | null;
   model?: string | null;
   table?: ChatDataTable | null;
+  answerReview?: ChatAnswerReview;
 };
 
 export type ManagedApiKey = {

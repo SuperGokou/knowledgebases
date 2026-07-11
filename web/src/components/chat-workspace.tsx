@@ -115,6 +115,7 @@ export function ChatWorkspace() {
           provider: reply.provider,
           model: reply.model,
           table: reply.table,
+          answerReview: reply.answer_review,
         },
       ]);
       setServiceHint("知识检索已连接");
@@ -212,6 +213,7 @@ export function ChatWorkspace() {
                         headingId={`answer-sources-${message.id}`}
                         model={message.model}
                         provider={message.provider}
+                        answerReview={message.answerReview}
                         sourceStatus={message.sourceStatus}
                       />
                     ) : null}

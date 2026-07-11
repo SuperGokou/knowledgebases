@@ -2140,8 +2140,13 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         ) -> LlmChatResult:
             del temperature, max_tokens
             calls.append(messages)
+            content = (
+                '{"verdict":"pass","unsupported_claims":[]}'
+                if "strict grounding auditor" in messages[0]["content"]
+                else model_answer
+            )
             return LlmChatResult(
-                content=model_answer,
+                content=content,
                 provider=self.provider,
                 model=self.model,
                 prompt_tokens=10,
@@ -2186,7 +2191,11 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         "reason": "llm_generated",
         "citation_count": 1,
     }
-    assert len(calls) == 1
+    assert generated.json()["answer_review"] == {
+        "status": "passed",
+        "reason": "semantic_verified",
+    }
+    assert len(calls) == 2
     llm_payload = json.loads(calls[0][1]["content"])
     assert llm_payload == {
         "question": "travel approval",

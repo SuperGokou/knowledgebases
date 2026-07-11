@@ -43,6 +43,9 @@ class ChatSourceStatus(BaseModel):
         "missing_model_citations",
         "invalid_model_citations",
         "invalid_model_response",
+        "answer_review_rejected",
+        "answer_review_unavailable",
+        "answer_review_invalid",
         "no_matching_content",
     ]
     citation_count: int = Field(ge=0)
@@ -87,6 +90,27 @@ class ChatDataTable(BaseModel):
         return self
 
 
+class ChatAnswerReview(BaseModel):
+    """Public proof that generated prose passed the post-generation gate."""
+
+    status: Literal["passed", "fallback"]
+    reason: Literal[
+        "semantic_verified",
+        "retrieval_only",
+        "answer_review_rejected",
+        "answer_review_unavailable",
+        "answer_review_invalid",
+    ]
+
+    @model_validator(mode="after")
+    def validate_status_reason_pair(self) -> ChatAnswerReview:
+        if self.status == "passed" and self.reason != "semantic_verified":
+            raise ValueError("passed reviews must be semantically verified")
+        if self.status == "fallback" and self.reason == "semantic_verified":
+            raise ValueError("fallback reviews cannot be semantically verified")
+        return self
+
+
 class ChatQueryResponse(BaseModel):
     knowledge_base_id: UUID
     answer: str
@@ -94,5 +118,8 @@ class ChatQueryResponse(BaseModel):
     provider: str | None = None
     model: str | None = None
     table: ChatDataTable | None = None
+    answer_review: ChatAnswerReview = Field(
+        default_factory=lambda: ChatAnswerReview(status="fallback", reason="retrieval_only")
+    )
     citations: list[ChatCitation]
     source_status: ChatSourceStatus

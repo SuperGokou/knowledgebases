@@ -9,7 +9,7 @@ import {
   citationTraceLabel,
   sourceSummary,
 } from "@/lib/chat-sources";
-import type { ChatCitation, ChatSourceStatus } from "@/lib/types";
+import type { ChatAnswerReview, ChatCitation, ChatSourceStatus } from "@/lib/types";
 
 type AnswerSourcesProps = {
   citations?: ChatCitation[];
@@ -18,6 +18,7 @@ type AnswerSourcesProps = {
   model?: string | null;
   provider?: string | null;
   sourceStatus?: ChatSourceStatus;
+  answerReview?: ChatAnswerReview;
 };
 
 const providerLabels: Record<string, string> = {
@@ -33,6 +34,7 @@ export function AnswerSources({
   model,
   provider,
   sourceStatus,
+  answerReview,
 }: AnswerSourcesProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const summary = sourceSummary(citations, sourceStatus, failed);
@@ -56,7 +58,7 @@ export function AnswerSources({
           </div>
           <span className={`source-state ${summary.state}`}>
             {summary.state === "grounded" ? <Icon name="check" /> : <Icon name="warning" />}
-            {summary.state === "grounded" ? "可核验" : summary.state === "failed" ? "未生成" : "无引用"}
+            {answerReview?.status === "passed" ? "已审核" : summary.state === "grounded" ? "可核验" : summary.state === "failed" ? "未生成" : "无引用"}
           </span>
         </header>
 
@@ -108,6 +110,7 @@ export function AnswerSources({
             <strong>RAG</strong>
             {providerLabel ? <span>{providerLabel}</span> : null}
             {model ? <code>{model}</code> : null}
+            {answerReview?.status === "passed" ? <span>语义审核通过</span> : <span>确定性检索</span>}
           </div>
         ) : null}
       </section>
