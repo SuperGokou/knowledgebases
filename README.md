@@ -42,6 +42,8 @@
   ·
   <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">商业版审计报告</a>
   ·
+  <a href="docs/ENTERPRISE_ACCEPTANCE_STANDARD.zh-CN.md">企业验收标准</a>
+  ·
   <a href="SECURITY.md">安全报告策略</a>
 </p>
 
