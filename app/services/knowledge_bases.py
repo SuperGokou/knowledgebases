@@ -154,10 +154,29 @@ async def list_accessible_knowledge_bases(
 
 
 def _query_terms(query: str) -> list[str]:
-    terms = [item.casefold() for item in re.findall(r"[\w-]+", query, flags=re.UNICODE)]
+    terms: list[str] = []
+    for item in re.findall(r"[\w-]+", query, flags=re.UNICODE):
+        cjk_sequences = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]+", item)
+        for sequence in cjk_sequences:
+            if len(sequence) <= 2:
+                terms.append(sequence)
+            else:
+                # PostgreSQL ILIKE does not tokenize Chinese. Overlapping bigrams
+                # keep ordinary Chinese questions searchable without requiring an
+                # external tokenizer in the phase-one retrieval path.
+                terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
+        non_cjk = re.sub(r"[\u3400-\u4dbf\u4e00-\u9fff]+", " ", item)
+        terms.extend(
+            token.casefold()
+            for token in re.findall(r"[a-zA-Z0-9_-]+", non_cjk)
+        )
     if not terms:
         return [query.casefold()]
-    meaningful = [item for item in terms if len(item) >= 3]
+    meaningful = [
+        item
+        for item in terms
+        if len(item) >= 3 or bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", item))
+    ]
     return list(dict.fromkeys(meaningful or terms))[:12]
 
 

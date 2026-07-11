@@ -385,7 +385,7 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时的本地验收结果：**130 backend tests + 142 frontend tests passed，branch coverage 84.47%，Ruff clean，mypy strict passed，npm audit 0 vulnerabilities，TypeScript/ESLint/Next.js production build passed**。同一组门禁已写入 GitHub Actions，并额外在 PostgreSQL 17 与 Redis 8 service 上验证 Alembic 能升级到唯一 head。
+本 README 更新时的本地验收结果：**131 backend tests + 142 frontend tests passed，branch coverage 84.48%，Ruff clean，mypy strict passed，npm audit 0 vulnerabilities，TypeScript/ESLint/Next.js production build passed**。同一组门禁已写入 GitHub Actions，并额外在 PostgreSQL 17 与 Redis 8 service 上验证 Alembic 能升级到唯一 head。
 
 ## 部署到 Vercel
 

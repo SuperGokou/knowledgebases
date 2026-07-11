@@ -33,6 +33,7 @@
 | 生产可接受明文 Redis、示例对象存储凭据或通配 CORS | 中间人、错误部署或跨站访问风险 | 生产启动时 fail closed，强制 `rediss://`、精确 Origin 和非示例对象存储凭据 |
 | Refresh Token 请求体无合理上限 | 匿名端点可被超长字符串消耗资源 | 限制为 4 KiB |
 | 模型切换后仍显示“DeepSeek 自动转换” | 管理员可能误判数据外发目标 | 文案改为当前启用的外部模型，并明确 DeepSeek/Qwen/MiniMax |
+| 中文整句被当成一个检索词 | 数据存在时仍错误返回“无结果” | 为阶段一 PostgreSQL/ILIKE 检索增加中文重叠二元词切分和真实搜索回归测试 |
 | 仓库缺少自动发布门禁 | 回归可直接进入部署 | 新增前后端 CI：Lint、类型、测试、覆盖率、构建、依赖审计和迁移验证 |
 
 ## 4. 正向安全与架构能力
@@ -129,7 +130,7 @@ Vercel Function 当前位于新加坡，而现有 Supabase 数据库位于美国
 - 浏览器：登录、知识问答、连续提问、来源展示、新对话取消和管理页冒烟；
 - 线上：Web/API liveness/readiness、Vercel READY、错误日志扫描和真实浏览器控制台检查。
 
-本轮本地最终结果：**130 项后端测试、142 项前端测试全部通过；Python branch coverage 84.47%；Ruff、mypy strict、ESLint、TypeScript 与 Next.js production build 全部通过；npm 与 Python 已锁定依赖均未发现已知漏洞。** PostgreSQL 17 + Redis 8 的 CI 演练已验证 Alembic 可以升级到唯一 head。
+本轮本地最终结果：**131 项后端测试、142 项前端测试全部通过；Python branch coverage 84.48%；Ruff、mypy strict、ESLint、TypeScript 与 Next.js production build 全部通过；npm 与 Python 已锁定依赖均未发现已知漏洞。** PostgreSQL 17 + Redis 8 的 CI 演练已验证 Alembic 可以升级到唯一 head。
 
 ## 10. 依据与来源
 
