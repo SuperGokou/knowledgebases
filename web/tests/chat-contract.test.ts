@@ -9,6 +9,12 @@ const validReply = {
   mode: "rag",
   provider: "deepseek",
   model: "deepseek-chat",
+  table: {
+    title: "审批信息",
+    columns: ["项目", "要求"],
+    rows: [["发布", "必须先审批"]],
+    citation_numbers: [1],
+  },
   citations: [
     {
       entry_id: "00000000-0000-4000-8000-000000000002",
@@ -44,6 +50,14 @@ describe("parseChatReply", () => {
     {
       ...validReply,
       source_status: { ...validReply.source_status, citation_count: 9 },
+    },
+    {
+      ...validReply,
+      table: { ...validReply.table, rows: [["缺少第二列"]] },
+    },
+    {
+      ...validReply,
+      table: { ...validReply.table, citation_numbers: [99] },
     },
   ])("rejects malformed successful JSON before React renders it", (payload) => {
     expect(() => parseChatReply(payload)).toThrowError(ApiClientError);
