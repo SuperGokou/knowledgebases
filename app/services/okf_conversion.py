@@ -15,11 +15,17 @@ from app.db.models import (
     KnowledgeBase,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    KnowledgeIngestionStatus,
     OkfConversionJob,
     OkfConversionStatus,
 )
 from app.services.audit import add_audit_event
-from app.services.llm_provider import LlmProviderError, LlmResult, OpenAICompatibleClient
+from app.services.llm_provider import (
+    LlmProviderError,
+    LlmResult,
+    OkfConceptDraft,
+    OpenAICompatibleClient,
+)
 from app.services.storage import StorageService
 
 PROMPT_VERSION = "okf-phase1-v1"
@@ -46,6 +52,8 @@ async def enqueue_okf_conversion(session: AsyncSession, file: File) -> OkfConver
         file_version=file.version,
         prompt_version=PROMPT_VERSION,
     )
+    file.knowledge_status = KnowledgeIngestionStatus.PENDING
+    file.knowledge_error_code = None
     session.add(job)
     await session.flush()
     return job
@@ -54,13 +62,11 @@ async def enqueue_okf_conversion(session: AsyncSession, file: File) -> OkfConver
 async def process_okf_conversion_batch(
     session: AsyncSession,
     storage: StorageService,
-    client: OpenAICompatibleClient,
+    client: OpenAICompatibleClient | None,
     settings: Settings,
     *,
     batch_size: int,
 ) -> int:
-    if not client.configured:
-        return 0
     processed = 0
     deadline = monotonic() + settings.okf_conversion_time_budget_seconds
     for _ in range(batch_size):
@@ -117,8 +123,7 @@ async def _claim_job(session: AsyncSession, settings: Settings) -> OkfConversion
     )
     job = await session.scalar(
         select(OkfConversionJob)
-        .join(KnowledgeBase, KnowledgeBase.id == OkfConversionJob.knowledge_base_id)
-        .where(eligible, KnowledgeBase.external_llm_processing_enabled.is_(True))
+        .where(eligible)
         .order_by(OkfConversionJob.created_at, OkfConversionJob.id)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -137,7 +142,7 @@ async def _claim_job(session: AsyncSession, settings: Settings) -> OkfConversion
 async def _process_claimed_job(
     session: AsyncSession,
     storage: StorageService,
-    client: OpenAICompatibleClient,
+    client: OpenAICompatibleClient | None,
     settings: Settings,
     job_id: UUID,
     lease_id: UUID,
@@ -153,9 +158,6 @@ async def _process_claimed_job(
     if row is None:
         return
     job, file, knowledge_base = row
-    if not knowledge_base.external_llm_processing_enabled:
-        await _release_for_policy_change(session, job_id, lease_id)
-        return
     if file.extension not in SUPPORTED_TEXT_EXTENSIONS:
         await _finish_terminal(
             session, job_id, lease_id, OkfConversionStatus.UNSUPPORTED, "parser_required"
@@ -187,26 +189,62 @@ async def _process_claimed_job(
         )
         return
 
-    # Re-read consent immediately before the external request; object access
+    # Re-read consent immediately before any external request; object access
     # can take time and a manager may have opted out after this job was claimed.
     await session.refresh(knowledge_base)
-    if not knowledge_base.external_llm_processing_enabled:
-        await _release_for_policy_change(session, job_id, lease_id)
-        return
-
-    try:
-        result = await client.compile_okf(source_text, user_id=f"kb_{job.knowledge_base_id.hex}")
-    except LlmProviderError as error:
-        await _mark_failure(
-            session,
-            job_id,
-            lease_id,
-            code=error.code,
-            retryable=error.retryable,
-            settings=settings,
-        )
-        return
+    external_allowed = (
+        settings.external_llm_enabled and knowledge_base.external_llm_processing_enabled
+    )
+    if external_allowed:
+        if client is None or not client.configured:
+            await _mark_failure(
+                session,
+                job_id,
+                lease_id,
+                code="llm_not_configured",
+                retryable=True,
+                settings=settings,
+            )
+            return
+        try:
+            result = await client.compile_okf(
+                source_text,
+                user_id=f"kb_{job.knowledge_base_id.hex}",
+            )
+        except LlmProviderError as error:
+            await _mark_failure(
+                session,
+                job_id,
+                lease_id,
+                code=error.code,
+                retryable=error.retryable,
+                settings=settings,
+            )
+            return
+    else:
+        result = _compile_local_okf(file, source_text)
     await _persist_result(session, job_id, lease_id, file, result)
+
+
+def _compile_local_okf(file: File, source_text: str) -> LlmResult:
+    """Create a lossless local draft when external model processing is disabled."""
+
+    title = file.original_name.rsplit(".", maxsplit=1)[0].strip() or "Untitled document"
+    normalized_source = source_text.strip()
+    body = f"# {title}\n\n{normalized_source}"
+    return LlmResult(
+        draft=OkfConceptDraft(
+            type="document",
+            title=title[:500],
+            description="Locally imported without external model transformation.",
+            tags=["local-import", file.extension.removeprefix(".")],
+            body_markdown=body,
+        ),
+        provider="local",
+        model="local-deterministic-v1",
+        prompt_tokens=0,
+        completion_tokens=0,
+    )
 
 
 async def _persist_result(
@@ -234,6 +272,8 @@ async def _persist_result(
     if locked_file is None:
         await session.rollback()
         return
+    locked_file.knowledge_status = KnowledgeIngestionStatus.DRAFT_READY
+    locked_file.knowledge_error_code = None
     now = datetime.now(UTC)
     entry = KnowledgeEntry(
         knowledge_base_id=locked.knowledge_base_id,
@@ -319,6 +359,14 @@ async def _mark_failure(
     )
     if locked.status is OkfConversionStatus.FAILED:
         locked.completed_at = datetime.now(UTC)
+    file = await session.get(File, locked.file_id)
+    if file is not None:
+        file.knowledge_status = (
+            KnowledgeIngestionStatus.FAILED
+            if locked.status is OkfConversionStatus.FAILED
+            else KnowledgeIngestionStatus.PENDING
+        )
+        file.knowledge_error_code = code
     add_audit_event(
         session,
         action="okf.conversion_failed",
@@ -351,6 +399,14 @@ async def _finish_terminal(
     job.locked_at = None
     job.lease_id = None
     job.completed_at = datetime.now(UTC)
+    file = await session.get(File, job.file_id)
+    if file is not None:
+        file.knowledge_status = (
+            KnowledgeIngestionStatus.UNSUPPORTED
+            if status is OkfConversionStatus.UNSUPPORTED
+            else KnowledgeIngestionStatus.FAILED
+        )
+        file.knowledge_error_code = error_code
     add_audit_event(
         session,
         action="okf.conversion_skipped",
@@ -358,27 +414,6 @@ async def _finish_terminal(
         resource_id=str(job.id),
         details={"reason": error_code},
     )
-    await session.commit()
-
-
-async def _release_for_policy_change(
-    session: AsyncSession, job_id: UUID, lease_id: UUID
-) -> None:
-    job = await session.scalar(
-        select(OkfConversionJob)
-        .where(
-            OkfConversionJob.id == job_id,
-            OkfConversionJob.lease_id == lease_id,
-        )
-        .with_for_update()
-    )
-    if job is None:
-        return
-    job.status = OkfConversionStatus.PENDING
-    job.attempts = max(0, job.attempts - 1)
-    job.error_code = "external_processing_not_allowed"
-    job.locked_at = None
-    job.lease_id = None
     await session.commit()
 
 

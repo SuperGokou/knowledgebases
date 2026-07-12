@@ -74,6 +74,15 @@ class OkfConversionStatus(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class KnowledgeIngestionStatus(StrEnum):
+    NOT_REQUESTED = "not_requested"
+    PENDING = "pending"
+    DRAFT_READY = "draft_ready"
+    INDEXED = "indexed"
+    FAILED = "failed"
+    UNSUPPORTED = "unsupported"
+
+
 class KnowledgeEntryPublicationStatus(StrEnum):
     DRAFT = "draft"
     PUBLISHED = "published"
@@ -272,6 +281,12 @@ class File(TimestampMixin, Base):
     status: Mapped[FileStatus] = mapped_column(
         Enum(FileStatus, name="file_status"), default=FileStatus.PENDING, nullable=False
     )
+    knowledge_status: Mapped[KnowledgeIngestionStatus] = mapped_column(
+        Enum(KnowledgeIngestionStatus, name="knowledge_ingestion_status"),
+        default=KnowledgeIngestionStatus.NOT_REQUESTED,
+        nullable=False,
+    )
+    knowledge_error_code: Mapped[str | None] = mapped_column(String(100))
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

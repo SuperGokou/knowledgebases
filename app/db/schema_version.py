@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-EXPECTED_ALEMBIC_HEADS = frozenset({"20260712_0007"})
+EXPECTED_ALEMBIC_HEADS = frozenset({"20260712_0008"})
 
 
 class DatabaseSchemaDriftError(RuntimeError):

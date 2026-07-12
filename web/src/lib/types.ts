@@ -84,6 +84,15 @@ export type FileRecord = {
     | "quarantined"
     | "failed"
     | "deleted";
+  knowledge_status:
+    | "not_requested"
+    | "pending"
+    | "draft_ready"
+    | "indexed"
+    | "failed"
+    | "unsupported";
+  knowledge_error_code: string | null;
+  searchable: boolean;
   custom_metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;

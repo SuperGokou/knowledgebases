@@ -42,10 +42,15 @@ async def run_maintenance(
         total += cleaned
         if cleaned < settings.maintenance_batch_size:
             break
+    client = (
+        await resolve_provider_client(session, settings)
+        if settings.external_llm_enabled
+        else None
+    )
     converted = await process_okf_conversion_batch(
         session,
         storage,
-        await resolve_provider_client(session, settings),
+        client,
         settings,
         batch_size=settings.okf_conversion_batch_size,
     )

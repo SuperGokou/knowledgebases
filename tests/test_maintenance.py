@@ -22,13 +22,14 @@ async def test_isolated_maintenance_skips_external_conversion_and_keeps_cleanup(
         calls.append("resolve")
         raise AssertionError("isolated maintenance must not resolve a public LLM client")
 
-    async def forbidden_conversion(*_args: Any, **_kwargs: Any) -> int:
+    async def local_conversion(*args: Any, **_kwargs: Any) -> int:
         calls.append("convert")
-        raise AssertionError("isolated maintenance must not process external LLM jobs")
+        assert args[2] is None
+        return 1
 
     monkeypatch.setattr("app.maintenance.cleanup_expired_uploads", cleanup)
     monkeypatch.setattr("app.maintenance.resolve_provider_client", forbidden_resolve)
-    monkeypatch.setattr("app.maintenance.process_okf_conversion_batch", forbidden_conversion)
+    monkeypatch.setattr("app.maintenance.process_okf_conversion_batch", local_conversion)
 
     result = await run_maintenance_once(
         session=object(),  # type: ignore[arg-type]
@@ -36,5 +37,5 @@ async def test_isolated_maintenance_skips_external_conversion_and_keeps_cleanup(
         settings=Settings(environment="test", external_llm_enabled=False),
     )
 
-    assert result == {"cleaned": 2, "converted": 0}
-    assert calls == ["cleanup"]
+    assert result == {"cleaned": 2, "converted": 1}
+    assert calls == ["cleanup", "convert"]

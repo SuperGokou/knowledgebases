@@ -22,6 +22,7 @@ from app.db.models import (
     KnowledgeBaseRoleGrant,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    KnowledgeIngestionStatus,
     OkfConversionJob,
     OkfConversionStatus,
     ReservationStatus,
@@ -674,6 +675,8 @@ async def retry_okf_conversion(
     conversion.locked_at = None
     conversion.lease_id = None
     conversion.completed_at = None
+    file.knowledge_status = KnowledgeIngestionStatus.PENDING
+    file.knowledge_error_code = None
     add_audit_event(
         session,
         actor_id=access.user.id,
@@ -811,6 +814,15 @@ async def approve_processed_file(
     file.available_at = datetime.now(UTC)
     if generated_entry is not None:
         generated_entry.publication_status = KnowledgeEntryPublicationStatus.PUBLISHED
+        file.knowledge_status = KnowledgeIngestionStatus.INDEXED
+        file.knowledge_error_code = None
+    elif latest_conversion is not None:
+        file.knowledge_status = (
+            KnowledgeIngestionStatus.UNSUPPORTED
+            if latest_conversion.status is OkfConversionStatus.UNSUPPORTED
+            else KnowledgeIngestionStatus.FAILED
+        )
+        file.knowledge_error_code = latest_conversion.error_code
     add_audit_event(
         session,
         actor_id=access.user.id,

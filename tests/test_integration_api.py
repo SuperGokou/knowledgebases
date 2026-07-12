@@ -28,6 +28,7 @@ from app.db.models import (
     KnowledgeBase,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    KnowledgeIngestionStatus,
     LimitDefinition,
     LlmProviderConfig,
     OkfConversionJob,
@@ -306,6 +307,9 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     )
     assert revoked_refresh.status_code == 401
 
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
     role = await api_harness.client.post(
         "/api/v1/roles",
         headers=headers,
@@ -529,6 +533,16 @@ async def test_file_approval_follows_latest_okf_job_state(
         headers=headers,
     )
     assert response.status_code == expected_status_code, response.text
+    if response.status_code == 200:
+        expected_knowledge_status = {
+            OkfConversionStatus.SUCCEEDED: KnowledgeIngestionStatus.INDEXED,
+            OkfConversionStatus.FAILED: KnowledgeIngestionStatus.FAILED,
+            OkfConversionStatus.UNSUPPORTED: KnowledgeIngestionStatus.UNSUPPORTED,
+        }[latest_status]
+        assert response.json()["knowledge_status"] == expected_knowledge_status.value
+        assert response.json()["searchable"] is (
+            expected_knowledge_status is KnowledgeIngestionStatus.INDEXED
+        )
 
     async with api_harness.session_factory() as session:
         persisted_file = await session.get(File, file_id)
@@ -541,6 +555,7 @@ async def test_file_approval_follows_latest_okf_job_state(
             assert persisted_file.status is FileStatus.PROCESSING
         else:
             assert persisted_file.status is FileStatus.AVAILABLE
+            assert persisted_file.knowledge_status is expected_knowledge_status
         if latest_entry_id is not None:
             persisted_latest = await session.get(KnowledgeEntry, latest_entry_id)
             assert persisted_latest is not None

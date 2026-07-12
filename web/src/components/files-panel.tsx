@@ -6,6 +6,7 @@ import { useAccess } from "@/components/access-provider";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { apiRequest, formatBytes, readableError } from "@/lib/api-client";
+import { fileKnowledgePresentation } from "@/lib/file-knowledge-status";
 import type { FileRecord, KnowledgeBase, PartUrlResponse, UploadPlan } from "@/lib/types";
 
 type CompletedPart = { part_number: number; etag: string };
@@ -174,7 +175,7 @@ export function FilesPanel() {
         body: JSON.stringify({ parts: parts.sort((a, b) => a.part_number - b.part_number) }),
       });
       setProgress(100);
-      setPhase("上传完成，文件正在等待内容审核");
+      setPhase("上传完成，正在生成知识草稿");
       setSelected(null);
       await load();
     } catch (reason) {
@@ -261,13 +262,18 @@ export function FilesPanel() {
           {files?.length ? (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>文件</th><th>大小</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+                <thead><tr><th>文件</th><th>大小</th><th>文件状态</th><th>知识状态</th><th>更新时间</th><th>操作</th></tr></thead>
                 <tbody>
                   {filtered.map((file) => (
                     <tr key={file.id}>
                       <td><div className="primary-cell"><span className="file-icon"><Icon name="file" /></span><span><strong>{file.original_name}</strong><small>{file.content_type}</small></span></div></td>
                       <td>{formatBytes(file.size_bytes)}</td>
                       <td><StatusBadge tone={toneByStatus[file.status]}>{labelByStatus[file.status]}</StatusBadge></td>
+                      <td title={file.knowledge_error_code ?? undefined}>
+                        <StatusBadge tone={fileKnowledgePresentation(file.knowledge_status).tone}>
+                          {fileKnowledgePresentation(file.knowledge_status).label}
+                        </StatusBadge>
+                      </td>
                       <td>{new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(file.updated_at))}</td>
                       <td><div className="button-row">
                         {file.status === "available" && can("file:read") ? <button className="button ghost small" type="button" onClick={() => void download(file)}>下载</button> : null}

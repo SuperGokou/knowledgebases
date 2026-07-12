@@ -14,6 +14,7 @@ from app.db.models import (
     FileStatus,
     KnowledgeBase,
     KnowledgeEntry,
+    KnowledgeIngestionStatus,
     OkfConversionJob,
     OkfConversionStatus,
     User,
@@ -174,27 +175,75 @@ async def test_binary_format_is_not_sent_to_model() -> None:
             await process_okf_conversion_batch(
                 session,
                 TextStorage(b"must not be read"),  # type: ignore[arg-type]
-                SuccessfulClient(),  # type: ignore[arg-type]
-                Settings(environment="test"),
+                None,
+                Settings(environment="test", external_llm_enabled=False),
                 batch_size=1,
             )
-            == 0
-        )
-        await session.refresh(job)
-        assert job.status is OkfConversionStatus.PENDING
-
-        kb.external_llm_processing_enabled = True
-        await session.commit()
-        await process_okf_conversion_batch(
-            session,
-            TextStorage(b"must not be read"),  # type: ignore[arg-type]
-            SuccessfulClient(),  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
+            == 1
         )
         await session.refresh(job)
         assert job.status is OkfConversionStatus.UNSUPPORTED
         assert job.error_code == "parser_required"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_isolated_text_conversion_uses_local_deterministic_compiler() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with factory() as session:
+        user = User(email="isolated@example.com", password_hash="hash")
+        session.add(user)
+        await session.flush()
+        kb = KnowledgeBase(
+            owner_id=user.id,
+            name="Isolated documents",
+            external_llm_processing_enabled=False,
+        )
+        session.add(kb)
+        await session.flush()
+        file = File(
+            owner_id=user.id,
+            knowledge_base_id=kb.id,
+            bucket="kb",
+            object_key="objects/source.txt",
+            original_name="company-profile.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=32,
+            status=FileStatus.PROCESSING,
+        )
+        session.add(file)
+        await session.flush()
+        job = await enqueue_okf_conversion(session, file)
+        assert job is not None
+        await session.commit()
+
+        processed = await process_okf_conversion_batch(
+            session,
+            TextStorage("江苏和熠光显有限公司成立于2023年。".encode()),  # type: ignore[arg-type]
+            None,
+            Settings(environment="test", external_llm_enabled=False),
+            batch_size=1,
+        )
+
+        assert processed == 1
+        await session.refresh(job)
+        assert job.status is OkfConversionStatus.SUCCEEDED
+        assert job.output_entry_id is not None
+        entry = await session.get(KnowledgeEntry, job.output_entry_id)
+        assert entry is not None
+        await session.refresh(file)
+        assert file.knowledge_status is KnowledgeIngestionStatus.DRAFT_READY
+        assert "江苏和熠光显有限公司" in entry.content
+        assert entry.custom_metadata["generator"] == {
+            "provider": "local",
+            "model": "local-deterministic-v1",
+            "prompt_version": PROMPT_VERSION,
+        }
+        assert entry.publication_status.value == "draft"
     await engine.dispose()
 
 
