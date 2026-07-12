@@ -35,6 +35,16 @@ class Settings(BaseSettings):
         ),
         validation_alias=AliasChoices("KB_DATABASE_URL", "DATABASE_URL"),
     )
+    database_pool_size: int = Field(default=8, ge=1, le=50)
+    database_max_overflow: int = Field(default=4, ge=0, le=50)
+    database_pool_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    database_statement_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
+    database_lock_timeout_ms: int = Field(default=5_000, ge=100, le=60_000)
+    database_idle_transaction_timeout_ms: int = Field(
+        default=30_000,
+        ge=1_000,
+        le=300_000,
+    )
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         validation_alias=AliasChoices("KB_REDIS_URL", "KV_URL", "REDIS_URL"),

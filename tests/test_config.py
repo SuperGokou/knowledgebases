@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.db.session import engine_options
 
 
 def production_settings(**overrides: object) -> Settings:
@@ -147,6 +148,28 @@ def test_multipart_threshold_can_be_lowered_for_integration_testing() -> None:
     settings = Settings(multipart_threshold_bytes=1)
 
     assert settings.multipart_threshold_bytes == 1
+
+
+def test_database_pool_and_timeout_budget_is_configurable() -> None:
+    settings = Settings(
+        database_pool_size=7,
+        database_max_overflow=3,
+        database_pool_timeout_seconds=9,
+        database_statement_timeout_ms=12_000,
+        database_lock_timeout_ms=4_000,
+        database_idle_transaction_timeout_ms=20_000,
+    )
+
+    options = engine_options(settings)
+
+    assert options["pool_size"] == 7
+    assert options["max_overflow"] == 3
+    assert options["pool_timeout"] == 9
+    assert options["connect_args"]["server_settings"] == {
+        "statement_timeout": "12000",
+        "lock_timeout": "4000",
+        "idle_in_transaction_session_timeout": "20000",
+    }
 
 
 def test_vercel_environment_enables_serverless_mode(monkeypatch: pytest.MonkeyPatch) -> None:

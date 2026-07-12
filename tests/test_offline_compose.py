@@ -99,3 +99,22 @@ def test_offline_object_proxy_does_not_log_presigned_request_uris() -> None:
     object_server = caddyfile.split("https://{$KB_PUBLIC_HOST}:9443", maxsplit=1)[1]
 
     assert "\n\tlog {" not in object_server
+
+
+def test_offline_stack_reserves_cpu_and_graceful_shutdown_budget() -> None:
+    config = offline_compose_config()
+    steady_services = (
+        "postgres",
+        "redis",
+        "minio",
+        "minio-multipart-gc",
+        "api",
+        "maintenance",
+        "web",
+        "proxy",
+    )
+
+    allocated_cpu = sum(float(config["services"][name]["cpus"]) for name in steady_services)
+    assert allocated_cpu <= 6.5
+    for name in steady_services:
+        assert config["services"][name]["stop_grace_period"] == "30s", name
