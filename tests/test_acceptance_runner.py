@@ -184,6 +184,47 @@ def test_local_profile_contains_required_deterministic_gates() -> None:
     } <= ids
 
 
+def test_final_profile_adds_real_e2e_and_every_declared_hard_blocker() -> None:
+    gates = build_profile("final")
+    by_id = {gate.gate_id: gate for gate in gates}
+
+    assert by_id["E2E-P0-001"].command == ("npm", "run", "test:e2e")
+    assert Path(by_id["E2E-P0-001"].cwd).name == "web"
+    blockers = {
+        "CAPACITY-P0-001": "5 billion tokens per day",
+        "STORAGE-P0-001": "10 TB",
+        "MALWARE-P0-001": "malware scanning",
+        "TOKEN-GOV-P0-001": "token cost governance",
+        "DR-P0-001": "disaster-recovery restore drill",
+        "SECURITY-SCAN-P0-001": "thread limit",
+    }
+    for gate_id, evidence_phrase in blockers.items():
+        gate = by_id[gate_id]
+        assert gate.severity == "P0"
+        assert gate.command == ()
+        assert gate.blocked_reason is not None
+        assert evidence_phrase in gate.blocked_reason
+
+
+def test_final_profile_is_guaranteed_to_fail_while_local_and_ci_semantics_are_unchanged() -> None:
+    local_ids = {gate.gate_id for gate in build_profile("local")}
+    ci_ids = {gate.gate_id for gate in build_profile("ci")}
+    final_gates = build_profile("final")
+    final_results = [
+        run_gate(
+            gate,
+            executor=lambda _gate: CommandOutcome(returncode=0, stdout="ok", stderr=""),
+        )
+        for gate in final_gates
+    ]
+
+    assert "E2E-P0-001" not in local_ids | ci_ids
+    assert "CAPACITY-P0-001" not in local_ids | ci_ids
+    assert "SERVER-P1-001" in local_ids
+    assert "SERVER-P1-001" not in ci_ids
+    assert calculate_verdict(final_results) == "FAIL"
+
+
 def test_executor_signature_is_injectable() -> None:
     gate = AcceptanceGate(
         gate_id="CODE-P0-001",

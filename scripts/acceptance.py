@@ -16,6 +16,7 @@ from typing import Literal
 Severity = Literal["P0", "P1", "P2"]
 GateStatus = Literal["passed", "failed", "blocked"]
 Verdict = Literal["PASS", "CONDITIONAL", "FAIL"]
+Profile = Literal["local", "ci", "final"]
 
 _SUMMARY_LIMIT = 4_096
 _SENSITIVE_ASSIGNMENT = re.compile(
@@ -150,7 +151,7 @@ def run_gate(
     )
 
 
-def build_profile(profile: Literal["local", "ci"]) -> tuple[AcceptanceGate, ...]:
+def build_profile(profile: Profile) -> tuple[AcceptanceGate, ...]:
     repository = Path(__file__).resolve().parents[1]
     web = repository / "web"
     base = (
@@ -235,9 +236,87 @@ def build_profile(profile: Literal["local", "ci"]) -> tuple[AcceptanceGate, ...]
             ),
         ),
     )
-    return base if profile == "local" else tuple(
-        gate for gate in base if gate.gate_id != "SERVER-P1-001"
+    if profile == "local":
+        return base
+    if profile == "ci":
+        return tuple(gate for gate in base if gate.gate_id != "SERVER-P1-001")
+
+    final_gates = (
+        AcceptanceGate(
+            "E2E-P0-001",
+            "P0",
+            ("npm", "run", "test:e2e"),
+            str(web),
+            900,
+        ),
+        AcceptanceGate(
+            "CAPACITY-P0-001",
+            "P0",
+            (),
+            str(repository),
+            1,
+            blocked_reason=(
+                "No reproducible load-test and provider-capacity evidence demonstrates "
+                "5 billion tokens per day under the required 1,000-user workload."
+            ),
+        ),
+        AcceptanceGate(
+            "STORAGE-P0-001",
+            "P0",
+            (),
+            str(repository),
+            1,
+            blocked_reason=(
+                "The 10 TB durable file-storage requirement conflicts with the declared "
+                "300 GB SSD host, and no accepted external capacity evidence is available."
+            ),
+        ),
+        AcceptanceGate(
+            "MALWARE-P0-001",
+            "P0",
+            (),
+            str(repository),
+            1,
+            blocked_reason=(
+                "Production malware scanning and fail-closed quarantine evidence is missing "
+                "from the upload-to-approval path."
+            ),
+        ),
+        AcceptanceGate(
+            "TOKEN-GOV-P0-001",
+            "P0",
+            (),
+            str(repository),
+            1,
+            blocked_reason=(
+                "Per-user, per-knowledge-base, and provider-level token cost governance "
+                "with atomic reservation and actual-usage settlement is missing."
+            ),
+        ),
+        AcceptanceGate(
+            "DR-P0-001",
+            "P0",
+            (),
+            str(repository),
+            1,
+            blocked_reason=(
+                "A timed disaster-recovery restore drill with measured RPO/RTO and restored "
+                "data-integrity evidence has not been completed."
+            ),
+        ),
+        AcceptanceGate(
+            "SECURITY-SCAN-P0-001",
+            "P0",
+            (),
+            str(repository),
+            1,
+            blocked_reason=(
+                "The Codex deep security scan has no completed artifact; the attempted scan "
+                "was blocked by the Codex thread limit."
+            ),
+        ),
     )
+    return (*base, *final_gates)
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -305,7 +384,7 @@ def _revision(repository: Path) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run redacted enterprise acceptance gates")
-    parser.add_argument("--profile", choices=("local", "ci"), default="local")
+    parser.add_argument("--profile", choices=("local", "ci", "final"), default="local")
     parser.add_argument("--report-dir", type=Path, default=Path("artifacts/acceptance"))
     arguments = parser.parse_args(argv)
 
