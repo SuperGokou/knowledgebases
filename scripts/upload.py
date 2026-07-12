@@ -24,7 +24,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -32,6 +31,9 @@ from email.utils import parsedate_to_datetime
 from http.client import HTTPMessage
 from pathlib import Path
 from typing import IO, Any, BinaryIO, cast
+
+from defusedxml import ElementTree as DefusedET
+from defusedxml.common import DefusedXmlException
 
 USER_AGENT = "knowledge-base-uploader/1.0"
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -208,10 +210,10 @@ def _storage_error(error: urllib.error.HTTPError) -> StorageRequestError:
     message = str(error.reason or "request failed")
     if body:
         try:
-            root = ET.fromstring(body)
+            root = DefusedET.fromstring(body)
             code = root.findtext("Code") or code
             message = root.findtext("Message") or message
-        except ET.ParseError:
+        except (DefusedET.ParseError, DefusedXmlException):
             pass
     return StorageRequestError(
         status=status,

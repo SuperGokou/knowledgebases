@@ -8,6 +8,7 @@ dependencies = [
   "alembic>=1.16,<2",
   "asyncpg>=0.30,<1",
   "boto3>=1.39,<2",
+  "defusedxml>=0.7.1,<1",
   "email-validator>=2.2,<3",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
@@ -30,6 +31,7 @@ dev = [
   "pytest-asyncio>=1.0,<2",
   "pytest-cov>=6.2,<8",
   "ruff>=0.12,<1",
+  "types-defusedxml>=0.7,<1",
 ]
 
 [build-system]
