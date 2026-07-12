@@ -98,10 +98,23 @@ class OpenAICompatibleClient:
         )
         self._timeout = config.timeout_seconds
         self._max_tokens = config.max_tokens
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(self._timeout),
+            follow_redirects=False,
+        )
 
     @property
     def configured(self) -> bool:
         return bool(self._api_key)
+
+    async def __aenter__(self) -> OpenAICompatibleClient:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
 
     async def compile_okf(self, source_text: str, *, user_id: str) -> LlmResult:
         del user_id  # Provider adapters must not receive internal identifiers by default.
@@ -203,17 +216,14 @@ class OpenAICompatibleClient:
 
     async def _post(self, payload: dict[str, Any]) -> httpx.Response:
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self._timeout), follow_redirects=False
-            ) as client:
-                return await client.post(
-                    self._endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
+            return await self._http.post(
+                self._endpoint,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
         except httpx.RequestError as error:
             raise LlmProviderError(
                 "llm_transport_error", provider=self.provider, retryable=True

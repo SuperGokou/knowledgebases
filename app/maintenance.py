@@ -113,13 +113,23 @@ async def run_maintenance_once(
         if settings.external_llm_enabled
         else None
     )
-    converted = await process_okf_conversion_batch(
-        session,
-        storage,
-        client,
-        settings,
-        batch_size=settings.okf_conversion_batch_size,
-    )
+    if client is None:
+        converted = await process_okf_conversion_batch(
+            session,
+            storage,
+            None,
+            settings,
+            batch_size=settings.okf_conversion_batch_size,
+        )
+    else:
+        async with client:
+            converted = await process_okf_conversion_batch(
+                session,
+                storage,
+                client,
+                settings,
+                batch_size=settings.okf_conversion_batch_size,
+            )
     return {"cleaned": cleaned, "converted": converted}
 
 

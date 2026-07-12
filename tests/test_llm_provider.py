@@ -33,12 +33,16 @@ class StubAsyncClient:
     ) -> None:
         self._responses = responses
         self._calls = calls
+        self.closed = False
 
     async def __aenter__(self) -> StubAsyncClient:
         return self
 
     async def __aexit__(self, *_args: object) -> None:
         return None
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     async def post(
         self,
@@ -87,10 +91,13 @@ async def test_openai_adapter_retries_json_mode_without_provider_specific_fields
         ),
     ]
     constructor_options: list[dict[str, Any]] = []
+    created_clients: list[StubAsyncClient] = []
 
     def client_factory(**kwargs: Any) -> StubAsyncClient:
         constructor_options.append(kwargs)
-        return StubAsyncClient(responses, calls)
+        client = StubAsyncClient(responses, calls)
+        created_clients.append(client)
+        return client
 
     monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
     client = OpenAICompatibleClient(
@@ -114,9 +121,11 @@ async def test_openai_adapter_retries_json_mode_without_provider_specific_fields
     assert "thinking" not in calls[0][2]
     assert "user_id" not in calls[0][2]
     assert "user" not in calls[0][2]
-    assert len(constructor_options) == 2
+    assert len(constructor_options) == 1
     assert all(item["follow_redirects"] is False for item in constructor_options)
     assert all(item["timeout"].connect == 10 for item in constructor_options)
+    await client.aclose()
+    assert created_clients[0].closed is True
 
 
 @pytest.mark.asyncio

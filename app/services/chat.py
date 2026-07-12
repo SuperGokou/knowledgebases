@@ -23,7 +23,11 @@ from app.services.knowledge_bases import (
     require_knowledge_base_access,
     search_knowledge_entries,
 )
-from app.services.llm_provider import LlmChatResult, LlmProviderError
+from app.services.llm_provider import (
+    LlmChatResult,
+    LlmProviderError,
+    OpenAICompatibleClient,
+)
 from app.services.llm_settings import LlmConfigurationError, resolve_provider_client
 
 _RAG_SYSTEM_PROMPT = """Answer naturally and directly using only knowledge_context. Use the same
@@ -425,6 +429,21 @@ def _model_response_error(
     _, citation_error = _referenced_citations(answer, citations)
     return citation_error or "invalid_model_response"
 
+
+async def _answer_with_provider(
+    client: OpenAICompatibleClient,
+    *,
+    knowledge_base_id: UUID,
+    citations: list[ChatCitation],
+    message: str,
+) -> ChatQueryResponse:
+    async with client:
+        return await _answer_with_provider(
+            client,
+            knowledge_base_id=knowledge_base_id,
+            citations=citations,
+            message=message,
+        )
 
 async def answer_knowledge_query(
     session: AsyncSession,
