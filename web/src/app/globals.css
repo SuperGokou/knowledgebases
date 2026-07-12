@@ -307,7 +307,7 @@ tbody tr:hover { background: #fbfbfd; }
 .form-heading { margin-bottom: 3px; }.form-heading h1 { margin-bottom: 10px; font-size: 26px; letter-spacing: -.035em; }.form-heading > p:last-child { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
 .login-form input { height: 46px; background: #fafbfc; }
 .login-submit { min-height: 46px; margin-top: 3px; }
-.form-note { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 0; color: #8b92a1; font-size: 9px; }.form-note svg { width: 13px; height: 13px; color: var(--green); }
+.form-note { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 0; color: #5f6876; font-size: 10px; }.form-note svg { width: 13px; height: 13px; color: var(--green); }
 
 /* Chat */
 .content:has(> .chat-layout) { max-width: none; padding: 0; }

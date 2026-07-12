@@ -32,3 +32,5 @@ Thumbs.db
 *.log
 tmp/
 artifacts/acceptance/
+web/playwright-report/
+web/test-results/
