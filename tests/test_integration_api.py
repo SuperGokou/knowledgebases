@@ -816,11 +816,23 @@ async def test_authentication_rejects_bad_credentials_tokens_and_refresh_replay(
         json={"refresh_token": tokens["refresh_token"]},
     )
     assert first_refresh.status_code == 200
+    successor = first_refresh.json()
     replay = await api_harness.client.post(
         "/api/v1/auth/refresh",
         json={"refresh_token": tokens["refresh_token"]},
     )
     assert replay.status_code == 401
+
+    compromised_successor = await api_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": successor["refresh_token"]},
+    )
+    assert compromised_successor.status_code == 401
+    invalidated_access = await api_harness.client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {successor['access_token']}"},
+    )
+    assert invalidated_access.status_code == 401
 
     invalid_access = await api_harness.client.get(
         "/api/v1/files",

@@ -6,6 +6,7 @@ import time
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from typing import Annotated
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -154,14 +155,22 @@ async def _check_auth_rate_limit(
         )
 
 
-def _pair(tokens: TokenService, user: User) -> tuple[TokenPair, RefreshToken]:
+def _pair(
+    tokens: TokenService,
+    user: User,
+    *,
+    family_id: UUID | None = None,
+    parent_id: UUID | None = None,
+) -> tuple[TokenPair, RefreshToken]:
     settings = get_settings()
     access = tokens.create_access_token(user_id=user.id, token_version=user.token_version)
     refresh = tokens.create_refresh_token(user_id=user.id, token_version=user.token_version)
     claims = tokens.decode(refresh, expected_type="refresh")
     record = RefreshToken(
         id=claims.token_id,
+        family_id=family_id or uuid4(),
         user_id=user.id,
+        parent_id=parent_id,
         token_hash=tokens.fingerprint(refresh),
         expires_at=claims.expires_at,
     )
@@ -274,10 +283,47 @@ async def refresh_tokens(
             code="invalid_refresh_token",
             message="Refresh token is invalid or has been revoked",
         )
+    fingerprint_matches = hmac.compare_digest(
+        record.token_hash,
+        tokens.fingerprint(payload.refresh_token),
+    )
+    reuse_attempt = record.revoked_at is not None or not fingerprint_matches
+    if reuse_attempt:
+        if record.reuse_detected_at is None:
+            family = list(
+                (
+                    await session.scalars(
+                        select(RefreshToken)
+                        .where(RefreshToken.family_id == record.family_id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for family_token in family:
+                if family_token.revoked_at is None:
+                    family_token.revoked_at = now
+                family_token.reuse_detected_at = now
+            user.token_version += 1
+            add_audit_event(
+                session,
+                action="auth.token.reuse_detected",
+                resource_type="refresh_token_family",
+                resource_id=str(record.family_id),
+                actor_id=user.id,
+                request_id=getattr(request.state, "request_id", None),
+                details={"compromised_token_id": str(record.id)},
+            )
+            await session.commit()
+        else:
+            await session.rollback()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="refresh_token_reuse_detected",
+            message="Refresh token reuse was detected and the session was revoked",
+        )
+
     invalid = (
-        record.revoked_at is not None
-        or as_utc(record.expires_at) <= now
-        or record.token_hash != tokens.fingerprint(payload.refresh_token)
+        as_utc(record.expires_at) <= now
         or user.status is not UserStatus.ACTIVE
         or user.token_version != claims.token_version
     )
@@ -290,7 +336,13 @@ async def refresh_tokens(
         )
 
     record.revoked_at = now
-    pair, replacement = _pair(tokens, user)
+    pair, replacement = _pair(
+        tokens,
+        user,
+        family_id=record.family_id,
+        parent_id=record.id,
+    )
+    record.replaced_by_id = replacement.id
     session.add(replacement)
     add_audit_event(
         session,
