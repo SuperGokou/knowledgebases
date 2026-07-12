@@ -1,7 +1,9 @@
 # Third-Party Notices
 
-> Status: **engineering draft — legal approval required before distribution**  
-> Generated: 2026-07-12  
+> Status: **engineering draft — legal approval required before distribution**
+>
+> Generated: 2026-07-12
+>
 > Scope: locked Web and Python production application dependencies
 
 This file records third-party components detected by automated tooling. It is not a license grant for this project, is not legal advice, and is not a substitute for the complete upstream license texts that must accompany the final distribution.
@@ -15,7 +17,7 @@ No recipient should infer a right to copy, redistribute, sublicense, or modify t
 ## Complete machine-readable inventories
 
 - `artifacts/acceptance/sbom-web.cdx.json` — CycloneDX 1.6 JSON, SHA-256 `A90A51571435CA05986F976F9CAAADF2F5CF8F3435534D485272D7EFC0DEC5DF`
-- `artifacts/acceptance/sbom-python.cdx.json` — CycloneDX 1.6 JSON, SHA-256 `F9556EF2DC12E2B9C72B31962F48A91BFAE4FCE048952DDCAA341957670800FA`
+- `artifacts/acceptance/sbom-python.cdx.json` — CycloneDX 1.6 JSON, SHA-256 `6895E628CDE5244D3654749A9DC631C98E62139C92D928A034ABD84D164D97C9`
 - `DEPENDENCY_LICENSE_AUDIT.zh-CN.md` — generation commands, tool versions, counts, limitations, and release blockers
 
 The SBOMs are the exhaustive package/version inventories for this audit snapshot. This notice highlights obligations that require explicit release review and groups permissive components for readability.

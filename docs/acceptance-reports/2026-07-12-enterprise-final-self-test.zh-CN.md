@@ -133,7 +133,7 @@ uv run --no-sync python scripts/acceptance.py `
 | 产物 | 组件/依赖节点 | SHA-256 |
 |---|---:|---|
 | `sbom-web.cdx.json` | 54 / 57 | `A90A51571435CA05986F976F9CAAADF2F5CF8F3435534D485272D7EFC0DEC5DF` |
-| `sbom-python.cdx.json` | 52 / 53 | `F9556EF2DC12E2B9C72B31962F48A91BFAE4FCE048952DDCAA341957670800FA` |
+| `sbom-python.cdx.json` | 52 / 53 | `6895E628CDE5244D3654749A9DC631C98E62139C92D928A034ABD84D164D97C9` |
 
 许可证与权属 Gate 为 `FAIL`：
 

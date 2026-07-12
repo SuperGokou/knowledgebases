@@ -1,8 +1,11 @@
 # 依赖、许可证与 SBOM 审计
 
-> 审计日期：2026-07-12  
-> 审计结论：**FAIL / 法务阻断**  
-> 适用范围：Web 生产依赖、Python 生产依赖和项目根包  
+> 审计日期：2026-07-12
+>
+> 审计结论：**FAIL / 法务阻断**
+>
+> 适用范围：Web 生产依赖、Python 生产依赖和项目根包
+>
 > 声明：本文是工程审计证据，不是法律意见或不侵权保证。
 
 ## 执行摘要
@@ -67,7 +70,7 @@ uvx --from cyclonedx-bom==7.3.0 cyclonedx-py environment `
 | 产物 | 格式 | 组件 | 依赖节点 | SHA-256 |
 |---|---|---:|---:|---|
 | `artifacts/acceptance/sbom-web.cdx.json` | CycloneDX JSON 1.6 | 54 | 57 | `A90A51571435CA05986F976F9CAAADF2F5CF8F3435534D485272D7EFC0DEC5DF` |
-| `artifacts/acceptance/sbom-python.cdx.json` | CycloneDX JSON 1.6 | 52 | 53 | `F9556EF2DC12E2B9C72B31962F48A91BFAE4FCE048952DDCAA341957670800FA` |
+| `artifacts/acceptance/sbom-python.cdx.json` | CycloneDX JSON 1.6 | 52 | 53 | `6895E628CDE5244D3654749A9DC631C98E62139C92D928A034ABD84D164D97C9` |
 
 Web SBOM 按锁文件生成，包含 npm 用于跨平台分发的 optional 二进制组件；它的 54 个组件不等于 Windows 开发机或 Linux 运行镜像实际加载的包数。最终容器仍须对构建好的 Linux 镜像生成 image SBOM，并与本锁文件 SBOM 对账。
 
