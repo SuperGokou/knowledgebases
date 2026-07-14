@@ -1,6 +1,6 @@
 # 企业知识中台最终交付验收标准
 
-版本：1.0
+版本：1.1
 
 适用对象：江苏和熠光显有限公司企业知识中台
 
@@ -25,16 +25,18 @@
 |---|---:|
 | 注册/可授权用户 | 1,000 |
 | Token 日消耗目标 | 5,000,000,000 |
-| 原始文件目标 | 10 TB |
-| 企业单机模拟环境 | 8 vCPU / 16 GB RAM / 300 GB SSD |
+| 当前交付主机 | Linux amd64/x86_64、8 vCPU、16 GB RAM、300 GB SSD |
+| 当前单机对象停止线 | 180 GB；70% 预警、80% 停止批量上传、90% 拒绝新上传 |
+| 未来存储扩展目标 | 10 TB 独立企业内网存储集群，不属于当前 300 GB 单机 P0 |
 | 数据出网 | 默认禁止；任何外部模型调用必须显式批准、可审计并完成数据分级 |
 
 ### 2.2 不可回避的物理约束
 
 - 50 亿 Token/日等于 24 小时平均约 `57,870 token/s`；若集中在 8 小时业务窗口，平均约 `173,611 token/s`。单台 8 vCPU、无 GPU 主机不能承担该推理吞吐。
-- 300 GB 仅为 10 TB 的 3%；按 70% 存储高水位计算，10 TB 有效数据至少需要约 14.3 TB 可用主存储，尚未包含纠删码、版本、Multipart 暂存、增长和备份。
-- 因此，8C16G/300GB 只能验收控制面、小规模检索与部署隔离，不能作为 10 TB 存储或 50 亿 Token/日推理的容量证明。
-- 正式 `PASS` 必须增加独立存储集群和企业内网 GPU/模型服务，或者由业务负责人书面降低目标并重新基线化。
+- 当前发布必须在目标 Linux 主机本机执行只读预检：架构为 amd64/x86_64、可见逻辑 CPU 不少于 8、可见内存不少于 15 GiB、目标数据文件系统物理总量不少于 300 GB（十进制），且部署前可用空间不少于 240 GB。任一条件不满足均为 P0 失败；没有在目标主机执行则为 P0 `blocked`。
+- 当前 300 GB 单机是本次部署的正式硬件基线，而不是 10 TB 集群的缩小容量证明。对象数据建议在 180 GB 触发停止线，并执行 70%/80%/90% 水位策略，给操作系统、镜像、PostgreSQL、WAL、Multipart 暂存、日志与升级回滚留出空间。
+- 10 TB 调整为未来独立企业内网存储集群扩展目标，不再作为当前 300 GB 单机验收的 P0。启用该扩展前仍须单独完成冗余、校验、生命周期、备份恢复和扩容验收。
+- 50 亿 Token/日仍须由企业内网 GPU 推理集群或获批准的模型服务提供容量证据。8C16G 无 GPU 单机不得被描述为具备该本地推理能力。
 
 详细计算和压测方法见 [性能与容量模型](./PERFORMANCE_CAPACITY_MODEL.zh-CN.md)。
 
@@ -51,8 +53,9 @@
 | `FINAL-P0-007` | 检索质量 | 固定中文黄金集达到 Recall@5、MRR、nDCG、无答案准确率和 ACL 泄漏阈值；10 TB 方案不得依赖全表 `%ILIKE%` |
 | `FINAL-P0-008` | 防幻觉 | 每个事实和每个表格行可追溯；非法引用接受率 0%；审核故障确定性降级；独立审核或确定性 claim/evidence 校验 |
 | `FINAL-P0-009` | Token/成本 | 调用前原子预留、调用后按供应商 usage 结算；用户/知识库/租户/模型/供应商多级日预算和成本熔断可对账 |
-| `FINAL-P0-010` | 容量 | 1,000 用户与 50 亿 Token/日的控制面、模型面容量报告完整；实测与模型值明确区分 |
-| `FINAL-P0-011` | 存储 | 10 TB 有效容量、冗余、高水位、增长、校验、生命周期与独立备份方案完成实测 |
+| `FINAL-P0-010` | 容量 | 当前主机控制面压测与 1,000 用户模型完整；50 亿 Token/日由独立推理服务提供实测容量、限额与成本证据，且实测与模型值明确区分 |
+| `FINAL-P0-011` | 目标主机与本地存储 | 目标 Linux amd64/x86_64 主机通过 8 vCPU、15 GiB 可见内存、300 GB 总量和部署前 240 GB 可用空间预检；`STORAGE-WATERMARK-P0-001` 在目标主机实测 180 GB 对象停止线及 70%/80%/90% 水位策略，无法采集真实证据时必须 blocked/FAIL |
+| `FINAL-P0-019` | 离线镜像与病毒库 | 镜像清单由 `docker compose config --images` 生成并验证，包含 ClamAV；`main`/`daily` 病毒库只读挂载，存在性、可读权限、SHA-256、更新时间和 `sigtool --info` 兼容性预检全部通过 |
 | `FINAL-P0-012` | 数据一致性 | 配额、刷新令牌、任务领取、角色替换、幂等上传在真实 PostgreSQL/Redis 并发测试中无超卖、双发和丢失更新 |
 | `FINAL-P0-013` | 审计 | 关键操作可按权限查询导出；运行时账号不能更新/删除审计日志；敏感字段 0 泄漏；完整性可验证 |
 | `FINAL-P0-014` | 离线隔离 | PostgreSQL、Redis、对象存储、应用和日志均在企业受控环境；断网冷启动与全流程通过；无批准的公网调用为 0 |
@@ -80,9 +83,9 @@
 2. 后端、前端、类型、静态、迁移、浏览器 E2E 和 Compose/容器测试原始结果；
 3. CycloneDX 或 SPDX SBOM、依赖漏洞报告、许可证清单和第三方通知；
 4. 脱敏的威胁模型、深度安全扫描报告、修复复测和残余风险签字；
-5. 真实 8C16G/300GB 主机的资源曲线、负载数据集、P50/P95/P99、错误率和故障注入结果；
+5. 真实 Linux 8C16G/300GB 主机的只读预检 JSON、资源曲线、负载数据集、P50/P95/P99、错误率和故障注入结果；
 6. 50 亿 Token/日容量模型、供应商或内网推理服务的实测吞吐、限额和成本对账；
-7. 10 TB 存储容量、冗余、校验、扩容和恢复证据；
+7. 当前单机 180 GB 停止线、70%/80%/90% 水位、数据校验和恢复证据；未来启用 10 TB 独立存储集群时另附集群容量、冗余、扩容和恢复证据；
 8. 全新环境恢复报告、RPO/RTO、1000 个对象哈希抽检；
 9. 项目代码版权声明、素材授权、许可证审批记录；
 10. 最终自检报告，逐项给出 `passed/failed/blocked`，不得省略失败项。
@@ -96,10 +99,31 @@ $env:UV_NO_SYNC = '1'
 $env:PYTHONPATH = (Get-Location).Path
 uv run --no-sync python scripts/acceptance.py `
   --profile final `
+  --host-disk-path /srv `
+  --host-io-evidence /srv/heyi-knowledgebases-offline/evidence/host-io.json `
+  --storage-chain-evidence /srv/heyi-knowledgebases-offline/evidence/watermark-chain.json `
+  --offline-env-file /srv/heyi-knowledgebases-offline/shared/offline.env `
+  --offline-image-manifest /srv/heyi-knowledgebases-offline/evidence/offline-images.txt `
+  --offline-runtime-evidence /srv/heyi-knowledgebases-offline/evidence/offline-runtime/offline-runtime-evidence.json `
+  --e2e-evidence /srv/heyi-knowledgebases-offline/evidence/browser-e2e.json `
+  --functional-trust-store /etc/heyi-acceptance/functional-trust.json `
+  --functional-challenge-store /var/lib/heyi-acceptance/challenges `
+  --e2e-signing-key-path /etc/heyi-acceptance/browser-e2e-ed25519.key `
+  --e2e-signing-key-id browser-e2e-ed25519 `
+  --malware-evidence /srv/heyi-knowledgebases-offline/evidence/malware.json `
+  --security-scan-evidence /srv/heyi-knowledgebases-offline/evidence/security-scan.json `
   --report-dir artifacts/acceptance/final
 ```
 
-`final` Profile 必须同时执行可自动化门禁，并显式列出无法在当前环境验证的 P0。存在 P0 `blocked` 时命令退出非零且 verdict 必须为 `FAIL`。
+`final` Profile 必须在目标 Linux 主机执行，并把 `HOST-P0-001` 作为 P0。脚本只读取操作系统、架构、CPU、内存和指定路径所在文件系统，不读取 `.env`、IP 或凭据。Windows 或非目标环境返回 `blocked` 和退出码 2；目标 Linux 不符合规格返回退出码 1；通过返回 0。存在任何 P0 `failed/blocked` 时最终 verdict 必须为 `FAIL`。
+
+`local` 与 `ci` 只属于开发 Smoke，不是可签署交付证据。`final` 报告会记录 Git HEAD、工作树脏状态、状态分类计数、tracked diff SHA-256、untracked manifest/content SHA-256 与综合内容指纹；工作树不干净或无法采集身份时强制 `FAIL`。报告只记录计数与哈希，不记录未跟踪文件名、文件内容、`.env` 值或凭据。
+
+`E2E-P0-001` 固定运行 enterprise Profile，必须运行 18 项企业桌面/移动业务检查，默认 4 项 Smoke 不能满足终验。Playwright 退出 0 后仍必须通过 `scripts.functional_acceptance` 对唯一 `EXT-BROWSER-E2E-001` 执行正式 `ed25519-challenge-v1` 验签并原子消费一次性 challenge；只有两步都成功才可通过。缺拓扑、缺证据、SHA-only、自签名、签名/指纹/工件不匹配或 challenge 重放均为 `blocked`，普通业务断言失败为 `failed`。签名私钥路径、固定 key id 和选中的 browser challenge 文件只通过显式子进程环境 `KB_E2E_SIGNING_KEY_PATH`、`KB_E2E_SIGNING_KEY_ID`、`KB_E2E_CHALLENGE_PATH` 交给 reporter，不读取项目 `.env`、不输出私钥内容。
+
+`--functional-trust-store` 必须是仓库外 root 所有的 `0400/0600` 非符号链接普通文件；`--functional-challenge-store` 必须是仓库外 root 所有的 `0700` 非符号链接目录，内部 challenge 为 `0400/0600` 普通文件；`--e2e-signing-key-path` 同样必须是仓库外 root 所有的受保护普通文件。`HOST-P0-001` 和 `STORAGE-WATERMARK-P0-001` 分别以模块入口消费显式的 `--host-io-evidence` 与 `--storage-chain-evidence`。`OFFLINE-P0-001` 必须先以 root 执行 `preflight-offline.sh`，`OFFLINE-IMAGES-P0-001` 再执行 `verify-offline-images.sh verify`；`OFFLINE-RUNTIME-P0-001` 独立验签 `--offline-runtime-evidence` 中的断网冷启动、业务闭环、持久化和网络恢复证据。只完成 RepoDigest、Compose 渲染或单元测试 fake runner 不能通过离线终验。`FORMAT-P0-001` 必须在内容寻址 API 镜像内执行 `python -m app.document_parser_preflight --require-all`；缺少 PDF/旧版 Office 工具或隔离沙箱时返回码 2 并记为 `blocked`。
+
+所有目标证据路径必须由命令行显式给出为 Linux 绝对路径。验收器不读取开发机 `.env` 推断路径或秘密；输入证据在运行前必须存在且是非符号链接的普通文件，下游验证器还会核对数据挂载、采集范围、原始工件哈希与目标内容指纹。离线运行态证据还必须来自 `subprocess-v1`、`result=passed`，匹配当前 Git、内容和同一次 Linux 启动的主机指纹，全部 11 项检查与原始工件 SHA-256/字节数/整体 attestation 均有效且不超过 24 小时。缺参数、Windows、非 root、test-only/fake、证据缺失或证据不属于目标运行均为 `blocked`，不得误报 `PASS`。`MALWARE-P0-001` 与 `SECURITY-SCAN-P0-001` 使用内容寻址的正式证据文档，并要求目标 Git/工作树内容指纹完全匹配。证据格式见 [终验正式证据格式](./ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md)。
 
 ## 7. 签署规则
 

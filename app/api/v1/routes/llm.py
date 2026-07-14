@@ -8,7 +8,7 @@ from sqlalchemy import select, update
 from app.api.dependencies import DatabaseSession, require_permission
 from app.api.errors import ApiError
 from app.core.config import Settings, get_settings
-from app.db.models import LlmProviderConfig
+from app.db.models import LlmModelPrice, LlmProviderConfig
 from app.schemas.llm import (
     LlmProviderName,
     LlmProviderRead,
@@ -16,7 +16,7 @@ from app.schemas.llm import (
     LlmProviderUpdate,
 )
 from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.audit import AuditResult, add_audit_event
 from app.services.llm_settings import (
     CredentialCipher,
     LlmConfigurationError,
@@ -35,8 +35,9 @@ async def list_llm_providers(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> LlmProvidersResponse:
     rows = await ensure_provider_configs(session, settings)
+    prices = list((await session.scalars(select(LlmModelPrice))).all())
     await session.commit()
-    return _response(rows, settings)
+    return _response(rows, settings, prices)
 
 
 @router.patch("/{provider}", response_model=LlmProviderRead)
@@ -80,6 +81,7 @@ async def update_llm_provider(
         ) from error
 
     credential_changed = payload.api_key is not None or payload.clear_api_key
+    pricing_changed = payload.input_micro_usd_per_million_tokens is not None
     if payload.api_key is not None:
         try:
             cipher = CredentialCipher(settings)
@@ -98,6 +100,32 @@ async def update_llm_provider(
     elif payload.clear_api_key:
         row.api_key_ciphertext = None
 
+    price = await session.get(LlmModelPrice, (provider, row.model))
+    if pricing_changed:
+        if price is None:
+            price = LlmModelPrice(
+                provider=provider,
+                model=row.model,
+                input_micro_usd_per_million_tokens=(
+                    payload.input_micro_usd_per_million_tokens or 0
+                ),
+                output_micro_usd_per_million_tokens=(
+                    payload.output_micro_usd_per_million_tokens or 0
+                ),
+                active=True,
+                updated_by=access.user.id,
+            )
+            session.add(price)
+        else:
+            price.input_micro_usd_per_million_tokens = (
+                payload.input_micro_usd_per_million_tokens or 0
+            )
+            price.output_micro_usd_per_million_tokens = (
+                payload.output_micro_usd_per_million_tokens or 0
+            )
+            price.active = True
+            price.updated_by = access.user.id
+
     if (row.is_default or payload.make_default) and credential_source(row, settings) == "none":
         raise ApiError(
             status_code=422,
@@ -115,6 +143,7 @@ async def update_llm_provider(
         session,
         actor_id=access.user.id,
         action="llm.provider_updated",
+        result=AuditResult.SUCCESS,
         resource_type="llm_provider",
         resource_id=provider,
         request_id=getattr(request.state, "request_id", None),
@@ -125,22 +154,47 @@ async def update_llm_provider(
             "made_default": payload.make_default,
             "credential_changed": credential_changed,
             "credential_cleared": payload.clear_api_key,
+            "pricing_changed": pricing_changed,
         },
     )
     await session.commit()
     await session.refresh(row)
-    return _read(row, settings)
+    return _read(row, settings, price)
 
 
-def _response(rows: list[LlmProviderConfig], settings: Settings) -> LlmProvidersResponse:
+def _response(
+    rows: list[LlmProviderConfig],
+    settings: Settings,
+    prices: list[LlmModelPrice],
+) -> LlmProvidersResponse:
     default = next((row.provider for row in rows if row.is_default), settings.llm_default_provider)
     return LlmProvidersResponse(
         default_provider=cast(LlmProviderName, default),
-        providers=[_read(row, settings) for row in rows],
+        providers=[
+            _read(
+                row,
+                settings,
+                next(
+                    (
+                        price
+                        for price in prices
+                        if price.provider == row.provider
+                        and price.model == row.model
+                        and price.active
+                    ),
+                    None,
+                ),
+            )
+            for row in rows
+        ],
     )
 
 
-def _read(row: LlmProviderConfig, settings: Settings) -> LlmProviderRead:
+def _read(
+    row: LlmProviderConfig,
+    settings: Settings,
+    price: LlmModelPrice | None,
+) -> LlmProviderRead:
     return LlmProviderRead(
         provider=cast(LlmProviderName, row.provider),
         model=row.model,
@@ -149,4 +203,11 @@ def _read(row: LlmProviderConfig, settings: Settings) -> LlmProviderRead:
         configured=credential_source(row, settings) != "none",
         credential_source=credential_source(row, settings),
         updated_at=row.updated_at,
+        pricing_configured=price is not None and price.active,
+        input_micro_usd_per_million_tokens=(
+            price.input_micro_usd_per_million_tokens if price is not None else None
+        ),
+        output_micro_usd_per_million_tokens=(
+            price.output_micro_usd_per_million_tokens if price is not None else None
+        ),
     )

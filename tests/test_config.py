@@ -12,6 +12,7 @@ def production_settings(**overrides: object) -> Settings:
         "bootstrap_admin_password": "A-production-admin-password-123!",  # pragma: allowlist secret
         "database_url": (
             "postgresql+psycopg://user:password@db.example.com/postgres"  # pragma: allowlist secret
+            "?sslmode=verify-full"
         ),
         "redis_url": (
             "rediss://default:password@"  # pragma: allowlist secret
@@ -78,6 +79,33 @@ def test_production_requires_tls_redis_and_exact_cors_origins() -> None:
         production_settings(cors_origins=("null",))
 
 
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+psycopg://user:pass@db.example.com/knowledge",
+        "postgresql+psycopg://user:pass@db.example.com/knowledge?sslmode=require",
+        "postgresql+psycopg://user:pass@db.example.com/knowledge?sslmode=verify-ca",
+        "postgresql+asyncpg://user:pass@db.example.com/knowledge?ssl=require",
+    ],
+)
+def test_standard_production_requires_verified_database_tls(database_url: str) -> None:
+    with pytest.raises(ValidationError, match="verify-full"):
+        production_settings(database_url=database_url)
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+psycopg://user:pass@db.example.com/knowledge?sslmode=verify-full",
+        "postgresql+asyncpg://user:pass@db.example.com/knowledge?ssl=verify-full",
+    ],
+)
+def test_standard_production_accepts_verified_database_tls(database_url: str) -> None:
+    settings = production_settings(database_url=database_url)
+
+    assert settings.database_url == database_url
+
+
 def test_production_rejects_example_object_storage_credentials() -> None:
     with pytest.raises(ValidationError):
         production_settings(s3_access_key="knowledge")
@@ -101,10 +129,63 @@ def test_isolated_production_accepts_only_compose_local_data_services() -> None:
         redis_url="redis://:password@redis:6379/0",
         s3_endpoint_url="http://minio:9000",
         s3_public_endpoint_url="https://knowledge.internal:19444",
+        malware_scan_host="clamd",
+        storage_capacity_probe_path="/var/lib/kb-capacity",
     )
 
     assert settings.deployment_profile == "isolated"
     assert settings.external_llm_enabled is False
+
+
+def test_isolated_production_requires_the_private_clamd_service() -> None:
+    with pytest.raises(ValidationError):
+        production_settings(
+            deployment_profile="isolated",
+            external_llm_enabled=False,
+            database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+            redis_url="redis://:pass@redis:6379/0",
+            s3_endpoint_url="http://minio:9000",
+            s3_public_endpoint_url="https://knowledge.internal:19444",
+            malware_scan_host="scanner.example.com",
+        )
+
+
+def test_upload_platform_limit_and_scanner_limit_must_match() -> None:
+    with pytest.raises(ValidationError, match="platform upload limit"):
+        Settings(
+            platform_max_upload_bytes=1_024,
+            malware_scan_max_stream_bytes=2_048,
+        )
+
+
+def test_isolated_production_requires_fixed_storage_safety_policy() -> None:
+    common: dict[str, object] = {
+        "deployment_profile": "isolated",
+        "external_llm_enabled": False,
+        "database_url": "postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+        "redis_url": "redis://:pass@redis:6379/0",
+        "s3_endpoint_url": "http://minio:9000",
+        "s3_public_endpoint_url": "https://knowledge.internal:19444",
+        "malware_scan_host": "clamd",
+        "storage_capacity_probe_path": "/var/lib/kb-capacity",
+    }
+
+    settings = production_settings(**common)
+    assert settings.platform_max_upload_bytes == settings.malware_scan_max_stream_bytes
+
+    for field, value in (
+        ("storage_capacity_probe_path", None),
+        ("storage_warning_percent", 71),
+        ("storage_bulk_stop_percent", 81),
+        ("storage_reject_percent", 91),
+        ("storage_object_stop_bytes", 179_000_000_000),
+        ("platform_max_upload_bytes", 1_000),
+    ):
+        overrides = {**common, field: value}
+        if field == "platform_max_upload_bytes":
+            overrides["malware_scan_max_stream_bytes"] = value
+        with pytest.raises(ValidationError):
+            production_settings(**overrides)
 
 
 @pytest.mark.parametrize(
@@ -248,6 +329,18 @@ def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
             environment="test",
             qwen_allowed_workspace_hosts=("*.maas.aliyuncs.com",),
         )
+
+
+def test_trusted_proxy_networks_must_be_narrow_private_cidrs() -> None:
+    settings = Settings(
+        environment="test",
+        trusted_proxy_cidrs=("172.30.240.0/24",),
+    )
+    assert settings.trusted_proxy_cidrs == ("172.30.240.0/24",)
+
+    for invalid in ("0.0.0.0/0", "198.51.100.0/24", "172.30.240.1/24", "10.0.0.0/8"):
+        with pytest.raises(ValidationError):
+            Settings(environment="test", trusted_proxy_cidrs=(invalid,))
 
 
 def test_settings_validation_errors_hide_sensitive_input() -> None:

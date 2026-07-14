@@ -240,7 +240,7 @@ $rolePayload = @{
 $role = Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/roles -Headers $headers -ContentType "application/json" -Body $rolePayload
 ~~~
 
-SQL NULL 表示无限，0 表示禁止。多角色有限值取最大；任一角色为 NULL 则该 key 无限；用户 override 最后覆盖。不要给普通角色设置 NULL，除非确实希望无限。
+SQL NULL 表示“不设角色额度”，0 表示禁止。多角色有限值取最大；任一角色为 NULL 则该 key 的角色合并结果为无限制；用户 override 最后覆盖。不要给普通角色设置 NULL，除非确实希望不设角额度。该语义不会绕过 2 GiB 单文件平台安全硬上限、clamd 扫描上限、180 GB 对象停止线或 70%/80%/90% 磁盘水位门禁。
 
 ### 6.3 创建用户
 

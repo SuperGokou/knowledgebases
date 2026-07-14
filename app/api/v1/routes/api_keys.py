@@ -8,12 +8,13 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy import select
 
 from app.api.dependencies import DatabaseSession, require_permission
+from app.api.egress_leases import deny_if_active_external_llm_egress
 from app.api.errors import ApiError
 from app.db.models import ApiKey, User, UserStatus
 from app.schemas.api_keys import ApiKeyCreate, ApiKeyCreated, ApiKeyRead
 from app.services.access import AccessContext, AccessService
 from app.services.api_keys import PUBLIC_API_PERMISSIONS, generate_api_key
-from app.services.audit import add_audit_event
+from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
 
 router = APIRouter()
@@ -114,6 +115,7 @@ async def create_api_key(
         session,
         actor_id=access.user.id,
         action="api_key.created",
+        result=AuditResult.SUCCESS,
         resource_type="api_key",
         resource_id=str(api_key.id),
         request_id=getattr(request.state, "request_id", None),
@@ -149,11 +151,21 @@ async def revoke_api_key(
     if api_key is None:
         raise ApiError(status_code=404, code="api_key_not_found", message="API key not found")
     if api_key.revoked_at is None:
+        await deny_if_active_external_llm_egress(
+            session,
+            request,
+            access,
+            revocation_scope="api_key",
+            resource_type="api_key",
+            resource_id=str(api_key.id),
+            api_key_id=api_key.id,
+        )
         api_key.revoked_at = datetime.now(UTC)
         add_audit_event(
             session,
             actor_id=access.user.id,
             action="api_key.revoked",
+            result=AuditResult.SUCCESS,
             resource_type="api_key",
             resource_id=str(api_key.id),
             request_id=getattr(request.state, "request_id", None),

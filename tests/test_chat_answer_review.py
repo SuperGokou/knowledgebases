@@ -5,6 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.schemas.chat import ChatCitation
+from app.services import chat as chat_service
 from app.services.chat import _GeneratedChatResponse, _review_generated_answer
 from app.services.llm_provider import LlmChatResult, LlmProviderError
 
@@ -40,9 +41,7 @@ class ReviewClient:
     ) -> LlmChatResult:
         del messages, temperature, max_tokens
         if self.fail:
-            raise LlmProviderError(
-                "llm_transport_error", provider=self.provider, retryable=True
-            )
+            raise LlmProviderError("llm_transport_error", provider=self.provider, retryable=True)
         return LlmChatResult(
             content=self.content or "",
             provider=self.provider,
@@ -71,18 +70,14 @@ async def test_answer_review_passes_only_explicit_grounding_verdict() -> None:
     ("client", "expected"),
     [
         (
-            ReviewClient(
-                '{"verdict":"fail","unsupported_claims":["注册资本为一亿元"]}'
-            ),
+            ReviewClient('{"verdict":"fail","unsupported_claims":["注册资本为一亿元"]}'),
             "answer_review_rejected",
         ),
         (ReviewClient("not-json"), "answer_review_invalid"),
         (ReviewClient(fail=True), "answer_review_unavailable"),
     ],
 )
-async def test_answer_review_fails_closed(
-    client: ReviewClient, expected: str
-) -> None:
+async def test_answer_review_fails_closed(client: ReviewClient, expected: str) -> None:
     generated = _GeneratedChatResponse(answer="公司注册资本为一亿元 [1]。")
 
     result = await _review_generated_answer(
@@ -93,3 +88,7 @@ async def test_answer_review_fails_closed(
     )
 
     assert result == expected
+
+
+def test_chat_service_has_no_orphan_recursive_provider_wrapper() -> None:
+    assert not hasattr(chat_service, "_answer_with_provider")

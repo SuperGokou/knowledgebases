@@ -1,0 +1,332 @@
+{
+  "schema_version": 1,
+  "standard": "docs/FUNCTIONAL_ACCEPTANCE_STANDARD.zh-CN.md",
+  "requirements": [
+    {
+      "id": "FUNC-AUTH-001",
+      "title": "统一登录、会话与按角色路由",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["存在管理员、内容管理员、聊天用户和无可用权限账户"],
+      "steps": ["从统一登录页认证", "解析服务端当前用户权限", "访问授权和未授权工作区"],
+      "expected_results": ["登录后仅按服务端权限选择落地页", "未授权路径降级到可访问页面", "会话异常时失败关闭且不签发 Cookie"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/auth.py", "contains": ["@router.post(\"/token\"", "@router.get(\"/me\"", "@router.post(\"/refresh\"", "@router.post(\"/logout\""]},
+        {"kind": "source", "path": "web/src/lib/access-routing.ts", "contains": ["export function defaultLandingPath", "export function canAccessPath", "export function resolveLandingPath"]},
+        {"kind": "automated_test", "path": "web/tests/access-routing.test.ts", "contains": ["routes superusers and control-plane accounts", "fails closed for an external or malformed requested destination"], "runner": "frontend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-ACCOUNT-001",
+      "title": "账户与会话全生命周期",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["管理员已登录", "系统角色与自定义角色目录可用"],
+      "steps": ["创建账户并分配角色", "修改账户并替换角色", "刷新会话、退出并尝试重放刷新令牌"],
+      "expected_results": ["账户创建、修改、角色替换均受授权控制", "退出后刷新令牌失效", "系统管理员角色不可被越权授予"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/users.py", "contains": ["@router.post(\"\"", "@router.patch(\"/{user_id}\"", "@router.put(\"/{user_id}/roles\""]},
+        {"kind": "automated_test", "path": "tests/test_integration_api.py", "contains": ["test_admin_role_user_and_refresh_workflow", "forbidden_system_assignment.status_code == 403"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-RBAC-001",
+      "title": "动态 RBAC、层级约束与中文权限语义",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["权限目录、角色目录和操作者有效权限已加载"],
+      "steps": ["创建自定义角色", "替换权限与完整策略", "尝试修改系统角色或授予操作者不具备的权限", "查看中文权限名称和说明"],
+      "expected_results": ["角色策略动态生效", "系统角色不可修改且权限提升被拒绝", "通配符与资源级权限按层级匹配", "全部当前权限和未知权限均有中文展示"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/roles.py", "contains": ["@router.put(\"/{role_id}/permissions\"", "@router.put(\"/{role_id}/policy\"", "@permission_router.get(\"\""]},
+        {"kind": "source", "path": "web/src/lib/role-policy.ts", "contains": ["export function permissionCopy", "permission.code.split(\":\")", "export function roleCopy"]},
+        {"kind": "automated_test", "path": "web/tests/role-policy.test.ts", "contains": ["覆盖服务端当前的全部权限代码", "未知权限也不会回退为英文能力名称"], "runner": "frontend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_domain_access.py", "contains": ["test_resource_wildcard_grants_only_its_resource", "test_global_wildcard_grants_every_permission"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-LIMIT-001",
+      "title": "角色配额、限额与平台硬上限语义",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["限额目录已初始化", "账户具有一个或多个角色"],
+      "steps": ["设置有限值、未设置值和无限制值", "合并多角色限额", "执行上传或下载并触发配额"],
+      "expected_results": ["有限、未设置、无限制三种状态不混淆", "多角色采用最宽松合法值且用户覆盖最终生效", "无限制仍受平台安全硬上限约束"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/roles.py", "contains": ["@router.put(\"/{role_id}/limits\"", "@limit_router.get(\"\""]},
+        {"kind": "source", "path": "web/src/lib/role-policy.ts", "contains": ["export type LimitMode = \"unset\" | \"limited\" | \"unlimited\"", "if (value === undefined) return \"未设置\"", "if (value === null) return \"无限制\""]},
+        {"kind": "automated_test", "path": "tests/test_domain_quota.py", "contains": ["test_concurrent_reservations_cannot_oversubscribe_logically", "test_none_limit_means_unlimited"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "web/tests/role-policy.test.ts", "contains": ["明确区分未设置、有限制和无限制", "为所有现有限额提供中文计算口径"], "runner": "frontend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-KB-ACL-001",
+      "title": "知识库 ACL 与撤权即时生效",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["知识库、读者角色、外部角色和知识条目存在"],
+      "steps": ["授予角色 reader/editor/manager 访问级别", "分别执行列表、检索、聊天、上传和修改", "撤销知识库授权后重复访问"],
+      "expected_results": ["仅返回有权知识库", "读写操作同时满足 RBAC 与知识库 ACL", "越权资源使用 404 隐藏", "撤权立即移除文件、上传与聊天访问"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/knowledge_bases.py", "contains": ["response_model=list[KnowledgeBaseRoleGrantRead]", "access_level=item.access_level", "response_model=KnowledgeSearchResponse"]},
+        {"kind": "automated_test", "path": "tests/test_integration_api.py", "contains": ["test_knowledge_base_chat_demo_and_acl_boundaries", "test_revoked_knowledge_grant_removes_file_and_upload_access"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-FILE-001",
+      "title": "文件单次/分片上传、扫描、OKF、审批与下载",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["对象存储、扫描器和维护任务可用", "账户具有相应文件与知识库权限"],
+      "steps": ["发起小文件单次上传", "发起大文件 Multipart、签发分片并完成", "执行恶意软件扫描与 OKF 转换", "审批干净且转换完成的文件", "签发下载授权"],
+      "expected_results": ["上传策略按阈值选择单次或 Multipart", "扫描未通过或未完成时保持隔离", "OKF 最新任务状态控制审批", "仅 clean 且 available 文件可下载", "异常和重试保持幂等"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/files.py", "contains": ["@router.post(\"/uploads\"", "@router.post(\"/uploads/{upload_session_id}/parts\"", "@router.post(\"/uploads/{upload_session_id}/complete\"", "@router.post(\"/{file_id}/approve\"", "@router.post(\"/{file_id}/download\"", "malware_scan_not_clean", "okf_conversion_in_progress"]},
+        {"kind": "automated_test", "path": "tests/test_integration_api.py", "contains": ["test_single_upload_approval_and_download_workflow", "test_multipart_upload_signs_batches_and_completes", "test_malware_scan_failures_remain_quarantined_and_inaccessible", "test_file_approval_follows_latest_okf_job_state"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_okf_conversion.py", "contains": ["test_conversion_creates_valid_okf_entry_and_is_idempotent", "test_unknown_transport_outcome_is_terminal_and_never_auto_retried"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-CHAT-001",
+      "title": "聊天检索、逐答引用、回答审计与表格可视化",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["知识库有已发布条目", "账户具有 chat:query 和知识库访问权"],
+      "steps": ["提交检索问答", "让模型返回合法、缺失、越界和伪造引用", "触发回答审计通过、拒绝与上游失败", "关闭外部 LLM 并验证离线检索降级", "请求结构化数据表"],
+      "expected_results": ["每次回答携带结构化 citations 与 source_status", "模型漏引、越界或审计不明确时丢弃模型文本并安全降级", "离线模式只返回授权检索与确定性来源，不伪造来源或模型审核结论", "表格只能引用已验证来源并以语义化表格展示"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/chat.py", "contains": ["@router.post(\"/query\"", "response_model=ChatQueryResponse"]},
+        {"kind": "source", "path": "web/src/lib/chat-contract.ts", "contains": ["missing_model_citations", "invalid_model_citations", "function isAnswerReview", "function isChatTable"]},
+        {"kind": "documentation", "path": "docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md", "contains": ["离线 AI 降级语义", "source_status.reason=external_processing_disabled", "不得编造答案或来源"]},
+        {"kind": "automated_test", "path": "tests/test_chat_answer_review.py", "contains": ["test_answer_review_passes_only_explicit_grounding_verdict", "test_answer_review_fails_closed"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "web/tests/chat-data-table.test.ts", "contains": ["renders a semantic, source-labelled data table"], "runner": "frontend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-MODEL-001",
+      "title": "DeepSeek、Qwen、MiniMax 模型切换",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["操作者具有 llm:manage", "服务端凭据加密配置有效"],
+      "steps": ["列出三家供应商", "配置模型、Base URL、价格与服务端凭据", "切换默认供应商", "执行问答并核对实际供应商和模型"],
+      "expected_results": ["仅允许 DeepSeek/Qwen/MiniMax 和其主机白名单", "凭据不回显且加密保存", "未配置供应商不可设为默认", "回答报告实际 provider/model"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/llm.py", "contains": ["@router.get(\"\"", "@router.patch(\"/{provider}\"", "llm_provider_not_configured"]},
+        {"kind": "documentation", "path": "docs/API_AND_MODEL_MANAGEMENT.zh-CN.md", "contains": ["DeepSeek / Qwen / MiniMax", "三家均通过 OpenAI-compatible Chat Completions 接口接入"]},
+        {"kind": "automated_test", "path": "tests/test_integration_api.py", "contains": ["test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed", "test_chat_generation_requires_kb_opt_in_and_reports_selected_model"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "web/tests/model-settings.test.ts", "contains": ["builds the API payload using integer micro-dollars per million tokens"], "runner": "frontend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-APIKEY-001",
+      "title": "API Key 生成、文档、范围与撤销",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["操作者具有 api-key:manage", "目标用户与知识库范围有效"],
+      "steps": ["生成带权限与知识库范围的 Key", "通过企业 TLS 入口调用公开搜索/问答接口", "尝试从公共入口访问控制面以及执行权限提升和跨账户操作", "撤销或等待过期后再次调用"],
+      "expected_results": ["明文 Key 仅创建时返回一次", "有效权限为用户 RBAC、Key scope、知识库 scope 交集", "只有 /api/v1/public/* 直达 FastAPI，控制面仍由 BFF 隔离", "越权签发被拒绝", "撤销/过期立即失效且受速率限制", "文档提供可执行示例"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/api_keys.py", "contains": ["@router.post(\"\"", "permission_codes=sorted(requested_permissions)", "@router.delete(\"/{api_key_id}\""]},
+        {"kind": "config", "path": "deploy/tencent/Caddyfile.offline", "contains": ["@public_api path /api/v1/public/*", "reverse_proxy @public_api api:8000", "header_up -X-KB-Client-Signature", "reverse_proxy web:3000"]},
+        {"kind": "config", "path": "deploy/tencent/compose.offline.yml", "contains": ["KB_TRUSTED_PROXY_CIDRS", "subnet: 172.30.240.0/24", "internal: true"]},
+        {"kind": "documentation", "path": "docs/API_AND_MODEL_MANAGEMENT.zh-CN.md", "contains": ["明文 Key 只在创建成功时返回一次", "用户当前 RBAC 权限 ∩ Key 权限范围 ∩ 知识库范围", "怀疑泄露时先撤销旧 Key"]},
+        {"kind": "automated_test", "path": "tests/test_integration_api.py", "contains": ["test_scoped_api_key_lifecycle_and_public_endpoints", "test_non_superuser_cannot_issue_api_key_for_another_account", "test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "web/tests/api-usage-examples.test.ts", "contains": ["builds the knowledge-base scoped search endpoint"], "runner": "frontend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-AUDIT-001",
+      "title": "审计记录、检索、脱敏与结果语义",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["账户具有或不具有 audit:read", "系统已有成功和失败操作事件"],
+      "steps": ["查询审计日志", "按动作、结果、时间筛选并翻页", "检查敏感字段与稳定游标", "尝试无权限查询"],
+      "expected_results": ["只有 audit:read 可读取", "事件记录 actor/action/resource/result/request_id", "过滤使用持久化 result", "敏感内容不出现在响应且分页稳定"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/v1/routes/audit_logs.py", "contains": ["@router.get(\"\"", "response_model=AuditLogPage", "require_permission(\"audit:read\")"]},
+        {"kind": "automated_test", "path": "tests/test_audit_logs_api.py", "contains": ["test_audit_log_api_requires_audit_read_permission", "test_audit_log_api_filters_redacts_and_uses_stable_cursor_pagination"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_audit_result_persistence.py", "contains": ["test_add_audit_event_requires_the_writer_to_choose_a_result", "test_audit_result_filter_uses_persisted_result_not_action_suffix"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-UXSTATE-001",
+      "title": "错误、加载、空态与连接状态",
+      "severity": "P1",
+      "blocking": true,
+      "preconditions": ["工作区可渲染", "可模拟加载、会话失效、后端不可用和渲染异常"],
+      "steps": ["进入加载状态", "模拟渲染错误与后端超时", "模拟会话刷新失败", "查看聊天连接与来源空态"],
+      "expected_results": ["加载过程有明确占位", "错误页给出可重试动作与安全错误编号", "日志不暴露消息/堆栈/凭据", "连接、空来源和失败状态不误报成功"],
+      "evidence": [
+        {"kind": "source", "path": "web/src/app/(workspace)/loading.tsx", "contains": ["export default function WorkspaceLoading"]},
+        {"kind": "source", "path": "web/src/app/(workspace)/error.tsx", "contains": ["workspaceErrorCode", "retryLabel=\"重新加载\""]},
+        {"kind": "automated_test", "path": "web/tests/error-reporting.test.ts", "contains": ["does not expose messages, stacks, or unsafe digests in log records"], "runner": "frontend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "web/tests/access-provider.test.ts", "contains": ["keeps an already loaded page visible during a background refresh", "redirects only after logout actually clears the expired session"], "runner": "frontend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-HEALTH-001",
+      "title": "存活、就绪与依赖健康",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["API 进程启动", "数据库/Redis 可分别设为正常、失败或 schema 漂移"],
+      "steps": ["调用 /health/live", "调用 /health/ready", "模拟数据库 schema 漂移或依赖不可用"],
+      "expected_results": ["liveness 不依赖外部服务", "readiness 仅在数据库、Redis 和 schema 均就绪时返回 ready", "异常时返回非 2xx 且不泄露连接信息"],
+      "evidence": [
+        {"kind": "route", "path": "app/api/health.py", "contains": ["@router.get(\"/live\")", "@router.get(\"/ready\")"]},
+        {"kind": "automated_test", "path": "tests/test_api_contract.py", "contains": ["test_liveness_endpoint_does_not_require_dependencies", "test_readiness_rejects_database_schema_drift"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_integration_api.py", "contains": ["test_readiness_uses_database_and_redis"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-FORMAT-001",
+      "title": "九类文档格式的隔离解析、来源定位与 OKF 闭环",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["解析运行时通过能力预检", "外部解析器由 root 所有且不可被非特权用户修改"],
+      "steps": ["分别解析 TXT、DOC、DOCX、XLS、XLSX、CSV、PDF、PPT、PPTX 黄金样本", "验证恶意 OOXML、主动 PDF、压缩炸弹和错配扩展名被拒绝", "将解析结果写入 OKF 草稿并检查来源定位"],
+      "expected_results": [".txt .doc .docx .xls .xlsx .csv .pdf .ppt .pptx 均有明确能力与失败关闭语义", "段落、表格行、工作表单元格、页码和幻灯片定位进入来源元数据", "任一必需工具或沙箱能力缺失时预检返回 blocked 且不得发布"],
+      "evidence": [
+        {"kind": "source", "path": "app/services/document_parser.py", "contains": ["SUPPORTED_DOCUMENT_EXTENSIONS", "def parser_capabilities", "def _sandboxed_command"]},
+        {"kind": "automated_test", "path": "tests/test_document_parser.py", "contains": ["test_internal_parsers_preserve_source_locations", "test_legacy_office_golden_conversion_preserves_provenance", "test_pdf_parser_preserves_page_locations"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_document_parser_preflight.py", "contains": ["test_require_all_covers_every_advertised_upload_format_and_fails_closed"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_okf_document_pipeline.py", "contains": ["test_docx_runs_through_okf_and_persists_parser_provenance"], "runner": "backend-functional", "status": "active"}
+      ]
+    },
+    {
+      "id": "FUNC-OFFLINE-001",
+      "title": "云厂商无关的 Linux 8C16G300G 离线部署基线",
+      "severity": "P0",
+      "blocking": true,
+      "preconditions": ["目标为 Linux amd64/x86_64", "Docker 镜像和 ClamAV 病毒库已通过离线介质校验"],
+      "steps": ["验证 8 vCPU、16 GB RAM、300 GB 数据盘和 240 GB 可用空间", "记录同机其他应用的容器、端口、网络、卷和健康指纹", "校验离线 Compose、私网依赖、只读文件系统、资源预算以及禁止现场拉取/构建", "通过企业 TLS 入口验证公共 API 与离线检索降级", "启动后执行健康、文件、聊天和审计业务链并复核其他应用指纹"],
+      "expected_results": ["主机规格或共享资源余量不足时阻断", "无公网数据依赖且镜像/病毒库清单完整，启动统一使用 --pull never --no-build", "稳态上限不超过 4.80 vCPU / 8.75 GiB，一次性任务具备资源和 PID 限制", "只有 /api/v1/public/* 直达 FastAPI，离线问答不伪造模型能力", "存储水位、优雅停机与无 down 回滚策略有效", "目标机完整业务链留存可追溯证据且同机其他应用没有变化"],
+      "evidence": [
+        {"kind": "config", "path": "deploy/tencent/compose.offline.yml", "contains": ["heyi-kb-offline", "cpus: 1.25", "mem_limit: 1536m", "pull_policy: never", "clamd:", "read_only: true"]},
+        {"kind": "documentation", "path": "docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md", "contains": ["8 vCPU、16 GB RAM、300 GB SSD", "目标文件系统必须至少有 240 GB 可用空间", "只有退出码 0 才能继续部署", "4.80 vCPU / 8.75 GiB", "--pull never --no-build", "/api/v1/public/*", "回滚时不执行 `down`"]},
+        {"kind": "automated_test", "path": "tests/test_host_preflight.py", "contains": ["test_exact_linux_host_thresholds_pass", "test_non_linux_environment_is_blocked_even_when_capacity_is_sufficient"], "runner": "backend-functional", "status": "active"},
+        {"kind": "automated_test", "path": "tests/test_offline_compose.py", "contains": ["test_offline_stack_reserves_cpu_and_graceful_shutdown_budget", "test_offline_one_shot_services_have_bounded_resources_and_processes", "test_offline_application_images_are_preloaded_and_never_built_or_pulled", "test_offline_clamd_is_private_fail_closed_and_required_by_maintenance", "test_offline_public_api_is_routed_before_the_web_fallback", "test_offline_deployment_documentation_matches_the_enforced_release_boundary"], "runner": "backend-functional", "status": "active"}
+      ]
+    }
+  ],
+  "test_commands": [
+    {
+      "id": "backend-functional",
+      "cwd": ".",
+      "command": [
+        "uv", "run", "pytest", "-rA",
+        "tests/test_integration_api.py::test_admin_role_user_and_refresh_workflow",
+        "tests/test_integration_api.py::test_single_upload_approval_and_download_workflow",
+        "tests/test_integration_api.py::test_malware_scan_failures_remain_quarantined_and_inaccessible",
+        "tests/test_integration_api.py::test_file_approval_follows_latest_okf_job_state",
+        "tests/test_integration_api.py::test_multipart_upload_signs_batches_and_completes",
+        "tests/test_integration_api.py::test_readiness_uses_database_and_redis",
+        "tests/test_integration_api.py::test_knowledge_base_chat_demo_and_acl_boundaries",
+        "tests/test_integration_api.py::test_revoked_knowledge_grant_removes_file_and_upload_access",
+        "tests/test_integration_api.py::test_scoped_api_key_lifecycle_and_public_endpoints",
+        "tests/test_integration_api.py::test_non_superuser_cannot_issue_api_key_for_another_account",
+        "tests/test_integration_api.py::test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed",
+        "tests/test_integration_api.py::test_chat_generation_requires_kb_opt_in_and_reports_selected_model",
+        "tests/test_integration_api.py::test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key",
+        "tests/test_role_policy.py", "tests/test_domain_access.py", "tests/test_domain_quota.py",
+        "tests/test_okf_conversion.py", "tests/test_chat_answer_review.py", "tests/test_chat_presentation.py",
+        "tests/test_audit_logs_api.py", "tests/test_audit_result_persistence.py",
+        "tests/test_api_contract.py::test_liveness_endpoint_does_not_require_dependencies",
+        "tests/test_api_contract.py::test_readiness_rejects_database_schema_drift",
+        "tests/test_host_preflight.py", "tests/test_offline_compose.py",
+        "tests/test_document_parser.py", "tests/test_document_parser_preflight.py",
+        "tests/test_okf_document_pipeline.py"
+      ],
+      "covers": ["FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-KB-ACL-001", "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001", "FUNC-AUDIT-001", "FUNC-HEALTH-001", "FUNC-FORMAT-001", "FUNC-OFFLINE-001"],
+      "framework": "pytest",
+      "required_test_nodes": [
+        "tests/test_integration_api.py::test_admin_role_user_and_refresh_workflow",
+        "tests/test_integration_api.py::test_single_upload_approval_and_download_workflow",
+        "tests/test_integration_api.py::test_malware_scan_failures_remain_quarantined_and_inaccessible",
+        "tests/test_integration_api.py::test_file_approval_follows_latest_okf_job_state",
+        "tests/test_integration_api.py::test_multipart_upload_signs_batches_and_completes",
+        "tests/test_integration_api.py::test_readiness_uses_database_and_redis",
+        "tests/test_integration_api.py::test_knowledge_base_chat_demo_and_acl_boundaries",
+        "tests/test_integration_api.py::test_revoked_knowledge_grant_removes_file_and_upload_access",
+        "tests/test_integration_api.py::test_scoped_api_key_lifecycle_and_public_endpoints",
+        "tests/test_integration_api.py::test_non_superuser_cannot_issue_api_key_for_another_account",
+        "tests/test_integration_api.py::test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed",
+        "tests/test_integration_api.py::test_chat_generation_requires_kb_opt_in_and_reports_selected_model",
+        "tests/test_integration_api.py::test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key",
+        "tests/test_role_policy.py",
+        "tests/test_domain_access.py",
+        "tests/test_domain_quota.py",
+        "tests/test_okf_conversion.py",
+        "tests/test_chat_answer_review.py",
+        "tests/test_chat_presentation.py",
+        "tests/test_audit_logs_api.py",
+        "tests/test_audit_result_persistence.py",
+        "tests/test_api_contract.py::test_liveness_endpoint_does_not_require_dependencies",
+        "tests/test_api_contract.py::test_readiness_rejects_database_schema_drift",
+        "tests/test_host_preflight.py",
+        "tests/test_offline_compose.py",
+        "tests/test_document_parser.py",
+        "tests/test_document_parser_preflight.py",
+        "tests/test_okf_document_pipeline.py"
+      ],
+      "minimum_passed_tests": 145,
+      "forbid_skips": true,
+      "timeout_seconds": 600
+    },
+    {
+      "id": "frontend-functional",
+      "cwd": "web",
+      "command": [
+        "npm", "test", "--",
+        "tests/access-routing.test.ts", "tests/login-route.test.ts", "tests/workspace-guard.test.ts",
+        "tests/role-policy.test.ts", "tests/chat-contract.test.ts", "tests/chat-sources.test.ts",
+        "tests/chat-data-table.test.ts", "tests/model-settings.test.ts", "tests/api-usage-examples.test.ts",
+        "tests/error-reporting.test.ts", "tests/access-provider.test.ts", "tests/chat-service-status.test.ts",
+        "tests/file-knowledge-status.test.ts"
+      ],
+      "covers": ["FUNC-AUTH-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001", "FUNC-UXSTATE-001"],
+      "framework": "vitest",
+      "required_test_nodes": [
+        "tests/access-routing.test.ts",
+        "tests/login-route.test.ts",
+        "tests/workspace-guard.test.ts",
+        "tests/role-policy.test.ts",
+        "tests/chat-contract.test.ts",
+        "tests/chat-sources.test.ts",
+        "tests/chat-data-table.test.ts",
+        "tests/model-settings.test.ts",
+        "tests/api-usage-examples.test.ts",
+        "tests/error-reporting.test.ts",
+        "tests/access-provider.test.ts",
+        "tests/chat-service-status.test.ts",
+        "tests/file-knowledge-status.test.ts"
+      ],
+      "minimum_passed_tests": 78,
+      "forbid_skips": true,
+      "timeout_seconds": 300
+    }
+  ],
+  "external_evidence": [
+    {
+      "id": "EXT-BROWSER-E2E-001",
+      "title": "真实浏览器完整业务链",
+      "severity": "P0",
+      "required_for": "runtime-functional",
+      "path": "artifacts/acceptance/functional/browser-e2e.json",
+      "required_checks": ["login_role_routing", "account_lifecycle", "knowledge_acl", "file_upload_scan_okf_approval_download", "chat_citations_audit_table", "model_switch", "api_key_lifecycle", "error_loading_states"],
+      "evidence_schema_version": 2,
+      "collector": {"id": "heyi-browser-e2e", "version": "1.0.0"},
+      "max_age_seconds": 86400
+    },
+    {
+      "id": "EXT-LINUX-HOST-001",
+      "title": "通用 Linux 目标机离线验收",
+      "severity": "P0",
+      "required_for": "runtime-functional",
+      "path": "artifacts/acceptance/functional/linux-host.json",
+      "required_checks": ["linux_amd64", "cpu_8", "memory_16g", "filesystem_300g", "free_space_240g", "offline_images", "clamav_database", "health_readiness", "business_smoke"],
+      "evidence_schema_version": 2,
+      "collector": {"id": "heyi-linux-host", "version": "1.0.0"},
+      "max_age_seconds": 86400
+    }
+  ]
+}

@@ -34,9 +34,9 @@
   ·
   <a href="docs/VERCEL_DEPLOYMENT.zh-CN.md">Vercel 部署</a>
   ·
-  <a href="docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md">腾讯云共享部署</a>
+  <a href="docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md">其他云共享部署基线</a>
   ·
-  <a href="docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md">腾讯云离线企业部署</a>
+  <a href="docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md">其他云 Linux 离线部署</a>
   ·
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
   ·
@@ -50,7 +50,10 @@
 </p>
 
 > [!IMPORTANT]
-> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传、第一阶段 OKF 知识编译，以及基于授权文本检索的生成式问答。每个成功回答都返回服务端编号的结构化来源，并经过引用完整性与生成后语义审核；模型漏引、越界引用、伪造来源、无依据陈述，或审核服务异常时都会丢弃模型文本并降级为确定性检索回答。自动转换目前仅处理管理员显式授权知识库中的 UTF-8 `.txt/.csv`，产物先进入草稿，源文件审批后才发布；Office/PDF 沙箱解析和混合向量检索仍属于后续阶段。
+> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传、九类文档的失败关闭解析链、OKF 知识编译，以及基于授权文本检索的生成式问答。TXT、CSV、DOCX、XLSX、PPTX 使用内建有界解析；PDF 与 DOC/XLS/PPT 必须在包含固定版本 Poppler、LibreOffice、bubblewrap 与 `prlimit` 的 Linux 镜像中通过 `--require-all` 门禁。任一外部工具或沙箱能力缺失时均为 `BLOCKED`，不得声称全格式可用。每个成功回答都返回结构化来源并经过引用完整性与生成后语义审核；失败时丢弃模型文本并降级为确定性检索回答。
+
+> [!WARNING]
+> “其他云 Linux 离线部署”使用 `isolated` 配置，固定 `KB_EXTERNAL_LLM_ENABLED=false`，运行时不会调用 DeepSeek、Qwen 或 MiniMax；管理界面可以保存模型选择，但不等于离线环境已具备外部推理能力。单台 Linux 8 核 / 16 GB / 300 GB SSD 仅是当前离线部署基线，尚无证据证明它能承载“每日 50 亿 token”。正式性能结论必须以目标机上预先批准的吞吐、延迟、错误率与磁盘阈值，以及可复核的压测证据为准；在这些材料齐备前，性能验收状态为 `BLOCKED`。
 
 ## 项目定位
 
@@ -84,7 +87,7 @@
 > Demo 的真实可用状态以 `/health/ready` 为准；生产密钥只保存在 Vercel Sensitive Environment Variables 中，不进入仓库。
 
 > [!NOTE]
-> Web 与 API 的 Vercel Functions 已固定到美国东部（华盛顿特区）`iad1`。静态资源仍由 Vercel 全球 CDN 就近分发；为避免跨区域访问，PostgreSQL 与 Redis 宜部署在美国东部或邻近区域。腾讯 COS 仍由浏览器直传，不经过 Vercel Function；此 Vercel 区域设置不会修改或重启腾讯云部署。
+> Web 与 API 的 Vercel Functions 已固定到美国东部（华盛顿特区）`iad1`。静态资源仍由 Vercel 全球 CDN 就近分发；为避免跨区域访问，PostgreSQL 与 Redis 宜部署在美国东部或邻近区域。对象存储仍由浏览器直传，不经过 Vercel Function；此 Vercel 区域设置不会修改或重启“其他云 Linux 8C16G300G”离线部署。
 
 ## 系统架构
 
@@ -152,7 +155,7 @@ sequenceDiagram
     A->>D: 创建幂等 OKF 转换任务
     Note over D: 仅管理员已开启外部模型处理时执行
     W->>D: 带 lease_id 领取任务
-    W->>O: 有界读取 UTF-8 TXT/CSV
+    W->>O: 九类文档有界读取与隔离解析
     W->>L: JSON Output 请求
     L-->>W: JSON 响应
     W->>D: schema 校验后写入 DRAFT
@@ -170,7 +173,7 @@ sequenceDiagram
 | 统一登录工作台 | 单一登录入口、RSC 输出前 `/auth/me` 会话与权限守卫、管理员/编辑者/问答用户自动落地、HttpOnly Cookie BFF 与刷新 single-flight |
 | 动态 RBAC | 自定义角色、权限目录、角色优先级、角色分配、通配权限与最后一个超级管理员保护 |
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
-| OKF Phase 1 | 上传后持久任务、DeepSeek JSON Output、严格 schema 校验、租约防竞态、指数退避、草稿/发布门禁 |
+| 文档解析与 OKF | TXT/CSV/OOXML 内建解析；PDF/旧版 Office 断网沙箱；来源定位、持久任务、严格 schema、租约、草稿/发布门禁 |
 | 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；审计只记录文档 ID、模型、策略版本与 token 用量，不记录正文 |
 | 强制来源与回答审核 | 授权检索与可选 RAG；正文来源脚注、结构化 `citations`、`source_status` 与 `answer_review`；引用或语义审核失败时自动降级 |
 | 分级限额 | 每分钟请求数、单文件大小、每日上传字节、总存储字节、每日下载凭证 |
@@ -179,7 +182,7 @@ sequenceDiagram
 | 对象安全 | 私有 Bucket、短期预签名 URL、精确 `Content-Length`、单 PUT SHA-256 强校验、staging/final key 隔离 |
 | 恢复与维护 | 上传状态机、`FINALIZING` 对账、过期会话与 reservation 清理、Vercel Cron |
 | 审计 | 用户、角色、上传、审批和下载凭证等安全事件持久化 |
-| 部署 | Docker Compose 本地栈、Alembic、幂等 Bootstrap、Vercel Functions、腾讯 COS |
+| 部署 | Docker Compose 本地栈、Alembic、幂等 Bootstrap、Vercel Functions、S3-compatible 对象存储、其他云 Linux 离线单机 |
 
 ### 权限与限额语义
 
@@ -208,9 +211,9 @@ sequenceDiagram
 | 元数据 | PostgreSQL 17 / Supabase | RBAC、配额、文件状态、Refresh Token 和审计 |
 | 短时状态 | Redis 8 + Lua | 登录与业务接口的分布式原子限流 |
 | 对象存储 | 腾讯 COS、AWS S3、MinIO | 私有文件、Multipart 与预签名访问 |
-| 本地编排 | Docker Compose | PostgreSQL、Redis、MinIO、迁移、Bootstrap 和 API |
+| 本地编排 | Docker Compose | PostgreSQL、Redis、MinIO、ClamAV、Migration、Bootstrap、FastAPI API/Maintenance、Next.js Web 与 Caddy |
 | Serverless | Vercel Functions + Cron | 无状态控制面与周期维护 |
-| 知识编译 | DeepSeek API、httpx、Pydantic | UTF-8 文本到 OKF v0.1 草稿、重试、审计与发布门禁 |
+| 文档与知识编译 | defusedxml、Poppler、LibreOffice、bubblewrap、DeepSeek/Qwen/MiniMax | 九类文档有界解析、来源定位、OKF 草稿、重试、审计与发布门禁 |
 | 工程质量 | uv、pytest、Ruff、mypy strict | 可复现依赖、测试、Lint 与静态类型检查 |
 
 ## 快速开始
@@ -295,7 +298,7 @@ KB_OKF_CONVERSION_BATCH_SIZE=5
 KB_OKF_CONVERSION_TIME_BUDGET_SECONDS=50
 ```
 
-后台可在三家供应商间切换默认模型；新聊天和 OKF 转换任务会使用该选择。随后仍须由知识库 Manager 在“知识空间”中显式开启外部 LLM 处理，未授权的知识库不会把正文发送给第三方。第一阶段只读取不超过配置上限的 UTF-8 `.txt/.csv`；其他格式会安全标记为 `unsupported/parser_required`，等待后续隔离解析 Worker。任务使用数据库持久化、`lease_id` 所有权、有限重试与时间预算，转换成功只生成 `draft`，批准源文件后才发布。
+后台可在三家供应商间切换默认模型；新聊天和 OKF 转换任务会使用该选择。随后仍须由知识库 Manager 在“知识空间”中显式开启外部 LLM 处理，未授权的知识库不会把正文发送给第三方。转换链支持 `.txt/.doc/.docx/.xls/.xlsx/.csv/.pdf/.ppt/.pptx`；其中 PDF 与旧版 Office 依赖 Linux 隔离工具，能力缺失时安全标记为 `parser_required`，不会伪装成功。任务使用数据库持久化、`lease_id` 所有权、有限重试与时间预算，转换成功只生成 `draft`，批准源文件后才发布。
 
 如使用 Qwen 工作空间专属地址，必须把精确主机名加入 `KB_QWEN_ALLOWED_WORKSPACE_HOSTS` JSON 数组；通配符、协议、路径和端口都会被拒绝，防止供应商密钥被发送到非预期主机。
 
@@ -361,6 +364,8 @@ Authorization: Bearer <access-token>
 │   ├── schemas/         # Pydantic 请求/响应模型
 │   └── services/        # Access、Quota、Storage、Audit、Rate Limit
 ├── alembic/             # PostgreSQL Schema migration
+├── deploy/tencent/      # 其他云 Linux 离线编排、预检、Caddy 与环境变量模板（历史目录名）
+├── docker/clamav/       # ClamAV 配置、离线病毒库预检与最小权限边界
 ├── docker/minio/        # Bucket、应用账号、CORS 与 Multipart 清理
 ├── docs/                # 架构、运维和 Vercel 部署文档
 ├── scripts/             # 本地启动与可恢复上传 CLI
@@ -378,6 +383,7 @@ uv sync --extra dev
 .\.venv\Scripts\python.exe -m pytest --cov=app --cov-report=term-missing -q
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m mypy app scripts
+.\.venv\Scripts\python.exe -m app.document_parser_preflight --require-all
 cd web
 npm test
 npm run lint
@@ -393,7 +399,10 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时的本地验收结果：**131 backend tests + 142 frontend tests passed，branch coverage 84.48%，Ruff clean，mypy strict passed，npm audit 0 vulnerabilities，TypeScript/ESLint/Next.js production build passed**。同一组门禁已写入 GitHub Actions，并额外在 PostgreSQL 17 与 Redis 8 service 上验证 Alembic 能升级到唯一 head。
+本 README 更新时已完成冻结依赖、断网模式的全量本地质量门禁：**后端 531 项通过、18 项按环境条件跳过、覆盖率 85.00%（门槛 80%）；前端 183 项通过**，Ruff、mypy、ESLint、TypeScript 与 Next.js production build 全部通过。Playwright 企业档案已收集 8 项业务检查的桌面/移动场景及 2 项失败关闭预检；未在真实预生产拓扑运行前，浏览器证据与最终交付结论仍为 `BLOCKED`。
+
+> [!CAUTION]
+> 功能测试通过不等于容量认证通过。目标机性能门禁还需要项目方批准的验收阈值和同机压测产物；仓库当前不把单机 8C16G300G、1,000 人并发或每日 50 亿 token 写成已验证能力。
 
 ## 部署到 Vercel
 
@@ -414,7 +423,7 @@ npm run build
 当前 Vercel 项目使用 Hobby 兼容的每日 Cron 做 OKF 漏单对账。若要求上传后近实时转换，应升级 Pro/Enterprise 后使用每分钟 Cron，或用 Upstash QStash、Vercel Queue、独立 Worker 承担即时消费。
 
 > [!WARNING]
-> `iad1` 是美国华盛顿特区节点，不是中国大陆节点，也不提供中国大陆 ICP 备案能力。它适合当前演示和海外 Serverless 架构；若系统要作为中国大陆公司正式生产服务，应继续使用独立的腾讯云境内部署，并评估 ICP 备案、数据跨境与等保要求。Vercel Hobby 仅适合非商业用途，公司正式生产需要使用合适的付费计划。
+> `iad1` 是美国华盛顿特区节点，不是中国大陆节点，也不提供中国大陆 ICP 备案能力。它适合当前演示和海外 Serverless 架构；若系统要作为中国大陆公司正式生产服务，应使用独立的其他云 Linux 境内部署，并评估 ICP 备案、数据跨境与等保要求。Vercel Hobby 仅适合非商业用途，公司正式生产需要使用合适的付费计划。
 
 完整变量映射、腾讯 COS virtual-host addressing、Supabase、Cron 和迁移顺序见：
 
@@ -422,6 +431,58 @@ npm run build
 
 > [!CAUTION]
 > 不要把 `.env` 提交到 Git，也不要把 Supabase service-role key、COS 永久密钥或 Bootstrap 密码暴露给浏览器。Vercel 生产密钥应使用 Sensitive Environment Variables，并按 Production 范围隔离。
+
+## 其他云 Linux 离线企业部署
+
+离线配置面向不允许业务数据出网的单机企业环境。所有业务依赖都由项目专属 Docker Compose 编排：PostgreSQL 保存事实数据，Redis 执行限流，MinIO 保存私有对象，ClamAV 执行恶意文件扫描，FastAPI API 提供控制面，Maintenance 持续处理扫描、转换与对账，Next.js Web 提供统一工作台，Caddy 负责 TLS 入口和对象访问。Migration、Bootstrap、MinIO 初始化与病毒库预检均为部署期任务，不作为常驻业务服务。
+
+```mermaid
+flowchart LR
+    Client["企业内网客户端"] --> Caddy["Caddy\n唯一宿主机入口"]
+
+    subgraph Edge["edge · 172.30.242.0/24"]
+        Caddy
+    end
+
+    subgraph Frontend["frontend · 172.30.240.0/24 · internal"]
+        Web["Next.js Web"]
+        API["FastAPI API"]
+        MinIO["MinIO 对象存储"]
+    end
+
+    subgraph Backend["backend · 172.30.241.0/24 · internal"]
+        PostgreSQL[("PostgreSQL")]
+        Redis[("Redis")]
+        ClamAV["ClamAV"]
+        Maintenance["Maintenance"]
+    end
+
+    Caddy --> Web
+    Caddy --> MinIO
+    Web --> API
+    API --> PostgreSQL
+    API --> Redis
+    API --> MinIO
+    Maintenance --> PostgreSQL
+    Maintenance --> Redis
+    Maintenance --> MinIO
+    Maintenance --> ClamAV
+```
+
+| 隔离层 | 连接范围 | 强制约束 |
+|---|---|---|
+| `edge` | 仅 Caddy 接入 | 唯一非 `internal` 网络；只有 Caddy 发布 HTTPS 端口，部署前检查固定 CIDR 不与宿主机路由重叠 |
+| `frontend` | Caddy、Web、API、MinIO | Docker `internal` 网络；支持 BFF 回源与对象反向代理，业务容器不直接发布宿主机端口 |
+| `backend` | API、Maintenance、PostgreSQL、Redis、MinIO、ClamAV 及部署期任务 | Docker `internal` 网络；数据库、缓存、扫描服务和 MinIO 原生端口均不对宿主机开放 |
+
+关键失败关闭条件：
+
+- `KB_TRUSTED_HOSTS` 必须严格等于 `["<KB_PUBLIC_HOST>","api"]`：公共 Host 用于浏览器和健康检查，内部 `api` Host 仅用于 Next.js BFF 回源；多余 Host 或漏掉 `api` 都会被预检拒绝；
+- API 健康检查连接 `127.0.0.1:8000/health/ready`，同时显式发送公共 `Host`，避免绕过 Trusted Host，也避免把合法探针误判为 `400`；
+- ClamAV 病毒库以只读方式挂载，部署前验证 root 所有权、daemon 可读、时效性与引擎兼容性；`clamd` 先 `cap_drop: ALL`，仅补回切换到 `User clamav` 所需的 `SETGID`、`SETUID`，并启用 `no-new-privileges`；
+- 离线镜像使用固定 digest 且 `pull_policy: never`，外部 LLM 固定关闭。任何镜像、病毒库、网络 CIDR、解析器或主机容量门禁失败都必须停止上线。
+
+完整的准备、预检、迁移、启动、验收与回滚流程见 [其他云 Linux 8C16G 离线部署手册](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。
 
 ## 安全边界
 
@@ -435,15 +496,18 @@ npm run build
 - 私有对象、短期签名、精确大小校验、不可复用最终写 key；
 - 单 PUT SHA-256 绑定签名并恒定时间校验，摘要不匹配时删除对象并释放配额；
 - OKF 草稿/发布门禁、知识库级外部模型 opt-in 与转换租约所有权；
+- 九类文档解析能力矩阵、OOXML 主动内容/Zip Bomb 拒绝，以及 PDF/旧版 Office 断网沙箱与资源上限；
+- 离线部署三网络隔离、固定 Trusted Host/健康检查 Host、固定镜像 digest，以及 ClamAV 只读病毒库和最小进程权限；
 - PostgreSQL 原子配额预留与持久审计。
 
 正式对外前仍必须补齐：
 
-- 恶意软件扫描、MIME/魔数验证与沙箱解析；
+- 真实目标机恶意软件全链路、MIME/魔数黄金集与解析沙箱运行证据；
 - PostgreSQL HA/PITR、Redis HA、对象版本化与恢复演练；
 - 指标、Trace、集中日志和审计防篡改归档；
 - 全量孤儿对象对账、文件保留/删除及法律保全流程；
 - 企业 OIDC/MFA 与数据库最小权限身份。
+- 目标机容量阈值审批，以及吞吐、延迟、错误率、磁盘性能和长稳压测证据；单机 8C16G300G 与每日 50 亿 token 不属于当前已认证能力。
 
 ## Roadmap
 
@@ -455,10 +519,10 @@ npm run build
 - [x] 登录、聊天、知识库、账号、角色、权限与限额管理前端
 - [x] 知识库 Reader/Editor/Manager 动态 ACL 与撤权回归
 - [x] OKF v0.1 兼容字段与原始来源/派生知识分层
-- [x] DeepSeek 自动编译 UTF-8 TXT/CSV、持久任务、租约、重试、草稿审批发布
+- [x] 九类文档失败关闭解析、来源定位、持久任务、租约、重试、草稿审批发布
 - [x] PostgreSQL `pg_trgm` GIN 多语言检索索引与数据库侧有界摘要
-- [ ] 恶意软件扫描与隔离解析 Worker
-- [ ] Office/PDF/CSV 文本抽取与版本化分块
+- [x] ClamAV 隔离扫描状态机与 Office/PDF 隔离解析代码路径
+- [ ] 在真实其他云 Linux 8C16G300G 目标机完成九类格式、ClamAV 与沙箱运行证据
 - [x] 授权全文检索、可选生成式 RAG、强制来源协议、生成后语义审核与确定性降级
 - [ ] 混合向量索引、重排、独立审核模型与离线引用蕴含评测
 - [ ] OKF Bundle 导入/导出、校验器与知识图谱视图
@@ -470,7 +534,9 @@ npm run build
 - [架构设计](docs/ARCHITECTURE.zh-CN.md)：系统边界、数据库模式、RBAC、配额、状态机与 10 TB+ 拓扑；
 - [运维手册](docs/OPERATIONS.zh-CN.md)：部署、备份、恢复、扩容、告警与排障；
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
-- [腾讯云共享服务器应用部署基线](docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)：跨应用隔离、端口登记、国内构建、最小权限、上线检查与回滚。
+- [其他云共享服务器应用部署基线（历史文件名）](docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)：跨应用隔离、端口登记、国内构建、最小权限、上线检查与回滚。
+- [其他云 Linux 8C16G 离线部署（历史文件名）](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)：本地 PostgreSQL、Redis、MinIO、镜像清单、格式门禁与目标机验收。
+- [文档解析能力与安全边界](docs/DOCUMENT_PARSER_SECURITY.zh-CN.md)：九类格式矩阵、来源定位、隔离工具和失败关闭语义。
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
 - [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。

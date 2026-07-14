@@ -210,6 +210,12 @@ jobs:
           uv sync --frozen --extra dev
           npm ci --prefix web --no-audit --no-fund
 
+      - name: Install document parser sandbox tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bubblewrap libreoffice-nogui poppler-utils procps
+
       - name: Run enterprise acceptance profile
         run: >-
           uv run --frozen python scripts/acceptance.py

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import time
 from datetime import UTC, datetime
-from ipaddress import ip_address
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -13,6 +11,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from redis.asyncio import Redis
 from sqlalchemy import select
 
+from app.api.client_ip import request_client_ip
 from app.api.dependencies import (
     DatabaseSession,
     get_access_context,
@@ -28,89 +27,10 @@ from app.core.time import as_utc
 from app.db.models import RefreshToken, User, UserStatus
 from app.schemas.auth import AuthMe, RefreshRequest, TokenPair
 from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.audit import AuditResult, add_audit_event
 from app.services.rate_limit import RateLimiter
 
 router = APIRouter()
-
-_BFF_CLIENT_IP_WINDOW_SECONDS = 60
-_BFF_CLIENT_IP_HEADERS = (
-    "x-kb-client-ip",
-    "x-kb-client-timestamp",
-    "x-kb-client-signature",
-)
-
-
-def _normalized_ip(value: str | None) -> str | None:
-    if value is None or not value or value != value.strip() or len(value) > 64 or "%" in value:
-        return None
-    try:
-        return str(ip_address(value))
-    except ValueError:
-        return None
-
-
-def _verified_bff_client_ip(request: Request, settings: Settings) -> str | None:
-    client_ip = request.headers.get(_BFF_CLIENT_IP_HEADERS[0])
-    timestamp = request.headers.get(_BFF_CLIENT_IP_HEADERS[1])
-    signature = request.headers.get(_BFF_CLIENT_IP_HEADERS[2])
-    if client_ip is None or timestamp is None or signature is None:
-        return None
-
-    secret = (
-        settings.bff_shared_secret.get_secret_value()
-        if settings.bff_shared_secret is not None
-        else ""
-    )
-    normalized_ip = _normalized_ip(client_ip)
-    if not secret or normalized_ip is None:
-        return None
-    if (
-        not timestamp.isascii()
-        or not timestamp.isdigit()
-        or len(timestamp) > 20
-        or str(int(timestamp)) != timestamp
-    ):
-        return None
-    timestamp_value = int(timestamp)
-    if abs(int(time.time()) - timestamp_value) > _BFF_CLIENT_IP_WINDOW_SECONDS:
-        return None
-    if len(signature) != 64 or any(character not in "0123456789abcdef" for character in signature):
-        return None
-
-    canonical = f"v1\n{timestamp}\n{client_ip}".encode()
-    expected = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return None
-    return normalized_ip
-
-
-def _auth_client_ip(request: Request, settings: Settings) -> str:
-    peer_ip = request.client.host if request.client else "unknown"
-    bff_secret_configured = bool(
-        settings.bff_shared_secret is not None
-        and settings.bff_shared_secret.get_secret_value()
-    )
-    signed_headers_present = any(
-        request.headers.get(name) is not None for name in _BFF_CLIENT_IP_HEADERS
-    )
-    if bff_secret_configured and signed_headers_present:
-        verified_ip = _verified_bff_client_ip(request, settings)
-        if verified_ip is None:
-            raise ApiError(
-                status_code=400,
-                code="invalid_bff_signature",
-                message="BFF client IP signature is invalid or expired",
-            )
-        return verified_ip
-
-    if settings.serverless:
-        for header in ("x-vercel-forwarded-for", "x-forwarded-for"):
-            forwarded_ip = _normalized_ip(request.headers.get(header))
-            if forwarded_ip is not None:
-                return forwarded_ip
-    return peer_ip
-
 
 @router.get("/me", response_model=AuthMe)
 async def current_session(
@@ -196,7 +116,7 @@ async def login(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenPair:
     email = form.username.strip().lower()
-    client_ip = _auth_client_ip(request, settings)
+    client_ip = request_client_ip(request, settings)
     await _check_auth_rate_limit(
         redis=redis,
         key=f"auth:login:ip:{client_ip}",
@@ -215,6 +135,7 @@ async def login(
         add_audit_event(
             session,
             action="auth.login.denied",
+            result=AuditResult.DENIED,
             resource_type="user",
             request_id=getattr(request.state, "request_id", None),
             ip_address=request.client.host if request.client else None,
@@ -234,6 +155,7 @@ async def login(
     add_audit_event(
         session,
         action="auth.login.succeeded",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         actor_id=user.id,
@@ -256,7 +178,7 @@ async def refresh_tokens(
     redis: Annotated[Redis, Depends(redis_dependency)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenPair:
-    client_ip = _auth_client_ip(request, settings)
+    client_ip = request_client_ip(request, settings)
     await _check_auth_rate_limit(
         redis=redis,
         key=f"auth:refresh:ip:{client_ip}",
@@ -307,6 +229,7 @@ async def refresh_tokens(
             add_audit_event(
                 session,
                 action="auth.token.reuse_detected",
+                result=AuditResult.DENIED,
                 resource_type="refresh_token_family",
                 resource_id=str(record.family_id),
                 actor_id=user.id,
@@ -347,6 +270,7 @@ async def refresh_tokens(
     add_audit_event(
         session,
         action="auth.token.refreshed",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         actor_id=user.id,
@@ -389,6 +313,7 @@ async def logout(
         add_audit_event(
             session,
             action="auth.logout.succeeded",
+            result=AuditResult.SUCCESS,
             resource_type="user",
             resource_id=str(record.user_id),
             actor_id=record.user_id,

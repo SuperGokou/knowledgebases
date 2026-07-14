@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, Request
 
 from app.api.dependencies import DatabaseSession, require_api_key_permission
 from app.api.errors import ApiError
@@ -20,11 +20,16 @@ router = APIRouter()
 @router.post("/chat/query", response_model=ChatQueryResponse)
 async def query_chat_with_api_key(
     payload: ChatQueryRequest,
+    request: Request,
     session: DatabaseSession,
     key_access: Annotated[
         ApiKeyAccess, Depends(require_api_key_permission("chat:query"))
     ],
     settings: Annotated[Settings, Depends(get_settings)],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", min_length=1, max_length=160),
+    ] = None,
 ) -> ChatQueryResponse:
     _require_key_knowledge_scope(key_access, payload.knowledge_base_id)
     return await answer_knowledge_query(
@@ -34,6 +39,8 @@ async def query_chat_with_api_key(
         knowledge_base_id=payload.knowledge_base_id,
         message=payload.message,
         limit=payload.limit,
+        idempotency_key=idempotency_key or str(request.state.request_id),
+        api_key_id=key_access.api_key.id,
     )
 
 

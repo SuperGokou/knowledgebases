@@ -121,8 +121,10 @@ export async function sessionView(): Promise<{ authenticated: boolean; email?: s
 }
 
 export function hasSameOrigin(request: NextRequest): boolean {
+  const production = process.env.NODE_ENV === "production";
   return isSameOriginRequest(request.headers, {
-    production: process.env.NODE_ENV === "production",
-    requestProtocol: request.nextUrl.protocol,
+    production,
+    trustedOrigin: process.env.KB_PUBLIC_ORIGIN?.trim()
+      || (production ? undefined : request.nextUrl.origin),
   });
 }

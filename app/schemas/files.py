@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.db.models import (
     FileStatus,
     KnowledgeIngestionStatus,
+    MalwareScanStatus,
     OkfConversionStatus,
     UploadSessionStatus,
 )
@@ -100,6 +101,11 @@ class FileRead(BaseModel):
     status: FileStatus
     knowledge_status: KnowledgeIngestionStatus
     knowledge_error_code: str | None
+    malware_scan_status: MalwareScanStatus
+    malware_signature: str | None
+    malware_scan_error_code: str | None
+    malware_scan_started_at: datetime | None
+    malware_scanned_at: datetime | None
     searchable: bool = False
     custom_metadata: dict[str, Any]
     created_at: datetime

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -30,7 +32,12 @@ from app.db.models import (
     KnowledgeEntryPublicationStatus,
     KnowledgeIngestionStatus,
     LimitDefinition,
+    LlmBudgetPolicy,
+    LlmModelPrice,
     LlmProviderConfig,
+    LlmUsageRecord,
+    LlmUsageStatus,
+    MalwareScanStatus,
     OkfConversionJob,
     OkfConversionStatus,
     Permission,
@@ -48,10 +55,12 @@ from app.db.models import (
 from app.db.schema_version import EXPECTED_ALEMBIC_HEADS
 from app.db.session import get_db
 from app.main import app
-from app.maintenance import cleanup_expired_uploads
+from app.maintenance import cleanup_expired_uploads, process_malware_scan_batch
 from app.services.llm_provider import LlmChatResult, LlmProviderError
 from app.services.llm_settings import LlmConfigurationError
+from app.services.malware_scanner import ScanResult, ScanVerdict
 from app.services.storage import InitiatedStorageUpload, PresignedPart, StoredObject
+from app.services.storage_capacity import FilesystemCapacity
 
 
 class FakeRedis:
@@ -73,6 +82,8 @@ class FakeStorage:
     completed_uploads: list[str] = field(default_factory=list)
     deleted_keys: list[str] = field(default_factory=list)
     promoted_keys: list[tuple[str, str]] = field(default_factory=list)
+    sealed_keys: list[tuple[str, str]] = field(default_factory=list)
+    object_bytes: bytes = b"clean test object"
 
     async def initiate(self, **kwargs: Any) -> InitiatedStorageUpload:
         key = str(kwargs["key"])
@@ -134,14 +145,37 @@ class FakeStorage:
     async def delete(self, *, key: str) -> None:
         self.deleted_keys.append(key)
 
-    async def promote(self, *, source_key: str, destination_key: str) -> StoredObject:
+    async def seal_single_upload(self, *, key: str, upload_session_id: str) -> None:
+        self.sealed_keys.append((key, upload_session_id))
+
+    async def promote(
+        self,
+        *,
+        source_key: str,
+        destination_key: str,
+        upload_session_id: str,
+    ) -> StoredObject:
         self.promoted_keys.append((source_key, destination_key))
         self.initiated_keys.append(destination_key)
-        self.deleted_keys.append(source_key)
+        await self.seal_single_upload(
+            key=source_key,
+            upload_session_id=upload_session_id,
+        )
         return await self.head(key=destination_key)
+
+    async def iter_chunks(self, *, key: str, chunk_size: int) -> Any:
+        assert key in self.initiated_keys
+        for offset in range(0, len(self.object_bytes), chunk_size):
+            yield self.object_bytes[offset : offset + chunk_size]
 
     def presign_download(self, *, key: str, filename: str) -> str:
         return f"http://storage.local/download/{key}?filename={filename}"
+
+
+class FakeCleanScanner:
+    async def scan(self, chunks: Any) -> ScanResult:
+        assert [chunk async for chunk in chunks]
+        return ScanResult(verdict=ScanVerdict.CLEAN)
 
 
 @dataclass
@@ -417,13 +451,60 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
         json={"parts": []},
     )
     assert completed.status_code == 200, completed.text
-    assert completed.json()["status"] == "processing"
+    assert completed.json()["status"] == "quarantined"
+    assert completed.json()["malware_scan_status"] == "pending"
     assert api_harness.storage.promoted_keys
+    assert api_harness.storage.sealed_keys == [
+        (api_harness.storage.promoted_keys[0][0], upload["upload_session_id"])
+    ]
     file_id = completed.json()["id"]
+
+    approved = await api_harness.client.post(f"/api/v1/files/{file_id}/approve", headers=headers)
+    assert approved.status_code == 409, approved.text
+    assert approved.json()["error"]["code"] == "malware_scan_not_clean"
+
+    # Defense in depth: even a forged primary state cannot bypass scan evidence.
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        persisted.status = FileStatus.PROCESSING
+        await session.commit()
+    forged_approval = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/approve",
+        headers=headers,
+    )
+    assert forged_approval.status_code == 409
+    assert forged_approval.json()["error"]["code"] == "malware_scan_not_clean"
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        persisted.status = FileStatus.AVAILABLE
+        await session.commit()
+    forged_download = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/download",
+        headers=headers,
+    )
+    assert forged_download.status_code == 409
+    assert forged_download.json()["error"]["code"] == "malware_scan_not_clean"
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        persisted.status = FileStatus.QUARANTINED
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        scanned = await process_malware_scan_batch(
+            session,
+            api_harness.storage,
+            FakeCleanScanner(),
+            get_settings(),
+        )
+    assert scanned == 1
 
     approved = await api_harness.client.post(f"/api/v1/files/{file_id}/approve", headers=headers)
     assert approved.status_code == 200, approved.text
     assert approved.json()["status"] == "available"
+    assert approved.json()["malware_scan_status"] == "clean"
 
     grant = await api_harness.client.post(f"/api/v1/files/{file_id}/download", headers=headers)
     assert grant.status_code == 200, grant.text
@@ -433,6 +514,93 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
     listed = await api_harness.client.get("/api/v1/files", headers=headers)
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == file_id
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_scan_status", "expected_error_code"),
+    [
+        ("infected", "infected", "malware_detected"),
+        ("timeout", "error", "scanner_timeout"),
+        ("unavailable", "error", "scanner_unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malware_scan_failures_remain_quarantined_and_inaccessible(
+    api_harness: ApiHarness,
+    outcome: str,
+    expected_scan_status: str,
+    expected_error_code: str,
+) -> None:
+    from app.services.malware_scanner import (
+        MalwareScannerTimeout,
+        MalwareScannerUnavailable,
+    )
+
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    object_key = f"objects/malware-{outcome}-{uuid4()}.txt"
+    async with api_harness.session_factory() as session:
+        owner = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert owner is not None
+        file = File(
+            owner_id=owner.id,
+            bucket="kb",
+            object_key=object_key,
+            original_name="eicar.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=5,
+            status=FileStatus.QUARANTINED,
+        )
+        session.add(file)
+        await session.commit()
+        file_id = file.id
+    api_harness.storage.initiated_keys.append(object_key)
+
+    class Scanner:
+        async def scan(self, chunks: Any) -> ScanResult:
+            assert [chunk async for chunk in chunks]
+            if outcome == "infected":
+                return ScanResult(
+                    verdict=ScanVerdict.INFECTED,
+                    signature="Win.Test.EICAR_HDB-1",
+                )
+            if outcome == "timeout":
+                raise MalwareScannerTimeout("test timeout")
+            raise MalwareScannerUnavailable("test unavailable")
+
+    async with api_harness.session_factory() as session:
+        assert (
+            await process_malware_scan_batch(
+                session,
+                api_harness.storage,
+                Scanner(),
+                get_settings(),
+            )
+            == 1
+        )
+
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, file_id)
+        assert persisted is not None
+        assert persisted.status is FileStatus.QUARANTINED
+        assert persisted.malware_scan_status.value == expected_scan_status
+        assert persisted.malware_scan_error_code == expected_error_code
+        if outcome == "infected":
+            assert persisted.malware_signature == "Win.Test.EICAR_HDB-1"
+
+    approval = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/approve",
+        headers=headers,
+    )
+    assert approval.status_code == 409
+    assert approval.json()["error"]["code"] == "malware_scan_not_clean"
+    download = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/download",
+        headers=headers,
+    )
+    assert download.status_code == 409
+    assert download.json()["error"]["code"] == "malware_scan_not_clean"
 
 
 @pytest.mark.parametrize(
@@ -471,6 +639,7 @@ async def test_file_approval_follows_latest_okf_job_state(
             content_type="text/plain",
             size_bytes=1,
             status=FileStatus.PROCESSING,
+            malware_scan_status=MalwareScanStatus.CLEAN,
             version=2,
         )
         session.add(file)
@@ -638,6 +807,7 @@ async def test_okf_retry_requires_file_to_remain_in_processing(
         else:
             assert persisted.status is OkfConversionStatus.PENDING
             assert persisted.attempts == 0
+            assert persisted.retry_generation == 1
             assert persisted.error_code is None
 
 
@@ -722,7 +892,8 @@ async def test_expired_finalizing_upload_can_be_retried_idempotently(
     )
 
     assert completed.status_code == 200, completed.text
-    assert completed.json()["status"] == "processing"
+    assert completed.json()["status"] == "quarantined"
+    assert completed.json()["malware_scan_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -768,8 +939,93 @@ async def test_maintenance_reconciles_stale_finalizing_upload(
             ).all()
         )
         assert upload.status is UploadSessionStatus.COMPLETED
-        assert file is not None and file.status is FileStatus.PROCESSING
+        assert file is not None and file.status is FileStatus.QUARANTINED
+        assert file.malware_scan_status.value == "pending"
         assert {item.status for item in reservations} == {ReservationStatus.CONSUMED}
+
+
+@pytest.mark.asyncio
+async def test_maintenance_promotes_stale_single_finalization_without_db_locking_s3(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    api_harness.storage.head_size = 5
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "single-maintenance-recovery.pdf",
+            "size_bytes": 5,
+            "idempotency_key": "single-maintenance-recovery-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        upload.status = UploadSessionStatus.FINALIZING
+        upload.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        cleaned = await cleanup_expired_uploads(session, api_harness.storage)
+
+    assert cleaned == 1
+    assert api_harness.storage.promoted_keys
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        file = await session.get(File, upload.file_id)
+        assert upload.status is UploadSessionStatus.COMPLETED
+        assert file is not None
+        assert file.status is FileStatus.QUARANTINED
+        assert file.object_key.startswith("objects/")
+
+
+@pytest.mark.asyncio
+async def test_maintenance_retries_aborted_upload_storage_cleanup(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    size = get_settings().multipart_threshold_bytes + 1
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "abort-reconcile.pdf",
+            "size_bytes": size,
+            "idempotency_key": "abort-reconcile-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        upload.status = UploadSessionStatus.ABORTED
+        upload.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        cleaned = await cleanup_expired_uploads(session, api_harness.storage)
+    assert cleaned == 1
+    assert api_harness.storage.deleted_keys
+
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        assert upload.status is UploadSessionStatus.ABORTED
+        held = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held is None
 
 
 @pytest.mark.asyncio
@@ -793,7 +1049,7 @@ async def test_internal_maintenance_requires_cron_secret(api_harness: ApiHarness
     assert denied.status_code == 401
     assert wrong.status_code == 401
     assert accepted.status_code == 200
-    assert accepted.json() == {"cleaned": 0, "converted": 0}
+    assert accepted.json() == {"cleaned": 0, "scanned": 0, "converted": 0}
 
 
 @pytest.mark.asyncio
@@ -984,6 +1240,10 @@ async def test_file_policy_idempotency_and_abort_rejection_paths(
         f"/api/v1/files/uploads/{upload['upload_session_id']}", headers=headers
     )
     assert aborted.status_code == 204
+    assert api_harness.storage.sealed_keys[-1] == (
+        api_harness.storage.initiated_keys[-1],
+        upload["upload_session_id"],
+    )
     assert (
         await api_harness.client.delete(
             f"/api/v1/files/uploads/{upload['upload_session_id']}", headers=headers
@@ -1014,7 +1274,7 @@ async def test_upload_size_mismatch_and_multipart_validation_paths(
         json={"parts": []},
     )
     assert mismatch.status_code == 422
-    assert api_harness.storage.deleted_keys
+    assert api_harness.storage.sealed_keys[-1][1] == single.json()["upload_session_id"]
 
     size = get_settings().multipart_threshold_bytes + 1
     api_harness.storage.head_size = size
@@ -1326,6 +1586,7 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
             },
         )
     ).status_code == 201
+
     editor_login = await api_harness.client.post(
         "/api/v1/auth/token",
         data={"username": "editor@example.com", "password": "Editor-password-123!"},
@@ -1353,6 +1614,16 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
             json={"parts": []},
         )
     ).status_code == 200
+    async with api_harness.session_factory() as session:
+        assert (
+            await process_malware_scan_batch(
+                session,
+                api_harness.storage,
+                FakeCleanScanner(),
+                get_settings(),
+            )
+            == 1
+        )
     async with api_harness.session_factory() as session:
         conversion = await session.scalar(
             select(OkfConversionJob).where(OkfConversionJob.file_id == UUID(completed_file_id))
@@ -1544,6 +1815,27 @@ async def test_unsigned_forwarded_ip_is_trusted_only_on_vercel(api_harness: ApiH
 
 
 @pytest.mark.asyncio
+async def test_unsigned_forwarded_ip_is_trusted_from_configured_proxy_only(
+    api_harness: ApiHarness,
+) -> None:
+    forwarded_ip = "198.51.100.21"
+    trusted = get_settings().model_copy(
+        update={"serverless": False, "trusted_proxy_cidrs": ("127.0.0.0/24",)}
+    )
+    app.dependency_overrides[get_settings] = lambda: trusted
+    try:
+        response = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers={"X-Vercel-Forwarded-For": forwarded_ip},
+            data={"username": "missing-proxy@example.com", "password": "Wrong-password-123!"},
+        )
+        assert response.status_code == 401
+        assert f"auth:login:ip:{forwarded_ip}" in api_harness.redis.counters
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
 async def test_chat_only_role_can_select_and_query_but_not_browse_entries(
     api_harness: ApiHarness,
 ) -> None:
@@ -1688,6 +1980,7 @@ async def test_atomic_role_policy_replaces_both_halves_or_neither(
         json={
             "code": "atomic_policy",
             "name": "Atomic Policy",
+            "priority": -1,
             "permission_codes": ["file:read"],
             "limits": {"max_upload_bytes": 10},
         },
@@ -2104,12 +2397,17 @@ async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
                 "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "api_key": "qwen-secret-api-key",
                 "make_default": True,
+                "input_micro_usd_per_million_tokens": 800_000,
+                "output_micro_usd_per_million_tokens": 2_000_000,
             },
         )
         assert updated.status_code == 200, updated.text
         assert updated.json()["is_default"] is True
         assert updated.json()["configured"] is True
         assert updated.json()["credential_source"] == "database"
+        assert updated.json()["pricing_configured"] is True
+        assert updated.json()["input_micro_usd_per_million_tokens"] == 800_000
+        assert updated.json()["output_micro_usd_per_million_tokens"] == 2_000_000
         assert "api_key" not in updated.json()
 
         refreshed = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
@@ -2120,6 +2418,9 @@ async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
             assert stored is not None
             assert stored.api_key_ciphertext
             assert stored.api_key_ciphertext != "qwen-secret-api-key"
+            price = await session.get(LlmModelPrice, ("qwen", "qwen-plus"))
+            assert price is not None
+            assert price.input_micro_usd_per_million_tokens == 800_000
     finally:
         app.dependency_overrides.pop(get_settings, None)
 
@@ -2158,13 +2459,45 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         )
     ).status_code == 201
 
+    async with api_harness.session_factory() as session:
+        session.add_all(
+            [
+                LlmModelPrice(
+                    provider="qwen",
+                    model="qwen-plus",
+                    input_micro_usd_per_million_tokens=1_000_000,
+                    output_micro_usd_per_million_tokens=2_000_000,
+                    active=True,
+                ),
+                LlmModelPrice(
+                    provider="minimax",
+                    model="MiniMax-M2.7",
+                    input_micro_usd_per_million_tokens=1_000_000,
+                    output_micro_usd_per_million_tokens=2_000_000,
+                    active=True,
+                ),
+                LlmBudgetPolicy(
+                    name="test tenant LLM budget",
+                    tenant_key="default",
+                    daily_token_limit=100_000,
+                    monthly_token_limit=1_000_000,
+                    daily_cost_limit_micro_usd=100_000,
+                    monthly_cost_limit_micro_usd=1_000_000,
+                    enabled=True,
+                ),
+            ]
+        )
+        await session.commit()
+
     calls: list[list[dict[str, str]]] = []
     model_answer = "Manager approval is required [1]."
 
     class FakeClient:
-        provider = "qwen"
-        model = "qwen-plus"
         configured = True
+
+        def __init__(self, provider: str, model: str) -> None:
+            self.provider = provider
+            self.model = model
 
         async def complete_chat(
             self,
@@ -2188,8 +2521,15 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
                 completion_tokens=8,
             )
 
-    async def fake_resolve(*_args: object, **_kwargs: object) -> FakeClient:
-        return FakeClient()
+    generation_client = FakeClient("qwen", "qwen-plus")
+    review_client = FakeClient("minimax", "MiniMax-M2.7")
+
+    async def fake_resolve(
+        *_args: object,
+        provider: str | None = None,
+        **_kwargs: object,
+    ) -> FakeClient:
+        return review_client if provider == "minimax" else generation_client
 
     monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_resolve)
     payload = {"knowledge_base_id": knowledge_base_id, "message": "travel approval"}
@@ -2207,7 +2547,9 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
     )
     assert opted_in.status_code == 200
     generated = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "grounded-generation-e2e"},
+        json=payload,
     )
     assert generated.status_code == 200, generated.text
     assert generated.json()["mode"] == "rag"
@@ -2231,6 +2573,17 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         "reason": "semantic_verified",
     }
     assert len(calls) == 2
+    async with api_harness.session_factory() as session:
+        usage_rows = list(
+            (
+                await session.scalars(
+                    select(LlmUsageRecord).order_by(LlmUsageRecord.operation)
+                )
+            ).all()
+        )
+    assert [row.operation for row in usage_rows] == ["chat.answer", "chat.review"]
+    assert all(row.status is LlmUsageStatus.SETTLED for row in usage_rows)
+    assert all(row.actual_token_count == 18 for row in usage_rows)
     llm_payload = json.loads(calls[0][1]["content"])
     assert llm_payload == {
         "question": "travel approval",
@@ -2450,3 +2803,426 @@ async def test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key(
         json={"query": "tenant"},
     )
     assert still_usable.status_code == 200, still_usable.text
+
+
+@pytest.mark.asyncio
+async def test_platform_upload_cap_applies_to_an_unlimited_admin_role(
+    api_harness: ApiHarness,
+) -> None:
+    async with api_harness.session_factory() as session:
+        role_limit = await session.scalar(
+            select(RoleLimit)
+            .join(LimitDefinition, LimitDefinition.id == RoleLimit.limit_definition_id)
+            .where(LimitDefinition.key == "max_upload_bytes")
+        )
+        assert role_limit is not None
+        role_limit.value = None
+        await session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_upload_bytes": 1_024,
+            "malware_scan_max_stream_bytes": 1_024,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        response = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            json={
+                "filename": "platform-capped.pdf",
+                "size_bytes": 1_025,
+                "idempotency_key": "platform-hard-cap-001",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "file_policy_violation"
+
+
+@pytest.mark.asyncio
+async def test_object_storage_stop_line_rejects_before_a_presigned_url_is_issued(
+    api_harness: ApiHarness,
+    tmp_path: Path,
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "storage_capacity_probe_path": tmp_path,
+            "storage_object_stop_bytes": 10,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        response = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            json={
+                "filename": "stop-line.pdf",
+                "size_bytes": 10,
+                "idempotency_key": "storage-stop-line-001",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == "object_storage_stop_line_reached"
+    assert api_harness.storage.initiated_keys == []
+
+
+@pytest.mark.asyncio
+async def test_file_count_quota_blocks_tiny_file_cardinality_amplification(
+    api_harness: ApiHarness,
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_files_per_user": 1,
+            "platform_max_files_total": 10,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        first = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "tiny-1.txt",
+                "size_bytes": 1,
+                "idempotency_key": "tiny-file-count-001",
+            },
+        )
+        second = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "tiny-2.txt",
+                "size_bytes": 1,
+                "idempotency_key": "tiny-file-count-002",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 429, second.text
+    assert second.json()["error"]["code"] == "quota_exceeded"
+    assert len(api_harness.storage.initiated_keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_multipart_storage_initiation_failure_is_idempotently_retryable(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    request = {
+        "filename": "retry-init.pdf",
+        "size_bytes": get_settings().multipart_threshold_bytes + 1,
+        "idempotency_key": "retry-storage-init-001",
+    }
+    original_initiate = api_harness.storage.initiate
+    attempts = 0
+
+    async def flaky_initiate(**kwargs: Any) -> InitiatedStorageUpload:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated object store outage")
+        return await original_initiate(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "initiate", flaky_initiate)
+    first = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json=request,
+    )
+    retried = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json=request,
+    )
+
+    assert first.status_code == 500
+    assert retried.status_code == 201, retried.text
+    upload_id = UUID(retried.json()["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        assert upload.status is UploadSessionStatus.INITIATED
+        assert upload.storage_upload_id == "multipart-123"
+
+
+@pytest.mark.asyncio
+async def test_abort_storage_failure_keeps_cleanup_retryable(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "retry-abort.pdf",
+            "size_bytes": get_settings().multipart_threshold_bytes + 1,
+            "idempotency_key": "retry-storage-abort-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+    original_abort = api_harness.storage.abort_multipart
+    attempts = 0
+
+    async def flaky_abort(**kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated object store outage")
+        await original_abort(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "abort_multipart", flaky_abort)
+    first = await api_harness.client.delete(
+        f"/api/v1/files/uploads/{upload_id}",
+        headers=headers,
+    )
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        assert upload.status is UploadSessionStatus.ABORTED
+        held_before_retry = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held_before_retry is not None
+    retried = await api_harness.client.delete(
+        f"/api/v1/files/uploads/{upload_id}",
+        headers=headers,
+    )
+
+    assert first.status_code == 500
+    assert retried.status_code == 204, retried.text
+    async with api_harness.session_factory() as session:
+        held_after_retry = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held_after_retry is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_abort_wins_over_inflight_multipart_completion(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    size = get_settings().multipart_threshold_bytes + 1
+    api_harness.storage.head_size = size
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "complete-abort-race.pdf",
+            "size_bytes": size,
+            "idempotency_key": "complete-abort-race-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload = initiated.json()
+    entered_storage = asyncio.Event()
+    release_storage = asyncio.Event()
+    original_complete = api_harness.storage.complete_multipart
+
+    async def delayed_complete(**kwargs: Any) -> None:
+        entered_storage.set()
+        await release_storage.wait()
+        await original_complete(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "complete_multipart", delayed_complete)
+    completion_task = asyncio.create_task(
+        api_harness.client.post(
+            f"/api/v1/files/uploads/{upload['upload_session_id']}/complete",
+            headers=headers,
+            json={
+                "parts": [
+                    {"part_number": number, "etag": f'"etag-{number}"'}
+                    for number in range(1, upload["part_count"] + 1)
+                ]
+            },
+        )
+    )
+    await asyncio.wait_for(entered_storage.wait(), timeout=2)
+    aborted = await api_harness.client.delete(
+        f"/api/v1/files/uploads/{upload['upload_session_id']}",
+        headers=headers,
+    )
+    release_storage.set()
+    completed = await asyncio.wait_for(completion_task, timeout=2)
+
+    assert aborted.status_code == 204, aborted.text
+    assert completed.status_code == 409, completed.text
+    assert completed.json()["error"]["code"] == "upload_state_conflict"
+    upload_id = UUID(upload["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(UploadSession, upload_id)
+        assert persisted is not None
+        assert persisted.status is UploadSessionStatus.ABORTED
+        held = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held is None
+    assert api_harness.storage.deleted_keys
+
+
+@pytest.mark.asyncio
+async def test_platform_file_count_stop_line_is_global_and_precedes_storage_io(
+    api_harness: ApiHarness,
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_files_per_user": 10,
+            "platform_max_files_total": 1,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        first = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "global-tiny-1.txt",
+                "size_bytes": 1,
+                "idempotency_key": "global-file-count-001",
+            },
+        )
+        second = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "global-tiny-2.txt",
+                "size_bytes": 1,
+                "idempotency_key": "global-file-count-002",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 507, second.text
+    assert second.json()["error"]["code"] == "platform_file_count_limit_reached"
+    assert len(api_harness.storage.initiated_keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_knowledge_entry_count_and_byte_caps_fail_closed(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Bounded manual entries"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    knowledge_base_id = knowledge_base.json()["id"]
+
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_entries_per_knowledge_base": 1,
+            "platform_max_entry_bytes_per_knowledge_base": 5,
+        }
+    )
+    try:
+        first = await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+            headers=headers,
+            json={
+                "entry_type": "manual",
+                "title": "First",
+                "content": "12345",
+            },
+        )
+        count_denied = await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+            headers=headers,
+            json={
+                "entry_type": "manual",
+                "title": "Second",
+                "content": "x",
+            },
+        )
+        bytes_denied = await api_harness.client.patch(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries/{first.json()['id']}",
+            headers=headers,
+            json={"content": "123456"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert first.status_code == 201, first.text
+    assert count_denied.status_code == 507, count_denied.text
+    assert count_denied.json()["error"]["code"] == "knowledge_entry_count_limit_reached"
+    assert bytes_denied.status_code == 507, bytes_denied.text
+    assert bytes_denied.json()["error"]["code"] == "knowledge_entry_bytes_limit_reached"
+
+
+@pytest.mark.asyncio
+async def test_bulk_watermark_stops_new_part_urls_for_an_existing_session(
+    api_harness: ApiHarness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacities = iter(
+        [
+            FilesystemCapacity(total_bytes=100, used_bytes=79, free_bytes=21),
+            FilesystemCapacity(total_bytes=100, used_bytes=80, free_bytes=20),
+        ]
+    )
+    monkeypatch.setattr(
+        FilesystemCapacity,
+        "from_path",
+        classmethod(lambda _cls, _path: next(capacities)),
+    )
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "multipart_threshold_bytes": 1,
+            "storage_capacity_probe_path": tmp_path,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        initiated = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "watermark.pdf",
+                "size_bytes": 6,
+                "idempotency_key": "storage-bulk-stop-001",
+            },
+        )
+        assert initiated.status_code == 201, initiated.text
+        response = await api_harness.client.post(
+            f"/api/v1/files/uploads/{initiated.json()['upload_session_id']}/parts",
+            headers=headers,
+            json={"part_numbers": [1]},
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == "storage_bulk_uploads_paused"

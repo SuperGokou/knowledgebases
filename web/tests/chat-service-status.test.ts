@@ -20,10 +20,10 @@ describe("knowledge connection status", () => {
 
   it("uses green for connected and yellow for every non-connected state", () => {
     expect(styles).toMatch(
-      /\.chat-status\[data-state="connected"\]\s*>\s*span\s*\{[^}]*background:\s*var\(--green\)/s,
+      /\.chat-status\[data-state="connected"\]\s*>\s*span\s*\{[^}]*background:\s*var\(--green\)/,
     );
     expect(styles).toMatch(
-      /\.chat-status\[data-state="warning"\]\s*>\s*span\s*\{[^}]*background:\s*#d6a350/s,
+      /\.chat-status\[data-state="warning"\]\s*>\s*span\s*\{[^}]*background:\s*#d6a350/,
     );
   });
 });

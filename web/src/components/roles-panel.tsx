@@ -261,7 +261,7 @@ export function RolesPanel() {
                     <div className="limit-legend">
                       <span><b>未设置</b><small>该角色不参与此项额度合并</small></span>
                       <span><b>有限制</b><small>按填写的数字限制；0 表示禁止</small></span>
-                      <span><b>无限制</b><small>该角色不为此项设置上限</small></span>
+                      <span><b>无限制</b><small>仅不设角色额度；仍受平台安全硬上限</small></span>
                     </div>
                     <div className="limit-grid">
                       {definitions.map((definition) => {
@@ -278,7 +278,7 @@ export function RolesPanel() {
                                   <option value="limited">有限制</option>
                                   <option value="unlimited">无限制</option>
                                 </select>
-                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "此角色不设置上限" : "不参与角色额度合并"}</small>}
+                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "不设角色额度，仍受平台安全限制" : "不参与角色额度合并"}</small>}
                               </div>
                             ) : (
                               <div className="limit-readout"><strong>{displayLimit(definition, storedValue)}</strong><small>{storedValue === undefined ? "该角色未配置" : storedValue === null ? "此角色不设置上限" : "该角色的数值上限"}</small></div>
@@ -287,7 +287,7 @@ export function RolesPanel() {
                         );
                       })}
                     </div>
-                    <div className="limit-policy-note"><strong>最终额度如何计算</strong><p>用户拥有多个角色时，数值取最大值；任一角色为“无限制”，角色合并结果就是无限制；用户级覆盖值最后生效。若所有角色都未设置，请求频率使用系统默认值，其余上传、累计存储写入与下载额度按 0 处理。每日限额按 UTC 00:00 重置。</p></div>
+                    <div className="limit-policy-note"><strong>最终额度如何计算</strong><p>用户拥有多个角色时，数值取最大值；任一角色为“无限制”，角色合并结果就是无限制；用户级覆盖值最后生效。若所有角色都未设置，请求频率使用系统默认值，其余上传、累计存储写入与下载额度按 0 处理。每日限额按 UTC 00:00 重置。“无限制”永远不会绕过单文件平台安全硬上限、恶意软件扫描上限或磁盘水位门禁。</p></div>
                     {mutable ? <p className="field-hint">容量类限额请输入原始字节数，保存后会自动换算为 KB、MB、GB 或 TB 显示。非超级管理员不能授予高于自身的额度。</p> : null}
                   </div>
                 </details>

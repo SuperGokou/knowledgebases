@@ -47,5 +47,53 @@ SELECT format(
   :'app_user'
 )
 \gexec
-SQL
 
+-- The application may append and inspect audit events, but it must never rewrite history.
+SELECT format(
+  'REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.audit_logs FROM %I',
+  :'app_user'
+)
+WHERE to_regclass('public.audit_logs') IS NOT NULL
+\gexec
+SELECT format(
+  'GRANT SELECT, INSERT ON TABLE public.audit_logs TO %I',
+  :'app_user'
+)
+WHERE to_regclass('public.audit_logs') IS NOT NULL
+\gexec
+SELECT format(
+  'GRANT USAGE, SELECT ON SEQUENCE public.audit_logs_id_seq TO %I',
+  :'app_user'
+)
+WHERE to_regclass('public.audit_logs_id_seq') IS NOT NULL
+\gexec
+
+-- The event trigger reapplies the restriction after Alembic creates or alters audit_logs,
+-- so broad owner default privileges cannot accidentally restore mutation privileges.
+SELECT format(
+  $definition$
+  CREATE OR REPLACE FUNCTION public.enforce_audit_log_runtime_privileges()
+  RETURNS event_trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = pg_catalog, public
+  AS $function$
+  BEGIN
+    IF to_regclass('public.audit_logs') IS NOT NULL THEN
+      EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.audit_logs FROM %1$I';
+      EXECUTE 'GRANT SELECT, INSERT ON TABLE public.audit_logs TO %1$I';
+    END IF;
+  END
+  $function$
+  $definition$,
+  :'app_user'
+)
+\gexec
+
+REVOKE ALL ON FUNCTION public.enforce_audit_log_runtime_privileges() FROM PUBLIC;
+DROP EVENT TRIGGER IF EXISTS enforce_audit_log_runtime_privileges;
+CREATE EVENT TRIGGER enforce_audit_log_runtime_privileges
+  ON ddl_command_end
+  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')
+  EXECUTE FUNCTION public.enforce_audit_log_runtime_privileges();
+SQL

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import TracebackType
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ from app.db.base import Base
 from app.db.models import LlmProviderConfig
 from app.services.llm_provider import (
     LlmProviderError,
+    MeteringOutcome,
     OpenAICompatibleClient,
     OpenAICompatibleConfig,
 )
@@ -53,6 +55,34 @@ class StubAsyncClient:
     ) -> httpx.Response:
         self._calls.append((url, headers, json))
         return self._responses.pop(0)
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+    ) -> StubResponseStream:
+        assert method == "POST"
+        self._calls.append((url, headers, json))
+        return StubResponseStream(self._responses.pop(0))
+
+
+class StubResponseStream:
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self._response
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
 
 
 def _response(status_code: int, body: dict[str, Any]) -> httpx.Response:
@@ -153,8 +183,163 @@ async def test_openai_adapter_reports_upstream_failure_without_response_body(
     assert caught.value.code == "llm_upstream_error"
     assert caught.value.upstream_status == 429
     assert caught.value.retryable is True
+    assert caught.value.metering_outcome is MeteringOutcome.NOT_STARTED
     assert "sensitive" not in str(caught.value)
     assert calls[0][0] == "https://api.minimax.io/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_aborts_oversized_provider_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient(
+            [
+                httpx.Response(
+                    200,
+                    content=b"x" * 257,
+                    request=httpx.Request(
+                        "POST", "https://provider.example/chat/completions"
+                    ),
+                )
+            ],
+            calls,
+        )
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+            max_response_bytes=256,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "hello"}])
+
+    assert caught.value.code == "llm_response_too_large"
+    assert caught.value.retryable is False
+    assert caught.value.metering_outcome is MeteringOutcome.UNKNOWN
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_treats_server_failure_as_unknown_metering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient([_response(503, {"error": {"message": "hidden"}})], calls)
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "hello"}])
+
+    assert caught.value.upstream_status == 503
+    assert caught.value.metering_outcome is MeteringOutcome.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_marks_bad_200_with_usage_as_known_metering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient(
+            [
+                _response(
+                    200,
+                    {
+                        "model": "qwen-plus",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "not-json"},
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 17, "completion_tokens": 3},
+                    },
+                )
+            ],
+            calls,
+        )
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.compile_okf("Refund policy", user_id="internal-user-id")
+
+    assert caught.value.code == "llm_invalid_output"
+    assert caught.value.metering_outcome is MeteringOutcome.KNOWN
+    assert caught.value.prompt_tokens == 17
+    assert caught.value.completion_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_marks_malformed_200_as_unknown_metering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient(
+            [
+                httpx.Response(
+                    200,
+                    content=b"not-json",
+                    request=httpx.Request("POST", "https://provider.example/chat/completions"),
+                )
+            ],
+            calls,
+        )
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "hello"}])
+
+    assert caught.value.code == "llm_invalid_response"
+    assert caught.value.metering_outcome is MeteringOutcome.UNKNOWN
 
 
 @pytest.mark.parametrize(

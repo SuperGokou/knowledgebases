@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "policy_id": "heyi-functional-acceptance-v1",
+  "manifest_standard": "docs/FUNCTIONAL_ACCEPTANCE_STANDARD.zh-CN.md",
+  "required_requirement_ids": [
+    "FUNC-AUTH-001", "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001",
+    "FUNC-KB-ACL-001", "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001",
+    "FUNC-APIKEY-001", "FUNC-AUDIT-001", "FUNC-UXSTATE-001", "FUNC-HEALTH-001",
+    "FUNC-FORMAT-001", "FUNC-OFFLINE-001"
+  ],
+  "required_external_evidence_ids": ["EXT-BROWSER-E2E-001", "EXT-LINUX-HOST-001"],
+  "runners": {
+    "backend-functional": {
+      "framework": "pytest",
+      "minimum_passed_tests": 145,
+      "covers": [
+        "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-KB-ACL-001",
+        "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001",
+        "FUNC-AUDIT-001", "FUNC-HEALTH-001", "FUNC-FORMAT-001", "FUNC-OFFLINE-001"
+      ],
+      "required_test_nodes": [
+        "tests/test_integration_api.py::test_admin_role_user_and_refresh_workflow",
+        "tests/test_integration_api.py::test_single_upload_approval_and_download_workflow",
+        "tests/test_integration_api.py::test_malware_scan_failures_remain_quarantined_and_inaccessible",
+        "tests/test_integration_api.py::test_file_approval_follows_latest_okf_job_state",
+        "tests/test_integration_api.py::test_multipart_upload_signs_batches_and_completes",
+        "tests/test_integration_api.py::test_readiness_uses_database_and_redis",
+        "tests/test_integration_api.py::test_knowledge_base_chat_demo_and_acl_boundaries",
+        "tests/test_integration_api.py::test_revoked_knowledge_grant_removes_file_and_upload_access",
+        "tests/test_integration_api.py::test_scoped_api_key_lifecycle_and_public_endpoints",
+        "tests/test_integration_api.py::test_non_superuser_cannot_issue_api_key_for_another_account",
+        "tests/test_integration_api.py::test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed",
+        "tests/test_integration_api.py::test_chat_generation_requires_kb_opt_in_and_reports_selected_model",
+        "tests/test_integration_api.py::test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key",
+        "tests/test_role_policy.py", "tests/test_domain_access.py", "tests/test_domain_quota.py",
+        "tests/test_okf_conversion.py", "tests/test_chat_answer_review.py", "tests/test_chat_presentation.py",
+        "tests/test_audit_logs_api.py", "tests/test_audit_result_persistence.py",
+        "tests/test_api_contract.py::test_liveness_endpoint_does_not_require_dependencies",
+        "tests/test_api_contract.py::test_readiness_rejects_database_schema_drift",
+        "tests/test_host_preflight.py", "tests/test_offline_compose.py", "tests/test_document_parser.py",
+        "tests/test_document_parser_preflight.py", "tests/test_okf_document_pipeline.py"
+      ]
+    },
+    "frontend-functional": {
+      "framework": "vitest",
+      "minimum_passed_tests": 78,
+      "covers": [
+        "FUNC-AUTH-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-FILE-001",
+        "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001", "FUNC-UXSTATE-001"
+      ],
+      "required_test_nodes": [
+        "tests/access-routing.test.ts", "tests/login-route.test.ts", "tests/workspace-guard.test.ts",
+        "tests/role-policy.test.ts", "tests/chat-contract.test.ts", "tests/chat-sources.test.ts",
+        "tests/chat-data-table.test.ts", "tests/model-settings.test.ts", "tests/api-usage-examples.test.ts",
+        "tests/error-reporting.test.ts", "tests/access-provider.test.ts", "tests/chat-service-status.test.ts",
+        "tests/file-knowledge-status.test.ts"
+      ]
+    }
+  },
+  "external_collectors": {
+    "EXT-BROWSER-E2E-001": {"collector_id": "heyi-browser-e2e", "key_id": "browser-e2e-ed25519"},
+    "EXT-LINUX-HOST-001": {"collector_id": "heyi-linux-host", "key_id": "linux-host-ed25519"}
+  }
+}

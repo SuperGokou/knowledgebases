@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy import delete, select
 
 from app.api.dependencies import DatabaseSession, require_permission
+from app.api.egress_leases import deny_if_active_external_llm_egress
 from app.api.errors import ApiError
 from app.db.models import LimitDefinition, Permission, Role, RoleLimit, RolePermission
 from app.schemas.roles import (
@@ -20,7 +21,7 @@ from app.schemas.roles import (
     RoleUpdate,
 )
 from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.audit import AuditResult, add_audit_event
 
 router = APIRouter()
 permission_router = APIRouter()
@@ -34,11 +35,11 @@ def _ensure_role_mutable(access: AccessContext, role: Role) -> None:
             code="system_role",
             message="System roles are immutable",
         )
-    if not access.user.is_superuser and role.priority > access.max_role_priority:
+    if not access.user.is_superuser and role.priority >= access.max_role_priority:
         raise ApiError(
             status_code=403,
             code="role_escalation_denied",
-            message="You cannot modify a role above your own priority",
+            message="You cannot modify a role at or above your own priority",
         )
 
 
@@ -203,6 +204,7 @@ async def create_role(
         session,
         actor_id=access.user.id,
         action="role.created",
+        result=AuditResult.SUCCESS,
         resource_type="role",
         resource_id=str(role.id),
         request_id=getattr(request.state, "request_id", None),
@@ -239,6 +241,7 @@ async def update_role(
         session,
         actor_id=access.user.id,
         action="role.updated",
+        result=AuditResult.SUCCESS,
         resource_type="role",
         resource_id=str(role.id),
         request_id=getattr(request.state, "request_id", None),
@@ -263,6 +266,15 @@ async def replace_permissions(
     _ensure_role_mutable(access, role)
     _ensure_policy_grantable(access, permission_codes=payload.permission_codes)
     permissions = await _resolve_permissions(session, payload.permission_codes)
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="role_permissions",
+        resource_type="role",
+        resource_id=str(role.id),
+        role_id=role.id,
+    )
     await session.execute(delete(RolePermission).where(RolePermission.role_id == role_id))
     session.add_all(
         [RolePermission(role_id=role_id, permission_id=item.id) for item in permissions]
@@ -271,6 +283,7 @@ async def replace_permissions(
         session,
         actor_id=access.user.id,
         action="role.permissions.replaced",
+        result=AuditResult.SUCCESS,
         resource_type="role",
         resource_id=str(role.id),
         request_id=getattr(request.state, "request_id", None),
@@ -306,6 +319,7 @@ async def replace_limits(
         session,
         actor_id=access.user.id,
         action="role.limits.replaced",
+        result=AuditResult.SUCCESS,
         resource_type="role",
         resource_id=str(role.id),
         request_id=getattr(request.state, "request_id", None),
@@ -336,6 +350,15 @@ async def replace_policy(
     permissions = await _resolve_permissions(session, payload.permission_codes)
     limits = await _resolve_limits(session, payload.limits)
 
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="role_policy",
+        resource_type="role",
+        resource_id=str(role.id),
+        role_id=role.id,
+    )
     await session.execute(delete(RolePermission).where(RolePermission.role_id == role_id))
     await session.execute(delete(RoleLimit).where(RoleLimit.role_id == role_id))
     session.add_all(
@@ -351,6 +374,7 @@ async def replace_policy(
         session,
         actor_id=access.user.id,
         action="role.policy.replaced",
+        result=AuditResult.SUCCESS,
         resource_type="role",
         resource_id=str(role.id),
         request_id=getattr(request.state, "request_id", None),

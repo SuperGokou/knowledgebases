@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from app.api.dependencies import DatabaseSession, get_storage_service
 from app.core.config import Settings, get_settings
-from app.maintenance import cleanup_expired_uploads
+from app.maintenance import cleanup_expired_uploads, process_malware_scan_batch
 from app.services.llm_settings import resolve_provider_client
+from app.services.malware_scanner import ClamdScanner
 from app.services.okf_conversion import process_okf_conversion_batch
 from app.services.storage import StorageService
 
@@ -42,6 +43,19 @@ async def run_maintenance(
         total += cleaned
         if cleaned < settings.maintenance_batch_size:
             break
+    scanner = ClamdScanner(
+        host=settings.malware_scan_host,
+        port=settings.malware_scan_port,
+        timeout_seconds=settings.malware_scan_timeout_seconds,
+        max_stream_bytes=settings.malware_scan_max_stream_bytes,
+    )
+    scanned = await process_malware_scan_batch(
+        session,
+        storage,
+        scanner,
+        settings,
+        batch_size=settings.maintenance_batch_size,
+    )
     client = (
         await resolve_provider_client(session, settings)
         if settings.external_llm_enabled
@@ -64,4 +78,4 @@ async def run_maintenance(
                 settings,
                 batch_size=settings.okf_conversion_batch_size,
             )
-    return {"cleaned": total, "converted": converted}
+    return {"cleaned": total, "scanned": scanned, "converted": converted}

@@ -190,7 +190,7 @@ export function persistWorkspaceSession(
   session: AuthenticatedWorkspaceSession,
 ): void {
   if (session.replacement) {
-    setSessionCookies(response, session.replacement, session.me.email, { resetFence: true });
+    setSessionCookies(response, session.replacement, session.me.email);
   } else if (request.cookies.get(IDENTITY_COOKIE)?.value !== session.me.email) {
     setIdentityCookie(response, session.me.email);
   }
@@ -201,6 +201,6 @@ export function persistReplacementSession(
   session: UnavailableWorkspaceSession,
 ): void {
   if (session.replacement) {
-    setSessionCookies(response, session.replacement, undefined, { resetFence: true });
+    setSessionCookies(response, session.replacement);
   }
 }

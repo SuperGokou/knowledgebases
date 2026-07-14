@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import cast
 from uuid import uuid4
 
@@ -7,6 +8,16 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+_SAFE_REQUEST_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+
+
+def normalize_request_id(value: str | None) -> str:
+    """Return a bounded identifier safe for response headers and structured logs."""
+
+    if value and _SAFE_REQUEST_ID.fullmatch(value):
+        return value
+    return str(uuid4())
 
 
 class RequestBodyLimitMiddleware:
@@ -85,8 +96,7 @@ class RequestBodyLimitMiddleware:
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        incoming = request.headers.get("X-Request-ID", "")
-        request_id = incoming[:100] if incoming else str(uuid4())
+        request_id = normalize_request_id(request.headers.get("X-Request-ID"))
         request.state.request_id = request_id
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id

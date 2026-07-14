@@ -6,14 +6,14 @@ describe("isSameOriginRequest", () => {
   it("rejects a production mutation without an Origin header", () => {
     expect(isSameOriginRequest(new Headers({ host: "knowledge.example" }), {
       production: true,
-      requestProtocol: "https:",
+      trustedOrigin: "https://knowledge.example",
     })).toBe(false);
   });
 
   it("permits an Origin-less development request", () => {
     expect(isSameOriginRequest(new Headers({ host: "localhost:3000" }), {
       production: false,
-      requestProtocol: "http:",
+      trustedOrigin: "http://localhost:3000",
     })).toBe(true);
   });
 
@@ -26,11 +26,11 @@ describe("isSameOriginRequest", () => {
     });
     expect(isSameOriginRequest(headers, {
       production: true,
-      requestProtocol: "http:",
+      trustedOrigin: "https://knowledge.example",
     })).toBe(false);
   });
 
-  it("accepts a same-origin request using the first forwarded host and protocol", () => {
+  it("accepts a request matching the fixed public origin", () => {
     const headers = new Headers({
       origin: "https://knowledge.example",
       "sec-fetch-site": "same-origin",
@@ -39,15 +39,37 @@ describe("isSameOriginRequest", () => {
     });
     expect(isSameOriginRequest(headers, {
       production: true,
-      requestProtocol: "http:",
+      trustedOrigin: "https://knowledge.example",
     })).toBe(true);
+  });
+
+  it("does not trust forged forwarded host or protocol headers", () => {
+    const headers = new Headers({
+      origin: "https://evil.example",
+      "sec-fetch-site": "same-origin",
+      host: "knowledge.internal",
+      "x-forwarded-host": "evil.example",
+      "x-forwarded-proto": "https",
+    });
+    expect(isSameOriginRequest(headers, {
+      production: true,
+      trustedOrigin: "https://knowledge.example",
+    })).toBe(false);
+  });
+
+  it("fails closed in production when no fixed public origin is configured", () => {
+    const headers = new Headers({ origin: "https://knowledge.example" });
+    expect(isSameOriginRequest(headers, {
+      production: true,
+      trustedOrigin: undefined,
+    })).toBe(false);
   });
 
   it.each([
     ["http", "knowledge.example"],
     ["https", "evil.example"],
     ["javascript", "knowledge.example"],
-  ])("rejects forwarded destination %s://%s", (proto, host) => {
+  ])("ignores untrusted forwarded destination %s://%s", (proto, host) => {
     const headers = new Headers({
       origin: "https://knowledge.example",
       "x-forwarded-host": host,
@@ -55,7 +77,7 @@ describe("isSameOriginRequest", () => {
     });
     expect(isSameOriginRequest(headers, {
       production: true,
-      requestProtocol: "https:",
-    })).toBe(false);
+      trustedOrigin: "https://knowledge.example",
+    })).toBe(true);
   });
 });

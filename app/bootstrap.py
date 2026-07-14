@@ -52,7 +52,7 @@ LIMIT_CATALOG: dict[str, tuple[str, str, str, str]] = {
         "单个文件大小上限",
         "bytes",
         "request",
-        "一次上传任务允许声明的最大文件大小",
+        "角色级单文件上限；无限制仅表示不设角色额度，仍受平台安全硬上限与恶意软件扫描上限约束",
     ),
     "daily_upload_bytes": (
         "每日上传总量",
@@ -71,6 +71,12 @@ LIMIT_CATALOG: dict[str, tuple[str, str, str, str]] = {
         "grants",
         "day",
         "每个 UTC 自然日可签发短期文件下载链接的次数",
+    ),
+    "file_count": (
+        "文件数量上限",
+        "files",
+        "lifetime",
+        "角色生命周期内允许创建的文件数量；角色无限制时仍受平台文件数量硬上限约束",
     ),
 }
 
@@ -117,7 +123,10 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
         role = Role(
             code="system_admin",
             name="系统管理员",
-            description="拥有全部系统权限且所有资源限额均为无限制的系统角色",
+            description=(
+                "拥有全部系统权限，角色额度不设上限；仍受平台安全硬上限、"
+                "恶意软件扫描上限及磁盘水位策略约束"
+            ),
             priority=10_000,
             is_system=True,
         )
@@ -129,7 +138,10 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
         )
     else:
         role.name = "系统管理员"
-        role.description = "拥有全部系统权限且所有资源限额均为无限制的系统角色"
+        role.description = (
+            "拥有全部系统权限，角色额度不设上限；仍受平台安全硬上限、"
+            "恶意软件扫描上限及磁盘水位策略约束"
+        )
 
     existing_permission_ids = set(
         (

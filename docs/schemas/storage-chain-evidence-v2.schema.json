@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:heyi:knowledge-base:storage-chain-evidence:v2",
+  "title": "和熠知识库真实存储链路验收证据 v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "producer_version",
+    "collector_mode",
+    "status",
+    "verified_artifacts",
+    "destructive_volume",
+    "volume_id",
+    "mount_target",
+    "object_root",
+    "knowledge_base_id",
+    "challenge",
+    "target",
+    "started_at",
+    "finished_at",
+    "filesystem_cross_check",
+    "minio_cross_check",
+    "scenarios",
+    "cleanup",
+    "attestation"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "producer": {"const": "heyi-storage-watermark-harness"},
+    "producer_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "collector_mode": {"const": "real"},
+    "status": {"const": "passed"},
+    "verified_artifacts": {"const": true},
+    "destructive_volume": {"const": true},
+    "volume_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "mount_target": {"type": "string", "pattern": "^/"},
+    "object_root": {"type": "string", "pattern": "^/"},
+    "knowledge_base_id": {"type": "string", "format": "uuid"},
+    "challenge": {"type": "string", "minLength": 16, "maxLength": 128},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployment_id", "git_head", "content_fingerprint"],
+      "properties": {
+        "deployment_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "git_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "content_fingerprint": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "filesystem_cross_check": {"const": true},
+    "minio_cross_check": {"const": true},
+    "scenarios": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/scenario"}
+    },
+    "cleanup": {"$ref": "#/$defs/artifact"},
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "artifact_count", "digest"],
+      "properties": {
+        "type": {"const": "sha256-chain-v1"},
+        "artifact_count": {"const": 26},
+        "digest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "artifact_sha256"],
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "artifact_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "watermark_percent",
+        "operation",
+        "http_status",
+        "reason_code",
+        "quota_before_bytes",
+        "quota_after_bytes",
+        "object_count_before",
+        "object_count_after",
+        "object_bytes_before",
+        "object_bytes_after",
+        "multipart_sessions_before",
+        "multipart_sessions_after",
+        "artifact",
+        "artifact_sha256"
+      ],
+      "properties": {
+        "watermark_percent": {"type": "integer", "enum": [1, 69, 70, 79, 80, 89, 90]},
+        "operation": {
+          "type": "string",
+          "enum": [
+            "single",
+            "multipart",
+            "retry",
+            "concurrent_reservation",
+            "object_stop_180gb"
+          ]
+        },
+        "http_status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "reason_code": {"type": ["string", "null"]},
+        "quota_before_bytes": {"type": "integer", "minimum": 0},
+        "quota_after_bytes": {"type": "integer", "minimum": 0},
+        "object_count_before": {"type": "integer", "minimum": 0},
+        "object_count_after": {"type": "integer", "minimum": 0},
+        "object_bytes_before": {"type": "integer", "minimum": 0},
+        "object_bytes_after": {"type": "integer", "minimum": 0},
+        "multipart_sessions_before": {"type": "integer", "minimum": 0},
+        "multipart_sessions_after": {"type": "integer", "minimum": 0},
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+        },
+        "artifact_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

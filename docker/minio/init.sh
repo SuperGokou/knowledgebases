@@ -8,11 +8,19 @@ set -eu
 : "${MINIO_APP_PASSWORD:?MINIO_APP_PASSWORD is required}"
 : "${MINIO_BUCKET:?MINIO_BUCKET is required}"
 
+MC_CONFIG_DIR="${MC_CONFIG_DIR:-/tmp/.mc}"
+export MC_CONFIG_DIR
+
 attempt=0
-until mc alias set local "${MINIO_ENDPOINT}" "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" >/dev/null 2>&1; do
+until mc alias set local \
+    "${MINIO_ENDPOINT}" \
+    "${MINIO_ROOT_USER}" \
+    "${MINIO_ROOT_PASSWORD}" \
+    --api S3v4 \
+    --path on >/dev/null 2>&1; do
     attempt=$((attempt + 1))
     if [ "${attempt}" -ge 60 ]; then
-        echo "MinIO did not become ready in time" >&2
+        echo "MinIO client alias initialization failed; verify the writable client config, DNS, readiness, and credentials" >&2
         exit 1
     fi
     sleep 2

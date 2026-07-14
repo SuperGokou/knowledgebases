@@ -45,6 +45,27 @@ describe("parseChatReply", () => {
   });
 
   it.each([
+    "usage_governance_unavailable",
+    "usage_budget_exceeded",
+    "usage_metering_unavailable",
+    "duplicate_request",
+    "independent_reviewer_unavailable",
+  ] as const)("accepts the documented safe fallback reason %s", (reason) => {
+    const fallbackReply = {
+      ...validReply,
+      mode: "retrieval",
+      answer_review: { status: "fallback", reason: "retrieval_only" },
+      source_status: {
+        ...validReply.source_status,
+        strategy: "retrieval_fallback",
+        reason,
+      },
+    };
+
+    expect(parseChatReply(fallbackReply)).toEqual(fallbackReply);
+  });
+
+  it.each([
     { ...validReply, citations: null },
     { ...validReply, provider: { name: "deepseek" } },
     {

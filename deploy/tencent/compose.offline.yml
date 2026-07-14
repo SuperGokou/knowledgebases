@@ -1,18 +1,13 @@
 name: ${COMPOSE_PROJECT_NAME:-heyi-kb-offline}
 
-x-api-build: &api-build
-  context: ../..
-  dockerfile: Dockerfile
-  target: runtime
-
 x-api-environment: &api-environment
   KB_ENVIRONMENT: production
   KB_DEPLOYMENT_PROFILE: isolated
   KB_EXTERNAL_LLM_ENABLED: "false"
   KB_DEBUG: "false"
   KB_DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:?required}:${POSTGRES_APP_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
-  KB_DATABASE_POOL_SIZE: ${KB_DATABASE_POOL_SIZE:-8}
-  KB_DATABASE_MAX_OVERFLOW: ${KB_DATABASE_MAX_OVERFLOW:-4}
+  KB_DATABASE_POOL_SIZE: ${KB_DATABASE_POOL_SIZE:-6}
+  KB_DATABASE_MAX_OVERFLOW: ${KB_DATABASE_MAX_OVERFLOW:-2}
   KB_DATABASE_POOL_TIMEOUT_SECONDS: ${KB_DATABASE_POOL_TIMEOUT_SECONDS:-10}
   KB_DATABASE_STATEMENT_TIMEOUT_MS: ${KB_DATABASE_STATEMENT_TIMEOUT_MS:-15000}
   KB_DATABASE_LOCK_TIMEOUT_MS: ${KB_DATABASE_LOCK_TIMEOUT_MS:-5000}
@@ -30,8 +25,21 @@ x-api-environment: &api-environment
   KB_S3_USE_SSL: "true"
   KB_S3_ADDRESSING_STYLE: path
   KB_TRUSTED_HOSTS: ${KB_TRUSTED_HOSTS:?required}
+  KB_TRUSTED_PROXY_CIDRS: '["172.30.240.0/24"]'
   KB_CORS_ORIGINS: ${KB_CORS_ORIGINS:-[]}
   KB_MULTIPART_THRESHOLD_BYTES: ${KB_MULTIPART_THRESHOLD_BYTES:-104857600}
+  KB_PLATFORM_MAX_UPLOAD_BYTES: "2147483648"
+  KB_STORAGE_CAPACITY_PROBE_PATH: /var/lib/kb-capacity
+  KB_STORAGE_WARNING_PERCENT: "70"
+  KB_STORAGE_BULK_STOP_PERCENT: "80"
+  KB_STORAGE_REJECT_PERCENT: "90"
+  KB_STORAGE_OBJECT_STOP_BYTES: "180000000000"
+  KB_MALWARE_SCAN_HOST: clamd
+  KB_MALWARE_SCAN_PORT: 3310
+  KB_MALWARE_SCAN_TIMEOUT_SECONDS: ${KB_MALWARE_SCAN_TIMEOUT_SECONDS:-120}
+  KB_MALWARE_SCAN_MAX_STREAM_BYTES: "2147483648"
+  KB_MALWARE_SCAN_CHUNK_SIZE_BYTES: ${KB_MALWARE_SCAN_CHUNK_SIZE_BYTES:-1048576}
+  KB_MALWARE_SCAN_RECLAIM_SECONDS: ${KB_MALWARE_SCAN_RECLAIM_SECONDS:-300}
 
 x-runtime-security: &runtime-security
   read_only: true
@@ -50,9 +58,9 @@ x-logging: &default-logging
 
 services:
   postgres:
-    image: postgres:17.5-bookworm
+    image: postgres:17.5-bookworm@sha256:2088c1744625793a8a89118d2dee63fb121139141ff0ff53bd72e63bb6089d0d
     restart: unless-stopped
-    shm_size: 1g
+    shm_size: 512m
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?required}
       POSTGRES_USER: ${POSTGRES_USER:?required}
@@ -63,15 +71,15 @@ services:
     command:
       - postgres
       - -c
-      - max_connections=100
+      - max_connections=80
       - -c
-      - shared_buffers=2GB
+      - shared_buffers=512MB
       - -c
-      - effective_cache_size=6GB
+      - effective_cache_size=1536MB
       - -c
-      - maintenance_work_mem=512MB
+      - maintenance_work_mem=128MB
       - -c
-      - work_mem=8MB
+      - work_mem=4MB
       - -c
       - wal_compression=on
       - -c
@@ -93,8 +101,8 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
-    mem_limit: 4g
-    cpus: 1.50
+    mem_limit: 2g
+    cpus: 1.00
     stop_grace_period: 30s
     pids_limit: 256
     security_opt:
@@ -104,7 +112,7 @@ services:
       - backend
 
   redis:
-    image: redis:8.0.3-bookworm
+    image: redis:8.0.3-bookworm@sha256:97a98080e13ec15bc4684baa57e6f25a8cbce5c0372789194d04bfd178cb34d4
     restart: unless-stopped
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?required}
@@ -115,7 +123,7 @@ services:
       - --appendfsync
       - everysec
       - --maxmemory
-      - 1gb
+      - 512mb
       - --maxmemory-policy
       - noeviction
       - --requirepass
@@ -129,8 +137,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 20
-    mem_limit: 1536m
-    cpus: 0.50
+    mem_limit: 768m
+    cpus: 0.25
     stop_grace_period: 30s
     pids_limit: 128
     cap_drop:
@@ -146,7 +154,7 @@ services:
       - backend
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -159,13 +167,13 @@ services:
         source: ${KB_DATA_ROOT:?required}/minio
         target: /data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/ready"]
       interval: 10s
       timeout: 5s
       retries: 30
       start_period: 20s
-    mem_limit: 2g
-    cpus: 1.00
+    mem_limit: 1280m
+    cpus: 0.75
     stop_grace_period: 30s
     pids_limit: 256
     security_opt:
@@ -176,10 +184,11 @@ services:
       - frontend
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:2582c2f48b1e31545143ba5285c67d7b38c8b8f6912142d0630686dc7aaac28b
     restart: "no"
     environment:
       MINIO_ENDPOINT: http://minio:9000
+      MC_CONFIG_DIR: /tmp/.mc
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
       MINIO_APP_USER: ${MINIO_APP_USER:?required}
@@ -191,6 +200,11 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    mem_limit: 128m
+    cpus: 0.10
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=32m,mode=1777
     cap_drop:
       - ALL
     security_opt:
@@ -200,10 +214,11 @@ services:
       - backend
 
   minio-multipart-gc:
-    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:2582c2f48b1e31545143ba5285c67d7b38c8b8f6912142d0630686dc7aaac28b
     restart: unless-stopped
     environment:
       MINIO_ENDPOINT: http://minio:9000
+      MC_CONFIG_DIR: /tmp/.mc
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
       MINIO_BUCKET: ${MINIO_BUCKET:-knowledge-base}
@@ -215,10 +230,12 @@ services:
     depends_on:
       minio-init:
         condition: service_completed_successfully
-    mem_limit: 256m
-    cpus: 0.10
+    mem_limit: 128m
+    cpus: 0.05
     stop_grace_period: 30s
     pids_limit: 64
+    tmpfs:
+      - /tmp:size=32m,mode=1777
     cap_drop:
       - ALL
     security_opt:
@@ -227,15 +244,80 @@ services:
     networks:
       - backend
 
+  clamd:
+    image: clamav/clamav:1.4.3@sha256:d39ad368e587cc204f71675c3982adbc6717b8c4cb309a7ee9a3213f7e684c50
+    restart: unless-stopped
+    entrypoint: ["clamd"]
+    command: ["--foreground=true", "--config-file=/etc/clamav/clamd.conf"]
+    volumes:
+      - ../../docker/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/clamav-db
+        target: /var/lib/clamav
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'zPING\\0' | nc -w 2 127.0.0.1 3310 | grep -q PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    mem_limit: 1792m
+    cpus: 0.50
+    stop_grace_period: 30s
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - backend
+
+  clamav-db-preflight:
+    image: clamav/clamav:1.4.3@sha256:d39ad368e587cc204f71675c3982adbc6717b8c4cb309a7ee9a3213f7e684c50
+    profiles: [ops]
+    restart: "no"
+    environment:
+      CLAMAV_DATABASE_DIRECTORY: /var/lib/clamav
+      CLAMAV_DATABASE_MAX_AGE_SECONDS: ${CLAMAV_DATABASE_MAX_AGE_SECONDS:-604800}
+    entrypoint: ["/bin/sh", "/opt/clamav/preflight-database.sh"]
+    volumes:
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/clamav-db
+        target: /var/lib/clamav
+        read_only: true
+      - ../../docker/clamav/preflight-database.sh:/opt/clamav/preflight-database.sh:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 512m
+    cpus: 0.25
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+
   migrate:
-    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
-    build: *api-build
+    image: ${KB_API_IMAGE:?required}
+    pull_policy: never
     profiles: [ops]
     restart: "no"
     environment:
       <<: *api-environment
       KB_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
-    command: ["alembic", "upgrade", "head"]
+      KB_DATABASE_RUNTIME_ROLE: ${POSTGRES_APP_USER:?required}
+    command:
+      - /bin/sh
+      - -ec
+      - alembic upgrade head && python -m app.db.runtime_role
     depends_on:
       postgres:
         condition: service_healthy
@@ -248,7 +330,8 @@ services:
       - backend
 
   bootstrap:
-    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
+    image: ${KB_API_IMAGE:?required}
+    pull_policy: never
     profiles: [ops]
     restart: "no"
     environment:
@@ -268,11 +351,16 @@ services:
       - backend
 
   api:
-    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
-    build: *api-build
+    image: ${KB_API_IMAGE:?required}
+    pull_policy: never
     restart: unless-stopped
     init: true
     environment: *api-environment
+    volumes:
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/capacity-probe
+        target: /var/lib/kb-capacity
+        read_only: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -285,14 +373,14 @@ services:
         - CMD
         - python
         - -c
-        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)
+        - import urllib.request; request = urllib.request.Request('http://127.0.0.1:8000/health/ready', headers={'Host':'${KB_PUBLIC_HOST:?required}'}); urllib.request.urlopen(request, timeout=4)
       interval: 15s
       timeout: 5s
       retries: 12
       start_period: 30s
     <<: *runtime-security
-    mem_limit: 2g
-    cpus: 1.50
+    mem_limit: 1536m
+    cpus: 1.25
     stop_grace_period: 30s
     pids_limit: 256
     logging: *default-logging
@@ -301,17 +389,25 @@ services:
       - frontend
 
   maintenance:
-    image: ${KB_API_IMAGE:-heyi-kb-offline-api:local}
+    image: ${KB_API_IMAGE:?required}
+    pull_policy: never
     restart: unless-stopped
     init: true
     environment: *api-environment
     command: ["python", "-m", "app.maintenance", "--interval", "60"]
+    volumes:
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/capacity-probe
+        target: /var/lib/kb-capacity
+        read_only: true
     depends_on:
       api:
         condition: service_healthy
+      clamd:
+        condition: service_healthy
     <<: *runtime-security
-    mem_limit: 768m
-    cpus: 0.35
+    mem_limit: 512m
+    cpus: 0.25
     stop_grace_period: 30s
     pids_limit: 128
     logging: *default-logging
@@ -319,16 +415,14 @@ services:
       - backend
 
   web:
-    image: ${KB_WEB_IMAGE:-heyi-kb-offline-web:local}
-    build:
-      context: ../../web
-      dockerfile: Dockerfile
-      target: runtime
+    image: ${KB_WEB_IMAGE:?required}
+    pull_policy: never
     restart: unless-stopped
     init: true
     environment:
       FASTAPI_URL: http://api:8000
       FASTAPI_BFF_SHARED_SECRET: ${KB_BFF_SHARED_SECRET:?required}
+      KB_PUBLIC_ORIGIN: ${KB_PUBLIC_ORIGIN:?required}
     depends_on:
       api:
         condition: service_healthy
@@ -340,8 +434,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    mem_limit: 1g
-    cpus: 0.75
+    mem_limit: 768m
+    cpus: 0.60
     stop_grace_period: 30s
     pids_limit: 256
     logging: *default-logging
@@ -349,7 +443,7 @@ services:
       - frontend
 
   proxy:
-    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    image: caddy:2.10.2-alpine@sha256:d8c17a862962def15cde69863a3a463f25a2664942eafd7bdbf050e9c3116b83
     restart: unless-stopped
     environment:
       KB_PUBLIC_HOST: ${KB_PUBLIC_HOST:?required}
@@ -378,18 +472,30 @@ services:
       - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
-    mem_limit: 256m
-    cpus: 0.20
+    mem_limit: 128m
+    cpus: 0.15
     stop_grace_period: 30s
     pids_limit: 64
     logging: *default-logging
     networks:
+      - edge
       - frontend
 
 networks:
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.242.0/24
   backend:
     driver: bridge
     internal: true
+    ipam:
+      config:
+        - subnet: 172.30.241.0/24
   frontend:
     driver: bridge
     internal: true
+    ipam:
+      config:
+        - subnet: 172.30.240.0/24

@@ -5,10 +5,12 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.api.dependencies import DatabaseSession, require_any_permission, require_permission
+from app.api.egress_leases import deny_if_active_external_llm_egress
 from app.api.errors import ApiError
+from app.core.config import Settings, get_settings
 from app.db.models import (
     File,
     KnowledgeBase,
@@ -32,7 +34,7 @@ from app.schemas.knowledge_bases import (
     KnowledgeSearchResponse,
 )
 from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import (
     KnowledgeBaseAccess,
     list_accessible_knowledge_bases,
@@ -49,6 +51,53 @@ def _ensure_metadata_size(value: dict[str, object]) -> None:
             status_code=422,
             code="metadata_too_large",
             message="Custom metadata must not exceed 16 KiB",
+        )
+
+
+async def _knowledge_entry_usage(
+    session: DatabaseSession,
+    *,
+    knowledge_base_id: UUID,
+) -> tuple[int, int]:
+    bind = session.get_bind()
+    content_bytes = (
+        func.octet_length(KnowledgeEntry.content)
+        if bind.dialect.name == "postgresql"
+        else func.length(KnowledgeEntry.content)
+    )
+    row = (
+        await session.execute(
+            select(
+                func.count(KnowledgeEntry.id),
+                func.coalesce(func.sum(content_bytes), 0),
+            ).where(
+                KnowledgeEntry.knowledge_base_id == knowledge_base_id,
+                KnowledgeEntry.deleted_at.is_(None),
+            )
+        )
+    ).one()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def _enforce_knowledge_entry_capacity(
+    *,
+    current_count: int,
+    current_bytes: int,
+    incoming_count: int,
+    incoming_bytes: int,
+    settings: Settings,
+) -> None:
+    if current_count + incoming_count > settings.platform_max_entries_per_knowledge_base:
+        raise ApiError(
+            status_code=507,
+            code="knowledge_entry_count_limit_reached",
+            message="The knowledge base entry-count safety limit has been reached",
+        )
+    if current_bytes + incoming_bytes > settings.platform_max_entry_bytes_per_knowledge_base:
+        raise ApiError(
+            status_code=507,
+            code="knowledge_entry_bytes_limit_reached",
+            message="The knowledge base entry-byte safety limit has been reached",
         )
 
 
@@ -108,6 +157,7 @@ async def create_knowledge_base(
         session,
         actor_id=access.user.id,
         action="knowledge_base.created",
+        result=AuditResult.SUCCESS,
         resource_type="knowledge_base",
         resource_id=str(knowledge_base.id),
         request_id=getattr(request.state, "request_id", None),
@@ -150,12 +200,26 @@ async def update_knowledge_base(
         _ensure_metadata_size(changes["custom_metadata"])
     if "name" in changes:
         changes["name"] = changes["name"].strip()
+    if (
+        changes.get("external_llm_processing_enabled") is False
+        and item.knowledge_base.external_llm_processing_enabled
+    ):
+        await deny_if_active_external_llm_egress(
+            session,
+            request,
+            access,
+            revocation_scope="knowledge_base_external_processing",
+            resource_type="knowledge_base",
+            resource_id=str(knowledge_base_id),
+            knowledge_base_id=knowledge_base_id,
+        )
     for key, value in changes.items():
         setattr(item.knowledge_base, key, value)
     add_audit_event(
         session,
         actor_id=access.user.id,
         action="knowledge_base.updated",
+        result=AuditResult.SUCCESS,
         resource_type="knowledge_base",
         resource_id=str(knowledge_base_id),
         request_id=getattr(request.state, "request_id", None),
@@ -213,7 +277,11 @@ async def replace_role_grants(
     role_ids = {item.role_id for item in payload.grants}
     if role_ids:
         existing = set(
-            (await session.scalars(select(Role.id).where(Role.id.in_(role_ids)))).all()
+            (
+                await session.scalars(
+                    select(Role.id).where(Role.id.in_(role_ids))
+                )
+            ).all()
         )
         if existing != role_ids:
             raise ApiError(
@@ -221,6 +289,15 @@ async def replace_role_grants(
                 code="unknown_role",
                 message="One or more roles do not exist",
             )
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="knowledge_base_role_grants",
+        resource_type="knowledge_base",
+        resource_id=str(knowledge_base_id),
+        knowledge_base_id=knowledge_base_id,
+    )
     await session.execute(
         delete(KnowledgeBaseRoleGrant).where(
             KnowledgeBaseRoleGrant.knowledge_base_id == knowledge_base_id
@@ -240,6 +317,7 @@ async def replace_role_grants(
         session,
         actor_id=access.user.id,
         action="knowledge_base.role_grants_replaced",
+        result=AuditResult.SUCCESS,
         resource_type="knowledge_base",
         resource_id=str(knowledge_base_id),
         request_id=getattr(request.state, "request_id", None),
@@ -337,14 +415,27 @@ async def create_entry(
     response: Response,
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("knowledge:update"))],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> KnowledgeEntry:
     await require_knowledge_base_access(
         session,
         access,
         knowledge_base_id,
         minimum=KnowledgeBaseAccessLevel.EDITOR,
+        lock=True,
     )
     _ensure_metadata_size(payload.custom_metadata)
+    current_count, current_bytes = await _knowledge_entry_usage(
+        session,
+        knowledge_base_id=knowledge_base_id,
+    )
+    _enforce_knowledge_entry_capacity(
+        current_count=current_count,
+        current_bytes=current_bytes,
+        incoming_count=1,
+        incoming_bytes=len(payload.content.encode("utf-8")),
+        settings=settings,
+    )
     if payload.source_file_id is not None:
         source_file = await session.scalar(
             select(File).where(
@@ -375,6 +466,7 @@ async def create_entry(
         session,
         actor_id=access.user.id,
         action="knowledge_entry.created",
+        result=AuditResult.SUCCESS,
         resource_type="knowledge_entry",
         resource_id=str(entry.id),
         request_id=getattr(request.state, "request_id", None),
@@ -399,12 +491,14 @@ async def update_entry(
     request: Request,
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("knowledge:update"))],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> KnowledgeEntry:
     await require_knowledge_base_access(
         session,
         access,
         knowledge_base_id,
         minimum=KnowledgeBaseAccessLevel.EDITOR,
+        lock=True,
     )
     entry = await session.scalar(
         select(KnowledgeEntry)
@@ -424,12 +518,27 @@ async def update_entry(
     changes = payload.model_dump(exclude_unset=True)
     if "custom_metadata" in changes:
         _ensure_metadata_size(changes["custom_metadata"])
+    if "content" in changes:
+        current_count, current_bytes = await _knowledge_entry_usage(
+            session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        previous_bytes = len(entry.content.encode("utf-8"))
+        next_bytes = len(str(changes["content"]).encode("utf-8"))
+        _enforce_knowledge_entry_capacity(
+            current_count=current_count,
+            current_bytes=max(current_bytes - previous_bytes, 0),
+            incoming_count=0,
+            incoming_bytes=next_bytes,
+            settings=settings,
+        )
     for key, value in changes.items():
         setattr(entry, key, value)
     add_audit_event(
         session,
         actor_id=access.user.id,
         action="knowledge_entry.updated",
+        result=AuditResult.SUCCESS,
         resource_type="knowledge_entry",
         resource_id=str(entry.id),
         request_id=getattr(request.state, "request_id", None),

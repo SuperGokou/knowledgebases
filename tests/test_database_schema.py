@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -36,6 +37,11 @@ def test_enterprise_metadata_tables_are_registered() -> None:
         "knowledge_entries",
         "api_keys",
         "llm_provider_configs",
+        "llm_model_prices",
+        "llm_budget_policies",
+        "llm_budget_counters",
+        "llm_usage_records",
+        "llm_usage_budget_holds",
     }
 
     assert expected <= set(Base.metadata.tables)
@@ -92,9 +98,7 @@ def test_api_keys_are_hashed_scoped_and_llm_default_is_unique() -> None:
 
     providers = Base.metadata.tables["llm_provider_configs"]
     default_indexes = [
-        index
-        for index in providers.indexes
-        if index.name == "uq_llm_provider_configs_default"
+        index for index in providers.indexes if index.name == "uq_llm_provider_configs_default"
     ]
     assert len(default_indexes) == 1
     assert default_indexes[0].unique
@@ -106,6 +110,69 @@ def test_expected_database_heads_match_the_alembic_graph() -> None:
     script = ScriptDirectory.from_config(Config("alembic.ini"))
 
     assert frozenset(script.get_heads()) == EXPECTED_ALEMBIC_HEADS
+
+
+def test_data_api_roles_are_denied_by_a_forward_migration() -> None:
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260712_0013_deny_direct_data_api.py"
+    )
+    assert migration.exists()
+    source = migration.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "20260712_0012"' in source
+    assert "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC" in source
+    assert "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC" in source
+    assert "ALTER DEFAULT PRIVILEGES IN SCHEMA public" in source
+    assert "anon" in source
+    assert "authenticated" in source
+
+
+def test_malware_scan_state_has_a_forward_migration() -> None:
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260712_0009_malware_scan_state.py"
+    )
+    assert migration.exists()
+    source = migration.read_text(encoding="utf-8")
+    for column in (
+        "malware_scan_status",
+        "malware_signature",
+        "malware_scan_error_code",
+        "malware_scan_started_at",
+        "malware_scanned_at",
+    ):
+        assert column in source
+    assert "publication_status = 'DRAFT'" in source
+    assert "knowledge_status = 'DRAFT_READY'" in source
+    assert "DELETE FROM okf_conversion_jobs" in source
+
+
+def test_llm_usage_governance_has_a_forward_migration() -> None:
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260712_0010_llm_usage_governance.py"
+    )
+    assert migration.exists()
+    source = migration.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "20260712_0009"' in source
+    for table in (
+        "llm_model_prices",
+        "llm_budget_policies",
+        "llm_budget_counters",
+        "llm_usage_records",
+        "llm_usage_budget_holds",
+    ):
+        assert table in source
+    assert "uq_llm_usage_tenant_idempotency" in source
+    assert "uq_llm_budget_counter_window" in source
+    assert "ix_llm_usage_knowledge_base_status" in source
+    assert '["knowledge_base_id", "status"]' in source
 
 
 class FakeRevisionResult:

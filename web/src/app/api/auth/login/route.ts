@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { resolveLandingPath } from "@/lib/access-routing";
 import { backendUrl, safeBackendFetch } from "@/lib/server/backend";
+import { readBoundedBody, RequestBodyTooLargeError } from "@/lib/server/bounded-body";
 import { BffSigningConfigurationError, signedClientIpHeaders } from "@/lib/server/client-ip";
 import { hasSameOrigin, setSessionCookies, type TokenPair } from "@/lib/server/session";
 import type { AuthMe } from "@/lib/types";
@@ -11,6 +12,10 @@ type LoginPayload = {
   password?: unknown;
   next?: unknown;
 };
+
+const MAX_LOGIN_BODY_BYTES = 4096;
+const MAX_LOGIN_EMAIL_CHARACTERS = 320;
+const MAX_LOGIN_PASSWORD_CHARACTERS = 256;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -86,13 +91,40 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  const payload = (await request.json().catch(() => null)) as LoginPayload | null;
+  let rawPayload: ArrayBuffer | undefined;
+  try {
+    rawPayload = await readBoundedBody(request, MAX_LOGIN_BODY_BYTES);
+  } catch (error) {
+    if (!(error instanceof RequestBodyTooLargeError)) throw error;
+    return NextResponse.json(
+      {
+        error: {
+          code: "request_body_too_large",
+          message: "登录请求不得超过 4 KiB。",
+        },
+      },
+      { status: 413, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+  const payload = (() => {
+    try {
+      const text = new TextDecoder().decode(rawPayload ?? new ArrayBuffer(0));
+      return (text ? JSON.parse(text) : null) as LoginPayload | null;
+    } catch {
+      return null;
+    }
+  })();
   const email = typeof payload?.email === "string" ? payload.email.trim().toLowerCase() : "";
   const password = typeof payload?.password === "string" ? payload.password : "";
   const requestedNext = typeof payload?.next === "string" && payload.next.length <= 2_048
     ? payload.next
     : null;
-  if (!email || !password) {
+  if (
+    !email
+    || !password
+    || email.length > MAX_LOGIN_EMAIL_CHARACTERS
+    || password.length > MAX_LOGIN_PASSWORD_CHARACTERS
+  ) {
     return NextResponse.json(
       { error: { code: "invalid_login", message: "请输入邮箱和密码。" } },
       { status: 422, headers: { "Cache-Control": "no-store" } },

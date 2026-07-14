@@ -4,8 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.errors import ApiError
-from app.api.health import readiness
-from app.api.middleware import RequestBodyLimitMiddleware
+from app.api.health import readiness, readiness_probe
+from app.api.middleware import RequestBodyLimitMiddleware, normalize_request_id
 from app.db.schema_version import DatabaseSchemaDriftError
 from app.main import app
 
@@ -22,6 +22,8 @@ def test_liveness_endpoint_does_not_require_dependencies() -> None:
 async def test_readiness_rejects_database_schema_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    readiness_probe.reset()
+
     class FakeSession:
         async def execute(self, _statement: Any) -> None:
             return None
@@ -35,8 +37,11 @@ async def test_readiness_rejects_database_schema_drift(
 
     monkeypatch.setattr("app.api.health.assert_database_schema_current", reject_drift)
 
-    with pytest.raises(ApiError) as captured:
-        await readiness(FakeSession(), FakeRedis())  # type: ignore[arg-type]
+    try:
+        with pytest.raises(ApiError) as captured:
+            await readiness(FakeSession(), FakeRedis())  # type: ignore[arg-type]
+    finally:
+        readiness_probe.reset()
 
     assert captured.value.status_code == 503
     assert captured.value.code == "dependency_unavailable"
@@ -72,6 +77,9 @@ def test_openapi_exposes_core_admin_and_file_flows() -> None:
         "/api/v1/api-keys/{api_key_id}",
         "/api/v1/llm/providers",
         "/api/v1/llm/providers/{provider}",
+        "/api/v1/llm/usage",
+        "/api/v1/llm/budget-policies",
+        "/api/v1/llm/budget-policies/{policy_id}",
         "/api/v1/public/chat/query",
         "/api/v1/public/knowledge-bases/{knowledge_base_id}/search",
     } <= paths
@@ -94,6 +102,34 @@ def test_large_control_plane_request_is_rejected_before_parsing() -> None:
 
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_body_too_large"
+
+
+def test_request_id_accepts_only_a_bounded_log_safe_identifier() -> None:
+    assert normalize_request_id("edge.req-123:abc_def") == "edge.req-123:abc_def"
+
+
+@pytest.mark.parametrize(
+    "untrusted",
+    [
+        "trusted\nforged-log-entry",
+        "trusted\r\nX-Forged: yes",
+        "含有中文",
+        "a" * 65,
+        "contains spaces",
+    ],
+)
+def test_request_id_replaces_untrusted_values_before_logging_or_response(
+    untrusted: str,
+) -> None:
+    normalized = normalize_request_id(untrusted)
+
+    assert normalized != untrusted
+    assert len(normalized) == 36
+    assert normalized.count("-") == 4
+    assert all(
+        character.isascii() and (character.isalnum() or character == "-")
+        for character in normalized
+    )
 
 
 @pytest.mark.asyncio

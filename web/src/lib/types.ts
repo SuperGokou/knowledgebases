@@ -158,12 +158,17 @@ export type ChatSourceStatus = {
     | "provider_unconfigured"
     | "provider_configuration_error"
     | "provider_unavailable"
+    | "usage_governance_unavailable"
+    | "usage_budget_exceeded"
+    | "usage_metering_unavailable"
+    | "duplicate_request"
     | "missing_model_citations"
     | "invalid_model_citations"
     | "invalid_model_response"
     | "answer_review_rejected"
     | "answer_review_unavailable"
     | "answer_review_invalid"
+    | "independent_reviewer_unavailable"
     | "no_matching_content";
   citation_count: number;
 };
@@ -237,6 +242,9 @@ export type LlmProviderSettings = {
   configured: boolean;
   credential_source: "database" | "environment" | "none";
   updated_at: string | null;
+  pricing_configured: boolean;
+  input_micro_usd_per_million_tokens: number | null;
+  output_micro_usd_per_million_tokens: number | null;
 };
 
 export type LlmProvidersResponse = {

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from ipaddress import IPv4Network, IPv6Network, ip_network
+from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -77,6 +79,28 @@ class Settings(BaseSettings):
         le=5 * 1024 * 1024 * 1024,
     )
     upload_session_hours: int = Field(default=24, ge=1, le=168)
+    platform_max_upload_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1024,
+        le=4 * 1024 * 1024 * 1024,
+    )
+    platform_max_files_per_user: int = Field(default=100_000, ge=1, le=10_000_000)
+    platform_max_files_total: int = Field(default=2_000_000, ge=1, le=100_000_000)
+    platform_max_entries_per_knowledge_base: int = Field(
+        default=100_000,
+        ge=1,
+        le=10_000_000,
+    )
+    platform_max_entry_bytes_per_knowledge_base: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1024,
+        le=100 * 1024 * 1024 * 1024,
+    )
+    storage_capacity_probe_path: Path | None = None
+    storage_warning_percent: int = Field(default=70, ge=1, le=99)
+    storage_bulk_stop_percent: int = Field(default=80, ge=1, le=99)
+    storage_reject_percent: int = Field(default=90, ge=1, le=100)
+    storage_object_stop_bytes: int = Field(default=180_000_000_000, ge=1)
 
     allowed_extensions: tuple[str, ...] = (
         ".txt",
@@ -96,10 +120,13 @@ class Settings(BaseSettings):
         "testserver",
         "*.vercel.app",
     )
+    trusted_proxy_cidrs: tuple[str, ...] = ()
     default_requests_per_minute: int = Field(default=60, ge=1)
+    authenticated_precheck_requests_per_minute: int = Field(default=10_000, ge=1)
     login_attempts_per_minute: int = Field(default=10, ge=1)
     login_attempts_per_account_per_minute: int = Field(default=5, ge=1)
     refresh_attempts_per_minute: int = Field(default=30, ge=1)
+    api_key_auth_attempts_per_minute: int = Field(default=60, ge=1)
     max_api_body_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
     cron_secret: SecretStr | None = Field(
         default=None,
@@ -107,6 +134,20 @@ class Settings(BaseSettings):
     )
     maintenance_batch_size: int = Field(default=100, ge=1, le=500)
     maintenance_max_batches: int = Field(default=10, ge=1, le=100)
+    malware_scan_host: str = "127.0.0.1"
+    malware_scan_port: int = Field(default=3310, ge=1, le=65_535)
+    malware_scan_timeout_seconds: float = Field(default=120, gt=0, le=3_600)
+    malware_scan_max_stream_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        ge=1024,
+        le=4 * 1024 * 1024 * 1024,
+    )
+    malware_scan_chunk_size_bytes: int = Field(
+        default=1024 * 1024,
+        ge=64 * 1024,
+        le=8 * 1024 * 1024,
+    )
+    malware_scan_reclaim_seconds: int = Field(default=300, ge=60, le=7_200)
 
     # Phase-one OKF compiler. The API key is optional so uploads keep working
     # while the external processor is intentionally disabled.
@@ -144,6 +185,7 @@ class Settings(BaseSettings):
         ),
     )
     llm_default_provider: Literal["deepseek", "qwen", "minimax"] = "deepseek"
+    llm_tenant_key: str = Field(default="default", min_length=1, max_length=100)
     llm_credentials_encryption_key: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -190,6 +232,47 @@ class Settings(BaseSettings):
             normalized.add(hostname)
         return tuple(sorted(normalized))
 
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def normalize_trusted_proxy_cidrs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: set[str] = set()
+        for item in value:
+            if not item or item != item.strip():
+                raise ValueError("KB_TRUSTED_PROXY_CIDRS must contain exact CIDR values")
+            try:
+                network = ip_network(item, strict=True)
+            except ValueError as error:
+                raise ValueError(
+                    "KB_TRUSTED_PROXY_CIDRS must contain canonical CIDR values"
+                ) from error
+            if isinstance(network, IPv4Network):
+                minimum_prefix = 24
+                approved = any(
+                    network.subnet_of(parent)
+                    for parent in (
+                        IPv4Network("10.0.0.0/8"),
+                        IPv4Network("172.16.0.0/12"),
+                        IPv4Network("192.168.0.0/16"),
+                        IPv4Network("127.0.0.0/8"),
+                    )
+                )
+            else:
+                assert isinstance(network, IPv6Network)
+                minimum_prefix = 64
+                approved = any(
+                    network.subnet_of(parent)
+                    for parent in (
+                        IPv6Network("fc00::/7"),
+                        IPv6Network("::1/128"),
+                    )
+                )
+            if network.prefixlen < minimum_prefix or not approved:
+                raise ValueError(
+                    "KB_TRUSTED_PROXY_CIDRS must contain narrow private proxy networks"
+                )
+            normalized.add(str(network))
+        return tuple(sorted(normalized))
+
     @field_validator("database_url", mode="before")
     @classmethod
     def normalize_database_driver(cls, value: object) -> object:
@@ -208,6 +291,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def reject_development_secrets_in_production(self) -> Settings:
+        if self.platform_max_upload_bytes != self.malware_scan_max_stream_bytes:
+            raise ValueError(
+                "platform upload limit must equal the malware scan stream limit"
+            )
+        if not (
+            self.storage_warning_percent
+            < self.storage_bulk_stop_percent
+            < self.storage_reject_percent
+        ):
+            raise ValueError("storage watermarks must increase from warning to rejection")
         if self.environment == "production":
             jwt_secret = self.jwt_secret.get_secret_value()
             admin_password = (
@@ -236,6 +329,23 @@ class Settings(BaseSettings):
             if self.debug:
                 raise ValueError("KB_DEBUG must be false in production")
             if self.deployment_profile == "isolated":
+                expected_storage_policy = {
+                    "storage_warning_percent": 70,
+                    "storage_bulk_stop_percent": 80,
+                    "storage_reject_percent": 90,
+                    "storage_object_stop_bytes": 180_000_000_000,
+                    "platform_max_upload_bytes": 2 * 1024 * 1024 * 1024,
+                }
+                if self.storage_capacity_probe_path != Path("/var/lib/kb-capacity"):
+                    raise ValueError(
+                        "KB_STORAGE_CAPACITY_PROBE_PATH must reference the isolated "
+                        "read-only capacity probe"
+                    )
+                for field_name, required_value in expected_storage_policy.items():
+                    if getattr(self, field_name) != required_value:
+                        raise ValueError(
+                            f"{field_name} must be {required_value} in isolated deployments"
+                        )
                 isolated_services = (
                     ("KB_DATABASE_URL", self.database_url, {"postgresql+asyncpg"}, "postgres"),
                     ("KB_REDIS_URL", self.redis_url, {"redis"}, "redis"),
@@ -251,6 +361,11 @@ class Settings(BaseSettings):
                             f"{variable} must reference the isolated Compose service "
                             f"{required_host!r}"
                         )
+                if self.malware_scan_host != "clamd":
+                    raise ValueError(
+                        "KB_MALWARE_SCAN_HOST must reference the isolated Compose service "
+                        "'clamd'"
+                    )
                 if self.external_llm_enabled:
                     raise ValueError(
                         "KB_EXTERNAL_LLM_ENABLED must be false in isolated deployments"
@@ -269,6 +384,20 @@ class Settings(BaseSettings):
                         raise ValueError(
                             f"{variable} must reference an external production service"
                         )
+                parsed_database = urlparse(self.database_url)
+                database_query = parse_qs(
+                    parsed_database.query,
+                    keep_blank_values=True,
+                )
+                tls_parameter = (
+                    "ssl" if parsed_database.scheme == "postgresql+asyncpg" else "sslmode"
+                )
+                tls_values = database_query.get(tls_parameter, [])
+                if len(tls_values) != 1 or tls_values[0].lower() != "verify-full":
+                    raise ValueError(
+                        "KB_DATABASE_URL must require certificate-verified TLS "
+                        f"with {tls_parameter}=verify-full in standard production"
+                    )
                 if urlparse(self.redis_url).scheme != "rediss":
                     raise ValueError("KB_REDIS_URL must use TLS (rediss://) in production")
             if "*" in self.cors_origins or "null" in {

@@ -43,6 +43,14 @@ class FileStatus(StrEnum):
     DELETED = "deleted"
 
 
+class MalwareScanStatus(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    CLEAN = "clean"
+    INFECTED = "infected"
+    ERROR = "error"
+
+
 class UploadSessionStatus(StrEnum):
     INITIATED = "initiated"
     FINALIZING = "finalizing"
@@ -57,6 +65,19 @@ class ReservationStatus(StrEnum):
     CONSUMED = "consumed"
     RELEASED = "released"
     EXPIRED = "expired"
+
+
+class LlmUsageStatus(StrEnum):
+    HELD = "held"
+    SETTLED = "settled"
+    RELEASED = "released"
+    INDETERMINATE = "indeterminate"
+
+
+class AuditResult(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    DENIED = "denied"
 
 
 class KnowledgeBaseAccessLevel(StrEnum):
@@ -262,6 +283,19 @@ class KnowledgeBaseRoleGrant(TimestampMixin, Base):
 
 class File(TimestampMixin, Base):
     __tablename__ = "files"
+    __table_args__ = (
+        CheckConstraint(
+            "malware_scan_attempts >= 0",
+            name="malware_scan_attempts_non_negative",
+        ),
+        Index(
+            "ix_files_malware_scan_claim",
+            "status",
+            "malware_scan_status",
+            "malware_scan_next_attempt_at",
+            "created_at",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     owner_id: Mapped[UUID] = mapped_column(
@@ -287,6 +321,20 @@ class File(TimestampMixin, Base):
         nullable=False,
     )
     knowledge_error_code: Mapped[str | None] = mapped_column(String(100))
+    malware_scan_status: Mapped[MalwareScanStatus] = mapped_column(
+        Enum(MalwareScanStatus, name="malware_scan_status"),
+        default=MalwareScanStatus.PENDING,
+        nullable=False,
+    )
+    malware_signature: Mapped[str | None] = mapped_column(String(255))
+    malware_scan_error_code: Mapped[str | None] = mapped_column(String(100))
+    malware_scan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    malware_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    malware_scan_lease_id: Mapped[UUID | None] = mapped_column(Uuid, index=True)
+    malware_scan_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    malware_scan_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     custom_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -326,6 +374,10 @@ class OkfConversionJob(TimestampMixin, Base):
     __tablename__ = "okf_conversion_jobs"
     __table_args__ = (
         UniqueConstraint("file_id", "file_version", name="uq_okf_conversion_file_version"),
+        CheckConstraint(
+            "retry_generation >= 0",
+            name="okf_conversion_retry_generation_non_negative",
+        ),
         Index("ix_okf_conversion_claim", "status", "next_attempt_at", "created_at"),
     )
 
@@ -343,6 +395,7 @@ class OkfConversionJob(TimestampMixin, Base):
         nullable=False,
     )
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    retry_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     model: Mapped[str | None] = mapped_column(String(100))
     prompt_version: Mapped[str] = mapped_column(String(50), nullable=False)
     output_entry_id: Mapped[UUID | None] = mapped_column(
@@ -462,7 +515,10 @@ class RefreshToken(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    __table_args__ = (Index("ix_audit_logs_resource", "resource_type", "resource_id"),)
+    __table_args__ = (
+        Index("ix_audit_logs_resource", "resource_type", "resource_id"),
+        Index("ix_audit_logs_result_id", "result", "id"),
+    )
 
     id: Mapped[int] = mapped_column(
         BigInteger().with_variant(Integer, "sqlite"),
@@ -473,6 +529,9 @@ class AuditLog(Base):
         ForeignKey("users.id", ondelete="SET NULL"), index=True
     )
     action: Mapped[str] = mapped_column(String(150), index=True, nullable=False)
+    result: Mapped[AuditResult] = mapped_column(
+        Enum(AuditResult, name="audit_result"), nullable=False
+    )
     resource_type: Mapped[str] = mapped_column(String(100), nullable=False)
     resource_id: Mapped[str | None] = mapped_column(String(255))
     request_id: Mapped[str | None] = mapped_column(String(100), index=True)
@@ -542,3 +601,222 @@ class LlmProviderConfig(TimestampMixin, Base):
     updated_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), index=True
     )
+
+
+class LlmModelPrice(TimestampMixin, Base):
+    """Auditable price snapshot source; unknown provider/model pairs are not billable."""
+
+    __tablename__ = "llm_model_prices"
+    __table_args__ = (
+        CheckConstraint(
+            "input_micro_usd_per_million_tokens >= 0",
+            name="llm_model_price_non_negative_input",
+        ),
+        CheckConstraint(
+            "output_micro_usd_per_million_tokens >= 0",
+            name="llm_model_price_non_negative_output",
+        ),
+    )
+
+    provider: Mapped[str] = mapped_column(String(30), primary_key=True)
+    model: Mapped[str] = mapped_column(String(100), primary_key=True)
+    input_micro_usd_per_million_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    output_micro_usd_per_million_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    updated_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+
+
+class LlmBudgetPolicy(TimestampMixin, Base):
+    """A hard budget matching a tenant and optional user/key/provider/model dimensions."""
+
+    __tablename__ = "llm_budget_policies"
+    __table_args__ = (
+        CheckConstraint(
+            "daily_token_limit IS NOT NULL OR monthly_token_limit IS NOT NULL OR "
+            "daily_cost_limit_micro_usd IS NOT NULL OR "
+            "monthly_cost_limit_micro_usd IS NOT NULL",
+            name="llm_budget_policy_has_limit",
+        ),
+        CheckConstraint(
+            "(daily_token_limit IS NULL OR daily_token_limit >= 0) AND "
+            "(monthly_token_limit IS NULL OR monthly_token_limit >= 0) AND "
+            "(daily_cost_limit_micro_usd IS NULL OR daily_cost_limit_micro_usd >= 0) AND "
+            "(monthly_cost_limit_micro_usd IS NULL OR monthly_cost_limit_micro_usd >= 0)",
+            name="llm_budget_policy_non_negative_limits",
+        ),
+        Index(
+            "ix_llm_budget_policy_match",
+            "tenant_key",
+            "user_id",
+            "api_key_id",
+            "provider",
+            "model",
+            "enabled",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    tenant_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    api_key_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("api_keys.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str | None] = mapped_column(String(30))
+    model: Mapped[str | None] = mapped_column(String(100))
+    daily_token_limit: Mapped[int | None] = mapped_column(BigInteger)
+    monthly_token_limit: Mapped[int | None] = mapped_column(BigInteger)
+    daily_cost_limit_micro_usd: Mapped[int | None] = mapped_column(BigInteger)
+    monthly_cost_limit_micro_usd: Mapped[int | None] = mapped_column(BigInteger)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    updated_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+
+
+class LlmBudgetCounter(Base):
+    """Serialized aggregate for one policy/window; mutated only while row-locked."""
+
+    __tablename__ = "llm_budget_counters"
+    __table_args__ = (
+        UniqueConstraint(
+            "policy_id",
+            "window_kind",
+            "window_start",
+            name="uq_llm_budget_counter_window",
+        ),
+        CheckConstraint("window_kind IN ('day', 'month')", name="llm_budget_window_kind"),
+        CheckConstraint(
+            "used_token_count >= 0 AND reserved_token_count >= 0 AND "
+            "used_cost_micro_usd >= 0 AND reserved_cost_micro_usd >= 0",
+            name="llm_budget_counter_non_negative",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    policy_id: Mapped[UUID] = mapped_column(
+        ForeignKey("llm_budget_policies.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    window_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_token_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    reserved_token_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    used_cost_micro_usd: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    reserved_cost_micro_usd: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class LlmUsageRecord(Base):
+    """Content-free LLM usage ledger and reservation state machine."""
+
+    __tablename__ = "llm_usage_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_key",
+            "idempotency_hash",
+            name="uq_llm_usage_tenant_idempotency",
+        ),
+        CheckConstraint(
+            "reserved_input_tokens >= 0 AND reserved_output_tokens >= 0 AND "
+            "reserved_token_count >= 0 AND reserved_cost_micro_usd >= 0",
+            name="llm_usage_non_negative_reservation",
+        ),
+        CheckConstraint(
+            "(actual_input_tokens IS NULL OR actual_input_tokens >= 0) AND "
+            "(actual_output_tokens IS NULL OR actual_output_tokens >= 0) AND "
+            "(actual_token_count IS NULL OR actual_token_count >= 0) AND "
+            "(actual_cost_micro_usd IS NULL OR actual_cost_micro_usd >= 0)",
+            name="llm_usage_non_negative_actual",
+        ),
+        Index(
+            "ix_llm_usage_tenant_created",
+            "tenant_key",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_llm_usage_knowledge_base_status",
+            "knowledge_base_id",
+            "status",
+        ),
+        Index("ix_llm_usage_dimensions", "provider", "model", "user_id", "api_key_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    tenant_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    idempotency_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    api_key_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("api_keys.id", ondelete="SET NULL"), index=True
+    )
+    knowledge_base_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="SET NULL"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(30), nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[LlmUsageStatus] = mapped_column(
+        Enum(LlmUsageStatus, name="llm_usage_status"),
+        default=LlmUsageStatus.HELD,
+        nullable=False,
+    )
+    reserved_input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_token_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_cost_micro_usd: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    input_price_micro_usd_per_million_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    output_price_micro_usd_per_million_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    actual_input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    actual_output_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    actual_token_count: Mapped[int | None] = mapped_column(BigInteger)
+    actual_cost_micro_usd: Mapped[int | None] = mapped_column(BigInteger)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True, nullable=False
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LlmUsageBudgetHold(Base):
+    """Immutable mapping from a usage reservation to counters selected at reservation time."""
+
+    __tablename__ = "llm_usage_budget_holds"
+    __table_args__ = (
+        UniqueConstraint(
+            "usage_id",
+            "policy_id",
+            "window_kind",
+            name="uq_llm_usage_budget_hold",
+        ),
+        CheckConstraint("window_kind IN ('day', 'month')", name="llm_hold_window_kind"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    usage_id: Mapped[UUID] = mapped_column(
+        ForeignKey("llm_usage_records.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    policy_id: Mapped[UUID] = mapped_column(
+        ForeignKey("llm_budget_policies.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    window_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reserved_token_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reserved_cost_micro_usd: Mapped[int] = mapped_column(BigInteger, nullable=False)

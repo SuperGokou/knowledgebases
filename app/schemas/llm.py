@@ -16,6 +16,12 @@ class LlmProviderUpdate(BaseModel):
     api_key: SecretStr | None = Field(default=None, repr=False)
     clear_api_key: bool = False
     make_default: bool = False
+    input_micro_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=10**15
+    )
+    output_micro_usd_per_million_tokens: int | None = Field(
+        default=None, ge=0, le=10**15
+    )
 
     @field_validator("model")
     @classmethod
@@ -37,6 +43,10 @@ class LlmProviderUpdate(BaseModel):
     def reject_conflicting_secret_operations(self) -> LlmProviderUpdate:
         if self.api_key is not None and self.clear_api_key:
             raise ValueError("api_key and clear_api_key cannot be used together")
+        if (self.input_micro_usd_per_million_tokens is None) != (
+            self.output_micro_usd_per_million_tokens is None
+        ):
+            raise ValueError("input and output model prices must be updated together")
         return self
 
 
@@ -48,6 +58,9 @@ class LlmProviderRead(BaseModel):
     configured: bool
     credential_source: Literal["database", "environment", "none"]
     updated_at: datetime | None = None
+    pricing_configured: bool
+    input_micro_usd_per_million_tokens: int | None = None
+    output_micro_usd_per_million_tokens: int | None = None
 
 
 class LlmProvidersResponse(BaseModel):

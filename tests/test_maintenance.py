@@ -27,8 +27,13 @@ async def test_isolated_maintenance_skips_external_conversion_and_keeps_cleanup(
         assert args[2] is None
         return 1
 
+    async def scan(*_args: Any, **_kwargs: Any) -> int:
+        calls.append("scan")
+        return 3
+
     monkeypatch.setattr("app.maintenance.cleanup_expired_uploads", cleanup)
     monkeypatch.setattr("app.maintenance.resolve_provider_client", forbidden_resolve)
+    monkeypatch.setattr("app.maintenance.process_malware_scan_batch", scan)
     monkeypatch.setattr("app.maintenance.process_okf_conversion_batch", local_conversion)
 
     result = await run_maintenance_once(
@@ -37,5 +42,5 @@ async def test_isolated_maintenance_skips_external_conversion_and_keeps_cleanup(
         settings=Settings(environment="test", external_llm_enabled=False),
     )
 
-    assert result == {"cleaned": 2, "converted": 1}
-    assert calls == ["cleanup", "convert"]
+    assert result == {"cleaned": 2, "scanned": 3, "converted": 1}
+    assert calls == ["cleanup", "scan", "convert"]

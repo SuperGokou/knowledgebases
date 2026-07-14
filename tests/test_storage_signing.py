@@ -28,6 +28,54 @@ async def test_single_upload_signs_exact_content_length() -> None:
     assert "content-length" in signed_headers(initiated.url)
 
 
+@pytest.mark.asyncio
+async def test_single_upload_is_a_create_only_capability() -> None:
+    service = StorageService(Settings())
+    initiated = await service.initiate(
+        key="staging/create-only.pdf",
+        content_type="application/pdf",
+        upload_session_id="session-create-only",
+        expected_size_bytes=123,
+        plan=UploadPlan(mode=UploadMode.SINGLE, part_size_bytes=123, part_count=1),
+    )
+
+    assert initiated.url is not None
+    assert initiated.required_headers["If-None-Match"] == "*"
+    assert "if-none-match" in signed_headers(initiated.url)
+
+
+@pytest.mark.asyncio
+async def test_seal_single_upload_replaces_the_capability_key_with_a_tombstone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = StorageService(Settings())
+    calls: list[dict[str, object]] = []
+
+    def put_object(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(service._client, "put_object", put_object)
+
+    await service.seal_single_upload(
+        key="staging/sealed.pdf",
+        upload_session_id="session-sealed",
+    )
+
+    assert calls == [
+        {
+            "Bucket": "knowledge-base",
+            "Key": "staging/sealed.pdf",
+            "Body": b"",
+            "ContentLength": 0,
+            "ContentType": "application/x-kb-upload-tombstone",
+            "Metadata": {
+                "upload-session-id": "session-sealed",
+                "upload-capability-state": "sealed",
+            },
+        }
+    ]
+
+
 def test_each_multipart_url_signs_its_expected_part_length() -> None:
     service = StorageService(Settings())
     parts = service.presign_parts(
@@ -84,6 +132,8 @@ async def test_isolated_storage_signs_the_internal_tls_proxy_origin() -> None:
             s3_access_key="offline-access-key",
             s3_secret_key="offline-secret-key",
             s3_use_ssl=True,
+            malware_scan_host="clamd",
+            storage_capacity_probe_path="/var/lib/kb-capacity",
             trusted_hosts=("knowledge.internal",),
         )
     )

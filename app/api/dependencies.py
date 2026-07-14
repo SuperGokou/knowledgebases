@@ -4,12 +4,13 @@ from collections.abc import AsyncIterator, Callable
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Depends, Response, status
+from fastapi import Depends, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.client_ip import request_client_ip
 from app.api.errors import ApiError
 from app.core.config import Settings, get_settings
 from app.core.security import PasswordService, TokenError, TokenService
@@ -56,6 +57,8 @@ async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     session: Annotated[AsyncSession, Depends(get_db)],
     tokens: Annotated[TokenService, Depends(get_token_service)],
+    redis: Annotated[Redis, Depends(redis_dependency)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> User:
     try:
         claims = tokens.decode(token, expected_type="access")
@@ -66,6 +69,29 @@ async def get_current_user(
             message="The access token is invalid or expired",
             headers={"WWW-Authenticate": "Bearer"},
         ) from error
+
+    # Enforce a high, configurable hard ceiling using only verified JWT claims
+    # before opening the database-backed user/RBAC path. The role-specific
+    # limiter still runs later once live policy has been resolved.
+    try:
+        decision = await RateLimiter(redis).check(
+            key=f"rate:preauth:user:{claims.user_id}",
+            limit=settings.authenticated_precheck_requests_per_minute,
+        )
+    except Exception as error:
+        raise ApiError(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="rate_limiter_unavailable",
+            message="Rate limiting service is temporarily unavailable",
+        ) from error
+    if not decision.allowed:
+        raise ApiError(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code="rate_limit_exceeded",
+            message="Authenticated request hard limit exceeded",
+            details={"retry_after_seconds": decision.retry_after_seconds},
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
 
     user = await session.scalar(select(User).where(User.id == claims.user_id))
     if user is None or user.status is not UserStatus.ACTIVE:
@@ -135,13 +161,16 @@ def require_permission(permission: str) -> Callable[..., object]:
         redis: Annotated[Redis, Depends(redis_dependency)],
         settings: Annotated[Settings, Depends(get_settings)],
     ) -> AccessContext:
+        # Meter both allowed and denied requests. Authorization resolution has
+        # already consumed database work, so a 403 must not bypass the account
+        # bucket and become an unbounded low-privilege amplification path.
+        await _enforce_access_rate_limit(response, access, redis, settings)
         if not access.allows(permission):
             raise ApiError(
                 status_code=status.HTTP_403_FORBIDDEN,
                 code="permission_denied",
                 message=f"Permission required: {permission}",
             )
-        await _enforce_access_rate_limit(response, access, redis, settings)
         return access
 
     return dependency
@@ -157,13 +186,13 @@ def require_any_permission(*permissions: str) -> Callable[..., object]:
         redis: Annotated[Redis, Depends(redis_dependency)],
         settings: Annotated[Settings, Depends(get_settings)],
     ) -> AccessContext:
+        await _enforce_access_rate_limit(response, access, redis, settings)
         if not any(access.allows(permission) for permission in permissions):
             raise ApiError(
                 status_code=status.HTTP_403_FORBIDDEN,
                 code="permission_denied",
                 message=f"One permission required: {', '.join(permissions)}",
             )
-        await _enforce_access_rate_limit(response, access, redis, settings)
         return access
 
     return dependency
@@ -171,8 +200,31 @@ def require_any_permission(*permissions: str) -> Callable[..., object]:
 
 async def get_api_key_access(
     cleartext: Annotated[str | None, Depends(api_key_header)],
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[Redis, Depends(redis_dependency)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> ApiKeyAccess:
+    source = request_client_ip(request, settings)
+    try:
+        decision = await RateLimiter(redis).check(
+            key=f"rate:api-key-auth:source:{source}",
+            limit=settings.api_key_auth_attempts_per_minute,
+        )
+    except Exception as error:
+        raise ApiError(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="rate_limiter_unavailable",
+            message="Rate limiting service is temporarily unavailable",
+        ) from error
+    if not decision.allowed:
+        raise ApiError(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code="rate_limit_exceeded",
+            message="Too many API key authentication attempts",
+            details={"retry_after_seconds": decision.retry_after_seconds},
+            headers={"Retry-After": str(decision.retry_after_seconds)},
+        )
     return await authenticate_api_key(session, cleartext)
 
 
@@ -183,14 +235,8 @@ def require_api_key_permission(permission: str) -> Callable[..., object]:
         redis: Annotated[Redis, Depends(redis_dependency)],
         settings: Annotated[Settings, Depends(get_settings)],
     ) -> ApiKeyAccess:
-        if not key_access.access.allows(permission):
-            raise ApiError(
-                status_code=status.HTTP_403_FORBIDDEN,
-                code="api_key_scope_denied",
-                message=f"API key permission required: {permission}",
-            )
-
-        # Retain the account-wide limit so issuing multiple keys cannot bypass RBAC quotas.
+        # Meter before scope authorization so repeated 403 responses cannot
+        # bypass either the account-wide or credential-specific bucket.
         await _enforce_access_rate_limit(response, key_access.access, redis, settings)
         try:
             decision = await RateLimiter(redis).check(
@@ -216,6 +262,12 @@ def require_api_key_permission(permission: str) -> Callable[..., object]:
                     "X-RateLimit-Limit": str(decision.limit),
                     "X-RateLimit-Remaining": "0",
                 },
+            )
+        if not key_access.access.allows(permission):
+            raise ApiError(
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="api_key_scope_denied",
+                message=f"API key permission required: {permission}",
             )
         return key_access
 

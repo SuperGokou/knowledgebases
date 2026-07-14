@@ -7,7 +7,23 @@
 https://{$KB_PUBLIC_HOST}:8443 {
 	tls internal
 	encode zstd gzip
-	reverse_proxy web:3000
+
+	# Public API clients reach FastAPI directly. This matcher is intentionally
+	# declared before the web fallback so these requests never enter Next.js.
+	@public_api path /api/v1/public/*
+	reverse_proxy @public_api api:8000 {
+		# The API uses the edge-replaced provider-style header for rate limiting.
+		header_up -X-KB-Client-IP
+		header_up -X-KB-Client-Timestamp
+		header_up -X-KB-Client-Signature
+		header_up X-Vercel-Forwarded-For {remote_host}
+	}
+
+	reverse_proxy web:3000 {
+		# The BFF signs this provider-style header as a rate-limit identity.
+		# Always replace any client-supplied value at the trusted edge.
+		header_up X-Vercel-Forwarded-For {remote_host}
+	}
 
 	log {
 		output stdout

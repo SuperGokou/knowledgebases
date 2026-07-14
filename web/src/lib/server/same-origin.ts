@@ -4,7 +4,7 @@ type ReadableHeaders = {
 
 export type SameOriginOptions = {
   production: boolean;
-  requestProtocol: string;
+  trustedOrigin: string | undefined;
 };
 
 export function isSameOriginRequest(
@@ -19,16 +19,17 @@ export function isSameOriginRequest(
 
   try {
     const source = new URL(origin);
-    const forwardedHost = (headers.get("x-forwarded-host") ?? headers.get("host"))
-      ?.split(",", 1)[0]
-      ?.trim();
-    const forwardedProto = (headers.get("x-forwarded-proto") ?? options.requestProtocol)
-      .split(",", 1)[0]
-      ?.trim()
-      .replace(/:$/, "")
-      .toLowerCase();
-    if (!forwardedHost || !["http", "https"].includes(forwardedProto)) return false;
-    return source.origin === new URL(`${forwardedProto}://${forwardedHost}`).origin;
+    if (!options.trustedOrigin) return false;
+    const trusted = new URL(options.trustedOrigin);
+    if (
+      !["http:", "https:"].includes(trusted.protocol)
+      || trusted.username
+      || trusted.password
+      || trusted.pathname !== "/"
+      || trusted.search
+      || trusted.hash
+    ) return false;
+    return source.origin === trusted.origin;
   } catch {
     return false;
   }

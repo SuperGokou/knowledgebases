@@ -76,7 +76,7 @@ describe("角色中文文案", () => {
       description: "Bootstrap role with every catalog permission and unlimited quotas",
     })).toEqual({
       name: "系统管理员",
-      description: "拥有全部系统权限且所有资源限额均为无限制的系统角色。",
+      description: "拥有全部系统权限，角色额度不设上限；仍受平台安全硬上限、恶意软件扫描上限及磁盘水位策略约束。",
     });
   });
 
@@ -104,6 +104,7 @@ describe("角色限额说明", () => {
       expect(copy.window).toMatch(/[\u3400-\u9fff]/u);
     }
     expect(limitCopy(definition("storage_bytes")).description).toContain("删除文件不会返还");
+    expect(limitCopy(definition("max_upload_bytes")).description).toContain("平台安全硬上限");
   });
 
   it("使用中文状态并格式化容量", () => {

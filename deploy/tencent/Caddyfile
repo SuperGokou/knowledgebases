@@ -7,7 +7,11 @@
 https://{$KB_PUBLIC_HOST}:8443 {
 	tls internal
 	encode zstd gzip
-	reverse_proxy web:3000
+	reverse_proxy web:3000 {
+		# The BFF signs this provider-style header as a rate-limit identity.
+		# Always replace any client-supplied value at the trusted edge.
+		header_up X-Vercel-Forwarded-For {remote_host}
+	}
 
 	log {
 		output stdout

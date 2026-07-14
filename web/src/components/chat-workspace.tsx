@@ -8,6 +8,7 @@ import { ChatDataTable } from "@/components/chat-data-table";
 import { Icon } from "@/components/icon";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import { parseChatReply } from "@/lib/chat-contract";
+import { createChatIdempotencyController } from "@/lib/chat-idempotency";
 import { answerWithoutEmbeddedSources } from "@/lib/chat-sources";
 import { scrollIntoViewIfSupported } from "@/lib/dom";
 import { createRequestDeadline, type RequestDeadline } from "@/lib/request-deadline";
@@ -23,6 +24,12 @@ const suggestions = [
   "给我一份适合新成员阅读的知识摘要。",
 ];
 
+type ChatOperation = {
+  content: string;
+  knowledgeBaseId: string;
+  userMessage: ChatMessage;
+};
+
 export function ChatWorkspace() {
   const { can, loading: accessLoading, me } = useAccess();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
@@ -33,8 +40,11 @@ export function ChatWorkspace() {
   const [loadError, setLoadError] = useState("");
   const [serviceHint, setServiceHint] = useState("正在连接知识检索");
   const [serviceState, setServiceState] = useState<"connected" | "warning">("warning");
+  const [retryFailureId, setRetryFailureId] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeRequestRef = useRef<RequestDeadline | null>(null);
+  const idempotencyRef = useRef(createChatIdempotencyController());
+  const retryOperationRef = useRef<ChatOperation | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -72,40 +82,51 @@ export function ChatWorkspace() {
     const activeRequest = activeRequestRef.current;
     activeRequestRef.current = null;
     activeRequest?.cancel();
+    retryOperationRef.current = null;
+    idempotencyRef.current.conversationReset();
+    setRetryFailureId(null);
     setPending(false);
     setMessages([]);
   }
 
-  async function send() {
-    const content = input.trim();
-    if (
-      !content
-      || content.length > CHAT_MESSAGE_MAX_LENGTH
-      || !knowledgeBaseId
-      || pending
-      || activeRequestRef.current
-      || !can("chat:query")
-    ) return;
+  function updateInput(nextInput: string) {
+    if (!pending && retryOperationRef.current) {
+      retryOperationRef.current = null;
+      idempotencyRef.current.messageEdited();
+      setRetryFailureId(null);
+    }
+    setInput(nextInput);
+  }
+
+  async function executeOperation(
+    operation: ChatOperation,
+    idempotencyKey: string,
+    appendUserMessage: boolean,
+  ) {
     const deadline = createRequestDeadline(CHAT_REQUEST_TIMEOUT_MS);
     activeRequestRef.current = deadline;
-    const userMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content,
-      createdAt: new Date().toISOString(),
-    };
-    setMessages((current) => [...current, userMessage]);
-    setInput("");
+    retryOperationRef.current = operation;
+    if (appendUserMessage) {
+      setMessages((current) => [...current, operation.userMessage]);
+    }
     setPending(true);
     try {
       const reply = parseChatReply(
         await apiRequest<unknown>("/api/v1/chat/query", {
           method: "POST",
-          body: JSON.stringify({ knowledge_base_id: knowledgeBaseId, message: content, limit: 5 }),
+          headers: { "Idempotency-Key": idempotencyKey },
+          body: JSON.stringify({
+            knowledge_base_id: operation.knowledgeBaseId,
+            message: operation.content,
+            limit: 5,
+          }),
           signal: deadline.signal,
         }),
       );
       if (activeRequestRef.current !== deadline) return;
+      retryOperationRef.current = null;
+      idempotencyRef.current.complete();
+      setRetryFailureId(null);
       setMessages((current) => [
         ...current,
         {
@@ -130,10 +151,12 @@ export function ChatWorkspace() {
       ) return;
       const timedOut = deadline.timedOut;
       const unavailable = reason instanceof ApiClientError && [404, 501].includes(reason.status);
+      const failureId = crypto.randomUUID();
+      setRetryFailureId(failureId);
       setMessages((current) => [
         ...current,
         {
-          id: crypto.randomUUID(),
+          id: failureId,
           role: "assistant",
           content: timedOut
             ? "问答请求超时，请稍后重试。"
@@ -153,6 +176,45 @@ export function ChatWorkspace() {
         setPending(false);
       }
     }
+  }
+
+  async function send() {
+    const content = input.trim();
+    if (
+      !content
+      || content.length > CHAT_MESSAGE_MAX_LENGTH
+      || !knowledgeBaseId
+      || pending
+      || activeRequestRef.current
+      || !can("chat:query")
+    ) return;
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content,
+      createdAt: new Date().toISOString(),
+    };
+    const operation: ChatOperation = { content, knowledgeBaseId, userMessage };
+    const idempotencyKey = idempotencyRef.current.begin();
+    setInput("");
+    await executeOperation(operation, idempotencyKey, true);
+  }
+
+  async function retryFailedOperation() {
+    const operation = retryOperationRef.current;
+    const idempotencyKey = idempotencyRef.current.retry();
+    if (
+      !operation
+      || !idempotencyKey
+      || pending
+      || activeRequestRef.current
+      || !can("chat:query")
+    ) return;
+    if (retryFailureId) {
+      setMessages((current) => current.filter((message) => message.id !== retryFailureId));
+    }
+    setRetryFailureId(null);
+    await executeOperation(operation, idempotencyKey, false);
   }
 
   const canQuery = !accessLoading && can("chat:query");
@@ -196,7 +258,7 @@ export function ChatWorkspace() {
               {ready ? (
                 <div className="suggestion-grid">
                   {suggestions.map((suggestion) => (
-                    <button className="suggestion" type="button" key={suggestion} onClick={() => setInput(suggestion)}>{suggestion}</button>
+                    <button className="suggestion" type="button" key={suggestion} onClick={() => updateInput(suggestion)}>{suggestion}</button>
                   ))}
                 </div>
               ) : null}
@@ -210,6 +272,16 @@ export function ChatWorkspace() {
                     <div className="answer-response">
                       <div className="message-content">{message.content}</div>
                       {message.role === "assistant" && message.table ? <ChatDataTable table={message.table} /> : null}
+                      {message.failed && message.id === retryFailureId ? (
+                        <button
+                          className="button secondary small"
+                          type="button"
+                          onClick={() => void retryFailedOperation()}
+                          disabled={pending}
+                        >
+                          重新发送
+                        </button>
+                      ) : null}
                     </div>
                     {message.role === "assistant" ? (
                       <AnswerSources
@@ -241,9 +313,9 @@ export function ChatWorkspace() {
               aria-label="输入问题"
               placeholder={ready ? "输入问题，按 Enter 发送…" : "请选择一个可访问的知识库"}
               value={input}
-              disabled={!ready}
+              disabled={!ready || pending}
               maxLength={CHAT_MESSAGE_MAX_LENGTH}
-              onChange={(event) => setInput(event.target.value)}
+              onChange={(event) => updateInput(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                   event.preventDefault();

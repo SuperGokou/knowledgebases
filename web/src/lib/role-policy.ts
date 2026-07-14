@@ -24,7 +24,7 @@ const ROLE_CODE_PATTERN = /^[a-z][a-z0-9_-]{1,99}$/;
 const SYSTEM_ROLE_COPY: Record<string, RoleCopy> = {
   system_admin: {
     name: "系统管理员",
-    description: "拥有全部系统权限且所有资源限额均为无限制的系统角色。",
+    description: "拥有全部系统权限，角色额度不设上限；仍受平台安全硬上限、恶意软件扫描上限及磁盘水位策略约束。",
   },
 };
 
@@ -116,7 +116,7 @@ const LIMIT_COPY: Record<string, LimitCopy> = {
   },
   max_upload_bytes: {
     name: "单个文件大小上限",
-    description: "一次上传任务允许声明的最大文件大小。",
+    description: "角色级单文件上限；“无限制”仅表示不设角色额度，仍受平台安全硬上限与恶意软件扫描上限约束。",
     unit: "文件大小",
     window: "每次上传",
   },

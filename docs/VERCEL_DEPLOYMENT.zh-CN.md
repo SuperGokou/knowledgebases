@@ -33,10 +33,10 @@ knowledgebases     / Root=web/    -> Next.js、HttpOnly BFF、登录与管理 UI
 - Supabase 已建项目不能原地修改区域，需要创建新项目后迁移；Upstash 主区域也不应通过删除/新增只读区域来伪装迁移。
 
 > [!WARNING]
-> Vercel `iad1` 是中国大陆以外的美国节点。Vercel 不提供中国大陆节点或 ICP 备案，因此大陆访问质量不能等同于境内部署。当前拓扑适合演示和海外 Serverless 服务；公司正式面向中国大陆生产时，应继续使用隔离的腾讯云境内部署，并评估 ICP 备案、等保和数据跨境要求。Vercel Hobby 仅限非商业用途，企业正式生产应升级到适用的商业计划。
+> Vercel `iad1` 是中国大陆以外的美国节点。Vercel 不提供中国大陆节点或 ICP 备案，因此大陆访问质量不能等同于境内部署。当前拓扑适合演示和海外 Serverless 服务；公司正式面向中国大陆生产时，应使用隔离的其他云 Linux 境内部署，并评估 ICP 备案、等保和数据跨境要求。Vercel Hobby 仅限非商业用途，企业正式生产应升级到适用的商业计划。
 
 > [!IMPORTANT]
-> 本次区域变更只作用于 Vercel Web/BFF 与 FastAPI Functions，不修改腾讯云 Compose、镜像、端口、发布目录或运行中的容器。若现有 Supabase/Upstash 仍位于新加坡，函数迁到美国后会增加数据层往返延迟；数据库迁移必须单独规划、备份和验证，不能把删除旧实例作为本次发布步骤。
+> 本次区域变更只作用于 Vercel Web/BFF 与 FastAPI Functions，不修改其他云 Linux 主机上的 Compose、镜像、端口、发布目录或运行中的容器。若现有 Supabase/Upstash 仍位于新加坡，函数迁到美国后会增加数据层往返延迟；数据库迁移必须单独规划、备份和验证，不能把删除旧实例作为本次发布步骤。
 
 ## 已完成的 Vercel 适配
 
@@ -59,7 +59,7 @@ knowledgebases     / Root=web/    -> Next.js、HttpOnly BFF、登录与管理 UI
 | Vercel 变量 | 来源/说明 |
 |---|---|
 | `KB_ENVIRONMENT` | 固定为 `production` |
-| `KB_DATABASE_URL` | Supabase Transaction Pooler URL；推荐 `postgresql+psycopg://...:6543/postgres` |
+| `KB_DATABASE_URL` | Supabase Transaction Pooler URL；必须使用 `postgresql+psycopg://...:6543/postgres?sslmode=verify-full` 强制服务器证书和主机名验证 |
 | `KB_REDIS_URL` | 外部 TLS Redis URL，例如 `rediss://...`；Upstash REST URL 不能直接替代 |
 | `KB_BFF_SHARED_SECRET` | 与 Web Project 相同的至少 32 字符随机密钥；验证 BFF 转发的终端 IP |
 | `KB_JWT_SECRET` | 新生成的至少 64 字符随机值 |
@@ -110,7 +110,7 @@ Web Project 的 Root Directory 必须设置为 `web/`。只配置服务端变量
 1. Runtime：Transaction Pooler，端口 `6543`，配置到 Vercel `KB_DATABASE_URL`；
 2. Migration：Direct 或 Session Pooler，供本地 Alembic/bootstrap 一次性使用，不注入 Vercel Runtime。
 
-把 Supabase 给出的 `postgresql://` scheme 改为 `postgresql+psycopg://`。密码中的特殊字符必须进行 URL 编码。
+把 Supabase 给出的 `postgresql://` scheme 改为 `postgresql+psycopg://`，并在查询参数中保留 `sslmode=verify-full`。密码中的特殊字符必须进行 URL 编码。迁移 `20260712_0013` 还会撤销 `PUBLIC`、`anon` 和 `authenticated` 对业务表与序列的直接权限；前端和 Data API 不得绕过 FastAPI 授权边界。
 
 迁移会把 `pg_trgm` 安装或移动到 `extensions` schema，再创建 schema-qualified GIN 索引。如果项目已在 `public` 安装该扩展，执行迁移的角色必须拥有扩展；Supabase 环境应通过受控的管理迁移执行这一步，而不是给应用运行时角色授予扩展所有权。
 

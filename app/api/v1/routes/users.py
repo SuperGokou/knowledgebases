@@ -5,13 +5,16 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, status
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import Select, delete, func, or_, select, text
 
 from app.api.dependencies import DatabaseSession, get_password_service, require_permission
+from app.api.egress_leases import deny_if_active_external_llm_egress
 from app.api.errors import ApiError
 from app.core.password_async import hash_password
 from app.core.security import PasswordService
 from app.db.models import (
+    KnowledgeBaseAccessLevel,
+    KnowledgeBaseRoleGrant,
     LimitDefinition,
     Permission,
     Role,
@@ -22,10 +25,82 @@ from app.db.models import (
     UserStatus,
 )
 from app.schemas.users import RoleAssignmentUpdate, UserCreate, UserRead, UserUpdate
-from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.access import AccessContext, AccessService
+from app.services.audit import AuditResult, add_audit_event
+from app.services.knowledge_bases import require_knowledge_base_access
 
 router = APIRouter()
+
+
+def _locked_roles_statement(role_ids: set[UUID]) -> Select[tuple[Role]]:
+    # PostgreSQL FK checks take KEY SHARE on Role. NO KEY UPDATE still serializes
+    # policy mutation/deletion but stays compatible with ACL grant replacement,
+    # whose global order is KnowledgeBase -> Role FK check.
+    return select(Role).where(Role.id.in_(role_ids)).with_for_update(key_share=True)
+
+
+def _locked_actor_user_statement(user_id: UUID) -> Select[tuple[User]]:
+    return select(User).where(User.id == user_id).with_for_update()
+
+
+def _locked_actor_roles_statement(user_id: UUID) -> Select[tuple[Role]]:
+    now = datetime.now(UTC)
+    return (
+        select(Role)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(
+            UserRole.user_id == user_id,
+            or_(UserRole.expires_at.is_(None), UserRole.expires_at > now),
+        )
+        .with_for_update(of=Role, key_share=True)
+    )
+
+
+async def _refresh_locked_actor_access(
+    session: DatabaseSession,
+    actor: User,
+    required_permissions: set[str],
+) -> AccessContext:
+    if actor.status is not UserStatus.ACTIVE:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    # Lock every active role before re-resolving mutable permissions and limits.
+    # Policy mutation endpoints coordinate on these same Role rows.
+    list((await session.scalars(_locked_actor_roles_statement(actor.id))).all())
+    current = await AccessService().resolve(session, actor)
+    missing = sorted(code for code in required_permissions if not current.allows(code))
+    if missing:
+        raise ApiError(
+            status_code=403,
+            code="permission_denied",
+            message=f"Permissions required: {', '.join(missing)}",
+        )
+    return current
+
+
+async def _lock_and_refresh_actor_access(
+    session: DatabaseSession,
+    access: AccessContext,
+    required_permissions: set[str],
+) -> AccessContext:
+    actor = await session.scalar(_locked_actor_user_statement(access.user.id))
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    return await _refresh_locked_actor_access(session, actor, required_permissions)
+
+
+async def _ensure_kb_grants_delegable(
+    session: DatabaseSession,
+    access: AccessContext,
+    grant_rows: list[tuple[UUID, KnowledgeBaseAccessLevel]],
+) -> None:
+    for knowledge_base_id, access_level in grant_rows:
+        await require_knowledge_base_access(
+            session,
+            access,
+            knowledge_base_id,
+            minimum=access_level,
+            lock=True,
+        )
 
 
 async def _user_reads(session: DatabaseSession, users: list[User]) -> list[UserRead]:
@@ -127,6 +202,19 @@ async def _ensure_roles_assignable(
                 code="limit_escalation_denied",
                 message="You cannot assign a role with limits above your effective limits",
             )
+    grant_rows = (
+        await session.execute(
+            select(
+                KnowledgeBaseRoleGrant.knowledge_base_id,
+                KnowledgeBaseRoleGrant.access_level,
+            ).where(KnowledgeBaseRoleGrant.role_id.in_(role_ids))
+        )
+    ).all()
+    await _ensure_kb_grants_delegable(
+        session,
+        access,
+        [(knowledge_base_id, access_level) for knowledge_base_id, access_level in grant_rows],
+    )
 
 
 @router.get("", response_model=list[UserRead])
@@ -154,11 +242,15 @@ async def create_user(
     access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
     passwords: Annotated[PasswordService, Depends(get_password_service)],
 ) -> UserRead:
+    role_ids = set(payload.role_ids)
+    required_permissions = {"user:manage"}
+    if role_ids:
+        required_permissions.add("role:assign")
+    access = await _lock_and_refresh_actor_access(session, access, required_permissions)
     email = str(payload.email).lower()
     if await session.scalar(select(User.id).where(User.email == email)) is not None:
         raise ApiError(status_code=409, code="email_exists", message="Email already exists")
 
-    role_ids = set(payload.role_ids)
     if role_ids and not access.allows("role:assign"):
         raise ApiError(
             status_code=403,
@@ -166,7 +258,7 @@ async def create_user(
             message="Permission required: role:assign",
         )
     if role_ids:
-        roles = list((await session.scalars(select(Role).where(Role.id.in_(role_ids)))).all())
+        roles = list((await session.scalars(_locked_roles_statement(role_ids))).all())
         existing_ids = {role.id for role in roles}
         if existing_ids != role_ids:
             raise ApiError(
@@ -187,6 +279,7 @@ async def create_user(
         session,
         actor_id=access.user.id,
         action="user.created",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         request_id=getattr(request.state, "request_id", None),
@@ -205,7 +298,22 @@ async def update_user(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
 ) -> UserRead:
-    user = await session.scalar(select(User).where(User.id == user_id).with_for_update())
+    locked_users = list(
+        (
+            await session.scalars(
+                select(User)
+                .where(User.id.in_({access.user.id, user_id}))
+                .order_by(User.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    users_by_id = {item.id: item for item in locked_users}
+    actor = users_by_id.get(access.user.id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    access = await _refresh_locked_actor_access(session, actor, {"role:assign"})
+    user = users_by_id.get(user_id)
     if user is None:
         raise ApiError(status_code=404, code="user_not_found", message="User not found")
     await _ensure_target_is_below_actor(session, access, user.id)
@@ -237,6 +345,20 @@ async def update_user(
                 code="last_superuser_protected",
                 message="The final active superuser cannot be disabled or locked",
             )
+    if (
+        user.status is UserStatus.ACTIVE
+        and changes.get("status") is not None
+        and changes["status"] is not UserStatus.ACTIVE
+    ):
+        await deny_if_active_external_llm_egress(
+            session,
+            request,
+            access,
+            revocation_scope="user_status",
+            resource_type="user",
+            resource_id=str(user.id),
+            user_id=user.id,
+        )
     for key, value in changes.items():
         setattr(user, key, value)
     if "status" in changes:
@@ -245,6 +367,7 @@ async def update_user(
         session,
         actor_id=access.user.id,
         action="user.updated",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         request_id=getattr(request.state, "request_id", None),
@@ -263,7 +386,22 @@ async def replace_user_roles(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:assign"))],
 ) -> UserRead:
-    user = await session.scalar(select(User).where(User.id == user_id).with_for_update())
+    locked_users = list(
+        (
+            await session.scalars(
+                select(User)
+                .where(User.id.in_({access.user.id, user_id}))
+                .order_by(User.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    users_by_id = {item.id: item for item in locked_users}
+    actor = users_by_id.get(access.user.id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    access = await _refresh_locked_actor_access(session, actor, {"role:assign"})
+    user = users_by_id.get(user_id)
     if user is None:
         raise ApiError(status_code=404, code="user_not_found", message="User not found")
     await _ensure_target_is_below_actor(session, access, user.id)
@@ -291,13 +429,26 @@ async def replace_user_roles(
                 message="The final active superuser's roles cannot be replaced",
             )
     role_ids = set(payload.role_ids)
-    roles = list((await session.scalars(select(Role).where(Role.id.in_(role_ids)))).all())
+    roles = list((await session.scalars(_locked_roles_statement(role_ids))).all())
     existing_ids = {role.id for role in roles}
     if existing_ids != role_ids:
         raise ApiError(
             status_code=422, code="unknown_role", message="One or more roles do not exist"
         )
     await _ensure_roles_assignable(session, access, roles)
+    current_role_ids = set(
+        (await session.scalars(select(UserRole.role_id).where(UserRole.user_id == user_id))).all()
+    )
+    if current_role_ids != role_ids:
+        await deny_if_active_external_llm_egress(
+            session,
+            request,
+            access,
+            revocation_scope="user_roles",
+            resource_type="user",
+            resource_id=str(user.id),
+            user_id=user.id,
+        )
     await session.execute(delete(UserRole).where(UserRole.user_id == user_id))
     for role_id in role_ids:
         session.add(UserRole(user_id=user_id, role_id=role_id, assigned_by=access.user.id))
@@ -306,6 +457,7 @@ async def replace_user_roles(
         session,
         actor_id=access.user.id,
         action="user.roles.replaced",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         request_id=getattr(request.state, "request_id", None),
