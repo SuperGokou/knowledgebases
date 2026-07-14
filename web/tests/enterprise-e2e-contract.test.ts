@@ -8,6 +8,10 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 
 import {
+  DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS,
+  resolveEnterpriseTestTimeoutMs,
+} from "../playwright.config";
+import {
   EVIDENCE_COLLECTOR,
   EVIDENCE_ID,
   EVIDENCE_KEY_ID,
@@ -20,11 +24,30 @@ import {
   type EvidenceArtifact,
 } from "../e2e/support/evidence-reporter";
 import { resolvePlaywrightProfile } from "../e2e/support/playwright-profile";
-import { inspectEnterpriseConfig } from "../e2e/support/enterprise-config";
+import {
+  REQUIRED_ENTERPRISE_ENV,
+  inspectEnterpriseConfig,
+  requireEnterpriseConfig,
+  validateObjectDownloadUrl,
+} from "../e2e/support/enterprise-config";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
 describe("enterprise Playwright profile", () => {
+  test("uses a long-running default timeout and accepts an explicit validated override", () => {
+    expect(resolveEnterpriseTestTimeoutMs({})).toBe(DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS);
+    expect(DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS).toBe(30 * 60_000);
+    expect(
+      resolveEnterpriseTestTimeoutMs({ KB_E2E_TEST_TIMEOUT_MS: "3600000" }),
+    ).toBe(3_600_000);
+    expect(() =>
+      resolveEnterpriseTestTimeoutMs({ KB_E2E_TEST_TIMEOUT_MS: "59999" }),
+    ).toThrow(/KB_E2E_TEST_TIMEOUT_MS/);
+    expect(() =>
+      resolveEnterpriseTestTimeoutMs({ KB_E2E_TEST_TIMEOUT_MS: "not-a-number" }),
+    ).toThrow(/KB_E2E_TEST_TIMEOUT_MS/);
+  });
+
   test("keeps smoke as the default and requires an explicit enterprise profile", () => {
     const smoke = resolvePlaywrightProfile({}, path.resolve("C:/repo/web"));
     expect(smoke.enterprise).toBe(false);
@@ -70,6 +93,7 @@ describe("enterprise Playwright profile", () => {
     const base = {
       KB_E2E_BASE_URL: "https://web.invalid",
       KB_E2E_PUBLIC_API_ORIGIN: "https://api.invalid",
+      KB_E2E_OBJECTS_ORIGIN: "https://objects.invalid",
       KB_E2E_ADMIN_EMAIL: "synthetic@example.invalid",
       KB_E2E_ADMIN_PASSWORD: "not-a-real-secret",
       KB_E2E_FAULT_CONTROL_ORIGIN: "https://fault.invalid",
@@ -88,6 +112,62 @@ describe("enterprise Playwright profile", () => {
     expect(
       inspectEnterpriseConfig({ ...base, KB_E2E_MULTIPART_BYTES: "104857600" }),
     ).toEqual({ missing: [], invalid: [] });
+  });
+
+  test("requires one exact object origin and rejects unsafe signed download URLs", () => {
+    const env = {
+      KB_E2E_BASE_URL: "https://web.invalid",
+      KB_E2E_PUBLIC_API_ORIGIN: "https://api.invalid",
+      KB_E2E_OBJECTS_ORIGIN: "https://objects.invalid",
+      KB_E2E_ADMIN_EMAIL: "synthetic@example.invalid",
+      KB_E2E_ADMIN_PASSWORD: "not-a-real-secret",
+      KB_E2E_FAULT_CONTROL_ORIGIN: "https://fault.invalid",
+      KB_E2E_FAULT_CONTROL_TOKEN: "not-a-real-token",
+      KB_E2E_SEEDED_KNOWLEDGE_BASE_ID: "seeded",
+      KB_E2E_UNSCOPED_KNOWLEDGE_BASE_ID: "unscoped",
+      KB_E2E_MULTIPART_BYTES: "104857600",
+      KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
+      KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+      KB_E2E_DOCUMENT_FIXTURE_ROOT: "C:/trust/document-fixtures",
+      KB_E2E_DOCUMENT_FIXTURE_MANIFEST:
+        "C:/trust/document-fixtures/document-fixtures-v1.json",
+    };
+    expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_OBJECTS_ORIGIN");
+    expect(
+      inspectEnterpriseConfig({ ...env, KB_E2E_OBJECTS_ORIGIN: undefined }).missing,
+    ).toContain("KB_E2E_OBJECTS_ORIGIN");
+    expect(inspectEnterpriseConfig(env)).toEqual({ missing: [], invalid: [] });
+    expect(requireEnterpriseConfig(env).objectsOrigin).toBe("https://objects.invalid");
+
+    for (const unsafeOrigin of [
+      "ftp://objects.invalid",
+      "https://user:password@objects.invalid",
+      "https://objects.invalid/path",
+      "https://objects.invalid?",
+      "https://objects.invalid#",
+    ]) {
+      expect(
+        inspectEnterpriseConfig({ ...env, KB_E2E_OBJECTS_ORIGIN: unsafeOrigin }).invalid,
+      ).toContain("KB_E2E_OBJECTS_ORIGIN");
+    }
+
+    expect(
+      validateObjectDownloadUrl(
+        "https://objects.invalid/bucket/report.pdf?signature=synthetic",
+        env.KB_E2E_OBJECTS_ORIGIN,
+      ),
+    ).toBe("https://objects.invalid/bucket/report.pdf?signature=synthetic");
+    for (const unsafeDownload of [
+      "https://user:password@objects.invalid/bucket/report.pdf?signature=synthetic",
+      "https://objects.invalid/bucket/report.pdf?signature=synthetic#fragment",
+      "https://metadata.invalid/latest/meta-data",
+      "file:///etc/passwd",
+      "/relative/object",
+    ]) {
+      expect(() =>
+        validateObjectDownloadUrl(unsafeDownload, env.KB_E2E_OBJECTS_ORIGIN),
+      ).toThrow();
+    }
   });
 });
 

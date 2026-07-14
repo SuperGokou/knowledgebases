@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
 
@@ -8,9 +8,10 @@ import {
   loginAs,
   test,
 } from "./support/enterprise-fixtures";
-import type {
-  EnterpriseConfig,
-  FaultMode,
+import {
+  validateObjectDownloadUrl,
+  type EnterpriseConfig,
+  type FaultMode,
 } from "./support/enterprise-config";
 import type { DocumentFixture } from "./support/document-fixtures";
 
@@ -223,6 +224,7 @@ async function sendChatQuestion(page: Page, question: string) {
 
 async function uploadApproveAndGroundFixture(
   page: Page,
+  request: APIRequestContext,
   enterprise: EnterpriseConfig,
   knowledgeBaseId: string,
   fixture: DocumentFixture,
@@ -264,6 +266,66 @@ async function uploadApproveAndGroundFixture(
     200,
     `approve ${fixture.extension}`,
   );
+
+  const grant = await bffRequest<Row>(
+    page,
+    `/api/v1/files/${String(file.id)}/download`,
+    { method: "POST", body: {} },
+  );
+  assertStatus(grant.status, 200, `create ${fixture.extension} download grant`);
+  const grantBody = row(grant.body, `${fixture.extension} download grant`);
+  const rawDownloadUrl = String(grantBody.url ?? "");
+  const expiresIn = Number(grantBody.expires_in);
+  if (
+    !rawDownloadUrl ||
+    !Number.isSafeInteger(expiresIn) ||
+    expiresIn < 1 ||
+    expiresIn > 300
+  ) {
+    throw new Error(`${fixture.extension} download grant contract is invalid`);
+  }
+  const downloadUrl = validateObjectDownloadUrl(rawDownloadUrl, enterprise.objectsOrigin);
+
+  const download = await request.get(downloadUrl, {
+    failOnStatusCode: false,
+    maxRedirects: 0,
+  });
+  try {
+    if (download.status() >= 300 && download.status() < 400) {
+      throw new Error(`${fixture.extension} download redirect was refused`);
+    }
+    assertStatus(download.status(), 200, `download ${fixture.extension}`);
+    const disposition = download.headers()["content-disposition"] ?? "";
+    const encodedFilename = /(?:^|;\s*)filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1]
+      ?.trim()
+      .replace(/^"(.*)"$/, "$1");
+    if (!encodedFilename) {
+      throw new Error(`${fixture.extension} download omitted an RFC 5987 filename`);
+    }
+    let downloadedFilename: string;
+    try {
+      downloadedFilename = decodeURIComponent(encodedFilename);
+    } catch {
+      throw new Error(`${fixture.extension} download returned an invalid encoded filename`);
+    }
+    if (downloadedFilename !== fixture.filename) {
+      throw new Error(
+        `${fixture.extension} download filename mismatch: expected ${fixture.filename}, received ${downloadedFilename}`,
+      );
+    }
+    const payload = await download.body();
+    if (payload.byteLength !== fixture.bytes) {
+      throw new Error(
+        `${fixture.extension} download size mismatch: expected ${fixture.bytes}, received ${payload.byteLength}`,
+      );
+    }
+    const downloadedSha256 = createHash("sha256").update(payload).digest("hex");
+    if (downloadedSha256 !== fixture.sha256) {
+      throw new Error(`${fixture.extension} download SHA-256 does not match the fixture manifest`);
+    }
+  } finally {
+    await download.dispose();
+  }
 
   const searched = await bffRequest<Row>(
     page,
@@ -425,6 +487,7 @@ test("@enterprise all nine document formats complete scan, OKF, approval, retrie
   for (const fixture of enterpriseDocuments) {
     await uploadApproveAndGroundFixture(
       page,
+      request,
       enterprise,
       String(knowledgeBase.id),
       fixture,

@@ -32,6 +32,7 @@
 $env:KB_E2E_PROFILE = "enterprise"
 $env:KB_E2E_BASE_URL = "https://<preproduction-host>"
 $env:KB_E2E_PUBLIC_API_ORIGIN = "https://<public-api-host>"
+$env:KB_E2E_OBJECTS_ORIGIN = "https://<objects-host>"
 $env:KB_E2E_ADMIN_EMAIL = "<synthetic-admin>"
 $env:KB_E2E_ADMIN_PASSWORD = "<secret>"
 $env:KB_E2E_FAULT_CONTROL_ORIGIN = "https://<private-fault-controller>"
@@ -46,6 +47,8 @@ $env:KB_E2E_CHALLENGE_PATH = "/var/lib/heyi-acceptance/challenges/<challenge-id>
 
 npm run test:e2e
 ```
+
+`KB_E2E_OBJECTS_ORIGIN` 为必填项，必须配置为唯一且纯净的绝对 HTTP(S) 源（origin），不得包含用户名、密码、路径、查询参数或片段。所有签名下载 URL 的源必须与其精确一致，并且测试会拒绝任何重定向。
 
 补充变量：
 

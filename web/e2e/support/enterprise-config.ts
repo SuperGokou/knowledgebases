@@ -4,6 +4,7 @@ import path from "node:path";
 export const REQUIRED_ENTERPRISE_ENV = [
   "KB_E2E_BASE_URL",
   "KB_E2E_PUBLIC_API_ORIGIN",
+  "KB_E2E_OBJECTS_ORIGIN",
   "KB_E2E_ADMIN_EMAIL",
   "KB_E2E_ADMIN_PASSWORD",
   "KB_E2E_FAULT_CONTROL_ORIGIN",
@@ -29,6 +30,7 @@ export type FaultMode =
 export interface EnterpriseConfig {
   readonly baseUrl: string;
   readonly publicApiOrigin: string;
+  readonly objectsOrigin: string;
   readonly adminEmail: string;
   readonly adminPassword: string;
   readonly faultControlOrigin: string;
@@ -59,10 +61,40 @@ function validatedOrigin(name: string, raw: string): string {
   if (!["http:", "https:"].includes(parsed.protocol)) {
     throw new Error(`${name} must use HTTP(S)`);
   }
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error(`${name} must not contain credentials, query parameters, or fragments`);
+  if (
+    parsed.username ||
+    parsed.password ||
+    raw.includes("?") ||
+    raw.includes("#") ||
+    parsed.pathname !== "/"
+  ) {
+    throw new Error(
+      `${name} must be a bare origin without credentials, paths, query parameters, or fragments`,
+    );
   }
   return parsed.origin;
+}
+
+export function validateObjectDownloadUrl(raw: string, configuredObjectsOrigin: string): string {
+  const objectsOrigin = validatedOrigin("KB_E2E_OBJECTS_ORIGIN", configuredObjectsOrigin);
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("download URL must be absolute");
+  }
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.username ||
+    parsed.password ||
+    raw.includes("#") ||
+    parsed.origin !== objectsOrigin
+  ) {
+    throw new Error(
+      "download URL must match the configured object origin without credentials or fragments",
+    );
+  }
+  return parsed.toString();
 }
 
 export function inspectEnterpriseConfig(
@@ -74,6 +106,7 @@ export function inspectEnterpriseConfig(
   for (const name of [
     "KB_E2E_BASE_URL",
     "KB_E2E_PUBLIC_API_ORIGIN",
+    "KB_E2E_OBJECTS_ORIGIN",
     "KB_E2E_FAULT_CONTROL_ORIGIN",
   ] as const) {
     const value = env[name]?.trim();
@@ -153,6 +186,7 @@ export function requireEnterpriseConfig(
       "KB_E2E_PUBLIC_API_ORIGIN",
       env.KB_E2E_PUBLIC_API_ORIGIN!,
     ),
+    objectsOrigin: validatedOrigin("KB_E2E_OBJECTS_ORIGIN", env.KB_E2E_OBJECTS_ORIGIN!),
     adminEmail: env.KB_E2E_ADMIN_EMAIL!.trim(),
     adminPassword: env.KB_E2E_ADMIN_PASSWORD!,
     faultControlOrigin: validatedOrigin(
