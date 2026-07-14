@@ -193,7 +193,7 @@ sudo docker compose \
 
 管理员创建成功后，立即从 `offline.env` 清空 `KB_BOOTSTRAP_ADMIN_PASSWORD`；以后正常重启不运行 `bootstrap`。升级时先备份，再使用新版本镜像执行一次带 `--pull never` 的 `migrate`，最后只对本项目执行带 `--pull never --no-build` 的 `up -d`。
 
-MinIO 的编排健康门禁使用 `/minio/health/ready`，而不是只证明进程存活的 `/minio/health/live`。`minio-init` 与 `minio-multipart-gc` 把 `MC_CONFIG_DIR` 固定到 `/tmp/.mc`，并仅使用临时可写的 `/tmp`；别名初始化失败时应检查 readiness、内部 DNS、凭据与客户端配置目录，不得绕过 `service_healthy`。ClamAV 根文件系统和病毒库保持只读，只为启动阶段降权保留 `SETGID`、`SETUID`，进程切换到 `clamav` 后不持有有效 capability；不得额外加入 `CHOWN`、`NET_RAW` 或 `SYS_ADMIN`。
+Redis 使用官方入口脚本在每次容器启动时检查 `/data` 所有权。由于首次启动后数据目录为 Redis 用户所有且权限为 `0700`，入口阶段除 `CHOWN`、`SETGID`、`SETUID` 外还必须临时具备只读遍历所需的 `DAC_READ_SEARCH`，否则项目级重启会在 `find /data` 阶段失败；不得用权限面更大的 `DAC_OVERRIDE` 代替。额外的 `SETPCAP` 仅供官方入口在降权时清空 capability bounding set；常驻 Redis 的 `CapInh`、`CapPrm`、`CapEff`、`CapBnd`、`CapAmb` 必须全部为 0，并保持 `no-new-privileges`。MinIO 的编排健康门禁使用 `/minio/health/ready`，而不是只证明进程存活的 `/minio/health/live`。`minio-init` 与 `minio-multipart-gc` 把 `MC_CONFIG_DIR` 固定到 `/tmp/.mc`，并仅使用临时可写的 `/tmp`；别名初始化失败时应检查 readiness、内部 DNS、凭据与客户端配置目录，不得绕过 `service_healthy`。ClamAV 根文件系统和病毒库保持只读，只为启动阶段降权保留 `SETGID`、`SETUID`，进程切换到 `clamav` 后不持有有效 capability；不得额外加入 `CHOWN`、`NET_RAW` 或 `SYS_ADMIN`。
 
 FastAPI 只接受 `KB_PUBLIC_HOST` 与内部 BFF 服务名 `api`。容器内 readiness 仍访问回环地址，但必须显式发送获批的 Host，例如：
 

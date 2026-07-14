@@ -38,12 +38,19 @@ def offline_compose_config() -> dict[str, Any]:
     return parsed
 
 
-def test_offline_redis_has_only_entrypoint_initialization_capabilities() -> None:
+def test_offline_redis_has_only_restart_safe_entrypoint_capabilities() -> None:
     config = offline_compose_config()
     redis = config["services"]["redis"]
 
     assert set(redis["cap_drop"]) == {"ALL"}
-    assert set(redis["cap_add"]) == {"CHOWN", "SETGID", "SETUID"}
+    assert set(redis["cap_add"]) == {
+        "CHOWN",
+        "DAC_READ_SEARCH",
+        "SETGID",
+        "SETPCAP",
+        "SETUID",
+    }
+    assert redis["security_opt"] == ["no-new-privileges:true"]
     maxmemory_index = redis["command"].index("--maxmemory")
     assert redis["command"][maxmemory_index + 1] == "512mb"
 

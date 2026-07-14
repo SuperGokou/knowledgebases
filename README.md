@@ -479,6 +479,7 @@ flowchart LR
 
 - `KB_TRUSTED_HOSTS` 必须严格等于 `["<KB_PUBLIC_HOST>","api"]`：公共 Host 用于浏览器和健康检查，内部 `api` Host 仅用于 Next.js BFF 回源；多余 Host 或漏掉 `api` 都会被预检拒绝；
 - API 健康检查连接 `127.0.0.1:8000/health/ready`，同时显式发送公共 `Host`，避免绕过 Trusted Host，也避免把合法探针误判为 `400`；
+- Redis 官方入口在重启时需要检查已归 Redis 用户所有的 `0700` 数据目录，因此仅在入口降权阶段补回 `CHOWN`、`DAC_READ_SEARCH`、`SETGID`、`SETPCAP`、`SETUID`，明确不使用权限面更大的 `DAC_OVERRIDE`；`SETPCAP` 只用于降权时清空 bounding set，常驻 Redis 的五组 capability 均为 0，并保持 `no-new-privileges`；
 - ClamAV 病毒库以只读方式挂载，部署前验证 root 所有权、daemon 可读、时效性与引擎兼容性；`clamd` 先 `cap_drop: ALL`，仅补回切换到 `User clamav` 所需的 `SETGID`、`SETUID`，并启用 `no-new-privileges`；
 - 离线镜像使用固定 digest 且 `pull_policy: never`，外部 LLM 固定关闭。任何镜像、病毒库、网络 CIDR、解析器或主机容量门禁失败都必须停止上线。
 
