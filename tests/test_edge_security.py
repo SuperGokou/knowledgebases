@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,39 @@ def test_shipped_caddy_edges_overwrite_the_provider_client_ip_header(
 
     web_proxy = caddyfile.split("reverse_proxy web:3000", 1)[1]
     assert "header_up X-Vercel-Forwarded-For {remote_host}" in web_proxy
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_https_sites"),
+    [
+        ("deploy/tencent/Caddyfile", 1),
+        ("deploy/tencent/Caddyfile.offline", 2),
+    ],
+)
+def test_shipped_caddy_https_sites_enforce_hsts(
+    relative_path: str,
+    expected_https_sites: int,
+) -> None:
+    caddyfile = (REPOSITORY / relative_path).read_text(encoding="utf-8")
+    site_offsets = [
+        match.start()
+        for match in re.finditer(r"(?m)^https://[^\r\n]+ \{$", caddyfile)
+    ]
+    https_sites = [
+        caddyfile[start:end]
+        for start, end in zip(
+            site_offsets,
+            [*site_offsets[1:], len(caddyfile)],
+            strict=True,
+        )
+    ]
+
+    assert len(https_sites) == expected_https_sites
+    for site in https_sites:
+        assert (
+            'header >Strict-Transport-Security "max-age=31536000; includeSubDomains"'
+            in site
+        )
 
 
 def test_offline_object_proxy_does_not_log_presigned_query_credentials() -> None:
