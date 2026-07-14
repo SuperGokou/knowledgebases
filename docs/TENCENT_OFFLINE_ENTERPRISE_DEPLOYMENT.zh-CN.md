@@ -11,9 +11,11 @@
 flowchart LR
     User["企业终端 / VPN"] -->|"HTTPS 19443"| Proxy["Caddy 内部 CA"]
     User -->|"预签名 HTTPS 19444"| Proxy
+    ApiClient["局域网业务系统"] -->|"X-API-Key · HTTPS 19443"| Proxy
     Proxy --> Web["Next.js 工作台"]
+    Proxy -->|"公共 API · OpenAPI · 健康检查"| API["本机 FastAPI"]
     Proxy --> MinIO["本机 MinIO"]
-    Web --> API["本机 FastAPI"]
+    Web --> API
     API --> PostgreSQL["本机 PostgreSQL 17"]
     API --> Redis["本机 Redis 8"]
     API --> MinIO
@@ -35,7 +37,10 @@ flowchart LR
 
 Compose 使用三个固定网段：`edge`（`172.30.242.0/24`）仅连接 Caddy 并负责宿主机端口发布；`frontend`（`172.30.240.0/24`）和 `backend`（`172.30.241.0/24`）均为 `internal: true`。Web、API、MinIO 与数据服务不连接 `edge`，因此不会因入口网络获得默认公网出口。PostgreSQL、Redis、MinIO 控制台和 FastAPI 均不发布宿主机端口；宿主机只发布工作台 `19443/tcp` 与对象直传 `19444/tcp`。边缘网络的宿主机出站仍必须由云安全组或主机防火墙按企业策略约束。即使管理员在数据库中误存 DeepSeek、Qwen 或 MiniMax 密钥，`KB_EXTERNAL_LLM_ENABLED=false` 仍会让模型客户端失败关闭。
 
-工作台入口同时承载登录界面和经过 API Key 鉴权的公共 API。Caddy 只把 `/api/v1/public/*` 转发到 FastAPI，其余控制面请求仍由 Next.js BFF 处理；PostgreSQL、Redis、MinIO 控制台和 FastAPI 端口不得直接暴露给宿主机或 VPN 客户端。
+工作台入口同时承载登录界面和经过 API Key 鉴权的公共 API。Caddy 仅把
+`/api/v1/public/*`、`/openapi.json`、`/health/live` 与 `/health/ready` 直接转发到
+FastAPI，其余控制面请求仍由 Next.js BFF 处理；PostgreSQL、Redis、MinIO 控制台
+和 FastAPI 端口不得直接暴露给宿主机或 VPN 客户端。
 
 ## 与现有应用的隔离
 
@@ -138,6 +143,18 @@ sha256sum clamav-db.tar.gz > clamav-db.tar.gz.sha256
 
 通过企业批准的介质或内网制品库传输，在服务器验证 SHA-256 后执行 `docker load`。将 `heyi-kb-offline-images.txt` 放到 `$ENV_FILE.images`，将已验证的病毒库解压到 `${KB_DATA_ROOT}/clamav-db`。离线预检会重新执行 `docker compose config --images`，拒绝任何可变标签，并逐个比对本地 `RepoDigest`；任何清单、镜像或摘要差异都会阻断启动。`KB_API_IMAGE` 与 `KB_WEB_IMAGE` 必须使用 `<repository>@sha256:<64 位小写十六进制>` 形式；Git SHA 标签只能用于可读性，不是内容完整性边界。
 
+服务器必须保留一套可独立冷恢复的本地制品，不能只保留 COS、GitHub 或镜像仓库
+地址：
+
+- 发布源码包、发布清单及各自 SHA-256；
+- 完整 8 镜像归档、不可变镜像清单及 SHA-256；
+- ClamAV 病毒库归档、版本信息及 SHA-256；
+- 企业内部 CA 链与受控恢复说明；
+- 独立保存、定期验证的 PostgreSQL 与 MinIO 恢复材料。
+
+COS、移动介质或内网制品库仅负责交付传输。制品落盘并完成摘要验证后，运行、重启、
+升级回滚与冷加载均不得依赖 GitHub、Vercel、COS、公共 npm/PyPI 或公共镜像仓库。
+
 API 镜像还必须包含固定版本的 `bubblewrap`、LibreOffice、Poppler 与 `procps/prlimit`。构建完成后，以最终镜像 digest 而不是包仓库标签作为离线交付身份；预检会在已核验的 API 镜像内执行 `python -m app.document_parser_preflight --require-all`。九类格式任一能力缺失时返回码 2，部署立即停止，不允许把“可上传”误报为“可进入知识问答”。
 
 ## 首次模拟部署
@@ -210,9 +227,24 @@ docker compose --project-name heyi-kb-offline --env-file "$ENV_FILE" \
 ```text
 https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/api/v1/public/chat/query
 https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/api/v1/public/knowledge-bases/<id>/search
+https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/openapi.json
+https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/health/live
+https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/health/ready
 ```
 
 客户端必须使用 `X-API-Key`，并信任企业内部 CA；不要把 API Key 放进 URL、浏览器代码、日志或截图。Caddy 的 `/api/v1/public/*` 匹配器必须位于 Web fallback 之前，并在边缘删除客户端伪造的 BFF 签名头、重写来源 IP。API 只信任固定的内部 `172.30.240.0/24` 代理网段；预检必须同时证明 `172.30.240.0/24`、`172.30.241.0/24` 与 `172.30.242.0/24` 均不与目标宿主路由或既有 Docker 网络重叠。`/api/v1/auth/*`、用户、角色、模型配置等控制面接口不得从该入口直接公开。完整请求体、权限交集、轮换和撤销语义见 [API 与模型管理](./API_AND_MODEL_MANAGEMENT.zh-CN.md)。
+
+`/openapi.json` 是无需公网资源的原始 OpenAPI 契约，可直接导入企业内部的
+Postman、Apifox 或 SDK 生成工具。该文件包含完整控制面契约，但局域网边缘仍只
+允许直接调用 `/api/v1/public/*`；用户、角色、文件与模型管理继续通过登录后的
+Next.js BFF 执行。离线入口不发布 FastAPI 默认的 `/docs` 与
+`/redoc`，因为它们默认从公共 CDN 加载 Swagger/ReDoc 脚本和字体；人类可读的
+使用说明统一由登录后的 `/admin/api-models` 页面提供。离线 Caddy 还覆盖浏览器
+`Content-Security-Policy`，将 `connect-src` 严格限制为工作台同源和同一内网主机的
+对象直传端口，防止管理页面向公网 Origin 发起请求，同时保持 Multipart 上传可用。
+
+> [!WARNING]
+> `/openapi.json` 包含完整控制面接口结构，只允许在 VPN 或企业可信网段内发布，不得映射到公网。局域网边缘仍只允许业务系统直接调用 `/api/v1/public/*`；Schema 中的控制面操作不能绕过登录、BFF 与 RBAC。
 
 ```bash
 curl --fail --cacert /etc/heyi/pki/root-ca.pem \
@@ -239,7 +271,8 @@ sudo docker compose \
   --env-file "$ENV_FILE" \
   --file "$COMPOSE_FILE" ps
 
-curl --fail --insecure "https://${KB_PUBLIC_HOST}:19443/login"
+curl --fail --cacert /etc/heyi/pki/root-ca.pem \
+  "https://${KB_PUBLIC_HOST}:19443/login"
 
 # API 容器应无法建立公网连接；失败是正确结果。
 sudo docker compose \
@@ -252,6 +285,11 @@ sudo docker compose \
 验收还必须包括：登录、角色权限、知识库 ACL、上传、审批、对象下载、来源引用、服务重启后数据仍存在、PostgreSQL 逻辑备份恢复、MinIO 文件恢复，以及断网状态下聊天不会调用公网模型。另需保留病毒库 `main`/`daily` 文件的 SHA-256、更新时间、权限和 `sigtool --info` 兼容性输出，以及 `STORAGE-WATERMARK-P0-001` 的目标主机 JSON 证据。
 
 公共 API 验收必须覆盖：有效 Key 返回 2xx、跨知识库访问不可枚举、超限返回 429、撤销后立即返回 401；同时确认控制面路由没有被 Caddy 直接暴露。离线问答验收必须验证公网模型连接为零、引用指向已审批条目、无结果时不生成内容，以及检索降级状态在前后端均可识别。
+
+边缘契约还必须实测：`/openapi.json` 返回 `200` 且为 JSON，`/health/live` 与
+`/health/ready` 返回 `200`，`/docs` 与 `/redoc` 保持 `404`，无 Key 调用两个公共
+API 均返回 `401`，响应 CSP 的 `connect-src` 只包含工作台同源与本机对象端口。浏览器和 API 客户端必须
+信任企业内部 CA，验收不得使用 `--insecure` 或关闭 TLS 校验。
 
 最终签署前从干净 Git 工作树运行严格 Profile；开发机的 `docker compose config` 只能作为 Smoke：
 

@@ -16,8 +16,10 @@ python3 -m scripts.collect_offline_runtime_evidence
 2. 要求项目容器与网络集合非空，并且每个项目网络都是 `Internal=true`。
 3. 先验证恢复通道，再武装独立 rollback watchdog，然后才允许断网。
 4. 断网后外部 DNS 解析必须失败，宿主机及项目容器不得留有公网 peer socket。
-5. 执行冷启动、登录、RBAC、知识库 ACL、上传、审批、下载、知识问答、持久化写入、重启与持久化复核。
-6. 无论业务步骤是否成功，只要已尝试断网就必须恢复网络；恢复或 rollback 验证失败时永远是 `BLOCKED`。
+5. 只使用服务器本地保存的源码包、完整镜像归档、病毒库和持久化数据执行冷加载与冷启动；不得访问 GitHub、Vercel、COS、公共镜像仓库或公共 CDN。
+6. 执行登录、公共 API、OpenAPI、RBAC、知识库 ACL、上传、审批、下载、知识问答、持久化写入、重启与持久化复核。
+7. 浏览器网络记录、宿主机 socket 与容器 socket 均不得出现未批准的公网连接。
+8. 无论业务步骤是否成功，只要已尝试断网就必须恢复网络；恢复或 rollback 验证失败时永远是 `BLOCKED`。
 
 ## 控制计划合同
 

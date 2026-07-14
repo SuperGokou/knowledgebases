@@ -7,6 +7,18 @@
 https://{$KB_PUBLIC_HOST}:8443 {
 	tls internal
 	encode zstd gzip
+	header >Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://{$KB_PUBLIC_HOST}:{$KB_OBJECTS_HTTPS_PORT}"
+
+	# Raw API metadata and health endpoints are LAN-local and require no CDN.
+	# Swagger/Redoc HTML is intentionally not exposed because FastAPI's default
+	# pages load browser assets from public CDNs.
+	@api_metadata path /openapi.json /health/live /health/ready
+	reverse_proxy @api_metadata api:8000 {
+		header_up -X-KB-Client-IP
+		header_up -X-KB-Client-Timestamp
+		header_up -X-KB-Client-Signature
+		header_up X-Vercel-Forwarded-For {remote_host}
+	}
 
 	# Public API clients reach FastAPI directly. This matcher is intentionally
 	# declared before the web fallback so these requests never enter Next.js.

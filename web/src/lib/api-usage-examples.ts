@@ -1,4 +1,4 @@
-export const PUBLIC_API_ORIGIN = "https://knowledgebases-api.vercel.app";
+export const API_ORIGIN_PLACEHOLDER = "https://YOUR_KNOWLEDGEBASE_HOST";
 
 export type ApiExampleLanguage = "curl" | "python" | "node";
 export type PublicApiOperation = "chat" | "search";
@@ -21,9 +21,10 @@ const operations: Record<PublicApiOperation, { path: string; body: Record<string
 export function buildApiUsageExample(
   language: ApiExampleLanguage,
   operation: PublicApiOperation,
+  apiOrigin: string,
 ): string {
   const spec = operations[operation];
-  const url = `${PUBLIC_API_ORIGIN}${spec.path}`;
+  const url = `${normalizeApiOrigin(apiOrigin)}${spec.path}`;
   const compactBody = JSON.stringify(spec.body);
   const formattedBody = JSON.stringify(spec.body, null, 2);
 
@@ -65,4 +66,25 @@ const response = await fetch("${url}", {
 
 if (!response.ok) throw new Error(\`API request failed: \${response.status}\`);
 console.log(await response.json());`;
+}
+
+export function normalizeApiOrigin(value: string): string {
+  const candidate = value.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error("API origin must be an absolute HTTP(S) URL");
+  }
+  if (
+    !["http:", "https:"].includes(parsed.protocol)
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== "/"
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new Error("API origin must contain only an HTTP(S) scheme, host, and optional port");
+  }
+  return parsed.origin;
 }

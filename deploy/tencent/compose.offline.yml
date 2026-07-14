@@ -449,6 +449,7 @@ services:
     restart: unless-stopped
     environment:
       KB_PUBLIC_HOST: ${KB_PUBLIC_HOST:?required}
+      KB_OBJECTS_HTTPS_PORT: ${KB_OBJECTS_HTTPS_PORT:-19444}
     ports:
       - "${KB_BIND_ADDRESS:-0.0.0.0}:${KB_HTTPS_PORT:-19443}:8443"
       - "${KB_BIND_ADDRESS:-0.0.0.0}:${KB_OBJECTS_HTTPS_PORT:-19444}:9443"

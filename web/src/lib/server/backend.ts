@@ -10,6 +10,17 @@ export class BackendConfigurationError extends Error {
   }
 }
 
+export class PublicApiOriginConfigurationError extends Error {
+  constructor() {
+    super(
+      "KB_PUBLIC_API_ORIGIN must be a valid HTTP(S) origin without credentials, path, query, or fragment",
+    );
+    this.name = "PublicApiOriginConfigurationError";
+  }
+}
+
+type PublicApiOriginEnvironment = Readonly<Record<string, string | undefined>>;
+
 export type SafeBackendFetchInit = RequestInit & {
   timeoutMs?: number;
 };
@@ -33,6 +44,35 @@ export function backendOrigin(): string {
   }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
     throw new BackendConfigurationError();
+  }
+  return url.origin;
+}
+
+export function publicApiOrigin(
+  environment: PublicApiOriginEnvironment = process.env,
+): string | undefined {
+  const explicitOrigin = environment.KB_PUBLIC_API_ORIGIN?.trim();
+  const vercelBackendOrigin = environment.VERCEL === "1"
+    ? environment.FASTAPI_URL?.trim()
+    : undefined;
+  const configured = explicitOrigin || vercelBackendOrigin;
+  if (!configured) return undefined;
+
+  let url: URL;
+  try {
+    url = new URL(configured);
+  } catch {
+    throw new PublicApiOriginConfigurationError();
+  }
+  if (
+    !["http:", "https:"].includes(url.protocol)
+    || url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+  ) {
+    throw new PublicApiOriginConfigurationError();
   }
   return url.origin;
 }

@@ -1,11 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 
 import { Icon } from "@/components/icon";
 import {
   buildApiUsageExample,
-  PUBLIC_API_ORIGIN,
+  API_ORIGIN_PLACEHOLDER,
   type ApiExampleLanguage,
   type PublicApiOperation,
 } from "@/lib/api-usage-examples";
@@ -21,11 +21,30 @@ const operations: Array<{ id: PublicApiOperation; label: string; path: string }>
   { id: "search", label: "知识检索", path: "/api/v1/public/knowledge-bases/{id}/search" },
 ];
 
-export function ApiUsageGuide() {
+function subscribeToApiOrigin(): () => void {
+  return () => undefined;
+}
+
+function readBrowserApiOrigin(): string {
+  return window.location.origin;
+}
+
+function readServerApiOrigin(): string {
+  return API_ORIGIN_PLACEHOLDER;
+}
+
+export function ApiUsageGuide({ configuredApiOrigin }: { configuredApiOrigin?: string }) {
   const [language, setLanguage] = useState<ApiExampleLanguage>("curl");
   const [operation, setOperation] = useState<PublicApiOperation>("chat");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  const example = buildApiUsageExample(language, operation);
+  const browserApiOrigin = useSyncExternalStore(
+    subscribeToApiOrigin,
+    readBrowserApiOrigin,
+    readServerApiOrigin,
+  );
+  const apiOrigin = configuredApiOrigin ?? browserApiOrigin;
+  const example = buildApiUsageExample(language, operation, apiOrigin);
+  const openApiUrl = `${apiOrigin}/openapi.json`;
 
   async function copyExample() {
     try {
@@ -87,7 +106,10 @@ export function ApiUsageGuide() {
         </div>
 
         <div className="api-origin-row">
-          <span>API Origin</span><code>{PUBLIC_API_ORIGIN}</code>
+          <span>API Origin</span><code>{apiOrigin}</code>
+          <a className="button ghost small" href={openApiUrl} target="_blank" rel="noreferrer">
+            OpenAPI JSON
+          </a>
         </div>
         {operation === "chat" ? (
           <div className="notice api-security-notice">

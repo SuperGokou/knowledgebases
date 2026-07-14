@@ -16,7 +16,7 @@
 具有 `api-key:manage` 或 `llm:manage` 权限的管理员可打开：
 
 ```text
-https://knowledgebases.vercel.app/admin/api-models
+https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/admin/api-models
 ```
 
 页面包含：
@@ -26,20 +26,39 @@ https://knowledgebases.vercel.app/admin/api-models
 3. cURL、Python 与 Node.js 的可复制调用示例；
 4. 密钥一次性展示、服务端保存和泄露处置提醒。
 
-## 外部 API
+## 服务端公共 API
 
-生产 API Origin：
+生产 API Origin 由当前部署决定。内网部署应使用同一台知识库服务器，不依赖
+GitHub、Vercel 或外部 CDN：
 
-```text
-https://knowledgebases-api.vercel.app
+```bash
+export KNOWLEDGEBASES_API_ORIGIN="https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>"
 ```
 
-所有外部调用都必须携带：
+局域网业务系统直接通过 Caddy 进入 FastAPI，不需要浏览器登录 Cookie，也不依赖
+Web 页面、GitHub 或 Vercel。所有调用都必须携带：
 
 ```http
 X-API-Key: kb_live_<one-time-secret>
 Content-Type: application/json
 ```
+
+部署使用企业内部 CA 时，应先把根证书安装到操作系统或应用运行时的信任库。无法
+修改系统信任库的受控客户端，可使用 cURL `--cacert <ROOT_CA.pem>`、Python/httpx
+`verify=<ROOT_CA.pem>` 或 Node.js `NODE_EXTRA_CA_CERTS=<ROOT_CA.pem>`；禁止使用
+`--insecure`、`verify=False` 或关闭 TLS 主机名校验。
+
+无需公网资源的机器可读契约与健康探针为：
+
+```text
+GET /openapi.json
+GET /health/live
+GET /health/ready
+```
+
+离线入口不发布依赖公共 CDN 的 FastAPI 默认 `/docs` 与 `/redoc`。`/openapi.json`
+包含完整控制面结构，只允许在 VPN/企业可信网段内使用；直接 API 调用范围仍限于
+`/api/v1/public/*`。
 
 ### 知识问答
 
@@ -58,7 +77,7 @@ POST /api/v1/public/chat/query
 cURL：
 
 ```bash
-curl "https://knowledgebases-api.vercel.app/api/v1/public/chat/query" \
+curl "${KNOWLEDGEBASES_API_ORIGIN}/api/v1/public/chat/query" \
   -H "X-API-Key: $KNOWLEDGEBASES_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -74,8 +93,9 @@ Python：
 import os
 import httpx
 
+api_origin = os.environ["KNOWLEDGEBASES_API_ORIGIN"].rstrip("/")
 response = httpx.post(
-    "https://knowledgebases-api.vercel.app/api/v1/public/chat/query",
+    f"{api_origin}/api/v1/public/chat/query",
     headers={"X-API-Key": os.environ["KNOWLEDGEBASES_API_KEY"]},
     json={
         "knowledge_base_id": "00000000-0000-0000-0000-000000000000",
@@ -91,8 +111,11 @@ print(response.json())
 Node.js：
 
 ```javascript
+const apiOrigin = process.env.KNOWLEDGEBASES_API_ORIGIN?.replace(/\/+$/, "");
+if (!apiOrigin) throw new Error("KNOWLEDGEBASES_API_ORIGIN is required");
+
 const response = await fetch(
-  "https://knowledgebases-api.vercel.app/api/v1/public/chat/query",
+  `${apiOrigin}/api/v1/public/chat/query`,
   {
     method: "POST",
     headers: {
@@ -222,7 +245,7 @@ KB_QWEN_ALLOWED_WORKSPACE_HOSTS=["workspace-id.cn-beijing.maas.aliyuncs.com"]
 
 ## 生产配置
 
-API Project 至少需要：
+FastAPI 服务端至少需要：
 
 ```dotenv
 KB_LLM_CREDENTIAL_ENCRYPTION_KEY=<独立生成且至少 32 字符的随机主密钥>
@@ -234,6 +257,10 @@ KB_MINIMAX_API_KEY=<optional environment credential>
 ```
 
 环境变量凭据适合平台统一管理；后台录入的凭据适合运行期轮换。无论哪种方式，明文都不会通过管理 GET 接口返回。更换加密主密钥前必须先规划供应商凭据重新加密或重新录入，不能直接覆盖旧主密钥。
+
+离线 Profile 固定 `KB_EXTERNAL_LLM_ENABLED=false`。DeepSeek、Qwen 与 MiniMax 的
+配置只适用于经审批的联网模式，不是局域网检索、来源回答、权限、限额或审计的运行
+依赖；完全离线的生成式回答需要另行部署并验收企业内网模型服务。
 
 ## 运维建议
 

@@ -2,7 +2,7 @@
   <img src="web/public/brand/heyi-display-logo.webp" alt="和熠光显 EFD Logo" width="180">
   <h1>江苏和熠光显有限公司 · 企业知识中台</h1>
   <p><strong>面向 10 TB+ 文档数据的企业知识库与安全问答工作台</strong></p>
-  <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、OKF 知识编译、强制来源问答与 Serverless 控制面。</p>
+  <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、OKF 知识编译、强制来源问答与可离线容器化控制面。</p>
 </div>
 
 <p align="center">
@@ -38,6 +38,8 @@
   ·
   <a href="docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md">其他云 Linux 离线部署</a>
   ·
+  <a href="docs/OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md">断网冷启动验收</a>
+  ·
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
   ·
   <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">商业版审计报告</a>
@@ -54,6 +56,9 @@
 
 > [!WARNING]
 > “其他云 Linux 离线部署”使用 `isolated` 配置，固定 `KB_EXTERNAL_LLM_ENABLED=false`，运行时不会调用 DeepSeek、Qwen 或 MiniMax；管理界面可以保存模型选择，但不等于离线环境已具备外部推理能力。单台 Linux 8 核 / 16 GB / 300 GB SSD 仅是当前离线部署基线，尚无证据证明它能承载“每日 50 亿 token”。正式性能结论必须以目标机上预先批准的吞吐、延迟、错误率与磁盘阈值，以及可复核的压测证据为准；在这些材料齐备前，性能验收状态为 `BLOCKED`。
+
+> [!NOTE]
+> 局域网离线 Profile 的运行时只依赖服务器已加载的固定镜像，以及本机 PostgreSQL、Redis、MinIO、ClamAV、FastAPI、Next.js 与 Caddy。GitHub、Vercel、COS、公共 CDN 和公共镜像仓库均不是运行、重启或冷恢复前置条件；它们只可作为源码协作、可选托管演示或首次制品传输通道。服务器必须长期保留带 SHA-256 的完整发布包和 8 镜像归档。
 
 ## 项目定位
 
@@ -74,17 +79,20 @@
 .txt  .doc  .docx  .xls  .xlsx  .csv  .pdf  .ppt  .pptx
 ```
 
-## Demo
+## 部署入口与 Demo
 
 | 资源 | 地址 | 用途 |
 |---|---|---|
+| 局域网工作台 | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/login` | 企业内网登录、聊天与管理；默认正式交付入口 |
+| 局域网公共 API | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/api/v1/public/*` | 业务系统使用 `X-API-Key` 调用，不依赖浏览器 Cookie |
+| 局域网 OpenAPI | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/openapi.json` | 无公共 CDN 的原始契约；仅限 VPN/可信网段 |
 | Web 工作台 | [knowledgebases.vercel.app](https://knowledgebases.vercel.app) | 登录、聊天与后台管理入口 |
 | Swagger UI | [knowledgebases-api.vercel.app/docs](https://knowledgebases-api.vercel.app/docs) | 浏览并调用 API |
 | OpenAPI Schema | [knowledgebases-api.vercel.app/openapi.json](https://knowledgebases-api.vercel.app/openapi.json) | 生成 SDK 或导入 API 工具 |
 | Liveness | [knowledgebases-api.vercel.app/health/live](https://knowledgebases-api.vercel.app/health/live) | 检查应用进程是否可用 |
 | Readiness | [knowledgebases-api.vercel.app/health/ready](https://knowledgebases-api.vercel.app/health/ready) | 检查 PostgreSQL 与 Redis |
 
-> Demo 的真实可用状态以 `/health/ready` 为准；生产密钥只保存在 Vercel Sensitive Environment Variables 中，不进入仓库。
+> Vercel 条目仅为可选托管演示，不参与局域网离线运行。Demo 的真实可用状态以 `/health/ready` 为准；生产密钥只保存在对应部署的服务端密钥存储中，不进入仓库。
 
 > [!NOTE]
 > Web 与 API 的 Vercel Functions 已固定到美国东部（华盛顿特区）`iad1`。静态资源仍由 Vercel 全球 CDN 就近分发；为避免跨区域访问，PostgreSQL 与 Redis 宜部署在美国东部或邻近区域。对象存储仍由浏览器直传，不经过 Vercel Function；此 Vercel 区域设置不会修改或重启“其他云 Linux 8C16G300G”离线部署。
@@ -208,11 +216,11 @@ sequenceDiagram
 | Web | Next.js 16、React 19、TypeScript | 登录、聊天、知识库、账号、角色、权限与文件管理 |
 | Web 安全边界 | Same-origin BFF、HttpOnly Cookie、HMAC Client IP | 隐藏 Token、刷新会话并保留真实终端限流维度 |
 | 数据访问 | SQLAlchemy Async、Alembic | 事务、迁移、行锁和数据库约束 |
-| 元数据 | PostgreSQL 17 / Supabase | RBAC、配额、文件状态、Refresh Token 和审计 |
-| 短时状态 | Redis 8 + Lua | 登录与业务接口的分布式原子限流 |
-| 对象存储 | 腾讯 COS、AWS S3、MinIO | 私有文件、Multipart 与预签名访问 |
+| 元数据 | PostgreSQL 17（离线默认）/ Supabase（托管可选） | RBAC、配额、文件状态、Refresh Token 和审计 |
+| 短时状态 | Redis 8 + Lua（离线默认）/ Upstash（托管可选） | 登录与业务接口的分布式原子限流 |
+| 对象存储 | MinIO（离线默认）/ 腾讯 COS、AWS S3（托管可选） | 私有文件、Multipart 与预签名访问 |
 | 本地编排 | Docker Compose | PostgreSQL、Redis、MinIO、ClamAV、Migration、Bootstrap、FastAPI API/Maintenance、Next.js Web 与 Caddy |
-| Serverless | Vercel Functions + Cron | 无状态控制面与周期维护 |
+| 可选托管演示 | Vercel Functions + Cron | 无状态控制面与周期维护；不是内网运行依赖 |
 | 文档与知识编译 | defusedxml、Poppler、LibreOffice、bubblewrap、DeepSeek/Qwen/MiniMax | 九类文档有界解析、来源定位、OKF 草稿、重试、审计与发布门禁 |
 | 工程质量 | uv、pytest、Ruff、mypy strict | 可复现依赖、测试、Lint 与静态类型检查 |
 
@@ -399,12 +407,12 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时已完成冻结依赖、断网模式的全量本地质量门禁：**后端 531 项通过、18 项按环境条件跳过、覆盖率 85.00%（门槛 80%）；前端 183 项通过**，Ruff、mypy、ESLint、TypeScript 与 Next.js production build 全部通过。Playwright 企业档案已收集 8 项业务检查的桌面/移动场景及 2 项失败关闭预检；未在真实预生产拓扑运行前，浏览器证据与最终交付结论仍为 `BLOCKED`。
+本 README 更新时已完成冻结依赖、断网模式的全量本地质量门禁：**后端 532 项通过、18 项按环境条件跳过、覆盖率 85.00%（门槛 80%）；前端 195 项通过**，Ruff、mypy、ESLint、TypeScript 与 Next.js production build 全部通过。Playwright 企业档案已收集 8 项业务检查的桌面/移动场景及 2 项失败关闭预检；未在真实预生产拓扑运行前，浏览器证据与最终交付结论仍为 `BLOCKED`。
 
 > [!CAUTION]
 > 功能测试通过不等于容量认证通过。目标机性能门禁还需要项目方批准的验收阈值和同机压测产物；仓库当前不把单机 8C16G300G、1,000 人并发或每日 50 亿 token 写成已验证能力。
 
-## 部署到 Vercel
+## 可选 Vercel 托管演示
 
 生产使用同一 Git 仓库的两个 Vercel Project，避免框架检测、根路由和 BFF 回源发生冲突：
 
@@ -439,6 +447,7 @@ npm run build
 ```mermaid
 flowchart LR
     Client["企业内网客户端"] --> Caddy["Caddy\n唯一宿主机入口"]
+    ApiClient["局域网业务系统"] -->|"X-API-Key · HTTPS 19443"| Caddy
 
     subgraph Edge["edge · 172.30.242.0/24"]
         Caddy
@@ -458,6 +467,7 @@ flowchart LR
     end
 
     Caddy --> Web
+    Caddy -->|"/api/v1/public/* · OpenAPI · 健康检查"| API
     Caddy --> MinIO
     Web --> API
     API --> PostgreSQL
@@ -482,6 +492,7 @@ flowchart LR
 - Redis 官方入口在重启时需要检查已归 Redis 用户所有的 `0700` 数据目录，因此仅在入口降权阶段补回 `CHOWN`、`DAC_READ_SEARCH`、`SETGID`、`SETPCAP`、`SETUID`，明确不使用权限面更大的 `DAC_OVERRIDE`；`SETPCAP` 只用于降权时清空 bounding set，常驻 Redis 的五组 capability 均为 0，并保持 `no-new-privileges`；
 - ClamAV 病毒库以只读方式挂载，部署前验证 root 所有权、daemon 可读、时效性与引擎兼容性；`clamd` 先 `cap_drop: ALL`，仅补回切换到 `User clamav` 所需的 `SETGID`、`SETUID`，并启用 `no-new-privileges`；
 - 离线镜像使用固定 digest 且 `pull_policy: never`，外部 LLM 固定关闭。任何镜像、病毒库、网络 CIDR、解析器或主机容量门禁失败都必须停止上线。
+- 服务器保留源码包、完整 8 镜像归档、ClamAV 病毒库及各自 SHA-256；制品传输完成后，运行、重启、回滚和冷恢复不访问 GitHub、Vercel、COS、公共 CDN、npm/PyPI 或公共镜像仓库。
 
 完整的准备、预检、迁移、启动、验收与回滚流程见 [其他云 Linux 8C16G 离线部署手册](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。
 
@@ -537,6 +548,7 @@ flowchart LR
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
 - [其他云共享服务器应用部署基线（历史文件名）](docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)：跨应用隔离、端口登记、国内构建、最小权限、上线检查与回滚。
 - [其他云 Linux 8C16G 离线部署（历史文件名）](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)：本地 PostgreSQL、Redis、MinIO、镜像清单、格式门禁与目标机验收。
+- [离线运行时与断网冷启动验收](docs/OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md)：本地制品冷加载、断网闭环、socket 证据与失败关闭判定。
 - [文档解析能力与安全边界](docs/DOCUMENT_PARSER_SECURITY.zh-CN.md)：九类格式矩阵、来源定位、隔离工具和失败关闭语义。
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。

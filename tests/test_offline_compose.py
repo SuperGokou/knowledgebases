@@ -472,6 +472,35 @@ def test_offline_public_api_is_routed_before_the_web_fallback() -> None:
         assert f"header_up -{header}" in public_block
 
 
+def test_offline_api_metadata_is_lan_local_and_precedes_the_web_fallback() -> None:
+    caddyfile = (REPOSITORY / "deploy/tencent/Caddyfile.offline").read_text(
+        encoding="utf-8"
+    )
+
+    metadata_matcher = "@api_metadata path /openapi.json /health/live /health/ready"
+    metadata_proxy = "reverse_proxy @api_metadata api:8000"
+    web_proxy = "reverse_proxy web:3000"
+    assert caddyfile.index(metadata_matcher) < caddyfile.index(metadata_proxy)
+    assert caddyfile.index(metadata_proxy) < caddyfile.index(web_proxy)
+    metadata_block = caddyfile.split(metadata_proxy, 1)[1].split("}", 1)[0]
+    for header in (
+        "X-KB-Client-IP",
+        "X-KB-Client-Timestamp",
+        "X-KB-Client-Signature",
+    ):
+        assert f"header_up -{header}" in metadata_block
+    assert (
+        "connect-src 'self' https://{$KB_PUBLIC_HOST}:{$KB_OBJECTS_HTTPS_PORT}"
+        in caddyfile
+    )
+    assert "@api_metadata path /docs" not in caddyfile
+    assert "@api_metadata path /redoc" not in caddyfile
+
+    compose = offline_compose_config()
+    proxy_environment = compose["services"]["proxy"]["environment"]
+    assert proxy_environment["KB_OBJECTS_HTTPS_PORT"] == "19444"
+
+
 def test_offline_deployment_documentation_matches_the_enforced_release_boundary() -> None:
     deployment = (
         REPOSITORY / "docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md"

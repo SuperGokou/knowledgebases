@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   backendRequestTimeoutMs,
+  publicApiOrigin,
   safeBackendFetch,
 } from "../src/lib/server/backend";
 
@@ -23,6 +24,35 @@ function rejectWhenAborted(): ReturnType<typeof vi.fn> {
 }
 
 describe("safe backend fetch", () => {
+  it("uses an explicit public API origin without cloud-specific defaults", () => {
+    expect(publicApiOrigin({
+      KB_PUBLIC_API_ORIGIN: "https://kb.intranet.example:19443/",
+      FASTAPI_URL: "https://api.example.invalid",
+      VERCEL: "1",
+    })).toBe("https://kb.intranet.example:19443");
+  });
+
+  it("uses the configured backend origin only for a Vercel split deployment", () => {
+    expect(publicApiOrigin({
+      FASTAPI_URL: "https://api.example.test",
+      VERCEL: "1",
+    })).toBe("https://api.example.test");
+    expect(publicApiOrigin({
+      FASTAPI_URL: "http://api:8000",
+    })).toBeUndefined();
+  });
+
+  it.each([
+    "javascript:alert(1)",
+    "https://user:password@api.example.test",
+    "https://api.example.test/private",
+    "https://api.example.test?token=secret",
+  ])("rejects an unsafe configured public API origin: %s", (configured) => {
+    expect(() => publicApiOrigin({ KB_PUBLIC_API_ORIGIN: configured })).toThrow(
+      /KB_PUBLIC_API_ORIGIN/,
+    );
+  });
+
   it("bounds configured request deadlines", () => {
     expect(backendRequestTimeoutMs("100")).toBe(1_000);
     expect(backendRequestTimeoutMs("90000")).toBe(90_000);

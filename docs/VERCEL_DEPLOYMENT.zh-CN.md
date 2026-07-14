@@ -89,6 +89,7 @@ Web Project 的 Root Directory 必须设置为 `web/`。只配置服务端变量
 | Vercel 变量 | 来源/说明 |
 |---|---|
 | `FASTAPI_URL` | API Project 的 HTTPS Origin，例如 `https://knowledgebases-api.vercel.app` |
+| `KB_PUBLIC_API_ORIGIN` | 可选；公开 API 的浏览器展示 Origin。省略时 Vercel 自动复用 `FASTAPI_URL`，非 Vercel 分离 Origin 部署应显式设置 |
 | `FASTAPI_BFF_SHARED_SECRET` | 与 API 的 `KB_BFF_SHARED_SECRET` 完全相同 |
 | `SESSION_REFRESH_MAX_AGE_SECONDS` | 可选；默认 `604800`（7 天） |
 
