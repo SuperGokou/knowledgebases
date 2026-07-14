@@ -104,6 +104,7 @@ def test_postgres_gate_runs_only_real_postgres_tests_without_skip_escape_hatch()
     assert "tests/test_scan_audit_postgres.py" in command
     assert "tests/test_rbac_acl_revocation_postgres.py" in command
     assert "tests/test_migration_0011_postgres.py" in command
+    assert "tests/test_auth_refresh_postgres.py" in command
     assert "--runxfail" in command
     assert "-rs" in command
     assert not any("sqlite" in item.lower() for item in command)
@@ -115,6 +116,7 @@ def test_postgres_tests_never_recreate_an_arbitrary_database() -> None:
         "tests/test_scan_audit_postgres.py",
         "tests/test_rbac_acl_revocation_postgres.py",
         "tests/test_migration_0011_postgres.py",
+        "tests/test_auth_refresh_postgres.py",
     ):
         source = (REPOSITORY / relative).read_text(encoding="utf-8")
         assert "Base.metadata.drop_all" not in source

@@ -14,14 +14,16 @@ POSTGRES_MAPPED_TESTS: tuple[str, ...] = (
     "tests/test_scan_audit_postgres.py",
     "tests/test_rbac_acl_revocation_postgres.py",
     "tests/test_migration_0011_postgres.py",
+    "tests/test_auth_refresh_postgres.py",
 )
-POSTGRES_MINIMUM_PASSED_TESTS = 17
+POSTGRES_MINIMUM_PASSED_TESTS = 21
 POSTGRES_REQUIRED_CHECKS: tuple[str, ...] = (
     "real_migrations",
     "budget_concurrency",
     "idempotency_single_winner",
     "malware_scan_lease",
     "rbac_acl_revocation_concurrency",
+    "refresh_token_rotation",
     "audit_append_only_runtime_role",
     "isolated_migration_0011",
 )

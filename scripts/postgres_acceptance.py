@@ -110,6 +110,7 @@ def build_pytest_command(repository: Path) -> tuple[str, ...]:
         "tests/test_scan_audit_postgres.py",
         "tests/test_rbac_acl_revocation_postgres.py",
         "tests/test_migration_0011_postgres.py",
+        "tests/test_auth_refresh_postgres.py",
     )
 
 
@@ -461,6 +462,7 @@ def run_acceptance(*, image: str, evidence_path: Path) -> int:
                         "idempotency_single_winner": "passed",
                         "malware_scan_lease": "passed",
                         "rbac_acl_revocation_concurrency": "passed",
+                        "refresh_token_rotation": "passed",
                         "audit_append_only_runtime_role": "passed",
                         "isolated_migration_0011": "passed",
                         "pytest_passed": int(passed_match.group(1)) if passed_match else None,
@@ -470,6 +472,7 @@ def run_acceptance(*, image: str, evidence_path: Path) -> int:
                             "tests/test_scan_audit_postgres.py",
                             "tests/test_rbac_acl_revocation_postgres.py",
                             "tests/test_migration_0011_postgres.py",
+                            "tests/test_auth_refresh_postgres.py",
                         ],
                     },
                 }
@@ -478,7 +481,7 @@ def run_acceptance(*, image: str, evidence_path: Path) -> int:
             assert isinstance(target, dict)
             output = {
                 "status": "passed",
-                "checks": 7,
+                "checks": 8,
                 "pytest_skipped": 0,
                 "worktree_fingerprint": target["content_fingerprint"],
             }

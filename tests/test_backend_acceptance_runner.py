@@ -24,10 +24,9 @@ def test_backend_command_excludes_only_tests_closed_by_postgres_p0() -> None:
         "tests/test_scan_audit_postgres.py",
         "tests/test_rbac_acl_revocation_postgres.py",
         "tests/test_migration_0011_postgres.py",
+        "tests/test_auth_refresh_postgres.py",
     }
-    ignored = {
-        item.removeprefix("--ignore=") for item in command if item.startswith("--ignore=")
-    }
+    ignored = {item.removeprefix("--ignore=") for item in command if item.startswith("--ignore=")}
     assert ignored == set(POSTGRES_MAPPED_TESTS)
     assert "--cov=app" in command
     assert "--cov-fail-under=80" in command
@@ -56,6 +55,7 @@ def test_backend_mapping_requires_matching_complete_postgres_evidence() -> None:
             "idempotency_single_winner": "passed",
             "malware_scan_lease": "passed",
             "rbac_acl_revocation_concurrency": "passed",
+            "refresh_token_rotation": "passed",
             "audit_append_only_runtime_role": "passed",
             "isolated_migration_0011": "passed",
             "covered_test_files": list(POSTGRES_MAPPED_TESTS),

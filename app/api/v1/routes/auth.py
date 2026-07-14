@@ -32,6 +32,7 @@ from app.services.rate_limit import RateLimiter
 
 router = APIRouter()
 
+
 @router.get("/me", response_model=AuthMe)
 async def current_session(
     response: Response,
@@ -193,12 +194,27 @@ async def refresh_tokens(
             message="Refresh token is invalid or expired",
         ) from error
 
+    # All refresh paths use one global lock order: user, token, then family.
+    # The user lock serializes token_version changes across independent token
+    # families, while the ordered family lock prevents self-referential cycles.
+    user = await session.scalar(select(User).where(User.id == claims.user_id).with_for_update())
+    if user is None:
+        await session.rollback()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_refresh_token",
+            message="Refresh token is invalid or has been revoked",
+        )
     record = await session.scalar(
-        select(RefreshToken).where(RefreshToken.id == claims.token_id).with_for_update()
+        select(RefreshToken)
+        .where(
+            RefreshToken.id == claims.token_id,
+            RefreshToken.user_id == user.id,
+        )
+        .with_for_update()
     )
-    user = await session.scalar(select(User).where(User.id == claims.user_id))
     now = datetime.now(UTC)
-    if record is None or user is None:
+    if record is None:
         await session.rollback()
         raise ApiError(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -216,7 +232,11 @@ async def refresh_tokens(
                 (
                     await session.scalars(
                         select(RefreshToken)
-                        .where(RefreshToken.family_id == record.family_id)
+                        .where(
+                            RefreshToken.family_id == record.family_id,
+                            RefreshToken.user_id == user.id,
+                        )
+                        .order_by(RefreshToken.id)
                         .with_for_update()
                     )
                 ).all()
@@ -265,8 +285,12 @@ async def refresh_tokens(
         family_id=record.family_id,
         parent_id=record.id,
     )
-    record.replaced_by_id = replacement.id
     session.add(replacement)
+    # The replacement row must exist before the current token points to it.
+    # SQLAlchemy cannot infer ordering from UUID scalar assignments alone, and
+    # PostgreSQL checks this self-referential foreign key immediately.
+    await session.flush()
+    record.replaced_by_id = replacement.id
     add_audit_event(
         session,
         action="auth.token.refreshed",
