@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import select, update
+from sqlalchemy import select, tuple_, update
 
 from app.api.dependencies import DatabaseSession, require_permission
 from app.api.errors import ApiError
@@ -23,6 +23,7 @@ from app.services.llm_settings import (
     credential_source,
     ensure_provider_configs,
     validate_provider_base_url,
+    validate_provider_runtime_policy,
 )
 
 router = APIRouter()
@@ -35,7 +36,17 @@ async def list_llm_providers(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> LlmProvidersResponse:
     rows = await ensure_provider_configs(session, settings)
-    prices = list((await session.scalars(select(LlmModelPrice))).all())
+    configured_models = [(row.provider, row.model) for row in rows]
+    prices = list(
+        (
+            await session.scalars(
+                select(LlmModelPrice).where(
+                    tuple_(LlmModelPrice.provider, LlmModelPrice.model).in_(configured_models),
+                    LlmModelPrice.active.is_(True),
+                )
+            )
+        ).all()
+    )
     await session.commit()
     return _response(rows, settings, prices)
 
@@ -64,21 +75,32 @@ async def update_llm_provider(
             code="llm_provider_not_found",
             message="LLM provider not found",
         )
+    if (
+        settings.llm_egress_mode == "controlled_gateway"
+        and provider not in settings.approved_llm_providers
+    ):
+        raise ApiError(
+            status_code=422,
+            code="llm_provider_not_approved",
+            message="Provider is outside the controlled-egress approval contract",
+        )
 
-    if payload.model is not None:
-        row.model = payload.model
+    candidate_model = payload.model if payload.model is not None else row.model
     try:
-        row.base_url = validate_provider_base_url(
+        candidate_base_url = validate_provider_base_url(
             provider,
             payload.base_url or row.base_url,
             qwen_workspace_hosts=settings.qwen_allowed_workspace_hosts,
         )
-    except ValueError as error:
+        validate_provider_runtime_policy(settings, provider, candidate_base_url)
+    except (ValueError, LlmConfigurationError) as error:
         raise ApiError(
             status_code=422,
             code="invalid_llm_base_url",
             message=str(error),
         ) from error
+    row.model = candidate_model
+    row.base_url = candidate_base_url
 
     credential_changed = payload.api_key is not None or payload.clear_api_key
     pricing_changed = payload.input_micro_usd_per_million_tokens is not None
@@ -89,9 +111,7 @@ async def update_llm_provider(
             raise ApiError(
                 status_code=503,
                 code="llm_credential_encryption_unavailable",
-                message=(
-                    "Configure KB_LLM_CREDENTIAL_ENCRYPTION_KEY before storing provider keys"
-                ),
+                message=("Configure KB_LLM_CREDENTIAL_ENCRYPTION_KEY before storing provider keys"),
             ) from error
         row.api_key_ciphertext = cipher.encrypt(
             payload.api_key.get_secret_value().strip(),

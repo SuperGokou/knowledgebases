@@ -1,3 +1,4 @@
+import base64
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -112,9 +113,7 @@ async def test_cos_virtual_addressing_places_bucket_in_hostname() -> None:
     )
 
     assert initiated.url is not None
-    assert urlparse(initiated.url).hostname == (
-        "example-1250000000.cos.ap-beijing.myqcloud.com"
-    )
+    assert urlparse(initiated.url).hostname == ("example-1250000000.cos.ap-beijing.myqcloud.com")
 
 
 @pytest.mark.asyncio
@@ -123,7 +122,6 @@ async def test_isolated_storage_signs_the_internal_tls_proxy_origin() -> None:
         Settings(
             environment="production",
             deployment_profile="isolated",
-            external_llm_enabled=False,
             jwt_secret="4f" * 32,
             database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
             redis_url="redis://:pass@redis:6379/0",
@@ -135,6 +133,8 @@ async def test_isolated_storage_signs_the_internal_tls_proxy_origin() -> None:
             malware_scan_host="clamd",
             storage_capacity_probe_path="/var/lib/kb-capacity",
             trusted_hosts=("knowledge.internal",),
+            chat_replay_encryption_keys={1: base64.urlsafe_b64encode(b"s" * 32).decode("ascii")},
+            chat_replay_active_key_version=1,
         )
     )
     initiated = await service.initiate(

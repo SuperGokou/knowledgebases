@@ -87,10 +87,6 @@ def legacy_audit_result(action: str) -> str:
     return "FAILURE"
 
 
-def _quoted_actions(actions: frozenset[str]) -> str:
-    return ", ".join(f"'{action}'" for action in sorted(actions))
-
-
 def upgrade() -> None:
     # Backfilling audit_logs may exceed the application's 15-second timeout on
     # mature installations. Run this revision only in a declared maintenance
@@ -164,19 +160,31 @@ def upgrade() -> None:
     )
     # This one-time compatibility mapping is deliberately not used by runtime
     # queries. New writers must always persist an explicit controlled result.
-    op.execute(
-        f"""
+    legacy_outcome_backfill = sa.text(
+        """
         UPDATE audit_logs
         SET result = CASE
-            WHEN lower(btrim(action)) IN ({_quoted_actions(_DENIED_LEGACY_ACTIONS)})
+            WHEN lower(btrim(action)) IN :denied_actions
               THEN 'DENIED'::audit_result
-            WHEN lower(btrim(action)) IN ({_quoted_actions(_FAILURE_LEGACY_ACTIONS)})
+            WHEN lower(btrim(action)) IN :failure_actions
               THEN 'FAILURE'::audit_result
-            WHEN lower(btrim(action)) IN ({_quoted_actions(_SUCCESS_LEGACY_ACTIONS)})
+            WHEN lower(btrim(action)) IN :success_actions
               THEN 'SUCCESS'::audit_result
             ELSE 'FAILURE'::audit_result
         END
         """
+    ).bindparams(
+        sa.bindparam("denied_actions", expanding=True),
+        sa.bindparam("failure_actions", expanding=True),
+        sa.bindparam("success_actions", expanding=True),
+    )
+    op.get_bind().execute(
+        legacy_outcome_backfill,
+        {
+            "denied_actions": tuple(sorted(_DENIED_LEGACY_ACTIONS)),
+            "failure_actions": tuple(sorted(_FAILURE_LEGACY_ACTIONS)),
+            "success_actions": tuple(sorted(_SUCCESS_LEGACY_ACTIONS)),
+        },
     )
     op.alter_column(
         "audit_logs",

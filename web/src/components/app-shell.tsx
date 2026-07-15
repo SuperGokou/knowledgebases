@@ -6,6 +6,7 @@ import { BrandIdentity } from "@/components/brand-identity";
 import { Icon } from "@/components/icon";
 import { LogoutButton } from "@/components/logout-button";
 import { MobileNav } from "@/components/mobile-nav";
+import { SelfPasswordDialog } from "@/components/self-password-dialog";
 import { SideNav } from "@/components/side-nav";
 import { ThemeSelector } from "@/components/theme-selector";
 import { WorkspaceAccessBoundary } from "@/components/workspace-access-boundary";
@@ -35,6 +36,7 @@ export function AppShell({ children, email }: { children: ReactNode; email?: str
                 <strong>{email ?? "已登录账号"}</strong>
                 <small>企业工作区</small>
               </span>
+              <SelfPasswordDialog />
               <LogoutButton />
             </div>
           </div>

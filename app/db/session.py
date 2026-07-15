@@ -44,7 +44,9 @@ def engine_options(settings: Settings) -> dict[str, Any]:
     connect_args = (
         asyncpg_timeouts
         if "+asyncpg" in settings.database_url
-        else psycopg_timeouts if "+psycopg" in settings.database_url else {}
+        else psycopg_timeouts
+        if "+psycopg" in settings.database_url
+        else {}
     )
     return {
         "pool_pre_ping": True,
@@ -53,6 +55,7 @@ def engine_options(settings: Settings) -> dict[str, Any]:
         "pool_timeout": settings.database_pool_timeout_seconds,
         "connect_args": connect_args,
     }
+
 
 settings = get_settings()
 engine = create_async_engine(

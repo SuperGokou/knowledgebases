@@ -15,7 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.db.models import LlmProviderConfig
 from app.schemas.llm import LlmProviderName
-from app.services.llm_provider import OpenAICompatibleClient, OpenAICompatibleConfig
+from app.services.llm_provider import (
+    OpenAICompatibleClient,
+    OpenAICompatibleConfig,
+    acquire_shared_llm_client,
+)
 
 CredentialSource = Literal["database", "environment", "none"]
 SUPPORTED_PROVIDERS: tuple[LlmProviderName, ...] = ("deepseek", "qwen", "minimax")
@@ -34,6 +38,17 @@ PROVIDER_DEFAULTS: dict[LlmProviderName, ProviderDefault] = {
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     ),
     "minimax": ProviderDefault(model="MiniMax-M2.7", base_url="https://api.minimax.io/v1"),
+}
+
+_CONTROLLED_PROVIDER_BASE_URLS: dict[LlmProviderName, str] = {
+    "deepseek": "https://api.deepseek.com",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "minimax": "https://api.minimax.io/v1",
+}
+_CONTROLLED_PROVIDER_GATEWAY_PATHS: dict[LlmProviderName, str] = {
+    "deepseek": "/deepseek",
+    "qwen": "/qwen/compatible-mode/v1",
+    "minimax": "/minimax/v1",
 }
 
 
@@ -106,14 +121,32 @@ def validate_provider_base_url(
     elif provider == "minimax":
         allowed = hostname == "api.minimax.io"
     elif provider == "qwen":
-        allowed = hostname in {
-            "dashscope.aliyuncs.com",
-            "dashscope-us.aliyuncs.com",
-            "dashscope-intl.aliyuncs.com",
-        } or hostname in qwen_workspace_hosts
+        allowed = (
+            hostname
+            in {
+                "dashscope.aliyuncs.com",
+                "dashscope-us.aliyuncs.com",
+                "dashscope-intl.aliyuncs.com",
+            }
+            or hostname in qwen_workspace_hosts
+        )
     if not allowed:
         raise ValueError(f"base_url host is not approved for provider {provider}")
     return normalized
+
+
+def validate_provider_runtime_policy(
+    settings: Settings,
+    provider: LlmProviderName,
+    logical_base_url: str,
+) -> None:
+    """Reject provider URLs that the selected egress topology cannot route safely."""
+
+    if settings.llm_egress_mode == "controlled_gateway":
+        if provider not in settings.approved_llm_providers:
+            raise LlmConfigurationError("controlled_gateway_provider_not_approved")
+        if logical_base_url != _CONTROLLED_PROVIDER_BASE_URLS[provider]:
+            raise LlmConfigurationError("controlled_gateway_provider_url_not_allowed")
 
 
 async def ensure_provider_configs(
@@ -122,6 +155,12 @@ async def ensure_provider_configs(
     rows = list((await session.scalars(select(LlmProviderConfig))).all())
     by_provider = {row.provider: row for row in rows}
     has_default = any(row.is_default for row in rows)
+    preferred_default = settings.llm_default_provider
+    if (
+        settings.llm_egress_mode == "controlled_gateway"
+        and preferred_default not in settings.approved_llm_providers
+    ):
+        preferred_default = settings.approved_llm_providers[0]
     for provider in SUPPORTED_PROVIDERS:
         if provider in by_provider:
             continue
@@ -130,7 +169,7 @@ async def ensure_provider_configs(
             provider=provider,
             model=default.model,
             base_url=default.base_url,
-            is_default=not has_default and provider == settings.llm_default_provider,
+            is_default=not has_default and provider == preferred_default,
         )
         if row.is_default:
             has_default = True
@@ -138,14 +177,12 @@ async def ensure_provider_configs(
         rows.append(row)
         by_provider[provider] = row
     if not has_default:
-        by_provider[settings.llm_default_provider].is_default = True
+        by_provider[preferred_default].is_default = True
     await session.flush()
     return sorted(rows, key=lambda row: SUPPORTED_PROVIDERS.index(_provider_name(row.provider)))
 
 
-def credential_source(
-    row: LlmProviderConfig, settings: Settings
-) -> CredentialSource:
+def credential_source(row: LlmProviderConfig, settings: Settings) -> CredentialSource:
     if row.api_key_ciphertext:
         return "database"
     if _environment_key(settings, _provider_name(row.provider)):
@@ -159,14 +196,14 @@ async def resolve_provider_client(
     *,
     provider: LlmProviderName | None = None,
 ) -> OpenAICompatibleClient:
-    if not settings.external_llm_enabled:
+    if not settings.external_llm_enabled or settings.llm_egress_mode == "strict_offline":
         raise LlmConfigurationError("external_llm_disabled")
     if provider is None:
         row = await session.scalar(
             select(LlmProviderConfig).where(LlmProviderConfig.is_default.is_(True))
         )
-        selected_provider = settings.llm_default_provider if row is None else _provider_name(
-            row.provider
+        selected_provider = (
+            settings.llm_default_provider if row is None else _provider_name(row.provider)
         )
     else:
         row = await session.get(LlmProviderConfig, provider)
@@ -195,16 +232,37 @@ async def resolve_provider_client(
         )
     elif row is not None:
         api_key = _environment_key(settings, selected_provider)
-    return OpenAICompatibleClient(
+    runtime_base_url = _runtime_provider_base_url(
+        settings,
+        selected_provider,
+        base_url,
+    )
+    return await acquire_shared_llm_client(
         OpenAICompatibleConfig(
             provider=selected_provider,
             api_key=api_key,
-            base_url=base_url,
+            base_url=runtime_base_url,
             model=model,
             timeout_seconds=settings.deepseek_timeout_seconds,
             max_tokens=settings.deepseek_max_tokens,
         )
     )
+
+
+def _runtime_provider_base_url(
+    settings: Settings,
+    provider: LlmProviderName,
+    logical_base_url: str,
+) -> str:
+    """Map reviewed logical provider URLs onto the fixed same-host gateway."""
+
+    validate_provider_runtime_policy(settings, provider, logical_base_url)
+    if settings.llm_egress_mode != "controlled_gateway":
+        return logical_base_url
+    gateway_url = settings.llm_egress_gateway_url
+    if gateway_url is None:
+        raise LlmConfigurationError("controlled_gateway_url_missing")
+    return f"{gateway_url}{_CONTROLLED_PROVIDER_GATEWAY_PATHS[provider]}"
 
 
 def _settings_default(settings: Settings, provider: LlmProviderName) -> ProviderDefault:

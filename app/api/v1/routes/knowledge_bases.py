@@ -18,7 +18,6 @@ from app.db.models import (
     KnowledgeBaseRoleGrant,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
-    Role,
 )
 from app.schemas.knowledge_bases import (
     KnowledgeBaseCreate,
@@ -40,6 +39,13 @@ from app.services.knowledge_bases import (
     list_accessible_knowledge_bases,
     require_knowledge_base_access,
     search_knowledge_entries,
+)
+from app.services.knowledge_entry_quota import consume_manual_entry_storage_quota
+from app.services.rbac_mutation import (
+    acquire_rbac_mutation_lock,
+    lock_role_union,
+    locked_users_statement,
+    refresh_locked_actor_access,
 )
 
 router = APIRouter()
@@ -110,6 +116,7 @@ def _knowledge_base_read(item: KnowledgeBaseAccess) -> KnowledgeBaseRead:
         description=knowledge_base.description,
         external_llm_processing_enabled=knowledge_base.external_llm_processing_enabled,
         custom_metadata=knowledge_base.custom_metadata,
+        role_grant_version=knowledge_base.role_grant_version,
         access_level=item.level,
         created_at=knowledge_base.created_at,
         updated_at=knowledge_base.updated_at,
@@ -125,12 +132,16 @@ async def list_knowledge_bases(
     ],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    q: Annotated[str | None, Query(max_length=200)] = None,
+    minimum_access_level: Annotated[KnowledgeBaseAccessLevel | None, Query()] = None,
 ) -> list[KnowledgeBaseRead]:
     rows = await list_accessible_knowledge_bases(
         session,
         access,
         limit=limit,
         offset=offset,
+        query=q,
+        minimum_access_level=minimum_access_level,
     )
     return [_knowledge_base_read(item) for item in rows]
 
@@ -213,6 +224,14 @@ async def update_knowledge_base(
             resource_id=str(knowledge_base_id),
             knowledge_base_id=knowledge_base_id,
         )
+    if (
+        "external_llm_processing_enabled" in changes
+        and changes["external_llm_processing_enabled"]
+        is not item.knowledge_base.external_llm_processing_enabled
+    ):
+        # Consent changes invalidate completed answers under the same KB lock;
+        # a replay cannot bypass a revocation that commits first.
+        item.knowledge_base.content_version += 1
     for key, value in changes.items():
         setattr(item.knowledge_base, key, value)
     add_audit_event(
@@ -267,28 +286,60 @@ async def replace_role_grants(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("knowledge:grant"))],
 ) -> list[KnowledgeBaseRoleGrant]:
+    # Reject callers outside the KB boundary before they can contend on arbitrary
+    # role rows. The authorization decision is repeated under the KB row lock below.
     await require_knowledge_base_access(
+        session,
+        access,
+        knowledge_base_id,
+        minimum=KnowledgeBaseAccessLevel.MANAGER,
+    )
+    role_ids = {item.role_id for item in payload.grants}
+    await acquire_rbac_mutation_lock(session)
+    actor = await session.scalar(locked_users_statement({access.user.id}))
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={actor.id},
+        additional_role_ids=role_ids,
+    )
+    access = await refresh_locked_actor_access(session, actor, {"knowledge:grant"})
+    if set(locked_roles).intersection(role_ids) != role_ids:
+        raise ApiError(
+            status_code=422,
+            code="unknown_role",
+            message="One or more roles do not exist",
+        )
+    locked_access = await require_knowledge_base_access(
         session,
         access,
         knowledge_base_id,
         minimum=KnowledgeBaseAccessLevel.MANAGER,
         lock=True,
     )
-    role_ids = {item.role_id for item in payload.grants}
-    if role_ids:
-        existing = set(
-            (
-                await session.scalars(
-                    select(Role.id).where(Role.id.in_(role_ids))
-                )
-            ).all()
+    knowledge_base = locked_access.knowledge_base
+    current_version = knowledge_base.role_grant_version
+    if payload.expected_version != current_version:
+        raise ApiError(
+            status_code=409,
+            code="stale_knowledge_grants",
+            message="Knowledge-base grants changed; reload them before retrying",
+            details={"current_version": current_version},
         )
-        if existing != role_ids:
-            raise ApiError(
-                status_code=422,
-                code="unknown_role",
-                message="One or more roles do not exist",
+    current_grants = list(
+        (
+            await session.scalars(
+                select(KnowledgeBaseRoleGrant)
+                .where(KnowledgeBaseRoleGrant.knowledge_base_id == knowledge_base_id)
+                .order_by(KnowledgeBaseRoleGrant.role_id)
             )
+        ).all()
+    )
+    current_policy = {item.role_id: item.access_level for item in current_grants}
+    requested_policy = {item.role_id: item.access_level for item in payload.grants}
+    if current_policy == requested_policy:
+        return current_grants
     await deny_if_active_external_llm_egress(
         session,
         request,
@@ -313,6 +364,7 @@ async def replace_role_grants(
         for item in payload.grants
     ]
     session.add_all(grants)
+    knowledge_base.role_grant_version += 1
     add_audit_event(
         session,
         actor_id=access.user.id,
@@ -321,7 +373,11 @@ async def replace_role_grants(
         resource_type="knowledge_base",
         resource_id=str(knowledge_base_id),
         request_id=getattr(request.state, "request_id", None),
-        details={"role_ids": sorted(str(item) for item in role_ids)},
+        details={
+            "from_version": current_version,
+            "to_version": knowledge_base.role_grant_version,
+            "role_ids": sorted(str(item) for item in role_ids),
+        },
     )
     await session.commit()
     for grant in grants:
@@ -450,6 +506,13 @@ async def create_entry(
                 code="invalid_source_file",
                 message="Source file does not belong to this knowledge base",
             )
+    storage_bytes_charged = await consume_manual_entry_storage_quota(
+        session,
+        user_id=access.user.id,
+        storage_limit=access.limits.get("storage_bytes", 0),
+        previous_content=None,
+        next_content=payload.content,
+    )
     entry = KnowledgeEntry(
         knowledge_base_id=knowledge_base_id,
         source_file_id=payload.source_file_id,
@@ -470,13 +533,14 @@ async def create_entry(
         resource_type="knowledge_entry",
         resource_id=str(entry.id),
         request_id=getattr(request.state, "request_id", None),
-        details={"knowledge_base_id": str(knowledge_base_id)},
+        details={
+            "knowledge_base_id": str(knowledge_base_id),
+            "storage_bytes_charged": storage_bytes_charged,
+        },
     )
     await session.commit()
     await session.refresh(entry)
-    response.headers["Location"] = (
-        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries/{entry.id}"
-    )
+    response.headers["Location"] = f"/api/v1/knowledge-bases/{knowledge_base_id}/entries/{entry.id}"
     return entry
 
 
@@ -516,6 +580,7 @@ async def update_entry(
             message="Knowledge entry not found",
         )
     changes = payload.model_dump(exclude_unset=True)
+    storage_bytes_charged = 0
     if "custom_metadata" in changes:
         _ensure_metadata_size(changes["custom_metadata"])
     if "content" in changes:
@@ -532,6 +597,13 @@ async def update_entry(
             incoming_bytes=next_bytes,
             settings=settings,
         )
+        storage_bytes_charged = await consume_manual_entry_storage_quota(
+            session,
+            user_id=access.user.id,
+            storage_limit=access.limits.get("storage_bytes", 0),
+            previous_content=entry.content,
+            next_content=str(changes["content"]),
+        )
     for key, value in changes.items():
         setattr(entry, key, value)
     add_audit_event(
@@ -542,7 +614,10 @@ async def update_entry(
         resource_type="knowledge_entry",
         resource_id=str(entry.id),
         request_id=getattr(request.state, "request_id", None),
-        details={"fields": sorted(changes)},
+        details={
+            "fields": sorted(changes),
+            "storage_bytes_charged": storage_bytes_charged,
+        },
     )
     await session.commit()
     await session.refresh(entry)

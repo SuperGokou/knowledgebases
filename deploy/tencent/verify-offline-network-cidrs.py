@@ -11,6 +11,18 @@ from collections.abc import Iterable
 from typing import Any
 
 PROJECT_LABEL = "com.docker.compose.project"
+NETWORK_LABEL = "com.docker.compose.network"
+OWNER_LABEL = "io.heyi.knowledgebases.owner"
+STACK_LABEL = "io.heyi.knowledgebases.stack"
+EXPECTED_OWNER = "jiangsu-heyi-knowledgebases"
+EXPECTED_STACK = "offline"
+EXPECTED_NETWORKS: dict[str, tuple[ipaddress.IPv4Network, bool]] = {
+    "frontend": (ipaddress.IPv4Network("172.30.240.0/24"), True),
+    "backend": (ipaddress.IPv4Network("172.30.241.0/24"), True),
+    "edge": (ipaddress.IPv4Network("172.30.242.0/24"), True),
+    "llm-control": (ipaddress.IPv4Network("172.30.243.0/24"), True),
+    "llm-uplink": (ipaddress.IPv4Network("172.30.244.0/24"), False),
+}
 
 
 def _run_json(command: list[str]) -> Any:
@@ -82,21 +94,55 @@ def _labels(network: dict[str, Any]) -> dict[str, str]:
     return {str(key): str(value) for key, value in labels.items()}
 
 
+def _validate_owned_network(
+    project: str,
+    network: dict[str, Any],
+    requested: set[ipaddress.IPv4Network],
+) -> tuple[ipaddress.IPv4Network, str | None]:
+    labels = _labels(network)
+    logical_name = labels.get(NETWORK_LABEL)
+    if logical_name not in EXPECTED_NETWORKS:
+        raise RuntimeError("project-owned Docker network has an unexpected logical name")
+    expected_subnet, expected_internal = EXPECTED_NETWORKS[logical_name]
+    if expected_subnet not in requested:
+        raise RuntimeError("project-owned Docker network is outside the requested contract")
+    if labels.get(OWNER_LABEL) != EXPECTED_OWNER or labels.get(STACK_LABEL) != EXPECTED_STACK:
+        raise RuntimeError("project-owned Docker network lacks the offline ownership labels")
+    if network.get("Name") != f"{project}_{logical_name}":
+        raise RuntimeError("project-owned Docker network has an unexpected runtime name")
+    if network.get("Driver") != "bridge":
+        raise RuntimeError("project-owned Docker network must use the bridge driver")
+    if network.get("Internal") is not expected_internal:
+        raise RuntimeError("project-owned Docker network has an unsafe Internal setting")
+    observed_subnets = list(_subnets(network))
+    if observed_subnets != [expected_subnet]:
+        raise RuntimeError("project-owned Docker network has unexpected IPAM configuration")
+    return expected_subnet, _bridge_device(network)
+
+
 def validate(project: str, requested: list[ipaddress.IPv4Network]) -> None:
     allowed_existing: set[ipaddress.IPv4Network] = set()
     allowed_devices: set[str] = set()
+    seen_owned_names: set[str] = set()
+    requested_set = set(requested)
 
     for network in _docker_networks():
-        owned = _labels(network).get(PROJECT_LABEL) == project
-        device = _bridge_device(network)
+        labels = _labels(network)
+        owned = labels.get(PROJECT_LABEL) == project
+        if owned:
+            logical_name = labels.get(NETWORK_LABEL, "")
+            if logical_name in seen_owned_names:
+                raise RuntimeError("duplicate project-owned Docker network identity")
+            seen_owned_names.add(logical_name)
+            existing, device = _validate_owned_network(project, network, requested_set)
+            allowed_existing.add(existing)
+            if device:
+                allowed_devices.add(device)
         for existing in _subnets(network):
             overlaps = [candidate for candidate in requested if candidate.overlaps(existing)]
             if not overlaps:
                 continue
             if owned and existing in requested:
-                allowed_existing.add(existing)
-                if device:
-                    allowed_devices.add(device)
                 continue
             raise RuntimeError(
                 f"requested Docker CIDR overlaps an unrelated Docker network: {existing}"
@@ -149,6 +195,8 @@ def main(arguments: list[str]) -> int:
             requested.append(parsed)
         if len(set(requested)) != len(requested):
             raise ValueError("requested Docker CIDRs must be unique")
+        if set(requested) != {item[0] for item in EXPECTED_NETWORKS.values()}:
+            raise ValueError("requested Docker CIDRs differ from the fixed offline contract")
         for index, left in enumerate(requested):
             for right in requested[index + 1 :]:
                 if left.overlaps(right):

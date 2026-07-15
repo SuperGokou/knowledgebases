@@ -16,12 +16,8 @@ class LlmProviderUpdate(BaseModel):
     api_key: SecretStr | None = Field(default=None, repr=False)
     clear_api_key: bool = False
     make_default: bool = False
-    input_micro_usd_per_million_tokens: int | None = Field(
-        default=None, ge=0, le=10**15
-    )
-    output_micro_usd_per_million_tokens: int | None = Field(
-        default=None, ge=0, le=10**15
-    )
+    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0, le=10**15)
+    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0, le=10**15)
 
     @field_validator("model")
     @classmethod

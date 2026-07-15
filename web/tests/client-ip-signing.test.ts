@@ -5,7 +5,7 @@ import {
   createSignedClientIpHeaders,
 } from "../src/lib/server/client-ip-signing";
 
-const SECRET = "0123456789abcdef0123456789abcdef";
+const SECRET = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- deterministic HMAC test fixture
 const NOW = () => 1_700_000_000_999;
 
 describe("createSignedClientIpHeaders", () => {

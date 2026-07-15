@@ -4,6 +4,10 @@ import { resolvePlaywrightProfile } from "./e2e/support/playwright-profile";
 
 const profile = resolvePlaywrightProfile(process.env, __dirname);
 const enterpriseProfile = profile.enterprise;
+const [desktopProject, mobileProject] = profile.projects;
+if (!desktopProject || !mobileProject || profile.projects.length !== 2) {
+  throw new Error("Playwright profile must define exactly one desktop and one mobile project");
+}
 
 export const DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS = 30 * 60_000;
 
@@ -53,15 +57,10 @@ export default defineConfig({
     actionTimeout: 10_000,
     navigationTimeout: 30_000,
   },
-  projects: enterpriseProfile
-    ? [
-        { name: "enterprise-desktop", use: { ...devices["Desktop Chrome"] } },
-        { name: "enterprise-mobile", use: { ...devices["Pixel 5"] } },
-      ]
-    : [
-        { name: "desktop-chromium", use: { ...devices["Desktop Chrome"] } },
-        { name: "mobile-chromium", use: { ...devices["Pixel 5"] } },
-      ],
+  projects: [
+    { name: desktopProject.name, use: { ...devices["Desktop Chrome"] } },
+    { name: mobileProject.name, use: { ...devices["Pixel 5"] } },
+  ],
   webServer: enterpriseProfile
     ? undefined
     : {

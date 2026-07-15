@@ -1,3 +1,5 @@
+import { CHAT_BROWSER_TIMEOUT_MS } from "./chat-timeout-budget";
+
 export const API_ORIGIN_PLACEHOLDER = "https://YOUR_KNOWLEDGEBASE_HOST";
 
 export type ApiExampleLanguage = "curl" | "python" | "node";
@@ -18,6 +20,8 @@ const operations: Record<PublicApiOperation, { path: string; body: Record<string
   },
 };
 
+const CONTROL_PLANE_CLIENT_TIMEOUT_MS = 30_000;
+
 export function buildApiUsageExample(
   language: ApiExampleLanguage,
   operation: PublicApiOperation,
@@ -27,41 +31,63 @@ export function buildApiUsageExample(
   const url = `${normalizeApiOrigin(apiOrigin)}${spec.path}`;
   const compactBody = JSON.stringify(spec.body);
   const formattedBody = JSON.stringify(spec.body, null, 2);
+  const isChat = operation === "chat";
+  const clientTimeoutMs = isChat
+    ? CHAT_BROWSER_TIMEOUT_MS
+    : CONTROL_PLANE_CLIENT_TIMEOUT_MS;
+  const clientTimeoutSeconds = clientTimeoutMs / 1_000;
 
   if (language === "curl") {
     return `curl --request POST '${url}' \\
+  --connect-timeout 10 \\
+  --max-time ${clientTimeoutSeconds} \\
   --header "X-API-Key: $KNOWLEDGEBASES_API_KEY" \\
-  --header 'Content-Type: application/json' \\
+${isChat ? '  --header "Idempotency-Key: $KNOWLEDGEBASES_IDEMPOTENCY_KEY" \\\n' : ""}  --header 'Content-Type: application/json' \\
   --data '${compactBody}'`;
   }
 
   if (language === "python") {
-    return `import os
-import requests
+    const imports = isChat ? "import os\nimport uuid\n\nimport requests" : "import os\n\nimport requests";
+    const idempotencySetup = isChat
+      ? '\nidempotency_key = f"chat-{uuid.uuid4()}"\n'
+      : "";
+    const idempotencyHeader = isChat
+      ? '        "Idempotency-Key": idempotency_key,\n'
+      : "";
+    return `${imports}
+${idempotencySetup}
 
 response = requests.post(
     "${url}",
     headers={
         "X-API-Key": os.environ["KNOWLEDGEBASES_API_KEY"],
-        "Content-Type": "application/json",
+${idempotencyHeader}        "Content-Type": "application/json",
     },
     json=${formattedBody.replaceAll("null", "None")},
-    timeout=30,
+    timeout=(10, ${clientTimeoutSeconds}),
 )
 response.raise_for_status()
 print(response.json())`;
   }
 
+  const idempotencySetup = isChat
+    ? "\nconst idempotencyKey = `chat-${crypto.randomUUID()}`;"
+    : "";
+  const idempotencyHeader = isChat
+    ? '    "Idempotency-Key": idempotencyKey,\n'
+    : "";
   return `const apiKey = process.env.KNOWLEDGEBASES_API_KEY;
 if (!apiKey) throw new Error("KNOWLEDGEBASES_API_KEY is required");
+${idempotencySetup}
 
 const response = await fetch("${url}", {
   method: "POST",
   headers: {
     "X-API-Key": apiKey,
-    "Content-Type": "application/json",
+${idempotencyHeader}    "Content-Type": "application/json",
   },
   body: JSON.stringify(${formattedBody}),
+  signal: AbortSignal.timeout(${clientTimeoutMs}),
 });
 
 if (!response.ok) throw new Error(\`API request failed: \${response.status}\`);

@@ -47,7 +47,7 @@ export const REQUIRED_CHECKS = [
   "error_loading_states",
 ] as const;
 
-const REQUIRED_PROJECTS = ["enterprise-desktop", "enterprise-mobile"] as const;
+export const REQUIRED_PROJECTS = ["enterprise-desktop", "enterprise-mobile"] as const;
 const REQUIRED_ATTACHMENTS = ["e2e-a11y", "e2e-observability", "e2e-screenshot"] as const;
 const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 
@@ -64,6 +64,7 @@ type ReporterOptions = {
 export type EvidenceTarget = {
   readonly git_head: string;
   readonly content_fingerprint: string;
+  readonly run_id: string;
 };
 
 export type EvidenceArtifact = {
@@ -128,6 +129,7 @@ const SECRET_ASSIGNMENT =
   /\b(password|passwd|secret|token|api[-_ ]?key|authorization|cookie|credential|session)\b(\s*[:=]\s*)([^\s,;]+)/gi;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GIT_HEAD_PATTERN = /^[0-9a-f]{40,64}$/;
+const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
 function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -236,7 +238,9 @@ export function parseEvidenceChallenge(
     value.status !== "issued" ||
     value.target.git_head !== expectedTarget.git_head ||
     value.target.content_fingerprint !== expectedTarget.content_fingerprint ||
-    Object.keys(value.target).length !== 2
+    value.target.run_id !== expectedTarget.run_id ||
+    !RUN_ID_PATTERN.test(expectedTarget.run_id) ||
+    Object.keys(value.target).length !== 3
   ) {
     throw new Error("invalid E2E signing challenge binding");
   }
@@ -303,6 +307,8 @@ export function buildCompleteEvidence(input: {
   if (
     !GIT_HEAD_PATTERN.test(input.target.git_head) ||
     !SHA256_PATTERN.test(input.target.content_fingerprint) ||
+    !RUN_ID_PATTERN.test(input.target.run_id) ||
+    Object.keys(input.target).length !== 3 ||
     !Number.isFinite(Date.parse(input.collectedAt)) ||
     input.artifacts.length === 0
   ) {
@@ -429,7 +435,10 @@ function untrackedManifestHash(repositoryRoot: string): string {
   return digest.digest("hex");
 }
 
-export function collectWorktreeTarget(cwd = process.cwd()): EvidenceTarget {
+export function collectWorktreeTarget(
+  cwd = process.cwd(),
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): EvidenceTarget {
   const repositoryRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
     cwd,
     encoding: "utf8",
@@ -440,9 +449,14 @@ export function collectWorktreeTarget(cwd = process.cwd()): EvidenceTarget {
     gitBuffer(repositoryRoot, "diff", "--binary", "HEAD", "--", "."),
   );
   const untrackedHash = untrackedManifestHash(repositoryRoot);
+  const runId = env.KB_E2E_RUN_ID?.trim() ?? "";
+  if (!RUN_ID_PATTERN.test(runId)) {
+    throw new Error("KB_E2E_RUN_ID must be bound to formal browser evidence");
+  }
   return {
     git_head: gitHead,
     content_fingerprint: sha256(`${gitHead}\0${trackedDiffHash}\0${untrackedHash}`),
+    run_id: runId,
   };
 }
 
@@ -515,7 +529,7 @@ function loadSigningMaterial(
   const privateKeyBytes = readRootProtectedFile(signingKeyPath, 32 * 1024);
   const privateKeyText = privateKeyBytes.toString("ascii");
   if (
-    !privateKeyText.startsWith("-----BEGIN PRIVATE KEY-----\n") ||
+    !privateKeyText.startsWith("-----BEGIN PRIVATE KEY-----\n") || // gitleaks:allow -- validates a PEM boundary, not key material
     !privateKeyText.trimEnd().endsWith("-----END PRIVATE KEY-----")
   ) {
     throw new Error("E2E signing key must be an unencrypted PKCS#8 PEM key");

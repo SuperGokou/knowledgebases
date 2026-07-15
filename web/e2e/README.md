@@ -14,7 +14,7 @@
 | 检查项 | 真实闭环 |
 | --- | --- |
 | `login_role_routing` | 统一登录、管理员/普通成员/无权限账号按角色落地 |
-| `account_lifecycle` | 创建、重复冲突、角色撤销、停用与会话失效 |
+| `account_lifecycle` | 创建、重复冲突、角色撤销、停用、他人改密仅限超级管理员、自改验证当前密码并退出、旧凭据与旧会话失效、角色编辑/删除、占用保护、系统角色只读与并发版本冲突 |
 | `knowledge_acl` | 知识库授权、可见性与撤权后即时拒绝 |
 | `file_upload_scan_okf_approval_download` | 直传、扫描、OKF、审批、下载内容校验 |
 | `chat_citations_audit_table` | 引用来源、无答案、审核拒绝、数据表与表格来源 |
@@ -22,7 +22,7 @@
 | `api_key_lifecycle` | 一次性密钥、知识库 scope、限流、撤销后 401 |
 | `error_loading_states` | loading、401、403、409、429、5xx、超时 |
 
-每项必须在 `enterprise-desktop` 与 `enterprise-mobile` 两个项目中完成，同时产出截图、可访问性结果、控制台与网络异常摘要。任一项目或工件缺失，证据采集器不会签发 `passed`。
+上表是 **8 个证据聚合组**，不是 Playwright 的测试实例数量。正式 collection 固定为每个项目 11 个实例（10 个业务场景 + 1 个失败关闭预检），在 `enterprise-desktop` 与 `enterprise-mobile` 两个项目中合计 **22 个实例**。每个聚合组必须从真实实例结果生成截图、可访问性结果、控制台与网络异常摘要；任一项目、实例或必需工件缺失，证据采集器不会签发 `passed`。
 
 ## 运行档案
 
@@ -44,6 +44,7 @@ $env:KB_E2E_DOCUMENT_FIXTURE_ROOT = "C:\\acceptance\\document-fixtures"
 $env:KB_E2E_DOCUMENT_FIXTURE_MANIFEST = "C:\\acceptance\\document-fixtures\\document-fixtures-v1.json"
 $env:KB_E2E_SIGNING_KEY_PATH = "/etc/heyi-acceptance/private/browser-e2e-ed25519.pem"
 $env:KB_E2E_CHALLENGE_PATH = "/var/lib/heyi-acceptance/challenges/<challenge-id>.json"
+$env:KB_E2E_RUN_ID = "acceptance-20260714-a001"
 
 npm run test:e2e
 ```
@@ -55,7 +56,9 @@ npm run test:e2e
 | 变量 | 说明 |
 | --- | --- |
 | `KB_E2E_JOB_TIMEOUT_MS` | 扫描与 OKF 作业等待上限，最低 30 秒，默认 180 秒 |
-| `KB_E2E_RUN_ID` | 8–80 位字母、数字、`_`、`-`，用于隔离合成数据 |
+| `KB_E2E_TEST_TIMEOUT_MS` | Playwright 单项企业测试上限，最低 60 秒，默认 30 分钟 |
+| `KB_E2E_SUITE_TIMEOUT_MS` | 正式验收器执行整套企业 E2E 的上限，默认 2 小时；允许 30 分钟至 12 小时，且不得短于单项测试上限 |
+| `KB_E2E_RUN_ID` | **必填**。8–80 位字母、数字、`_`、`-`，用于隔离并追踪所有合成数据；缺失或格式错误时 fail-closed |
 | `KB_E2E_MULTIPART_BYTES` | 真实 Multipart 载荷字节数，必须为 100 MiB–512 MiB，并且必须达到目标拓扑的 Multipart 阈值 |
 | `KB_E2E_DOCUMENT_FIXTURE_ROOT` | 九格式黄金样本的绝对专用目录；不得指向生产上传目录 |
 | `KB_E2E_DOCUMENT_FIXTURE_MANIFEST` | 由离线生成器产生并通过 SHA-256 验证的 v1 清单绝对路径 |
@@ -63,8 +66,22 @@ npm run test:e2e
 | `KB_E2E_CHALLENGE_PATH` | **必填**。仓库外的一次性 challenge JSON 绝对路径；文件名必须为 `<challenge_id>.json`，并满足相同的 root/类型/权限门禁 |
 | `KB_E2E_EVIDENCE_PATH` | 正式证据 JSON 输出路径，默认 `artifacts/acceptance/functional/browser-e2e.json` |
 
+`KB_E2E_SUITE_TIMEOUT_MS` 由正式 `scripts/acceptance.py --run-browser-e2e` 路径执行；直接运行 `npm run test:e2e` 时仍由 Playwright 的单项超时负责。非法整数、越界值或整套上限短于 `KB_E2E_TEST_TIMEOUT_MS` 时，验收器会在启动 npm 前以 `BLOCKED` 结束。外层 Gate 会在整套上限之外保留 60 秒退出与证据收尾时间，避免父进程先于 Playwright 的受控超时终止。
+
 > [!CAUTION]
 > 不要把任何真实员工账号、生产密钥或企业文档用于此套件。目标环境必须是一次性或可清理的预生产数据集；Playwright 企业档案关闭 trace 与 video，避免把一次性 API Key 写入工件。
+
+## 合成数据生命周期
+
+企业场景仅面向独立验收栈，允许在断开外网的局域网中运行，不依赖 GitHub、Vercel 或公网模型服务。所有新建角色、成员、知识库、API Key 和 Multipart 对象均绑定 `KB_E2E_RUN_ID`：角色/成员名称带完整 `run_id`，知识库写入 `custom_metadata.e2e_run_id`，文件通过所属知识库追溯到同一运行批次。
+
+`KB_E2E_RUN_ID` 同时写入一次性 challenge 与正式证据的 `target.run_id`；它会参与 canonical evidence digest 和 Ed25519 签名。challenge、运行环境与证据三者的 `run_id` 任一不一致，reporter 必须 fail-closed，不能生成 `complete` 证据。
+
+- 一次性 API Key 在场景结束前撤销；可安全删除且未被引用的合成角色会删除。
+- 产品没有成员硬删除接口。密码与角色生命周期场景会对其合成成员解除角色并停用；其他业务闭环可能保留仍可追踪的合成成员，因此不得笼统描述为“已清理”。
+- 文件、知识库和成员等需要保留的记录必须按 `run_id` 归档或由验收环境管理员在取证完成后执行受控数据集销毁。
+- 每次正式验收使用新的 `run_id`；同一套件重复运行依靠唯一后缀避免冲突，但不能复用旧数据冒充本次结果。
+- 若场景中途失败，可能留下仍带 `run_id` 的合成记录；验收环境必须禁止真实用户访问，并按该标识完成复核与处置。
 
 ## 故障控制面契约
 
@@ -110,7 +127,7 @@ challenge 必须由验收方预先签发，并精确绑定本次 `EXT-BROWSER-E2
 
 诊断结果只有三种：
 
-- `passed`：8 项检查在桌面与移动端全部通过，质量工件齐全，代码身份可计算，并成功生成受信 Ed25519 challenge 签名。
+- `passed`：22 个 Playwright 实例（11 个场景 × 桌面/移动）全部通过，8 个证据聚合组及质量工件齐全，代码身份可计算，并成功生成受信 Ed25519 challenge 签名。
 - `failed`：真实场景、断言、可访问性、控制台或网络检查失败。
 - `blocked`：配置/拓扑缺失、场景未收集、项目/工件缺失、代码身份不可得或工作树不干净。
 

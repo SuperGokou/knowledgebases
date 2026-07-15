@@ -1,10 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import {
+  apiKeyPagePath,
+  knowledgeBasePagePath,
+  mergeAdminPage,
+  replaceRotatedApiKey,
+  splitAdminPage,
+} from "@/lib/api-key-administration";
 import { apiRequest, readableError } from "@/lib/api-client";
 import type { KnowledgeBase, ManagedApiKey } from "@/lib/types";
 
@@ -15,6 +22,13 @@ type ApiKeyCreationResponse = ManagedApiKey & {
   secret?: string;
   plaintext_key?: string;
   item?: ManagedApiKey;
+};
+
+type IssuedCredential = {
+  keyId: string;
+  name: string;
+  operation: "created" | "rotated";
+  secret: string;
 };
 
 function listItems(response: ApiKeyListResponse): ManagedApiKey[] {
@@ -29,6 +43,7 @@ function createdItem(response: ApiKeyCreationResponse): ManagedApiKey {
   if (response.item) return response.item;
   return {
     id: response.id,
+    credential_family_id: response.credential_family_id,
     user_id: response.user_id,
     created_by: response.created_by,
     name: response.name,
@@ -57,53 +72,124 @@ function displayDate(value: string | null): string {
 export function ApiKeysPanel() {
   const { can, canAny, loading: accessLoading } = useAccess();
   const [keys, setKeys] = useState<ManagedApiKey[] | null>(null);
+  const [keysHasMore, setKeysHasMore] = useState(false);
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [keysError, setKeysError] = useState("");
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
+  const [knowledgeHasMore, setKnowledgeHasMore] = useState(false);
+  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
+  const [knowledgeError, setKnowledgeError] = useState("");
+  const [knowledgeQuery, setKnowledgeQuery] = useState("");
+  const [debouncedKnowledgeQuery, setDebouncedKnowledgeQuery] = useState("");
   const [name, setName] = useState("");
   const [knowledgeBaseIds, setKnowledgeBaseIds] = useState<string[]>([]);
   const [permissionCodes, setPermissionCodes] = useState<string[]>([]);
   const [requestsPerMinute, setRequestsPerMinute] = useState("60");
   const [expiresAt, setExpiresAt] = useState("");
-  const [issuedKey, setIssuedKey] = useState("");
+  const [issuedCredential, setIssuedCredential] = useState<IssuedCredential | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const keysRequestId = useRef(0);
+  const knowledgeRequestId = useRef(0);
 
-  const load = useCallback(async () => {
+  const loadKeys = useCallback(async (offset: number, replace: boolean) => {
     if (accessLoading) return;
     if (!can("api-key:manage")) {
       setKeys([]);
+      setKeysHasMore(false);
       return;
     }
-    setError("");
+    const requestId = ++keysRequestId.current;
+    setKeysLoading(true);
+    setKeysError("");
     try {
-      const canListKnowledge = canAny(["knowledge:read", "chat:query", "file:upload"]);
-      const [keyResponse, knowledgeResponse] = await Promise.all([
-        apiRequest<ApiKeyListResponse>("/api/v1/api-keys"),
-        canListKnowledge
-          ? apiRequest<KnowledgeBase[]>("/api/v1/knowledge-bases?limit=100&offset=0")
-          : Promise.resolve([]),
-      ]);
-      setKeys(listItems(keyResponse));
-      setKnowledgeBases(knowledgeResponse);
+      const response = await apiRequest<ApiKeyListResponse>(apiKeyPagePath(offset));
+      if (requestId !== keysRequestId.current) return;
+      const page = splitAdminPage(listItems(response));
+      setKeys((current) => mergeAdminPage(current ?? [], page.items, replace));
+      setKeysHasMore(page.hasMore);
+    } catch (reason) {
+      if (requestId === keysRequestId.current) setKeysError(readableError(reason));
+    } finally {
+      if (requestId === keysRequestId.current) setKeysLoading(false);
+    }
+  }, [accessLoading, can]);
+
+  const loadKnowledgeBases = useCallback(async (
+    query: string,
+    offset: number,
+    replace: boolean,
+  ) => {
+    if (accessLoading) return;
+    if (!canAny(["knowledge:read", "chat:query", "file:upload"])) {
+      setKnowledgeBases([]);
+      setKnowledgeHasMore(false);
+      return;
+    }
+    const requestId = ++knowledgeRequestId.current;
+    setKnowledgeLoading(true);
+    setKnowledgeError("");
+    try {
+      const response = await apiRequest<KnowledgeBase[]>(knowledgeBasePagePath({
+        offset,
+        query,
+      }));
+      if (requestId !== knowledgeRequestId.current) return;
+      const page = splitAdminPage(response);
+      setKnowledgeBases((current) => mergeAdminPage(current ?? [], page.items, replace));
+      setKnowledgeHasMore(page.hasMore);
+    } catch (reason) {
+      if (requestId === knowledgeRequestId.current) {
+        setKnowledgeError(readableError(reason));
+      }
+    } finally {
+      if (requestId === knowledgeRequestId.current) setKnowledgeLoading(false);
+    }
+  }, [accessLoading, canAny]);
+
+  useEffect(() => {
+    if (accessLoading) return;
+    const timeout = window.setTimeout(() => {
       const availablePermissions = ["chat:query", "knowledge:read"].filter((permission) => can(permission));
       setPermissionCodes((current) => {
         const retained = current.filter((permission) => availablePermissions.includes(permission));
         return retained.length ? retained : availablePermissions;
       });
-    } catch (reason) {
-      setError(readableError(reason));
-    }
-  }, [accessLoading, can, canAny]);
+      void loadKeys(0, true);
+    }, 0);
+    return () => window.clearTimeout(timeout);
+  }, [accessLoading, can, loadKeys]);
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => void load(), 0);
+    const timeout = window.setTimeout(
+      () => setDebouncedKnowledgeQuery(knowledgeQuery.trim()),
+      300,
+    );
     return () => window.clearTimeout(timeout);
-  }, [load]);
+  }, [knowledgeQuery]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => void loadKnowledgeBases(debouncedKnowledgeQuery, 0, true),
+      0,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [debouncedKnowledgeQuery, loadKnowledgeBases]);
+
+  function clearIssuedCredential() {
+    setIssuedCredential(null);
+    setCopyState("idle");
+  }
 
   async function generateKey(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setPending(true);
-    setError("");
+    if (issuedCredential) {
+      setActionError("请先安全保存并关闭当前明文，再生成新凭证。");
+      return;
+    }
+    setPendingAction("create");
+    setActionError("");
     setCopyState("idle");
     try {
       const created = await apiRequest<ApiKeyCreationResponse>("/api/v1/api-keys", {
@@ -117,17 +203,20 @@ export function ApiKeysPanel() {
         }),
       });
       const secret = createdSecret(created);
-      if (!secret) throw new Error("后台没有返回一次性 API Key，请撤销该凭证后重试。");
       const item = createdItem(created);
-      setIssuedKey(secret);
+      if (!secret) {
+        void loadKeys(0, true);
+        throw new Error("后台没有返回一次性 API Key，请立即刷新列表并撤销该凭证。");
+      }
+      setIssuedCredential({ keyId: item.id, name: item.name, operation: "created", secret });
       setName("");
       setKnowledgeBaseIds([]);
       setExpiresAt("");
-      setKeys((current) => current ? [item, ...current.filter((key) => key.id !== item.id)] : [item]);
+      setKeys((current) => replaceRotatedApiKey(current ?? [], item.id, item));
     } catch (reason) {
-      setError(readableError(reason));
+      setActionError(readableError(reason));
     } finally {
-      setPending(false);
+      setPendingAction(null);
     }
   }
 
@@ -136,25 +225,57 @@ export function ApiKeysPanel() {
   }
 
   async function copyIssuedKey() {
+    if (!issuedCredential) return;
     try {
-      await navigator.clipboard.writeText(issuedKey);
+      await navigator.clipboard.writeText(issuedCredential.secret);
       setCopyState("copied");
     } catch {
       setCopyState("failed");
     }
   }
 
+  async function rotateKey(key: ManagedApiKey) {
+    if (issuedCredential) {
+      setActionError("请先安全保存并关闭当前明文，再轮换其他凭证。");
+      return;
+    }
+    if (!window.confirm(`确定轮换“${key.name}”吗？旧 Key 将立即失效。`)) return;
+    setPendingAction(`rotate:${key.id}`);
+    setActionError("");
+    try {
+      const created = await apiRequest<ApiKeyCreationResponse>(
+        `/api/v1/api-keys/${key.id}/rotate`,
+        { method: "POST" },
+      );
+      const secret = createdSecret(created);
+      const item = createdItem(created);
+      if (!secret) {
+        void loadKeys(0, true);
+        throw new Error("轮换已提交，但后台未返回一次性明文。请立即刷新列表并撤销新凭证。");
+      }
+      setIssuedCredential({ keyId: item.id, name: item.name, operation: "rotated", secret });
+      setCopyState("idle");
+      setKeys((current) => replaceRotatedApiKey(current ?? [], key.id, item));
+    } catch (reason) {
+      setActionError(readableError(reason));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
   async function revokeKey(key: ManagedApiKey) {
     if (!window.confirm(`确定撤销“${key.name}”吗？使用该 Key 的系统将立即无法调用 API。`)) return;
-    setPending(true);
-    setError("");
+    setPendingAction(`revoke:${key.id}`);
+    setActionError("");
     try {
       await apiRequest<null>(`/api/v1/api-keys/${key.id}`, { method: "DELETE" });
+      if (issuedCredential?.keyId === key.id) clearIssuedCredential();
       setKeys((current) => current?.filter((item) => item.id !== key.id) ?? current);
+      void loadKeys(0, true);
     } catch (reason) {
-      setError(readableError(reason));
+      setActionError(readableError(reason));
     } finally {
-      setPending(false);
+      setPendingAction(null);
     }
   }
 
@@ -162,13 +283,28 @@ export function ApiKeysPanel() {
     return <EmptyState compact icon="lock" title="没有 API Key 管理权限" description="当前角色不包含 api-key:manage；FastAPI 会在服务端再次校验权限。" />;
   }
 
+  const mutationPending = pendingAction !== null;
+  const visibleKnowledgeIds = new Set(knowledgeBases?.map((item) => item.id) ?? []);
+  const hiddenSelectionCount = knowledgeBaseIds.filter((id) => !visibleKnowledgeIds.has(id)).length;
+
   return (
     <section className="panel api-keys-panel">
       <div className="panel-header">
         <div><h2>API Key</h2><p>为内部系统生成独立凭证，并按应用执行撤销和轮换</p></div>
-        <button className="button ghost small" type="button" disabled={pending} onClick={() => void load()}><Icon name="refresh" />刷新</button>
+        <button
+          className="button ghost small"
+          type="button"
+          disabled={mutationPending || keysLoading || knowledgeLoading}
+          onClick={() => {
+            void loadKeys(0, true);
+            void loadKnowledgeBases(debouncedKnowledgeQuery, 0, true);
+          }}
+        ><Icon name="refresh" />刷新</button>
       </div>
-      {error ? <div className="panel-inline-state"><ErrorState message={error} onRetry={() => void load()} /></div> : null}
+
+      {actionError ? <div className="panel-inline-state"><ErrorState message={actionError} /></div> : null}
+      {keysError ? <div className="panel-inline-state"><ErrorState message={keysError} onRetry={() => void loadKeys(0, true)} /></div> : null}
+
       <form className="api-key-create" onSubmit={generateKey}>
         <div className="api-key-form-grid">
           <label htmlFor="api-key-name">凭证名称<input id="api-key-name" value={name} maxLength={200} onChange={(event) => setName(event.target.value)} placeholder="例如：ERP 生产环境" required /></label>
@@ -181,37 +317,41 @@ export function ApiKeysPanel() {
               {can("knowledge:read") ? <label className="check-option"><input type="checkbox" checked={permissionCodes.includes("knowledge:read")} onChange={() => toggleValue("knowledge:read", permissionCodes, setPermissionCodes)} /><span>知识检索<small>knowledge:read</small></span></label> : null}
             </div>
           </fieldset>
-          <fieldset className="fieldset api-knowledge-fieldset">
+          <fieldset className="fieldset api-knowledge-fieldset" aria-busy={knowledgeLoading}>
             <legend>允许访问的知识库</legend>
-            {knowledgeBases === null ? <p className="field-hint">正在加载知识库…</p> : null}
-            {knowledgeBases?.length === 0 ? <p className="field-hint">当前账号没有可授权的知识库。请先创建知识库或授予访问权限。</p> : null}
+            <label htmlFor="api-key-knowledge-search">搜索知识库<input id="api-key-knowledge-search" type="search" maxLength={200} value={knowledgeQuery} onChange={(event) => setKnowledgeQuery(event.target.value)} placeholder="输入知识库名称" /></label>
+            {knowledgeBaseIds.length ? <p className="field-hint">已选择 {knowledgeBaseIds.length} 个知识库；搜索和翻页不会清除已选范围。{hiddenSelectionCount ? ` 当前搜索外 ${hiddenSelectionCount} 个。` : ""}</p> : null}
+            {knowledgeError ? <ErrorState message={knowledgeError} onRetry={() => void loadKnowledgeBases(debouncedKnowledgeQuery, 0, true)} /> : null}
+            {knowledgeBases === null && knowledgeLoading ? <p className="field-hint">正在加载知识库…</p> : null}
+            {knowledgeBases?.length === 0 && !knowledgeLoading && !knowledgeError ? <p className="field-hint">没有找到可授权的知识库。请调整搜索，或先创建知识库并授予访问权限。</p> : null}
             {knowledgeBases?.length ? <div className="api-knowledge-options">{knowledgeBases.map((knowledgeBase) => <label className="check-option" key={knowledgeBase.id}><input type="checkbox" checked={knowledgeBaseIds.includes(knowledgeBase.id)} onChange={() => toggleValue(knowledgeBase.id, knowledgeBaseIds, setKnowledgeBaseIds)} /><span>{knowledgeBase.name}<small>{knowledgeBase.access_level} · {knowledgeBase.id.slice(0, 8)}</small></span></label>)}</div> : null}
+            {knowledgeHasMore ? <button className="button secondary small" type="button" disabled={knowledgeLoading} onClick={() => void loadKnowledgeBases(debouncedKnowledgeQuery, knowledgeBases?.length ?? 0, false)}>{knowledgeLoading ? "正在加载…" : "加载更多知识库"}</button> : null}
           </fieldset>
         </div>
         <div className="api-key-create-footer">
           <p>按“系统 + 环境”隔离凭证，并只勾选业务必需的知识库与接口。</p>
-          <button className="button primary" type="submit" disabled={pending || !name.trim() || permissionCodes.length === 0 || knowledgeBaseIds.length === 0}><Icon name="plus" />{pending ? "正在生成…" : "生成 API Key"}</button>
+          <button className="button primary" type="submit" disabled={mutationPending || Boolean(issuedCredential) || !name.trim() || permissionCodes.length === 0 || knowledgeBaseIds.length === 0}><Icon name="plus" />{pendingAction === "create" ? "正在生成…" : "生成 API Key"}</button>
         </div>
       </form>
 
-      {issuedKey ? (
-        <div className="issued-key" role="status" aria-live="polite">
+      {issuedCredential ? (
+        <div className="issued-key" role="status" aria-live="polite" data-sensitive="true">
           <div className="issued-key-heading">
             <span><Icon name="warning" /></span>
-            <div><strong>请立即复制并安全保存</strong><p>这是 API Key 唯一一次明文展示。关闭后无法恢复，只能撤销并重新生成。</p></div>
+            <div><strong>{issuedCredential.operation === "rotated" ? "轮换完成，请立即保存新 Key" : "请立即复制并安全保存"}</strong><p>“{issuedCredential.name}”的 API Key 只有这一次明文展示。关闭后无法恢复，只能再次轮换或撤销。</p></div>
           </div>
           <div className="secret-copy-row">
-            <code>{issuedKey}</code>
+            <code>{issuedCredential.secret}</code>
             <button className="button secondary" type="button" onClick={() => void copyIssuedKey()}><Icon name={copyState === "copied" ? "check" : "file"} />{copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制"}</button>
           </div>
-          <button className="issued-dismiss" type="button" onClick={() => { setIssuedKey(""); setCopyState("idle"); }}>我已保存，关闭明文</button>
+          <button className="issued-dismiss" type="button" onClick={clearIssuedCredential}>我已保存，关闭明文</button>
         </div>
       ) : null}
 
-      {keys === null && !error ? <LoadingRows count={3} /> : null}
-      {keys?.length === 0 && !error ? <EmptyState compact icon="lock" title="还没有 API Key" description="为第一个服务端应用创建独立凭证。明文只会展示一次。" /> : null}
+      {keys === null && keysLoading && !keysError ? <LoadingRows count={3} /> : null}
+      {keys?.length === 0 && !keysLoading && !keysError ? <EmptyState compact icon="lock" title="还没有 API Key" description="为第一个服务端应用创建独立凭证。明文只会展示一次。" /> : null}
       {keys?.length ? (
-        <div className="table-wrap">
+        <div className="table-wrap" aria-busy={keysLoading}>
           <table>
             <thead><tr><th>名称</th><th>Key 标识</th><th>状态</th><th>最近使用</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody>
@@ -222,11 +362,17 @@ export function ApiKeysPanel() {
                   <td>{key.expires_at && new Date(key.expires_at) <= new Date() ? <StatusBadge tone="danger">已过期</StatusBadge> : <StatusBadge tone="success">有效 · {key.requests_per_minute}/min</StatusBadge>}</td>
                   <td>{displayDate(key.last_used_at)}</td>
                   <td>{displayDate(key.created_at)}</td>
-                  <td><button className="button danger small" type="button" disabled={pending} onClick={() => void revokeKey(key)}>撤销</button></td>
+                  <td>
+                    <div className="form-actions">
+                      <button className="button secondary small" type="button" aria-label={`轮换 ${key.name}`} disabled={mutationPending || Boolean(issuedCredential)} onClick={() => void rotateKey(key)}>{pendingAction === `rotate:${key.id}` ? "轮换中…" : "轮换"}</button>
+                      <button className="button danger small" type="button" aria-label={`撤销 ${key.name}`} disabled={mutationPending} onClick={() => void revokeKey(key)}>{pendingAction === `revoke:${key.id}` ? "撤销中…" : "撤销"}</button>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          {keysHasMore ? <div className="panel-footer"><button className="button secondary" type="button" disabled={keysLoading || mutationPending} onClick={() => void loadKeys(keys.length, false)}>{keysLoading ? "正在加载…" : "加载更多 API Key"}</button></div> : null}
         </div>
       ) : null}
     </section>

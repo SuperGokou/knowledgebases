@@ -1,8 +1,13 @@
+import base64
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.db.session import engine_options
+
+_CHAT_REPLAY_KEY = base64.urlsafe_b64encode(b"r" * 32).decode("ascii")
 
 
 def production_settings(**overrides: object) -> Settings:
@@ -23,6 +28,8 @@ def production_settings(**overrides: object) -> Settings:
         "s3_access_key": "production-access-key",
         "s3_secret_key": "production-secret-key",  # pragma: allowlist secret
         "s3_use_ssl": True,
+        "chat_replay_encryption_keys": {1: _CHAT_REPLAY_KEY},
+        "chat_replay_active_key_version": 1,
     }
     values.update(overrides)
     return Settings(**values)
@@ -38,6 +45,26 @@ def production_settings(**overrides: object) -> Settings:
 def test_production_rejects_published_example_secrets(field: str, value: str) -> None:
     with pytest.raises(ValidationError):
         production_settings(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "a" * 16,
+        "Lowercase-only-password",
+        "UPPERCASE-ONLY-PASSWORD",
+        "NoSymbolPassword123",
+        "NoNumericPassword!",
+        "Whitespace password-123!",
+        "Unicode-password-123-" + chr(0x4E2D) + chr(0x6587) + "!",
+        "A1!" + ("x" * 254),
+    ],
+)
+def test_production_rejects_weak_or_oversized_bootstrap_admin_password(
+    password: str,
+) -> None:
+    with pytest.raises(ValidationError, match="KB_BOOTSTRAP_ADMIN_PASSWORD"):
+        production_settings(bootstrap_admin_password=password)
 
 
 def test_production_rejects_debug_and_plain_http_object_urls() -> None:
@@ -119,13 +146,43 @@ def test_production_accepts_explicit_secure_values() -> None:
     assert settings.environment == "production"
 
 
+def test_production_requires_a_valid_chat_replay_keyring() -> None:
+    with pytest.raises(ValidationError, match="CHAT_REPLAY_ENCRYPTION_KEYS"):
+        production_settings(
+            chat_replay_encryption_keys={},
+            chat_replay_active_key_version=None,
+        )
+    with pytest.raises(ValidationError, match="32-byte base64url"):
+        production_settings(
+            chat_replay_encryption_keys={1: "not-a-cryptographic-key"},
+            chat_replay_active_key_version=1,
+        )
+    with pytest.raises(ValidationError, match="active key version"):
+        production_settings(
+            chat_replay_encryption_keys={1: _CHAT_REPLAY_KEY},
+            chat_replay_active_key_version=2,
+        )
+
+
+def test_chat_replay_keyring_loads_from_unprefixed_json_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "CHAT_REPLAY_ENCRYPTION_KEYS",
+        json.dumps({"7": _CHAT_REPLAY_KEY}),
+    )
+    monkeypatch.setenv("CHAT_REPLAY_ACTIVE_KEY_VERSION", "7")
+
+    settings = Settings(_env_file=None, environment="test")
+
+    assert settings.chat_replay_active_key_version == 7
+    assert settings.chat_replay_encryption_keys[7].get_secret_value() == _CHAT_REPLAY_KEY
+
+
 def test_isolated_production_accepts_only_compose_local_data_services() -> None:
     settings = production_settings(
         deployment_profile="isolated",
-        external_llm_enabled=False,
-        database_url=(
-            "postgresql+asyncpg://knowledge:password@postgres:5432/knowledge"
-        ),
+        database_url=("postgresql+asyncpg://knowledge:password@postgres:5432/knowledge"),
         redis_url="redis://:password@redis:6379/0",
         s3_endpoint_url="http://minio:9000",
         s3_public_endpoint_url="https://knowledge.internal:19444",
@@ -135,13 +192,103 @@ def test_isolated_production_accepts_only_compose_local_data_services() -> None:
 
     assert settings.deployment_profile == "isolated"
     assert settings.external_llm_enabled is False
+    assert settings.llm_egress_mode == "strict_offline"
+
+
+def test_llm_egress_mode_defaults_to_strict_offline() -> None:
+    settings = Settings(_env_file=None, environment="test")
+
+    assert settings.llm_egress_mode == "strict_offline"
+    assert settings.llm_egress_gateway_url is None
+
+
+def test_isolated_production_accepts_only_the_fixed_controlled_llm_gateway() -> None:
+    settings = production_settings(
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="deepseek,qwen,minimax",
+        database_url="postgresql+asyncpg://knowledge:password@postgres:5432/knowledge",
+        redis_url="redis://:password@redis:6379/0",
+        s3_endpoint_url="http://minio:9000",
+        s3_public_endpoint_url="https://knowledge.internal:19444",
+        malware_scan_host="clamd",
+        storage_capacity_probe_path="/var/lib/kb-capacity",
+    )
+
+    assert settings.llm_egress_mode == "controlled_gateway"
+    assert settings.external_llm_enabled is True
+    assert settings.llm_egress_gateway_url == "http://llm-egress:8080"
+    assert settings.approved_llm_providers == ("deepseek", "qwen", "minimax")
+
+
+@pytest.mark.parametrize(
+    "gateway_url",
+    (
+        "https://llm-egress:8080",
+        "http://llm-egress:8080/",
+        "http://127.0.0.1:8080",
+        "http://attacker.internal:8080",
+    ),
+)
+def test_controlled_llm_gateway_rejects_every_noncanonical_url(gateway_url: str) -> None:
+    with pytest.raises(ValidationError, match="KB_LLM_EGRESS_GATEWAY_URL"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            deployment_profile="isolated",
+            llm_egress_mode="controlled_gateway",
+            llm_egress_gateway_url=gateway_url,
+        )
+
+
+def test_strict_offline_mode_rejects_an_enabled_gateway_url() -> None:
+    with pytest.raises(ValidationError, match="must be empty"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            llm_egress_mode="strict_offline",
+            llm_egress_gateway_url="http://llm-egress:8080",
+        )
+
+
+def test_controlled_llm_gateway_rejects_custom_qwen_workspace_hosts() -> None:
+    with pytest.raises(ValidationError, match="workspace hosts"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            deployment_profile="isolated",
+            llm_egress_mode="controlled_gateway",
+            llm_egress_gateway_url="http://llm-egress:8080",
+            qwen_allowed_workspace_hosts=("tenant.cn-beijing.maas.aliyuncs.com",),
+        )
+
+
+def test_controlled_llm_gateway_is_only_valid_for_isolated_deployments() -> None:
+    with pytest.raises(ValidationError, match="isolated deployments"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            deployment_profile="standard",
+            llm_egress_mode="controlled_gateway",
+            llm_egress_gateway_url="http://llm-egress:8080",
+        )
+
+
+def test_isolated_deployment_rejects_direct_llm_egress() -> None:
+    with pytest.raises(ValidationError, match="direct LLM egress"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            deployment_profile="isolated",
+            llm_egress_mode="direct",
+        )
 
 
 def test_isolated_production_requires_the_private_clamd_service() -> None:
     with pytest.raises(ValidationError):
         production_settings(
             deployment_profile="isolated",
-            external_llm_enabled=False,
             database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
             redis_url="redis://:pass@redis:6379/0",
             s3_endpoint_url="http://minio:9000",
@@ -161,7 +308,6 @@ def test_upload_platform_limit_and_scanner_limit_must_match() -> None:
 def test_isolated_production_requires_fixed_storage_safety_policy() -> None:
     common: dict[str, object] = {
         "deployment_profile": "isolated",
-        "external_llm_enabled": False,
         "database_url": "postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
         "redis_url": "redis://:pass@redis:6379/0",
         "s3_endpoint_url": "http://minio:9000",
@@ -202,7 +348,6 @@ def test_isolated_production_rejects_nonlocal_data_services(
 ) -> None:
     overrides: dict[str, object] = {
         "deployment_profile": "isolated",
-        "external_llm_enabled": False,
         "database_url": "postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
         "redis_url": "redis://:pass@redis:6379/0",
         "s3_endpoint_url": "http://minio:9000",
@@ -213,15 +358,14 @@ def test_isolated_production_rejects_nonlocal_data_services(
         production_settings(**overrides)
 
 
-def test_isolated_production_fails_closed_when_external_llm_is_enabled() -> None:
-    with pytest.raises(ValidationError):
-        production_settings(
-            deployment_profile="isolated",
-            external_llm_enabled=True,
-            database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
-            redis_url="redis://:pass@redis:6379/0",
-            s3_endpoint_url="http://minio:9000",
-            s3_public_endpoint_url="https://knowledge.internal:19444",
+def test_removed_external_llm_enable_flag_is_rejected_as_a_second_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KB_EXTERNAL_LLM_ENABLED", "true")
+    with pytest.raises(ValidationError, match="KB_EXTERNAL_LLM_ENABLED was removed"):
+        Settings(
+            _env_file=None,
+            environment="test",
         )
 
 
@@ -320,9 +464,7 @@ def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
             "tenant.us-east-1.maas.aliyuncs.com",
         ),
     )
-    assert settings.qwen_allowed_workspace_hosts == (
-        "tenant.us-east-1.maas.aliyuncs.com",
-    )
+    assert settings.qwen_allowed_workspace_hosts == ("tenant.us-east-1.maas.aliyuncs.com",)
 
     with pytest.raises(ValidationError):
         Settings(
@@ -334,11 +476,21 @@ def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
 def test_trusted_proxy_networks_must_be_narrow_private_cidrs() -> None:
     settings = Settings(
         environment="test",
-        trusted_proxy_cidrs=("172.30.240.0/24",),
+        trusted_proxy_cidrs=("172.30.240.0/24", "fd12:3456:789a::/64"),
     )
-    assert settings.trusted_proxy_cidrs == ("172.30.240.0/24",)
+    assert settings.trusted_proxy_cidrs == (
+        "172.30.240.0/24",
+        "fd12:3456:789a::/64",
+    )
 
-    for invalid in ("0.0.0.0/0", "198.51.100.0/24", "172.30.240.1/24", "10.0.0.0/8"):
+    for invalid in (
+        "0.0.0.0/0",
+        "198.51.100.0/24",
+        "172.30.240.1/24",
+        "10.0.0.0/8",
+        "2001:db8::/64",
+        "fc00::/7",
+    ):
         with pytest.raises(ValidationError):
             Settings(environment="test", trusted_proxy_cidrs=(invalid,))
 

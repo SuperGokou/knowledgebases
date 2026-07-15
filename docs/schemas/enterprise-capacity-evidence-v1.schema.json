@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledgebases.heyi.internal/schemas/enterprise-capacity-evidence-v1.schema.json",
+  "title": "Enterprise Capacity Evidence Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "status",
+    "evidence_classification",
+    "issued_at",
+    "expires_at",
+    "target",
+    "signing_key_sha256",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "enterprise-capacity"},
+    "status": {"const": "complete"},
+    "evidence_classification": {
+      "const": "combined_control_plane_and_real_model_capacity"
+    },
+    "issued_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "expires_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_head", "content_fingerprint", "release_id"],
+      "properties": {
+        "git_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "release_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+        }
+      }
+    },
+    "signing_key_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/artifact"},
+      "allOf": [
+        {"contains": {"properties": {"id": {"const": "control_plane_report"}}}},
+        {"contains": {"properties": {"id": {"const": "real_model_benchmark"}}}},
+        {"contains": {"properties": {"id": {"const": "provider_quota"}}}}
+      ]
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256", "bytes"],
+      "properties": {
+        "id": {
+          "enum": ["control_plane_report", "real_model_benchmark", "provider_quota"]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.json$"
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 1, "maximum": 8388608}
+      }
+    }
+  }
+}

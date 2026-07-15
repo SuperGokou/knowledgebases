@@ -16,7 +16,7 @@ import {
   signedClientIpHeaders,
 } from "@/lib/server/client-ip";
 import { isValidIdempotencyKey } from "@/lib/chat-idempotency";
-import { refreshSessionOnce } from "@/lib/server/session-refresh";
+import { refreshSessionOnce, refreshSessionStatus } from "@/lib/server/session-refresh";
 import {
   hasSameOrigin,
   requestTokens,
@@ -173,7 +173,12 @@ async function handleBackendRequest(
       },
       { status: 502, headers: { "Cache-Control": "no-store" } },
     );
-    if (replacement) setSessionCookies(response, replacement, tokens.email);
+    if (
+      replacement
+      && await refreshSessionStatus(replacement.refresh_token, request) === "active"
+    ) {
+      setSessionCookies(response, replacement, tokens.email);
+    }
     return response;
   }
   const response = new NextResponse(responseBody, { status: backend.status });
@@ -189,7 +194,12 @@ async function handleBackendRequest(
   }
   response.headers.set("Cache-Control", "no-store");
 
-  if (replacement) setSessionCookies(response, replacement, tokens.email);
+  if (
+    replacement
+    && await refreshSessionStatus(replacement.refresh_token, request) === "active"
+  ) {
+    setSessionCookies(response, replacement, tokens.email);
+  }
   return response;
 }
 

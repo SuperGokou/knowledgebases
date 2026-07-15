@@ -91,17 +91,11 @@ def test_capacity_only_host_is_blocked_without_storage_identity_and_fio() -> Non
 def test_rotational_disk_cannot_pass_as_ssd() -> None:
     facts = compliant_facts()
     assert facts.storage_device is not None
-    hdd = StorageDeviceEvidence(
-        **{**facts.storage_device.as_mapping(), "rotational": True}
-    )
-    assessment = evaluate_host(
-        HostFacts(**{**facts.as_mapping(), "storage_device": hdd})
-    )
+    hdd = StorageDeviceEvidence(**{**facts.storage_device.as_mapping(), "rotational": True})
+    assessment = evaluate_host(HostFacts(**{**facts.as_mapping(), "storage_device": hdd}))
 
     assert assessment.status == "failed"
-    assert "solid_state_storage" in {
-        check.name for check in assessment.checks if not check.passed
-    }
+    assert "solid_state_storage" in {check.name for check in assessment.checks if not check.passed}
 
 
 def test_unknown_virtual_disk_requires_provider_spec_and_fio() -> None:
@@ -115,9 +109,7 @@ def test_unknown_virtual_disk_requires_provider_spec_and_fio() -> None:
         }
     )
 
-    assessment = evaluate_host(
-        HostFacts(**{**facts.as_mapping(), "storage_device": unknown})
-    )
+    assessment = evaluate_host(HostFacts(**{**facts.as_mapping(), "storage_device": unknown}))
 
     assert assessment.status == "failed"
 
@@ -126,9 +118,7 @@ def test_incomplete_or_under_threshold_fio_fails_closed() -> None:
     facts = compliant_facts()
     assert facts.fio is not None
     workloads = list(facts.fio.workloads)
-    workloads[0] = FioWorkloadEvidence(
-        **{**workloads[0].as_mapping(), "observed_iops": 499.0}
-    )
+    workloads[0] = FioWorkloadEvidence(**{**workloads[0].as_mapping(), "observed_iops": 499.0})
     fio = FioEvidence(**{**facts.fio.as_mapping(), "workloads": tuple(workloads)})
 
     assessment = evaluate_host(HostFacts(**{**facts.as_mapping(), "fio": fio}))
@@ -159,16 +149,12 @@ def test_target_linux_host_below_any_threshold_fails(
 
     assert assessment.status == "failed"
     assert exit_code_for(assessment) == 1
-    assert failed_check in {
-        check.name for check in assessment.checks if not check.passed
-    }
+    assert failed_check in {check.name for check in assessment.checks if not check.passed}
 
 
 def test_non_linux_environment_is_blocked_even_when_capacity_is_sufficient() -> None:
     facts = compliant_facts()
-    assessment = evaluate_host(
-        HostFacts(**{**facts.as_mapping(), "platform": "Windows"})
-    )
+    assessment = evaluate_host(HostFacts(**{**facts.as_mapping(), "platform": "Windows"}))
 
     assert assessment.status == "blocked"
     assert assessment.reason == "preflight must run on the target Linux host"

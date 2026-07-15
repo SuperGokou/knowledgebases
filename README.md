@@ -1,13 +1,14 @@
 <div align="center">
   <img src="web/public/brand/heyi-display-logo.webp" alt="和熠光显 EFD Logo" width="180">
   <h1>江苏和熠光显有限公司 · 企业知识中台</h1>
-  <p><strong>面向 10 TB+ 文档数据的企业知识库与安全问答工作台</strong></p>
+  <p><strong>面向 10 TB+ 扩展目标的企业知识库与安全问答工作台</strong></p>
   <p>登录前端、动态 RBAC、知识库分级 ACL、可恢复直传、OKF 知识编译、强制来源问答与可离线容器化控制面。</p>
 </div>
 
 <p align="center">
   <a href="https://github.com/SuperGokou/knowledgebases/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/SuperGokou/knowledgebases/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md"><img alt="Readiness: Internal Beta" src="https://img.shields.io/badge/Readiness-Internal%20Beta-F59E0B?style=flat-square"></a>
+  <a href="docs/ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md"><img alt="Readiness: Technical Pilot" src="https://img.shields.io/badge/Readiness-Technical%20Pilot-F59E0B?style=flat-square"></a>
+  <a href="docs/DEPENDENCY_LICENSE_AUDIT.zh-CN.md"><img alt="Commercial Release: NO-GO" src="https://img.shields.io/badge/Commercial%20Release-NO--GO-C62828?style=flat-square"></a>
   <a href="https://www.python.org/"><img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white"></a>
   <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI 0.116+" src="https://img.shields.io/badge/FastAPI-0.116%2B-009688?style=flat-square&amp;logo=fastapi&amp;logoColor=white"></a>
   <a href="https://nextjs.org/"><img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-000000?style=flat-square&amp;logo=nextdotjs&amp;logoColor=white"></a>
@@ -15,7 +16,7 @@
   <a href="https://redis.io/"><img alt="Redis 8" src="https://img.shields.io/badge/Redis-8-DC382D?style=flat-square&amp;logo=redis&amp;logoColor=white"></a>
   <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html"><img alt="S3 Compatible" src="https://img.shields.io/badge/Storage-S3%20Compatible-569A31?style=flat-square&amp;logo=amazons3&amp;logoColor=white"></a>
   <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF Phase 1" src="https://img.shields.io/badge/OKF-v0.1%20Phase%201-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
-  <a href="https://api-docs.deepseek.com/"><img alt="DeepSeek" src="https://img.shields.io/badge/AI-DeepSeek-536AF5?style=flat-square"></a>
+  <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md"><img alt="AI: DeepSeek, Qwen, MiniMax" src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Qwen%20%7C%20MiniMax-536AF5?style=flat-square"></a>
   <a href="https://www.docker.com/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
   <a href="https://vercel.com/docs/regions"><img alt="Vercel US East Region" src="https://img.shields.io/badge/Region-US%20East%20iad1-2563EB?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
   <a href="https://knowledgebases.vercel.app"><img alt="Vercel Demo" src="https://img.shields.io/badge/Demo-Vercel-000000?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
@@ -42,11 +43,11 @@
   ·
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md">API 与模型管理</a>
   ·
-  <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">商业版审计报告</a>
+  <a href="docs/README.zh-CN.md">企业文档中心</a>
   ·
-  <a href="docs/ENTERPRISE_ACCEPTANCE_STANDARD.zh-CN.md">企业验收标准</a>
+  <a href="docs/ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md">企业终验标准</a>
   ·
-  <a href="docs/acceptance-reports/2026-07-11-local-self-test.zh-CN.md">最新自测报告</a>
+  <a href="docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md">历史审计快照</a>
   ·
   <a href="SECURITY.md">安全报告策略</a>
 </p>
@@ -55,10 +56,13 @@
 > 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传、九类文档的失败关闭解析链、OKF 知识编译，以及基于授权文本检索的生成式问答。TXT、CSV、DOCX、XLSX、PPTX 使用内建有界解析；PDF 与 DOC/XLS/PPT 必须在包含固定版本 Poppler、LibreOffice、bubblewrap 与 `prlimit` 的 Linux 镜像中通过 `--require-all` 门禁。任一外部工具或沙箱能力缺失时均为 `BLOCKED`，不得声称全格式可用。每个成功回答都返回结构化来源并经过引用完整性与生成后语义审核；失败时丢弃模型文本并降级为确定性检索回答。
 
 > [!WARNING]
-> “其他云 Linux 离线部署”使用 `isolated` 配置，固定 `KB_EXTERNAL_LLM_ENABLED=false`，运行时不会调用 DeepSeek、Qwen 或 MiniMax；管理界面可以保存模型选择，但不等于离线环境已具备外部推理能力。单台 Linux 8 核 / 16 GB / 300 GB SSD 仅是当前离线部署基线，尚无证据证明它能承载“每日 50 亿 token”。正式性能结论必须以目标机上预先批准的吞吐、延迟、错误率与磁盘阈值，以及可复核的压测证据为准；在这些材料齐备前，性能验收状态为 `BLOCKED`。
+> 国内云 Linux 隔离部署默认使用 `KB_LLM_EGRESS_MODE=strict_offline`，不会实例化模型出口；只有完成数据外发审批后才可切换为 `controlled_gateway`，且网关 URL 必须精确为 `http://llm-egress:8080`、供应商白名单只能是 DeepSeek、Qwen、MiniMax 的规范子集。`direct` 模式在 `isolated` Profile 中被禁止。单台 Linux 8 核 / 16 GB / 300 GB SSD 仅是当前控制面与受水位保护数据面的部署基线，尚无证据证明它能承载“每日 50 亿 token”。正式性能结论必须以目标机上预先批准的吞吐、延迟、错误率与磁盘阈值，以及可复核的压测证据为准；在这些材料齐备前，性能验收状态为 `BLOCKED`。
+
+> [!CAUTION]
+> 当前技术候选版本不等于商业发行批准。仓库尚未取得项目许可证、全部第三方依赖/资产的签署授权和最终第三方声明；目标服务器也尚需提供数据库、对象、WAL、快照及备份静态加密的可复核证据。上述任一项缺失时，商业发布和敏感数据正式交付均为 `NO-GO`，不得宣称“零版权风险”或“全部企业验收通过”。
 
 > [!NOTE]
-> 局域网离线 Profile 的运行时只依赖服务器已加载的固定镜像，以及本机 PostgreSQL、Redis、MinIO、ClamAV、FastAPI、Next.js 与 Caddy。GitHub、Vercel、COS、公共 CDN 和公共镜像仓库均不是运行、重启或冷恢复前置条件；它们只可作为源码协作、可选托管演示或首次制品传输通道。服务器必须长期保留带 SHA-256 的完整发布包和 8 镜像归档。
+> 局域网离线 Profile 的运行时只依赖服务器已加载的固定镜像，以及本机 PostgreSQL、Redis、MinIO、ClamAV、FastAPI、Next.js 与 Caddy。GitHub、Vercel、COS、公共 CDN 和公共镜像仓库均不是运行、重启或冷恢复前置条件；COS 只可作为首次制品传输加速通道，不承载运行期数据。服务器必须长期保留带 SHA-256 的完整发布包和 9 类镜像制品清单。
 
 ## 项目定位
 
@@ -92,7 +96,7 @@
 | Liveness | [knowledgebases-api.vercel.app/health/live](https://knowledgebases-api.vercel.app/health/live) | 检查应用进程是否可用 |
 | Readiness | [knowledgebases-api.vercel.app/health/ready](https://knowledgebases-api.vercel.app/health/ready) | 检查 PostgreSQL 与 Redis |
 
-> Vercel 条目仅为可选托管演示，不参与局域网离线运行。Demo 的真实可用状态以 `/health/ready` 为准；生产密钥只保存在对应部署的服务端密钥存储中，不进入仓库。
+> Vercel 条目仅为可选托管演示，不参与局域网离线运行；本 README 与 badge 不构成实时可用性证明。访问前应即时检查 `/health/live`、`/health/ready` 与登录页，并以同一时间窗口的结果为准。生产密钥只保存在对应部署的服务端密钥存储中，不进入仓库。
 
 > [!NOTE]
 > Web 与 API 的 Vercel Functions 已固定到美国东部（华盛顿特区）`iad1`。静态资源仍由 Vercel 全球 CDN 就近分发；为避免跨区域访问，PostgreSQL 与 Redis 宜部署在美国东部或邻近区域。对象存储仍由浏览器直传，不经过 Vercel Function；此 Vercel 区域设置不会修改或重启“其他云 Linux 8C16G300G”离线部署。
@@ -147,6 +151,7 @@ sequenceDiagram
     participant R as Redis
     participant O as COS / S3 / MinIO
     participant W as OKF Worker
+    participant V as ClamAV
     participant L as 已选择的 LLM Provider
     participant M as 管理员
 
@@ -159,17 +164,23 @@ sequenceDiagram
     O-->>C: ETag
     C->>A: POST /uploads/{id}/complete
     A->>O: Complete / HEAD / Promote
-    A->>D: HELD → CONSUMED，File → PROCESSING
-    A->>D: 创建幂等 OKF 转换任务
-    Note over D: 仅管理员已开启外部模型处理时执行
-    W->>D: 带 lease_id 领取任务
-    W->>O: 九类文档有界读取与隔离解析
-    W->>L: JSON Output 请求
-    L-->>W: JSON 响应
-    W->>D: schema 校验后写入 DRAFT
-    A-->>C: FileRead(status=processing)
+    A->>D: HELD → CONSUMED，File → QUARANTINED，扫描=PENDING
+    W->>D: 带 lease_id 领取扫描任务
+    W->>O: 有界读取对象
+    W->>V: 流式恶意软件扫描
+    alt 扫描为 CLEAN
+        W->>D: File → PROCESSING；创建当前版本 OKF 任务
+        W->>O: 九类文档有界读取与隔离解析
+        W->>L: 可选 JSON Output 请求
+        L-->>W: 经审批的 JSON 响应
+        Note over W: strict_offline 使用 local-deterministic-v1
+        W->>D: schema 校验后写入 DRAFT
+    else 感染或扫描异常
+        W->>D: 保持 QUARANTINED，记录失败关闭状态与审计
+    end
+    A-->>C: FileRead(status=quarantined/processing)
     M->>A: POST /files/{id}/approve
-    A->>D: PROCESSING → AVAILABLE，DRAFT → PUBLISHED，写入审计
+    A->>D: 仅 CLEAN + 当前版本 OKF 成功时 PROCESSING → AVAILABLE，DRAFT → PUBLISHED
     A-->>M: FileRead(status=available)
 ```
 
@@ -183,8 +194,8 @@ sequenceDiagram
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
 | 文档解析与 OKF | TXT/CSV/OOXML 内建解析；PDF/旧版 Office 断网沙箱；来源定位、持久任务、严格 schema、租约、草稿/发布门禁 |
 | 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；审计只记录文档 ID、模型、策略版本与 token 用量，不记录正文 |
-| 强制来源与回答审核 | 授权检索与可选 RAG；正文来源脚注、结构化 `citations`、`source_status` 与 `answer_review`；引用或语义审核失败时自动降级 |
-| 分级限额 | 每分钟请求数、单文件大小、每日上传字节、总存储字节、每日下载凭证 |
+| 强制来源与回答审核 | 授权检索与可选 RAG；正文来源脚注、结构化 `citations`、`source_status` 与 `answer_review`；生成与审核使用独立客户端，引用或语义审核失败时丢弃模型文本并确定性降级 |
+| 分级限额 | 每分钟请求数、单文件大小、每日上传字节、生命周期累计存储写入量、每日下载凭证 |
 | 大文件上传 | 单 PUT、S3 Multipart、最多 10,000 分片、分批签名、并发上传和客户端断点续传 |
 | 并发安全 | PostgreSQL `used + reserved` 配额模型、行锁、唯一约束与幂等键 |
 | 对象安全 | 私有 Bucket、短期预签名 URL、精确 `Content-Length`、单 PUT SHA-256 强校验、staging/final key 隔离 |
@@ -195,7 +206,7 @@ sequenceDiagram
 ### 权限与限额语义
 
 - 多角色权限取并集，支持精确权限、`resource:*` 和全局 `*`；
-- 同一限额的有限值取最大值，SQL `NULL` 表示无限；
+- 同一限额的有限值取最大值，SQL `NULL` 表示角色级无限；无限仍持续计量，并受平台文件、知识条目容量与磁盘水位等硬上限约束；
 - 用户级 override 最后生效，可把有限改为无限，也可把无限收紧为有限；
 - 数值 `0` 表示禁止，不表示无限；
 - Redis 不可用时，受保护且需要限流的接口 fail closed，不会静默绕过策略。
@@ -205,7 +216,7 @@ sequenceDiagram
 | `requests_per_minute` | 固定分钟 | Redis Lua 原子计数 |
 | `max_upload_bytes` | 单次请求 | 限制一个对象的声明大小 |
 | `daily_upload_bytes` | UTC 日 | 发起上传时预留，完成后消费 |
-| `storage_bytes` | 生命周期 | 防止并发上传穿透总存储额度 |
+| `storage_bytes` | 生命周期 | 文件成功上传计入全部字节；手工知识正文仅计入 UTF-8 字节正增长。同长度替换、缩小及删除均不返还额度 |
 | `daily_downloads` | UTC 日 | 每签发一个短期下载 URL 计数一次 |
 
 ## 技术栈
@@ -324,14 +335,14 @@ $env:KB_PASSWORD = '你在 .env.kb 中设置的管理员密码'
   'C:\data\manual.pdf'
 ```
 
-上传完成后文件进入 `processing`，不会自动开放下载。开发环境可由拥有 `file:approve` 权限的管理员批准：
+上传完成后文件先进入 `quarantined` 并等待 ClamAV；扫描为 `CLEAN` 后进入 `processing` 并执行当前版本 OKF 转换，不会自动开放下载。拥有 `file:approve` 权限的管理员只能批准扫描通过且 OKF 成功的文件：
 
 ```http
 POST /api/v1/files/{file_id}/approve
 Authorization: Bearer <access-token>
 ```
 
-生产环境应由隔离的恶意软件扫描与内容解析 Worker 驱动审批，人工审批不能替代安全扫描。
+扫描感染、扫描异常、解析器缺失或当前版本 OKF 未完成都会失败关闭；人工审批不能替代安全扫描或转换门禁。
 
 ## 核心 API
 
@@ -340,7 +351,8 @@ Authorization: Bearer <access-token>
 | 登录、刷新与退出 | `POST /api/v1/auth/token` · `POST /api/v1/auth/refresh` · `POST /api/v1/auth/logout` |
 | 当前会话 | `GET /api/v1/auth/me` |
 | 用户管理 | `GET/POST /api/v1/users` · `PATCH /api/v1/users/{id}` · `PUT /api/v1/users/{id}/roles` |
-| 动态角色 | `GET/POST /api/v1/roles` · `PATCH /api/v1/roles/{id}` |
+| 密码生命周期 | `PUT /api/v1/users/me/password` · `PUT /api/v1/users/{id}/password` |
+| 动态角色 | `GET/POST /api/v1/roles` · `PATCH /api/v1/roles/{id}` · `DELETE /api/v1/roles/{id}?expected_version=N` |
 | 角色策略 | `PUT /api/v1/roles/{id}/policy`（原子更新）· 兼容 `/permissions` 与 `/limits` 分接口 |
 | 策略目录 | `GET /api/v1/permissions` · `GET /api/v1/limits` |
 | 文件列表 | `GET /api/v1/files` |
@@ -354,9 +366,37 @@ Authorization: Bearer <access-token>
 | 知识授权 | `GET/PUT /api/v1/knowledge-bases/{id}/role-grants` |
 | 知识条目 | `GET/POST /api/v1/knowledge-bases/{id}/entries` · `GET/PATCH .../entries/{entry_id}` |
 | 检索与聊天 | `POST /api/v1/knowledge-bases/{id}/search` · `POST /api/v1/chat/query` |
-| API Key 管理 | `GET/POST /api/v1/api-keys` · `DELETE /api/v1/api-keys/{id}` |
+| API Key 管理 | `GET/POST /api/v1/api-keys` · `POST /api/v1/api-keys/{id}/rotate` · `DELETE /api/v1/api-keys/{id}` |
 | 模型供应商 | `GET /api/v1/llm/providers` · `PATCH /api/v1/llm/providers/{provider}` |
 | 外部知识 API | `POST /api/v1/public/chat/query` · `POST /api/v1/public/knowledge-bases/{id}/search` |
+
+用户角色替换采用严格 CAS，客户端必须提交最近一次 `UserRead.role_assignment_version`，避免并发管理员用旧快照恢复已撤销权限：
+
+```http
+PUT /api/v1/users/{user_id}/roles
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "expected_version": 7,
+  "role_ids": ["<role-id>"]
+}
+```
+
+成功变更后 `role_assignment_version` 单调递增，并使该用户已有 token 失效；相同角色集合是无副作用操作。旧版本请求返回 `409 stale_role_assignment`，响应详情仅包含当前版本，客户端必须重新读取用户后再决策。
+
+角色自身的名称、描述、优先级、权限与限额也使用统一的严格 CAS。客户端先从 `RoleRead.policy_version` 保存编辑快照，再在 `PATCH /roles/{id}`、`PUT /roles/{id}/permissions`、`PUT /roles/{id}/limits` 或 `PUT /roles/{id}/policy` 中提交同值的 `expected_version`。实际变更令版本单调递增；完全相同的提交不写审计、不触发撤权检查且不递增版本。旧快照返回 `409 stale_role_policy`，管理端会立即关闭旧草稿并刷新，禁止自动重放整组权限或限额。删除角色也必须提交 `expected_version`；系统角色及高优先级越权操作被拒绝，存在用户分配或知识库授权引用时返回 `409 role_in_use` 和脱敏引用计数，成功删除写入 `role.deleted` 审计事件。
+
+用户自助改密必须提交当前密码，并经过限流；管理员重置他人密码仅允许仍有效的超级管理员执行。两条路径都使用统一强密码策略，并原子提升 `token_version`、撤销现有 refresh token，旧访问令牌与旧密码随即失效。
+
+知识库角色授权替换使用同样的严格 CAS：先从知识库响应读取 `role_grant_version`，再将它作为 `expected_version` 提交。成功变更后版本单调递增；旧版本返回 `409 stale_knowledge_grants`，客户端必须重新读取知识库和授权集合，禁止自动重放旧的整组授权。
+
+`POST /api/v1/chat/query` 与 `POST /api/v1/public/chat/query` 必须携带 1–160 位、日志安全的 `Idempotency-Key`。同一次逻辑问答的网络重试复用同一个 Key；新问题必须生成新 Key。服务端不再使用请求 ID 静默替代幂等键。
+
+聊天幂等是 PostgreSQL 持久语义，不是仅校验请求头：同一主体、同一 Key、同一规范化请求会在 24 小时保留期内原样重放最终 `ChatQueryResponse`，不会再次检索、调用模型或计费；请求内容不同返回 `409 idempotency_conflict`，原请求仍在执行返回 `409 idempotency_in_progress`，执行结果无法安全确认返回 `409 idempotency_outcome_unknown`，知识库内容版本变化返回 `409 idempotency_resource_changed` 并清空旧响应。公开 API 以稳定 `credential_family_id` 隔离命名空间，原子轮换前后的 Key 可安全重放且不能绕过限流；审计与用量仍保留实际 Key ID。数据库只保存主体、Key 与请求的 SHA-256，以及默认最多 128 KiB（硬上限 512 KiB）的 AES-256-GCM 有界加密响应，不保存问题正文；密钥保存在数据库之外并支持版本轮换，篡改或缺失旧密钥时安全转为 `OUTCOME_UNKNOWN` 且不会再次调用模型。maintenance worker 以独立批次处理超时 claim 和过期终态，密钥生成与轮换步骤见 [聊天幂等回放加密运维](./docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)。
+
+> [!WARNING]
+> 聊天重放体先有界压缩，再以 AES-256-GCM 加密；数据库保存密钥版本、12 字节随机 nonce、密文和原始大小，密钥环位于数据库与备份之外。迁移 `20260714_0020` 不可逆：历史 `zlib-json-v1` 的 `COMPLETED` 记录会转为 `OUTCOME_UNKNOWN` 并清除正文。AEAD 仅保护重放字段，不能替代 PostgreSQL 数据卷、WAL、快照和备份的静态加密；缺少这些证据时敏感数据交付仍为 `NO-GO`。
 
 下载限额统计的是“成功签发下载 URL 的次数”，不是对象存储确认完成的下载次数。若需要按真实传输次数或字节计费，应增加下载网关或 CDN 边缘鉴权。
 
@@ -407,7 +447,7 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时已完成冻结依赖、断网模式的全量本地质量门禁：**后端 532 项通过、18 项按环境条件跳过、覆盖率 85.00%（门槛 80%）；前端 195 项通过**，Ruff、mypy、ESLint、TypeScript 与 Next.js production build 全部通过。Playwright 企业档案已收集 8 项业务检查的桌面/移动场景及 2 项失败关闭预检；未在真实预生产拓扑运行前，浏览器证据与最终交付结论仍为 `BLOCKED`。
+当前候选版本已收集 **1,082 项后端测试（60 项 PostgreSQL 集成、1,022 项非 PostgreSQL）**；该数字只表示收集范围，最终通过/跳过/覆盖率必须由绑定本候选 Git 身份、内容指纹和目标环境的签名终验证据给出，在证据生成前不得写成“全部通过”。前端当前基线为 **Vitest 42 个文件、290 项测试**；Playwright 企业档案为 **22 个实例（11 个场景 × 桌面/移动）**。Ruff、mypy、ESLint、TypeScript、production build、真实浏览器与目标机运行结论同样以最终 Gate 产物为准。
 
 > [!CAUTION]
 > 功能测试通过不等于容量认证通过。目标机性能门禁还需要项目方批准的验收阈值和同机压测产物；仓库当前不把单机 8C16G300G、1,000 人并发或每日 50 亿 token 写成已验证能力。
@@ -442,14 +482,14 @@ npm run build
 
 ## 其他云 Linux 离线企业部署
 
-离线配置面向不允许业务数据出网的单机企业环境。所有业务依赖都由项目专属 Docker Compose 编排：PostgreSQL 保存事实数据，Redis 执行限流，MinIO 保存私有对象，ClamAV 执行恶意文件扫描，FastAPI API 提供控制面，Maintenance 持续处理扫描、转换与对账，Next.js Web 提供统一工作台，Caddy 负责 TLS 入口和对象访问。Migration、Bootstrap、MinIO 初始化与病毒库预检均为部署期任务，不作为常驻业务服务。
+离线配置面向国内任意云厂商或自建机房的 Linux 单机环境，不绑定腾讯云。历史目录名 `deploy/tencent/` 仅为兼容路径，内部制品和脚本均按供应商中立的 Docker/Linux 边界设计。所有业务依赖都由项目专属 Docker Compose 编排：PostgreSQL 保存事实数据，Redis 执行限流，MinIO 保存私有对象，ClamAV 执行恶意文件扫描，FastAPI API 提供控制面，Maintenance 持续处理扫描、转换与对账，Next.js Web 提供统一工作台，Caddy 负责 TLS 入口和对象访问。Migration、Bootstrap、MinIO 初始化与病毒库预检均为部署期任务，不作为常驻业务服务。
 
 ```mermaid
 flowchart LR
     Client["企业内网客户端"] --> Caddy["Caddy\n唯一宿主机入口"]
     ApiClient["局域网业务系统"] -->|"X-API-Key · HTTPS 19443"| Caddy
 
-    subgraph Edge["edge · 172.30.242.0/24"]
+    subgraph Edge["edge · 172.30.242.0/24 · internal"]
         Caddy
     end
 
@@ -466,6 +506,14 @@ flowchart LR
         Maintenance["Maintenance"]
     end
 
+    subgraph LLMControl["llm-control · 172.30.243.0/24 · internal"]
+        Gateway["可选 llm-egress\n固定路径与主机"]
+    end
+
+    subgraph Uplink["llm-uplink · 172.30.244.0/24 · controlled-egress only"]
+        Providers["DeepSeek / Qwen / MiniMax API"]
+    end
+
     Caddy --> Web
     Caddy -->|"/api/v1/public/* · OpenAPI · 健康检查"| API
     Caddy --> MinIO
@@ -473,17 +521,22 @@ flowchart LR
     API --> PostgreSQL
     API --> Redis
     API --> MinIO
+    API -. "仅 controlled_gateway" .-> Gateway
     Maintenance --> PostgreSQL
     Maintenance --> Redis
     Maintenance --> MinIO
     Maintenance --> ClamAV
+    Maintenance -. "仅 controlled_gateway" .-> Gateway
+    Gateway -. "固定 HTTPS 目的地" .-> Providers
 ```
 
 | 隔离层 | 连接范围 | 强制约束 |
 |---|---|---|
-| `edge` | 仅 Caddy 接入 | 唯一非 `internal` 网络；只有 Caddy 发布 HTTPS 端口，部署前检查固定 CIDR 不与宿主机路由重叠 |
+| `edge` | 仅 Caddy 接入 | Docker `internal` 网络；宿主机发布端口仍可接收入站流量，但入口容器没有公网默认出口 |
 | `frontend` | Caddy、Web、API、MinIO | Docker `internal` 网络；支持 BFF 回源与对象反向代理，业务容器不直接发布宿主机端口 |
 | `backend` | API、Maintenance、PostgreSQL、Redis、MinIO、ClamAV 及部署期任务 | Docker `internal` 网络；数据库、缓存、扫描服务和 MinIO 原生端口均不对宿主机开放 |
+| `llm-control` | API、Maintenance、可选 `llm-egress` | Docker `internal` 网络；业务进程只能访问固定模型网关，不能加入公网 uplink |
+| `llm-uplink` | 仅 `llm-egress` | 只在 `controlled-egress` Profile 创建；无宿主端口，不能连接 API、Maintenance、数据库或对象存储 |
 
 关键失败关闭条件：
 
@@ -491,8 +544,8 @@ flowchart LR
 - API 健康检查连接 `127.0.0.1:8000/health/ready`，同时显式发送公共 `Host`，避免绕过 Trusted Host，也避免把合法探针误判为 `400`；
 - Redis 官方入口在重启时需要检查已归 Redis 用户所有的 `0700` 数据目录，因此仅在入口降权阶段补回 `CHOWN`、`DAC_READ_SEARCH`、`SETGID`、`SETPCAP`、`SETUID`，明确不使用权限面更大的 `DAC_OVERRIDE`；`SETPCAP` 只用于降权时清空 bounding set，常驻 Redis 的五组 capability 均为 0，并保持 `no-new-privileges`；
 - ClamAV 病毒库以只读方式挂载，部署前验证 root 所有权、daemon 可读、时效性与引擎兼容性；`clamd` 先 `cap_drop: ALL`，仅补回切换到 `User clamav` 所需的 `SETGID`、`SETUID`，并启用 `no-new-privileges`；
-- 离线镜像使用固定 digest 且 `pull_policy: never`，外部 LLM 固定关闭。任何镜像、病毒库、网络 CIDR、解析器或主机容量门禁失败都必须停止上线。
-- 服务器保留源码包、完整 8 镜像归档、ClamAV 病毒库及各自 SHA-256；制品传输完成后，运行、重启、回滚和冷恢复不访问 GitHub、Vercel、COS、公共 CDN、npm/PyPI 或公共镜像仓库。
+- 离线镜像使用固定 digest 且 `pull_policy: never`。默认 `strict_offline` 不创建出口；受控出口只允许 `controlled_gateway`，隔离部署禁止 `direct`。任何镜像、病毒库、网络 CIDR、解析器、出口策略或主机容量门禁失败都必须停止上线。
+- 服务器保留源码包、9 类镜像制品清单、ClamAV 病毒库及各自 SHA-256；COS 只可加速首次制品传输。制品落盘验签后，运行、重启、回滚和冷恢复不访问 GitHub、Vercel、COS、公共 CDN、npm/PyPI 或公共镜像仓库。
 
 完整的准备、预检、迁移、启动、验收与回滚流程见 [其他云 Linux 8C16G 离线部署手册](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。
 
@@ -509,16 +562,18 @@ flowchart LR
 - 单 PUT SHA-256 绑定签名并恒定时间校验，摘要不匹配时删除对象并释放配额；
 - OKF 草稿/发布门禁、知识库级外部模型 opt-in 与转换租约所有权；
 - 九类文档解析能力矩阵、OOXML 主动内容/Zip Bomb 拒绝，以及 PDF/旧版 Office 断网沙箱与资源上限；
-- 离线部署三网络隔离、固定 Trusted Host/健康检查 Host、固定镜像 digest，以及 ClamAV 只读病毒库和最小进程权限；
+- 离线部署四个 `internal` 网络与一个可选模型 uplink、固定 Trusted Host/健康检查 Host、固定镜像 digest，以及 ClamAV 只读病毒库和最小进程权限；
 - PostgreSQL 原子配额预留与持久审计。
 
 正式对外前仍必须补齐：
 
 - 真实目标机恶意软件全链路、MIME/魔数黄金集与解析沙箱运行证据；
 - PostgreSQL HA/PITR、Redis HA、对象版本化与恢复演练；
+- PostgreSQL、对象存储、WAL、快照和备份静态加密的目标机证据；
 - 指标、Trace、集中日志和审计防篡改归档；
 - 全量孤儿对象对账、文件保留/删除及法律保全流程；
-- 企业 OIDC/MFA 与数据库最小权限身份。
+- 企业 OIDC/MFA 与数据库最小权限身份；
+- 项目许可证、第三方依赖与品牌资产的签署授权，以及经法务批准的 Third-Party Notices；
 - 目标机容量阈值审批，以及吞吐、延迟、错误率、磁盘性能和长稳压测证据；单机 8C16G300G 与每日 50 亿 token 不属于当前已认证能力。
 
 ## Roadmap
@@ -536,13 +591,14 @@ flowchart LR
 - [x] ClamAV 隔离扫描状态机与 Office/PDF 隔离解析代码路径
 - [ ] 在真实其他云 Linux 8C16G300G 目标机完成九类格式、ClamAV 与沙箱运行证据
 - [x] 授权全文检索、可选生成式 RAG、强制来源协议、生成后语义审核与确定性降级
-- [ ] 混合向量索引、重排、独立审核模型与离线引用蕴含评测
+- [ ] 混合向量索引、重排，以及目标环境离线引用蕴含评测证据
 - [ ] OKF Bundle 导入/导出、校验器与知识图谱视图
 - [ ] LLM-Wiki 多文档引用审阅、矛盾检测与增量重编译
 - [ ] 企业 OIDC、MFA 与集中可观测性
 
 ## 文档
 
+- [企业文档中心](docs/README.zh-CN.md)：按架构、部署、运维、安全、验收、容量与法律交付分类的权威索引；新增或更名文档必须同步维护该目录。
 - [架构设计](docs/ARCHITECTURE.zh-CN.md)：系统边界、数据库模式、RBAC、配额、状态机与 10 TB+ 拓扑；
 - [运维手册](docs/OPERATIONS.zh-CN.md)：部署、备份、恢复、扩容、告警与排障；
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
@@ -553,7 +609,7 @@ flowchart LR
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
 - [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。
-- [商业版代码审计与交付报告](docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md)：发布判定、已关闭问题、P1 商用门槛与验收标准。
+- [商业版代码审计与交付报告（历史快照）](docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md)：2026-07-11 时点证据，不代表当前候选版本状态。
 - [安全策略](SECURITY.md)：漏洞私密报告渠道、响应目标、安全港边界与凭据处理要求。
 
 ---

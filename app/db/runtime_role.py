@@ -45,9 +45,7 @@ async def reconcile_runtime_role_privileges(
         text(f"GRANT SELECT, INSERT ON TABLE public.audit_logs TO {quoted_role}")
     )
     await connection.execute(
-        text(
-            f"GRANT USAGE, SELECT ON SEQUENCE public.audit_logs_id_seq TO {quoted_role}"
-        )
+        text(f"GRANT USAGE, SELECT ON SEQUENCE public.audit_logs_id_seq TO {quoted_role}")
     )
     await connection.execute(
         text(
@@ -70,10 +68,7 @@ async def reconcile_runtime_role_privileges(
         )
     )
     await connection.execute(
-        text(
-            "REVOKE ALL ON FUNCTION public.enforce_audit_log_runtime_privileges() "
-            "FROM PUBLIC"
-        )
+        text("REVOKE ALL ON FUNCTION public.enforce_audit_log_runtime_privileges() FROM PUBLIC")
     )
     await connection.execute(
         text("DROP EVENT TRIGGER IF EXISTS enforce_audit_log_runtime_privileges")
@@ -100,9 +95,7 @@ async def reconcile_runtime_role_privileges(
     )
     actual = privileges.one()
     if tuple(actual) != (True, True, False, False, False):
-        raise RuntimeRoleReconciliationError(
-            "runtime database role privileges did not converge"
-        )
+        raise RuntimeRoleReconciliationError("runtime database role privileges did not converge")
     sequence_privileges = await connection.execute(
         text(
             "SELECT "

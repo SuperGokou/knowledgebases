@@ -85,7 +85,9 @@ async def external_llm_egress_allowed(
             (("role", role_id) for role_id in role_ids),
         )
 
-        user = await session.get(User, user_id)
+        user = await session.scalar(
+            select(User).where(User.id == user_id).execution_options(populate_existing=True)
+        )
         if user is None or user.status is not UserStatus.ACTIVE:
             await session.commit()
             return False
@@ -100,6 +102,7 @@ async def external_llm_egress_allowed(
                 current,
                 knowledge_base_id,
                 minimum=minimum_access,
+                refresh=True,
             )
         except ApiError:
             await session.commit()
@@ -109,7 +112,11 @@ async def external_llm_egress_allowed(
             return False
 
         if api_key_id is not None:
-            api_key = await session.get(ApiKey, api_key_id)
+            api_key = await session.scalar(
+                select(ApiKey)
+                .where(ApiKey.id == api_key_id)
+                .execution_options(populate_existing=True)
+            )
             if (
                 api_key is None
                 or api_key.user_id != user_id

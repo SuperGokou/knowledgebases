@@ -115,6 +115,7 @@ async def _prepare_authorization_scenario() -> _AuthorizationScenario:
             tenant_key=dimensions.tenant_key,
             user_id=dimensions.user_id,
             api_key_id=api_key.id,
+            api_key_credential_family_id=api_key.credential_family_id,
             knowledge_base_id=knowledge_base.id,
             provider=dimensions.provider,
             model=dimensions.model,
@@ -400,6 +401,45 @@ async def test_postgres_revocation_first_makes_fresh_egress_authorization_fail_c
         await acquire_llm_egress_locks(revoker, [_scenario_scope(scenario, scope)])
         await _apply_revocation(revoker, scenario, scope)
 
+        preflight = asyncio.create_task(
+            external_llm_egress_allowed(
+                caller,
+                user_id=scenario.dimensions.user_id,
+                knowledge_base_id=scenario.knowledge_base_id,
+                api_key_id=scenario.api_key_id,
+                required_permission="chat:query",
+                minimum_access=KnowledgeBaseAccessLevel.READER,
+            )
+        )
+        done, _ = await asyncio.wait({preflight}, timeout=0.1)
+        assert not done
+
+        await revoker.commit()
+        assert await asyncio.wait_for(preflight, timeout=5) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["user", "api_key", "knowledge_base"])
+async def test_postgres_revocation_first_refreshes_cached_egress_authorization(
+    scope: str,
+) -> None:
+    """A committed request Session must not reuse its pre-revocation ORM identity."""
+
+    scenario = await _prepare_authorization_scenario()
+    async with scenario.factory() as revoker, scenario.factory() as caller:
+        if scope == "user":
+            cached = await caller.get(User, scenario.dimensions.user_id)
+        elif scope == "api_key":
+            cached = await caller.get(ApiKey, scenario.api_key_id)
+        else:
+            cached = await caller.get(KnowledgeBase, scenario.knowledge_base_id)
+        assert cached is not None
+        # GovernedLlmExecutor commits the durable usage hold before this preflight.
+        # expire_on_commit=False deliberately preserves the identity-map entries.
+        await caller.commit()
+
+        await acquire_llm_egress_locks(revoker, [_scenario_scope(scenario, scope)])
+        await _apply_revocation(revoker, scenario, scope)
         preflight = asyncio.create_task(
             external_llm_egress_allowed(
                 caller,

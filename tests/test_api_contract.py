@@ -92,6 +92,48 @@ def test_openapi_exposes_core_admin_and_file_flows() -> None:
     }
 
 
+def test_openapi_requires_bounded_log_safe_chat_idempotency_keys() -> None:
+    schema = app.openapi()
+
+    for path in ("/api/v1/chat/query", "/api/v1/public/chat/query"):
+        parameters = schema["paths"][path]["post"]["parameters"]
+        idempotency = next(
+            item
+            for item in parameters
+            if item["in"] == "header" and item["name"] == "Idempotency-Key"
+        )
+
+        assert idempotency["required"] is True
+        assert idempotency["schema"]["minLength"] == 1
+        assert idempotency["schema"]["maxLength"] == 160
+        assert idempotency["schema"]["pattern"] == "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+
+
+def test_openapi_requires_knowledge_grant_compare_and_swap_version() -> None:
+    components = app.openapi()["components"]["schemas"]
+    payload = components["KnowledgeBaseRoleGrantSet"]
+    knowledge_base = components["KnowledgeBaseRead"]
+
+    assert set(payload["required"]) == {"expected_version", "grants"}
+    assert payload["properties"]["expected_version"]["minimum"] == 1
+    assert knowledge_base["required"] is not None
+    assert "role_grant_version" in knowledge_base["required"]
+    assert knowledge_base["properties"]["role_grant_version"]["minimum"] == 1
+
+
+def test_openapi_requires_role_policy_compare_and_swap_version() -> None:
+    components = app.openapi()["components"]["schemas"]
+
+    for schema_name in ("RoleUpdate", "PermissionSet", "LimitSet", "RolePolicySet"):
+        payload = components[schema_name]
+        assert "expected_version" in payload["required"]
+        assert payload["properties"]["expected_version"]["minimum"] == 1
+
+    role = components["RoleRead"]
+    assert "policy_version" in role["required"]
+    assert role["properties"]["policy_version"]["minimum"] == 1
+
+
 def test_large_control_plane_request_is_rejected_before_parsing() -> None:
     with TestClient(app) as client:
         response = client.post(
@@ -173,6 +215,51 @@ async def test_chunked_request_is_bounded_before_reaching_the_application() -> N
             "client": ("127.0.0.1", 1234),
             "server": ("testserver", 80),
             "state": {"request_id": "request-1"},
+        },
+        receive,
+        send,
+    )
+
+    assert not called
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 413
+
+
+@pytest.mark.asyncio
+async def test_sensitive_route_uses_its_stricter_body_limit() -> None:
+    called = False
+    sent: list[dict[str, object]] = []
+
+    async def downstream(scope: object, receive: object, send: object) -> None:
+        del scope, receive, send
+        nonlocal called
+        called = True
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"123456", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    middleware = RequestBodyLimitMiddleware(
+        downstream,
+        max_bytes=100,
+        path_limits={"/api/v1/auth/token": 5},
+    )
+    await middleware(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/v1/auth/token",
+            "raw_path": b"/api/v1/auth/token",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+            "state": {"request_id": "request-2"},
         },
         receive,
         send,

@@ -1,13 +1,41 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import re
 from functools import lru_cache
 from ipaddress import IPv4Network, IPv6Network, ip_network
+from math import ceil
 from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.password_policy import validate_strong_password
+
+_BASE64URL_256_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}={0,1}$")
+_CONTROLLED_LLM_GATEWAY_BASE_URL = "http://llm-egress:8080"
+_LLM_PROVIDER_ORDER: tuple[Literal["deepseek", "qwen", "minimax"], ...] = (
+    "deepseek",
+    "qwen",
+    "minimax",
+)
+
+
+def _is_base64url_256_key(value: str) -> bool:
+    if not _BASE64URL_256_PATTERN.fullmatch(value):
+        return False
+    try:
+        decoded = base64.b64decode(
+            value + ("=" * (-len(value) % 4)),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        return False
+    return len(decoded) == 32
 
 
 class Settings(BaseSettings):
@@ -28,7 +56,18 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("KB_SERVERLESS", "VERCEL"),
     )
     deployment_profile: Literal["standard", "isolated"] = "standard"
-    external_llm_enabled: bool = True
+    llm_egress_mode: Literal["strict_offline", "direct", "controlled_gateway"] = "strict_offline"
+    llm_egress_gateway_url: str | None = None
+    llm_egress_approved_providers: str = ""
+    legacy_external_llm_enabled: bool | None = Field(
+        default=None,
+        exclude=True,
+        validation_alias=AliasChoices(
+            "KB_EXTERNAL_LLM_ENABLED",
+            "EXTERNAL_LLM_ENABLED",
+            "external_llm_enabled",
+        ),
+    )
     api_prefix: str = "/api/v1"
     database_url: str = Field(
         default=(
@@ -134,6 +173,35 @@ class Settings(BaseSettings):
     )
     maintenance_batch_size: int = Field(default=100, ge=1, le=500)
     maintenance_max_batches: int = Field(default=10, ge=1, le=100)
+    chat_idempotency_ttl_seconds: int = Field(default=86_400, ge=60, le=604_800)
+    chat_idempotency_processing_timeout_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3_600,
+    )
+    chat_idempotency_response_max_bytes: int = Field(
+        default=128 * 1024,
+        ge=16 * 1024,
+        le=512 * 1024,
+    )
+    chat_replay_encryption_keys: dict[int, SecretStr] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices(
+            "KB_CHAT_REPLAY_ENCRYPTION_KEYS",
+            "CHAT_REPLAY_ENCRYPTION_KEYS",
+        ),
+    )
+    chat_replay_active_key_version: int | None = Field(
+        default=None,
+        ge=1,
+        le=2_147_483_647,
+        validation_alias=AliasChoices(
+            "KB_CHAT_REPLAY_ACTIVE_KEY_VERSION",
+            "CHAT_REPLAY_ACTIVE_KEY_VERSION",
+        ),
+    )
+    chat_idempotency_cleanup_batch_size: int = Field(default=1_000, ge=1, le=10_000)
+    chat_idempotency_cleanup_max_batches: int = Field(default=5, ge=1, le=100)
     malware_scan_host: str = "127.0.0.1"
     malware_scan_port: int = Field(default=3310, ge=1, le=65_535)
     malware_scan_timeout_seconds: float = Field(default=120, gt=0, le=3_600)
@@ -180,9 +248,7 @@ class Settings(BaseSettings):
     )
     minimax_model: str = Field(
         default="MiniMax-M2.7",
-        validation_alias=AliasChoices(
-            "KB_MINIMAX_MODEL", "MINIMAX_MODEL_NAME", "MINIMAX_MODEL"
-        ),
+        validation_alias=AliasChoices("KB_MINIMAX_MODEL", "MINIMAX_MODEL_NAME", "MINIMAX_MODEL"),
     )
     llm_default_provider: Literal["deepseek", "qwen", "minimax"] = "deepseek"
     llm_tenant_key: str = Field(default="default", min_length=1, max_length=100)
@@ -204,12 +270,50 @@ class Settings(BaseSettings):
     bootstrap_admin_email: str = "admin@example.com"
     bootstrap_admin_password: SecretStr | None = None
 
+    @property
+    def external_llm_enabled(self) -> bool:
+        """Compatibility view derived exclusively from the egress mode."""
+
+        return self.llm_egress_mode != "strict_offline"
+
     @field_validator("allowed_extensions")
     @classmethod
     def normalize_extensions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(
             sorted({item.lower() if item.startswith(".") else f".{item.lower()}" for item in value})
         )
+
+    @field_validator("llm_egress_gateway_url", mode="before")
+    @classmethod
+    def normalize_llm_egress_gateway_url(cls, value: object) -> object:
+        return None if value == "" else value
+
+    @field_validator("llm_egress_approved_providers")
+    @classmethod
+    def normalize_llm_egress_approved_providers(cls, value: str) -> str:
+        if not value:
+            return ""
+        providers = tuple(value.split(","))
+        if (
+            any(not item or item != item.strip() for item in providers)
+            or len(set(providers)) != len(providers)
+            or any(item not in _LLM_PROVIDER_ORDER for item in providers)
+            or providers != tuple(item for item in _LLM_PROVIDER_ORDER if item in providers)
+        ):
+            raise ValueError(
+                "KB_LLM_EGRESS_APPROVED_PROVIDERS must be a canonical subset of "
+                "deepseek,qwen,minimax"
+            )
+        return value
+
+    @property
+    def approved_llm_providers(
+        self,
+    ) -> tuple[Literal["deepseek", "qwen", "minimax"], ...]:
+        if not self.llm_egress_approved_providers:
+            return ()
+        selected = frozenset(self.llm_egress_approved_providers.split(","))
+        return tuple(provider for provider in _LLM_PROVIDER_ORDER if provider in selected)
 
     @field_validator("qwen_allowed_workspace_hosts")
     @classmethod
@@ -256,8 +360,7 @@ class Settings(BaseSettings):
                         IPv4Network("127.0.0.0/8"),
                     )
                 )
-            else:
-                assert isinstance(network, IPv6Network)
+            elif isinstance(network, IPv6Network):
                 minimum_prefix = 64
                 approved = any(
                     network.subnet_of(parent)
@@ -266,6 +369,8 @@ class Settings(BaseSettings):
                         IPv6Network("::1/128"),
                     )
                 )
+            else:  # pragma: no cover - ip_network() returns only IPv4/IPv6 networks.
+                raise ValueError("KB_TRUSTED_PROXY_CIDRS must contain canonical CIDR values")
             if network.prefixlen < minimum_prefix or not approved:
                 raise ValueError(
                     "KB_TRUSTED_PROXY_CIDRS must contain narrow private proxy networks"
@@ -291,17 +396,74 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def reject_development_secrets_in_production(self) -> Settings:
-        if self.platform_max_upload_bytes != self.malware_scan_max_stream_bytes:
+        if self.legacy_external_llm_enabled is not None:
             raise ValueError(
-                "platform upload limit must equal the malware scan stream limit"
+                "KB_EXTERNAL_LLM_ENABLED was removed; configure only "
+                "KB_LLM_EGRESS_MODE and KB_LLM_EGRESS_GATEWAY_URL"
             )
+        if self.llm_egress_mode == "controlled_gateway":
+            if self.llm_egress_gateway_url != _CONTROLLED_LLM_GATEWAY_BASE_URL:
+                raise ValueError(
+                    "KB_LLM_EGRESS_GATEWAY_URL must be exactly "
+                    f"{_CONTROLLED_LLM_GATEWAY_BASE_URL} in controlled gateway mode"
+                )
+            if self.deployment_profile != "isolated":
+                raise ValueError(
+                    "controlled LLM gateway mode is only valid for isolated deployments"
+                )
+            if self.qwen_allowed_workspace_hosts:
+                raise ValueError(
+                    "controlled gateway mode does not allow custom Qwen workspace hosts"
+                )
+            if not self.approved_llm_providers:
+                raise ValueError(
+                    "controlled gateway mode requires KB_LLM_EGRESS_APPROVED_PROVIDERS"
+                )
+        else:
+            if self.llm_egress_gateway_url is not None:
+                raise ValueError(
+                    "KB_LLM_EGRESS_GATEWAY_URL must be empty unless controlled gateway "
+                    "mode is enabled"
+                )
+            if self.llm_egress_mode == "direct" and self.deployment_profile == "isolated":
+                raise ValueError("direct LLM egress is forbidden in isolated deployments")
+            if self.approved_llm_providers:
+                raise ValueError(
+                    "KB_LLM_EGRESS_APPROVED_PROVIDERS is only valid in controlled gateway mode"
+                )
+
+        minimum_chat_claim_seconds = ceil(self.deepseek_timeout_seconds * 2) + 30
+        if self.chat_idempotency_processing_timeout_seconds < minimum_chat_claim_seconds:
+            raise ValueError(
+                "chat idempotency processing timeout must cover generation and review timeouts"
+            )
+        if self.platform_max_upload_bytes != self.malware_scan_max_stream_bytes:
+            raise ValueError("platform upload limit must equal the malware scan stream limit")
         if not (
             self.storage_warning_percent
             < self.storage_bulk_stop_percent
             < self.storage_reject_percent
         ):
             raise ValueError("storage watermarks must increase from warning to rejection")
+        for key_version, encoded_key in self.chat_replay_encryption_keys.items():
+            if key_version < 1 or key_version > 2_147_483_647:
+                raise ValueError("chat replay encryption key versions must be positive integers")
+            if not _is_base64url_256_key(encoded_key.get_secret_value()):
+                raise ValueError(
+                    "KB_CHAT_REPLAY_ENCRYPTION_KEYS values must be 32-byte base64url keys"
+                )
+        if self.chat_replay_encryption_keys:
+            if self.chat_replay_active_key_version not in self.chat_replay_encryption_keys:
+                raise ValueError(
+                    "chat replay active key version must exist in KB_CHAT_REPLAY_ENCRYPTION_KEYS"
+                )
+        elif self.chat_replay_active_key_version is not None:
+            raise ValueError(
+                "KB_CHAT_REPLAY_ACTIVE_KEY_VERSION requires KB_CHAT_REPLAY_ENCRYPTION_KEYS"
+            )
         if self.environment == "production":
+            if not self.chat_replay_encryption_keys:
+                raise ValueError("KB_CHAT_REPLAY_ENCRYPTION_KEYS is required in production")
             jwt_secret = self.jwt_secret.get_secret_value()
             admin_password = (
                 self.bootstrap_admin_password.get_secret_value()
@@ -315,11 +477,20 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "KB_JWT_SECRET must be a non-example secret of at least 64 characters"
                 )
-            if admin_password is not None and (
-                len(admin_password) < 16
-                or any(marker in admin_password.lower() for marker in placeholder_markers)
-            ):
-                raise ValueError("KB_BOOTSTRAP_ADMIN_PASSWORD must be changed in production")
+            if admin_password is not None:
+                if not 16 <= len(admin_password) <= 256 or any(
+                    marker in admin_password.lower() for marker in placeholder_markers
+                ):
+                    raise ValueError(
+                        "KB_BOOTSTRAP_ADMIN_PASSWORD must be a non-example password "
+                        "between 16 and 256 characters in production"
+                    )
+                try:
+                    validate_strong_password(admin_password)
+                except ValueError as error:
+                    raise ValueError(
+                        "KB_BOOTSTRAP_ADMIN_PASSWORD must satisfy the strong password policy"
+                    ) from error
             if self.bff_shared_secret is not None:
                 bff_secret = self.bff_shared_secret.get_secret_value()
                 if bff_secret and len(bff_secret) < 32:
@@ -363,12 +534,7 @@ class Settings(BaseSettings):
                         )
                 if self.malware_scan_host != "clamd":
                     raise ValueError(
-                        "KB_MALWARE_SCAN_HOST must reference the isolated Compose service "
-                        "'clamd'"
-                    )
-                if self.external_llm_enabled:
-                    raise ValueError(
-                        "KB_EXTERNAL_LLM_ENABLED must be false in isolated deployments"
+                        "KB_MALWARE_SCAN_HOST must reference the isolated Compose service 'clamd'"
                     )
             else:
                 for variable, endpoint in (
@@ -403,9 +569,7 @@ class Settings(BaseSettings):
             if "*" in self.cors_origins or "null" in {
                 origin.strip().lower() for origin in self.cors_origins
             }:
-                raise ValueError(
-                    "KB_CORS_ORIGINS must contain exact trusted origins in production"
-                )
+                raise ValueError("KB_CORS_ORIGINS must contain exact trusted origins in production")
             if (
                 self.s3_access_key.get_secret_value() == "knowledge"
                 or self.s3_secret_key.get_secret_value() == "knowledge-secret"
@@ -421,8 +585,7 @@ class Settings(BaseSettings):
             if not self.s3_use_ssl:
                 raise ValueError("KB_S3_USE_SSL must be true in production")
             if self.serverless and (
-                self.cron_secret is None
-                or len(self.cron_secret.get_secret_value()) < 16
+                self.cron_secret is None or len(self.cron_secret.get_secret_value()) < 16
             ):
                 raise ValueError("CRON_SECRET must contain at least 16 characters on serverless")
             if self.access_token_minutes > 60:
@@ -435,12 +598,11 @@ class Settings(BaseSettings):
                 ):
                     parsed_llm_url = urlparse(endpoint)
                     if parsed_llm_url.scheme != "https" or not parsed_llm_url.hostname:
-                        raise ValueError(
-                            f"{variable} must be an absolute HTTPS URL in production"
-                        )
-            if self.llm_credentials_encryption_key is not None and len(
-                self.llm_credentials_encryption_key.get_secret_value()
-            ) < 32:
+                        raise ValueError(f"{variable} must be an absolute HTTPS URL in production")
+            if (
+                self.llm_credentials_encryption_key is not None
+                and len(self.llm_credentials_encryption_key.get_secret_value()) < 32
+            ):
                 raise ValueError(
                     "KB_LLM_CREDENTIALS_ENCRYPTION_KEY must contain at least 32 characters"
                 )

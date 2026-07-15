@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from app.api.dependencies import DatabaseSession, get_storage_service
 from app.core.config import Settings, get_settings
 from app.maintenance import cleanup_expired_uploads, process_malware_scan_batch
-from app.services.llm_settings import resolve_provider_client
+from app.services.chat_idempotency import cleanup_chat_idempotency_records
+from app.services.llm_settings import LlmConfigurationError, resolve_provider_client
 from app.services.malware_scanner import ClamdScanner
 from app.services.okf_conversion import process_okf_conversion_batch
 from app.services.storage import StorageService
@@ -43,6 +44,12 @@ async def run_maintenance(
         total += cleaned
         if cleaned < settings.maintenance_batch_size:
             break
+    chat_idempotency = await cleanup_chat_idempotency_records(
+        session,
+        settings,
+        batch_size=settings.chat_idempotency_cleanup_batch_size,
+        max_batches=settings.chat_idempotency_cleanup_max_batches,
+    )
     scanner = ClamdScanner(
         host=settings.malware_scan_host,
         port=settings.malware_scan_port,
@@ -56,11 +63,17 @@ async def run_maintenance(
         settings,
         batch_size=settings.maintenance_batch_size,
     )
-    client = (
-        await resolve_provider_client(session, settings)
-        if settings.external_llm_enabled
-        else None
-    )
+    try:
+        client = (
+            await resolve_provider_client(session, settings)
+            if settings.external_llm_enabled
+            else None
+        )
+    except (LlmConfigurationError, ValueError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider configuration is invalid",
+        ) from error
     if client is None:
         converted = await process_okf_conversion_batch(
             session,
@@ -78,4 +91,9 @@ async def run_maintenance(
                 settings,
                 batch_size=settings.okf_conversion_batch_size,
             )
-    return {"cleaned": total, "scanned": scanned, "converted": converted}
+    return {
+        "cleaned": total,
+        "chat_idempotency": chat_idempotency,
+        "scanned": scanned,
+        "converted": converted,
+    }

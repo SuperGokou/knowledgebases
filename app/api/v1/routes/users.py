@@ -4,19 +4,28 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request, status
-from sqlalchemy import Select, delete, func, or_, select, text
+from fastapi import APIRouter, Depends, Query, Request, Response, status
+from redis.asyncio import Redis
+from sqlalchemy import delete, func, or_, select, text, update
 
-from app.api.dependencies import DatabaseSession, get_password_service, require_permission
+from app.api.dependencies import (
+    DatabaseSession,
+    get_password_service,
+    redis_dependency,
+    require_authenticated_access,
+    require_permission,
+)
 from app.api.egress_leases import deny_if_active_external_llm_egress
 from app.api.errors import ApiError
-from app.core.password_async import hash_password
+from app.core.config import Settings, get_settings
+from app.core.password_async import hash_password, verify_password
 from app.core.security import PasswordService
 from app.db.models import (
     KnowledgeBaseAccessLevel,
     KnowledgeBaseRoleGrant,
     LimitDefinition,
     Permission,
+    RefreshToken,
     Role,
     RoleLimit,
     RolePermission,
@@ -24,68 +33,26 @@ from app.db.models import (
     UserRole,
     UserStatus,
 )
-from app.schemas.users import RoleAssignmentUpdate, UserCreate, UserRead, UserUpdate
-from app.services.access import AccessContext, AccessService
+from app.schemas.users import (
+    RoleAssignmentUpdate,
+    UserCreate,
+    UserPasswordReset,
+    UserRead,
+    UserUpdate,
+)
+from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
+from app.services.list_search import literal_contains_pattern
+from app.services.rate_limit import RateLimiter
+from app.services.rbac_mutation import (
+    acquire_rbac_mutation_lock,
+    lock_role_union,
+    locked_users_statement,
+    refresh_locked_actor_access,
+)
 
 router = APIRouter()
-
-
-def _locked_roles_statement(role_ids: set[UUID]) -> Select[tuple[Role]]:
-    # PostgreSQL FK checks take KEY SHARE on Role. NO KEY UPDATE still serializes
-    # policy mutation/deletion but stays compatible with ACL grant replacement,
-    # whose global order is KnowledgeBase -> Role FK check.
-    return select(Role).where(Role.id.in_(role_ids)).with_for_update(key_share=True)
-
-
-def _locked_actor_user_statement(user_id: UUID) -> Select[tuple[User]]:
-    return select(User).where(User.id == user_id).with_for_update()
-
-
-def _locked_actor_roles_statement(user_id: UUID) -> Select[tuple[Role]]:
-    now = datetime.now(UTC)
-    return (
-        select(Role)
-        .join(UserRole, UserRole.role_id == Role.id)
-        .where(
-            UserRole.user_id == user_id,
-            or_(UserRole.expires_at.is_(None), UserRole.expires_at > now),
-        )
-        .with_for_update(of=Role, key_share=True)
-    )
-
-
-async def _refresh_locked_actor_access(
-    session: DatabaseSession,
-    actor: User,
-    required_permissions: set[str],
-) -> AccessContext:
-    if actor.status is not UserStatus.ACTIVE:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    # Lock every active role before re-resolving mutable permissions and limits.
-    # Policy mutation endpoints coordinate on these same Role rows.
-    list((await session.scalars(_locked_actor_roles_statement(actor.id))).all())
-    current = await AccessService().resolve(session, actor)
-    missing = sorted(code for code in required_permissions if not current.allows(code))
-    if missing:
-        raise ApiError(
-            status_code=403,
-            code="permission_denied",
-            message=f"Permissions required: {', '.join(missing)}",
-        )
-    return current
-
-
-async def _lock_and_refresh_actor_access(
-    session: DatabaseSession,
-    access: AccessContext,
-    required_permissions: set[str],
-) -> AccessContext:
-    actor = await session.scalar(_locked_actor_user_statement(access.user.id))
-    if actor is None:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    return await _refresh_locked_actor_access(session, actor, required_permissions)
 
 
 async def _ensure_kb_grants_delegable(
@@ -166,11 +133,11 @@ async def _ensure_roles_assignable(
 ) -> None:
     if access.user.is_superuser:
         return
-    if any(role.is_system or role.priority > access.max_role_priority for role in roles):
+    if any(role.is_system or role.priority >= access.max_role_priority for role in roles):
         raise ApiError(
             status_code=403,
             code="role_escalation_denied",
-            message="You cannot assign a system role or a role above your own priority",
+            message="You cannot assign a system role or a role at or above your own priority",
         )
     role_ids = [role.id for role in roles]
     permission_codes = (
@@ -207,7 +174,12 @@ async def _ensure_roles_assignable(
             select(
                 KnowledgeBaseRoleGrant.knowledge_base_id,
                 KnowledgeBaseRoleGrant.access_level,
-            ).where(KnowledgeBaseRoleGrant.role_id.in_(role_ids))
+            )
+            .where(KnowledgeBaseRoleGrant.role_id.in_(role_ids))
+            .order_by(
+                KnowledgeBaseRoleGrant.knowledge_base_id,
+                KnowledgeBaseRoleGrant.role_id,
+            )
         )
     ).all()
     await _ensure_kb_grants_delegable(
@@ -223,11 +195,22 @@ async def list_users(
     _: Annotated[AccessContext, Depends(require_permission("user:manage"))],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
 ) -> list[UserRead]:
+    statement = select(User)
+    term = search.strip() if search else ""
+    if term:
+        pattern = literal_contains_pattern(term)
+        statement = statement.where(
+            or_(
+                User.email.ilike(pattern, escape="\\"),
+                User.display_name.ilike(pattern, escape="\\"),
+            )
+        )
     users = list(
         (
             await session.scalars(
-                select(User).order_by(User.created_at.desc(), User.id).limit(limit).offset(offset)
+                statement.order_by(User.created_at.desc(), User.id).limit(limit).offset(offset)
             )
         ).all()
     )
@@ -246,7 +229,17 @@ async def create_user(
     required_permissions = {"user:manage"}
     if role_ids:
         required_permissions.add("role:assign")
-    access = await _lock_and_refresh_actor_access(session, access, required_permissions)
+    password_hash = await hash_password(passwords, payload.password)
+    await acquire_rbac_mutation_lock(session)
+    actor = await session.scalar(locked_users_statement({access.user.id}))
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={actor.id},
+        additional_role_ids=role_ids,
+    )
+    access = await refresh_locked_actor_access(session, actor, required_permissions)
     email = str(payload.email).lower()
     if await session.scalar(select(User.id).where(User.email == email)) is not None:
         raise ApiError(status_code=409, code="email_exists", message="Email already exists")
@@ -258,7 +251,7 @@ async def create_user(
             message="Permission required: role:assign",
         )
     if role_ids:
-        roles = list((await session.scalars(_locked_roles_statement(role_ids))).all())
+        roles = [locked_roles[role_id] for role_id in role_ids if role_id in locked_roles]
         existing_ids = {role.id for role in roles}
         if existing_ids != role_ids:
             raise ApiError(
@@ -268,7 +261,7 @@ async def create_user(
 
     user = User(
         email=email,
-        password_hash=await hash_password(passwords, payload.password),
+        password_hash=password_hash,
         display_name=payload.display_name,
     )
     session.add(user)
@@ -298,21 +291,16 @@ async def update_user(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
 ) -> UserRead:
+    await acquire_rbac_mutation_lock(session)
     locked_users = list(
-        (
-            await session.scalars(
-                select(User)
-                .where(User.id.in_({access.user.id, user_id}))
-                .order_by(User.id)
-                .with_for_update()
-            )
-        ).all()
+        (await session.scalars(locked_users_statement({access.user.id, user_id}))).all()
     )
     users_by_id = {item.id: item for item in locked_users}
+    await lock_role_union(session, user_ids=users_by_id)
     actor = users_by_id.get(access.user.id)
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    access = await _refresh_locked_actor_access(session, actor, {"role:assign"})
+    access = await refresh_locked_actor_access(session, actor, {"user:manage"})
     user = users_by_id.get(user_id)
     if user is None:
         raise ApiError(status_code=404, code="user_not_found", message="User not found")
@@ -378,6 +366,212 @@ async def update_user(
     return await _user_read(session, user)
 
 
+async def _replace_user_password(
+    user_id: UUID,
+    payload: UserPasswordReset,
+    request: Request,
+    response: Response,
+    session: DatabaseSession,
+    access: AccessContext,
+    passwords: PasswordService,
+    *,
+    required_permissions: set[str],
+) -> None:
+    """Replace a password and revoke every previously issued session atomically."""
+
+    is_self_change = access.user.id == user_id
+    current_password = (
+        payload.current_password.get_secret_value()
+        if payload.current_password is not None
+        else None
+    )
+    if not is_self_change and not access.user.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="superuser_required",
+            message="Only a superuser can reset another user's password",
+        )
+    if is_self_change and current_password is None:
+        raise ApiError(
+            status_code=422,
+            code="current_password_required",
+            message="The current password is required when changing your own password",
+        )
+    if not is_self_change and current_password is not None:
+        raise ApiError(
+            status_code=422,
+            code="current_password_not_allowed",
+            message="Do not provide the target user's current password for an administrative reset",
+        )
+
+    verified_password_hash: str | None = None
+    if is_self_change:
+        verified_password_hash = access.user.password_hash
+        if not await verify_password(passwords, current_password or "", verified_password_hash):
+            raise ApiError(
+                status_code=401,
+                code="invalid_current_password",
+                message="The current password is incorrect",
+            )
+
+    # Argon2 work is deliberately completed outside the RBAC critical section.
+    # The resulting one-way hash is safe to hold briefly and keeps the global
+    # policy lock from being occupied by CPU-bound password derivation.
+    password_hash = await hash_password(passwords, payload.new_password.get_secret_value())
+    await acquire_rbac_mutation_lock(session)
+    locked_users = list(
+        (await session.scalars(locked_users_statement({access.user.id, user_id}))).all()
+    )
+    users_by_id = {item.id: item for item in locked_users}
+    await lock_role_union(session, user_ids=users_by_id)
+    actor = users_by_id.get(access.user.id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    access = await refresh_locked_actor_access(session, actor, required_permissions)
+    user = users_by_id.get(user_id)
+    if user is None:
+        raise ApiError(status_code=404, code="user_not_found", message="User not found")
+
+    is_self_change = user.id == actor.id
+    if is_self_change:
+        # Verification happens outside the global RBAC lock. Bind it to the
+        # exact hash now locked so a concurrent password change cannot turn a
+        # stale proof into a successful replacement.
+        if verified_password_hash is None or actor.password_hash != verified_password_hash:
+            raise ApiError(
+                status_code=401,
+                code="invalid_current_password",
+                message="The current password is incorrect",
+            )
+    elif not actor.is_superuser:
+        # Re-check after locking so authorization cannot be won with a stale
+        # access context if the actor changes concurrently.
+        raise ApiError(
+            status_code=403,
+            code="superuser_required",
+            message="Only a superuser can reset another user's password",
+        )
+
+    now = datetime.now(UTC)
+    previous_token_version = user.token_version
+    user.password_hash = password_hash
+    user.token_version += 1
+    revoked = await session.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == user.id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    revoked_count = max(int(getattr(revoked, "rowcount", 0) or 0), 0)
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="user.password.reset",
+        result=AuditResult.SUCCESS,
+        resource_type="user",
+        resource_id=str(user.id),
+        request_id=getattr(request.state, "request_id", None),
+        details={
+            "from_token_version": previous_token_version,
+            "to_token_version": user.token_version,
+            "revoked_refresh_tokens": revoked_count,
+        },
+    )
+    await session.commit()
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+async def _enforce_self_password_change_rate_limit(
+    response: Response,
+    access: AccessContext,
+    redis: Redis,
+    settings: Settings,
+) -> None:
+    limit = settings.login_attempts_per_account_per_minute
+    try:
+        decision = await RateLimiter(redis).check(
+            key=f"rate:password-change:user:{access.user.id}",
+            limit=limit,
+        )
+    except Exception as error:
+        raise ApiError(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="rate_limiter_unavailable",
+            message="Password change rate limiting is temporarily unavailable",
+        ) from error
+    response.headers["X-RateLimit-Limit"] = str(decision.limit)
+    response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+    if not decision.allowed:
+        raise ApiError(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code="rate_limit_exceeded",
+            message="Too many password change attempts",
+            details={"retry_after_seconds": decision.retry_after_seconds},
+            headers={
+                "Retry-After": str(decision.retry_after_seconds),
+                "X-RateLimit-Limit": str(decision.limit),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
+
+
+@router.put("/me/password", status_code=status.HTTP_204_NO_CONTENT)
+async def change_own_password(
+    payload: UserPasswordReset,
+    request: Request,
+    response: Response,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_authenticated_access)],
+    passwords: Annotated[PasswordService, Depends(get_password_service)],
+    redis: Annotated[Redis, Depends(redis_dependency)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Change the signed-in user's password without granting member-management access."""
+
+    await _enforce_self_password_change_rate_limit(response, access, redis, settings)
+    await _replace_user_password(
+        access.user.id,
+        payload,
+        request,
+        response,
+        session,
+        access,
+        passwords,
+        required_permissions=set(),
+    )
+
+
+@router.put("/{user_id}/password", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_user_password(
+    user_id: UUID,
+    payload: UserPasswordReset,
+    request: Request,
+    response: Response,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
+    passwords: Annotated[PasswordService, Depends(get_password_service)],
+    redis: Annotated[Redis, Depends(redis_dependency)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Administratively replace a password; only a live superuser may target another user."""
+
+    if user_id == access.user.id:
+        await _enforce_self_password_change_rate_limit(response, access, redis, settings)
+    await _replace_user_password(
+        user_id,
+        payload,
+        request,
+        response,
+        session,
+        access,
+        passwords,
+        required_permissions={"user:manage"},
+    )
+
+
 @router.put("/{user_id}/roles", response_model=UserRead)
 async def replace_user_roles(
     user_id: UUID,
@@ -386,21 +580,21 @@ async def replace_user_roles(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:assign"))],
 ) -> UserRead:
+    role_ids = set(payload.role_ids)
+    await acquire_rbac_mutation_lock(session)
     locked_users = list(
-        (
-            await session.scalars(
-                select(User)
-                .where(User.id.in_({access.user.id, user_id}))
-                .order_by(User.id)
-                .with_for_update()
-            )
-        ).all()
+        (await session.scalars(locked_users_statement({access.user.id, user_id}))).all()
     )
     users_by_id = {item.id: item for item in locked_users}
+    locked_roles = await lock_role_union(
+        session,
+        user_ids=users_by_id,
+        additional_role_ids=role_ids,
+    )
     actor = users_by_id.get(access.user.id)
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    access = await _refresh_locked_actor_access(session, actor, {"role:assign"})
+    access = await refresh_locked_actor_access(session, actor, {"role:assign"})
     user = users_by_id.get(user_id)
     if user is None:
         raise ApiError(status_code=404, code="user_not_found", message="User not found")
@@ -428,8 +622,15 @@ async def replace_user_roles(
                 code="last_superuser_protected",
                 message="The final active superuser's roles cannot be replaced",
             )
-    role_ids = set(payload.role_ids)
-    roles = list((await session.scalars(_locked_roles_statement(role_ids))).all())
+    current_version = user.role_assignment_version
+    if payload.expected_version != current_version:
+        raise ApiError(
+            status_code=409,
+            code="stale_role_assignment",
+            message="The user's role assignment changed; reload it before retrying",
+            details={"current_version": current_version},
+        )
+    roles = [locked_roles[role_id] for role_id in role_ids if role_id in locked_roles]
     existing_ids = {role.id for role in roles}
     if existing_ids != role_ids:
         raise ApiError(
@@ -449,20 +650,24 @@ async def replace_user_roles(
             resource_id=str(user.id),
             user_id=user.id,
         )
-    await session.execute(delete(UserRole).where(UserRole.user_id == user_id))
-    for role_id in role_ids:
-        session.add(UserRole(user_id=user_id, role_id=role_id, assigned_by=access.user.id))
-    user.token_version += 1
-    add_audit_event(
-        session,
-        actor_id=access.user.id,
-        action="user.roles.replaced",
-        result=AuditResult.SUCCESS,
-        resource_type="user",
-        resource_id=str(user.id),
-        request_id=getattr(request.state, "request_id", None),
-        details={"roles": [str(item) for item in role_ids]},
-    )
+        await session.execute(delete(UserRole).where(UserRole.user_id == user_id))
+        for role_id in role_ids:
+            session.add(UserRole(user_id=user_id, role_id=role_id, assigned_by=access.user.id))
+        user.role_assignment_version += 1
+        user.token_version += 1
+        add_audit_event(
+            session,
+            actor_id=access.user.id,
+            action="user.roles.replaced",
+            result=AuditResult.SUCCESS,
+            resource_type="user",
+            resource_id=str(user.id),
+            request_id=getattr(request.state, "request_id", None),
+            details={
+                "from_version": current_version,
+                "to_version": user.role_assignment_version,
+            },
+        )
     await session.commit()
     await session.refresh(user)
     return await _user_read(session, user)

@@ -48,6 +48,7 @@ from app.schemas.files import (
 from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
+from app.services.list_search import literal_contains_pattern
 from app.services.quota import QuotaService, QuotaSpec, daily_window_start, lifetime_window_start
 from app.services.storage import StorageService, StoredObject
 from app.services.storage_capacity import (
@@ -283,6 +284,7 @@ async def list_files(
     access: Annotated[AccessContext, Depends(require_permission("file:read"))],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
 ) -> list[File]:
     statement = select(File).where(File.deleted_at.is_(None))
     if not access.allows("file:read:any"):
@@ -308,6 +310,10 @@ async def list_files(
                 role_grant,
             )
         )
+    term = search.strip() if search else ""
+    if term:
+        pattern = literal_contains_pattern(term)
+        statement = statement.where(File.original_name.ilike(pattern, escape="\\"))
     statement = statement.order_by(File.created_at.desc(), File.id).limit(limit).offset(offset)
     return list((await session.scalars(statement)).all())
 
@@ -399,9 +405,7 @@ async def initiate_upload(
                 upload_session_id=str(existing.id),
                 expected_size_bytes=existing.expected_size_bytes,
                 plan=plan,
-                expected_checksum_sha256_base64=_checksum_base64(
-                    existing_file.checksum_value
-                ),
+                expected_checksum_sha256_base64=_checksum_base64(existing_file.checksum_value),
             )
             return _initiate_response(
                 existing,
@@ -611,9 +615,8 @@ async def create_part_urls(
         incoming_bytes=0,
         is_bulk=True,
     )
-    if (
-        upload.status is UploadSessionStatus.INITIATED
-        and as_utc(upload.expires_at) <= datetime.now(UTC)
+    if upload.status is UploadSessionStatus.INITIATED and as_utc(upload.expires_at) <= datetime.now(
+        UTC
     ):
         raise ApiError(status_code=410, code="upload_expired", message="Upload session has expired")
     if any(number < 1 or number > upload.part_count for number in payload.part_numbers):
@@ -672,9 +675,8 @@ async def complete_upload(
             code="upload_state_conflict",
             message="Upload is not active",
         )
-    if (
-        upload.status is UploadSessionStatus.INITIATED
-        and as_utc(upload.expires_at) <= datetime.now(UTC)
+    if upload.status is UploadSessionStatus.INITIATED and as_utc(upload.expires_at) <= datetime.now(
+        UTC
     ):
         raise ApiError(status_code=410, code="upload_expired", message="Upload session has expired")
 
@@ -745,7 +747,12 @@ async def complete_upload(
                 destination_key=final_key,
                 upload_session_id=str(upload_session_id),
             )
-    assert stored is not None
+    if stored is None:
+        raise ApiError(
+            status_code=409,
+            code="stored_object_missing",
+            message="The uploaded object is not available in storage",
+        )
 
     rejection_code: str | None = None
     rejection_action: str | None = None
@@ -1075,60 +1082,51 @@ async def approve_processed_file(
         )
 
     latest_conversion = await session.scalar(
-        select(OkfConversionJob)
-        .where(OkfConversionJob.file_id == file.id)
-        .order_by(OkfConversionJob.file_version.desc())
-        .limit(1)
+        select(OkfConversionJob).where(
+            OkfConversionJob.file_id == file.id,
+            OkfConversionJob.file_version == file.version,
+        )
     )
-    if latest_conversion is not None and latest_conversion.status in {
-        OkfConversionStatus.PENDING,
-        OkfConversionStatus.PROCESSING,
-        OkfConversionStatus.RETRY_WAIT,
-    }:
+    if latest_conversion is None or latest_conversion.status is not OkfConversionStatus.SUCCEEDED:
         raise ApiError(
             status_code=409,
-            code="okf_conversion_in_progress",
-            message="The latest OKF conversion must finish before this file can be approved",
-            details={"status": latest_conversion.status.value},
+            code="okf_conversion_not_completed",
+            message=(
+                "The current file version requires a successful OKF conversion before approval"
+            ),
+            details={
+                "file_version": file.version,
+                "status": latest_conversion.status.value if latest_conversion is not None else None,
+            },
         )
 
-    generated_entry: KnowledgeEntry | None = None
-    if latest_conversion is not None and latest_conversion.status is OkfConversionStatus.SUCCEEDED:
-        if latest_conversion.output_entry_id is None:
-            raise ApiError(
-                status_code=409,
-                code="okf_conversion_result_missing",
-                message="The completed OKF conversion has no generated draft to approve",
-            )
-        generated_entry = await session.scalar(
-            select(KnowledgeEntry)
-            .where(
-                KnowledgeEntry.id == latest_conversion.output_entry_id,
-                KnowledgeEntry.source_file_id == file.id,
-                KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
-            )
-            .with_for_update()
+    if latest_conversion.output_entry_id is None:
+        raise ApiError(
+            status_code=409,
+            code="okf_conversion_result_missing",
+            message="The completed OKF conversion has no generated draft to approve",
         )
-        if generated_entry is None:
-            raise ApiError(
-                status_code=409,
-                code="okf_conversion_result_missing",
-                message="The completed OKF conversion draft is unavailable for approval",
-            )
+    generated_entry = await session.scalar(
+        select(KnowledgeEntry)
+        .where(
+            KnowledgeEntry.id == latest_conversion.output_entry_id,
+            KnowledgeEntry.source_file_id == file.id,
+            KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
+        )
+        .with_for_update()
+    )
+    if generated_entry is None:
+        raise ApiError(
+            status_code=409,
+            code="okf_conversion_result_missing",
+            message="The completed OKF conversion draft is unavailable for approval",
+        )
 
     file.status = FileStatus.AVAILABLE
     file.available_at = datetime.now(UTC)
-    if generated_entry is not None:
-        generated_entry.publication_status = KnowledgeEntryPublicationStatus.PUBLISHED
-        file.knowledge_status = KnowledgeIngestionStatus.INDEXED
-        file.knowledge_error_code = None
-    elif latest_conversion is not None:
-        file.knowledge_status = (
-            KnowledgeIngestionStatus.UNSUPPORTED
-            if latest_conversion.status is OkfConversionStatus.UNSUPPORTED
-            else KnowledgeIngestionStatus.FAILED
-        )
-        file.knowledge_error_code = latest_conversion.error_code
+    generated_entry.publication_status = KnowledgeEntryPublicationStatus.PUBLISHED
+    file.knowledge_status = KnowledgeIngestionStatus.INDEXED
+    file.knowledge_error_code = None
     add_audit_event(
         session,
         actor_id=access.user.id,

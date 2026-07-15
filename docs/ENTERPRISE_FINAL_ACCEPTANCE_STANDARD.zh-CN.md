@@ -102,7 +102,8 @@ uv run --no-sync python scripts/acceptance.py `
   --host-disk-path /srv `
   --host-io-evidence /srv/heyi-knowledgebases-offline/evidence/host-io.json `
   --storage-chain-evidence /srv/heyi-knowledgebases-offline/evidence/watermark-chain.json `
-  --offline-env-file /srv/heyi-knowledgebases-offline/shared/offline.env `
+  --offline-runtime-env-file /srv/heyi-knowledgebases-offline/shared/runtime.env `
+  --offline-release-env-file /srv/heyi-knowledgebases-offline/releases/<content-sha>/release.env `
   --offline-image-manifest /srv/heyi-knowledgebases-offline/evidence/offline-images.txt `
   --offline-runtime-evidence /srv/heyi-knowledgebases-offline/evidence/offline-runtime/offline-runtime-evidence.json `
   --e2e-evidence /srv/heyi-knowledgebases-offline/evidence/browser-e2e.json `
@@ -112,6 +113,13 @@ uv run --no-sync python scripts/acceptance.py `
   --e2e-signing-key-id browser-e2e-ed25519 `
   --malware-evidence /srv/heyi-knowledgebases-offline/evidence/malware.json `
   --security-scan-evidence /srv/heyi-knowledgebases-offline/evidence/security-scan.json `
+  --release-id <immutable-release-id> `
+  --capacity-evidence /srv/heyi-knowledgebases-offline/evidence/capacity/enterprise-capacity.json `
+  --capacity-evidence-signature /srv/heyi-knowledgebases-offline/evidence/capacity/enterprise-capacity.sig `
+  --capacity-evidence-public-key /etc/heyi-acceptance/operational-ed25519.pub `
+  --disaster-recovery-evidence /srv/heyi-knowledgebases-offline/evidence/dr/enterprise-disaster-recovery.json `
+  --disaster-recovery-evidence-signature /srv/heyi-knowledgebases-offline/evidence/dr/enterprise-disaster-recovery.sig `
+  --disaster-recovery-evidence-public-key /etc/heyi-acceptance/operational-ed25519.pub `
   --report-dir artifacts/acceptance/final
 ```
 
@@ -124,6 +132,8 @@ uv run --no-sync python scripts/acceptance.py `
 `--functional-trust-store` 必须是仓库外 root 所有的 `0400/0600` 非符号链接普通文件；`--functional-challenge-store` 必须是仓库外 root 所有的 `0700` 非符号链接目录，内部 challenge 为 `0400/0600` 普通文件；`--e2e-signing-key-path` 同样必须是仓库外 root 所有的受保护普通文件。`HOST-P0-001` 和 `STORAGE-WATERMARK-P0-001` 分别以模块入口消费显式的 `--host-io-evidence` 与 `--storage-chain-evidence`。`OFFLINE-P0-001` 必须先以 root 执行 `preflight-offline.sh`，`OFFLINE-IMAGES-P0-001` 再执行 `verify-offline-images.sh verify`；`OFFLINE-RUNTIME-P0-001` 独立验签 `--offline-runtime-evidence` 中的断网冷启动、业务闭环、持久化和网络恢复证据。只完成 RepoDigest、Compose 渲染或单元测试 fake runner 不能通过离线终验。`FORMAT-P0-001` 必须在内容寻址 API 镜像内执行 `python -m app.document_parser_preflight --require-all`；缺少 PDF/旧版 Office 工具或隔离沙箱时返回码 2 并记为 `blocked`。
 
 所有目标证据路径必须由命令行显式给出为 Linux 绝对路径。验收器不读取开发机 `.env` 推断路径或秘密；输入证据在运行前必须存在且是非符号链接的普通文件，下游验证器还会核对数据挂载、采集范围、原始工件哈希与目标内容指纹。离线运行态证据还必须来自 `subprocess-v1`、`result=passed`，匹配当前 Git、内容和同一次 Linux 启动的主机指纹，全部 11 项检查与原始工件 SHA-256/字节数/整体 attestation 均有效且不超过 24 小时。缺参数、Windows、非 root、test-only/fake、证据缺失或证据不属于目标运行均为 `blocked`，不得误报 `PASS`。`MALWARE-P0-001` 与 `SECURITY-SCAN-P0-001` 使用内容寻址的正式证据文档，并要求目标 Git/工作树内容指纹完全匹配。证据格式见 [终验正式证据格式](./ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md)。
+
+`CAPACITY-P0-001` 必须同时验证控制面报告、真实模型稳态吞吐以及供应商/私有推理集群配额；控制面桩测试不得提升为模型容量证明。`DR-P0-001` 必须验证全新隔离主机的真实恢复、RPO/RTO、数据库一致性、1,000 对象哈希与业务闭环。两项均使用 detached Ed25519 签名，并绑定同一个当前 Git HEAD、工作树内容指纹和显式 `--release-id`。缺任一证据、签名或公钥时保持 `blocked/FAIL`，不会回退到静态声明、旧版升级备份证据或模拟结果。详细契约见 [终验正式证据格式](./ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md)。
 
 ## 7. 签署规则
 

@@ -32,11 +32,7 @@ def test_add_audit_event_requires_the_writer_to_choose_a_result() -> None:
 def test_audit_result_has_a_dedicated_indexed_column() -> None:
     table = cast(Table, AuditLog.__table__)
     result = table.c.result
-    indexed_columns = {
-        column.name
-        for index in table.indexes
-        for column in index.columns
-    }
+    indexed_columns = {column.name for index in table.indexes for column in index.columns}
 
     assert result.nullable is False
     assert "result" in indexed_columns
@@ -84,7 +80,5 @@ async def test_audit_result_filter_uses_persisted_result_not_action_suffix(
     )
 
     assert response.status_code == 200, response.text
-    assert [item["resource_id"] for item in response.json()["items"]] == [
-        "failed-closed"
-    ]
+    assert [item["resource_id"] for item in response.json()["items"]] == ["failed-closed"]
     assert response.json()["items"][0]["result"] == "failure"

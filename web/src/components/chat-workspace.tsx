@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
 import { AnswerSources } from "@/components/answer-sources";
@@ -10,12 +10,18 @@ import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import { parseChatReply } from "@/lib/chat-contract";
 import { createChatIdempotencyController } from "@/lib/chat-idempotency";
 import { answerWithoutEmbeddedSources } from "@/lib/chat-sources";
+import { CHAT_BROWSER_TIMEOUT_MS } from "@/lib/chat-timeout-budget";
 import { scrollIntoViewIfSupported } from "@/lib/dom";
+import {
+  candidatesWithSelection,
+  knowledgeCandidatePagePath,
+  mergeKnowledgeCandidates,
+  splitKnowledgeCandidatePage,
+} from "@/lib/knowledge-base-catalog";
 import { createRequestDeadline, type RequestDeadline } from "@/lib/request-deadline";
 import type { ChatMessage, KnowledgeBase } from "@/lib/types";
 
 const CHAT_MESSAGE_MAX_LENGTH = 2_000;
-const CHAT_REQUEST_TIMEOUT_MS = 70_000;
 
 const suggestions = [
   "帮我总结这个知识库中的主要制度。",
@@ -34,10 +40,15 @@ export function ChatWorkspace() {
   const { can, loading: accessLoading, me } = useAccess();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [knowledgeBaseId, setKnowledgeBaseId] = useState("");
+  const [selectedKnowledgeBase, setSelectedKnowledgeBase] = useState<KnowledgeBase | null>(null);
+  const [knowledgeQuery, setKnowledgeQuery] = useState("");
+  const [activeKnowledgeQuery, setActiveKnowledgeQuery] = useState("");
+  const [knowledgeHasMore, setKnowledgeHasMore] = useState(false);
+  const [knowledgeCatalogLoading, setKnowledgeCatalogLoading] = useState(false);
+  const [knowledgeCatalogError, setKnowledgeCatalogError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
-  const [loadError, setLoadError] = useState("");
   const [serviceHint, setServiceHint] = useState("正在连接知识检索");
   const [serviceState, setServiceState] = useState<"connected" | "warning">("warning");
   const [retryFailureId, setRetryFailureId] = useState<string | null>(null);
@@ -45,28 +56,67 @@ export function ChatWorkspace() {
   const activeRequestRef = useRef<RequestDeadline | null>(null);
   const idempotencyRef = useRef(createChatIdempotencyController());
   const retryOperationRef = useRef<ChatOperation | null>(null);
+  const knowledgeRequestId = useRef(0);
+  const knowledgeBaseIdRef = useRef("");
 
-  useEffect(() => {
-    let active = true;
-    async function loadKnowledgeBases() {
-      try {
-        const items = await apiRequest<KnowledgeBase[]>("/api/v1/knowledge-bases");
-        if (!active) return;
-        setKnowledgeBases(items);
-        setKnowledgeBaseId((current) => current || items[0]?.id || "");
-        setServiceHint(items.length ? "知识检索已连接" : "暂无可访问知识库");
-        setServiceState(items.length ? "connected" : "warning");
-      } catch (reason) {
-        if (!active) return;
-        setKnowledgeBases([]);
-        setLoadError(readableError(reason));
-        setServiceHint(reason instanceof ApiClientError && [404, 501].includes(reason.status) ? "问答服务尚未接入" : "连接异常");
+  const loadKnowledgeBases = useCallback(async ({
+    search = activeKnowledgeQuery,
+    offset = 0,
+    append = false,
+  }: { search?: string; offset?: number; append?: boolean } = {}) => {
+    const requestId = ++knowledgeRequestId.current;
+    setKnowledgeCatalogLoading(true);
+    setKnowledgeCatalogError("");
+    try {
+      const response = await apiRequest<KnowledgeBase[]>(knowledgeCandidatePagePath({
+        offset,
+        query: search,
+        minimumAccessLevel: "reader",
+      }));
+      if (requestId !== knowledgeRequestId.current) return;
+      const page = splitKnowledgeCandidatePage(response);
+      setKnowledgeBases((current) => mergeKnowledgeCandidates(current ?? [], page.items, !append));
+      setKnowledgeHasMore(page.hasMore);
+
+      const selectedId = knowledgeBaseIdRef.current;
+      const refreshedSelection = selectedId
+        ? page.items.find((item) => item.id === selectedId)
+        : page.items[0];
+      if (!selectedId && refreshedSelection) {
+        knowledgeBaseIdRef.current = refreshedSelection.id;
+        setKnowledgeBaseId(refreshedSelection.id);
+        setSelectedKnowledgeBase(refreshedSelection);
+      } else if (refreshedSelection) {
+        setSelectedKnowledgeBase(refreshedSelection);
+      }
+
+      const hasSelection = Boolean(knowledgeBaseIdRef.current || refreshedSelection);
+      setServiceHint(hasSelection ? "知识检索已连接" : "暂无可访问知识库");
+      setServiceState(hasSelection ? "connected" : "warning");
+    } catch (reason) {
+      if (requestId !== knowledgeRequestId.current) return;
+      setKnowledgeBases((current) => current ?? []);
+      setKnowledgeCatalogError(readableError(reason));
+      if (!knowledgeBaseIdRef.current) {
+        setServiceHint(
+          reason instanceof ApiClientError && [404, 501].includes(reason.status)
+            ? "问答服务尚未接入"
+            : "连接异常",
+        );
         setServiceState("warning");
       }
+    } finally {
+      if (requestId === knowledgeRequestId.current) setKnowledgeCatalogLoading(false);
     }
-    void loadKnowledgeBases();
-    return () => { active = false; };
-  }, []);
+  }, [activeKnowledgeQuery]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => void loadKnowledgeBases(), 0);
+    return () => {
+      window.clearTimeout(timeout);
+      knowledgeRequestId.current += 1;
+    };
+  }, [loadKnowledgeBases]);
 
   useEffect(() => {
     scrollIntoViewIfSupported(bottomRef.current, { behavior: "smooth" });
@@ -103,7 +153,7 @@ export function ChatWorkspace() {
     idempotencyKey: string,
     appendUserMessage: boolean,
   ) {
-    const deadline = createRequestDeadline(CHAT_REQUEST_TIMEOUT_MS);
+    const deadline = createRequestDeadline(CHAT_BROWSER_TIMEOUT_MS);
     activeRequestRef.current = deadline;
     retryOperationRef.current = operation;
     if (appendUserMessage) {
@@ -220,6 +270,28 @@ export function ChatWorkspace() {
   const canQuery = !accessLoading && can("chat:query");
   const ready = canQuery && Boolean(knowledgeBaseId);
   const displayName = me?.display_name?.trim() || me?.email.split("@")[0] || "您好";
+  const knowledgeBaseOptions = candidatesWithSelection(
+    knowledgeBases ?? [],
+    selectedKnowledgeBase,
+  );
+
+  function searchKnowledgeBases(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const nextQuery = knowledgeQuery.trim();
+    if (nextQuery === activeKnowledgeQuery) {
+      void loadKnowledgeBases({ search: nextQuery, offset: 0, append: false });
+    } else {
+      setActiveKnowledgeQuery(nextQuery);
+    }
+  }
+
+  function selectKnowledgeBase(nextId: string) {
+    const next = knowledgeBaseOptions.find((item) => item.id === nextId) ?? null;
+    knowledgeBaseIdRef.current = nextId;
+    setKnowledgeBaseId(nextId);
+    setSelectedKnowledgeBase(next);
+    startNewConversation();
+  }
 
   return (
     <section className="chat-layout">
@@ -231,18 +303,47 @@ export function ChatWorkspace() {
             <span>有什么可以帮您？每个回答都会附上可核验的答案来源。</span>
           </div>
           <div className="chat-controls">
+            <form className="chat-knowledge-search" role="search" onSubmit={searchKnowledgeBases}>
+              <input
+                aria-label="搜索可问答知识库"
+                type="search"
+                maxLength={200}
+                value={knowledgeQuery}
+                onChange={(event) => setKnowledgeQuery(event.target.value)}
+                placeholder="搜索全部授权知识库"
+              />
+              <button className="button secondary small" type="submit" disabled={knowledgeCatalogLoading}>
+                搜索
+              </button>
+            </form>
             <select
               aria-label="选择知识库"
               value={knowledgeBaseId}
-              onChange={(event) => {
-                setKnowledgeBaseId(event.target.value);
-                startNewConversation();
-              }}
-              disabled={!knowledgeBases?.length || pending}
+              onChange={(event) => selectKnowledgeBase(event.target.value)}
+              disabled={!knowledgeBaseOptions.length || pending}
             >
-              {!knowledgeBases?.length ? <option value="">暂无可访问知识库</option> : null}
-              {knowledgeBases?.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+              {!knowledgeBaseOptions.length ? <option value="">暂无可访问知识库</option> : null}
+              {knowledgeBaseOptions.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
             </select>
+            {knowledgeHasMore ? (
+              <button
+                className="button secondary small"
+                type="button"
+                disabled={knowledgeCatalogLoading}
+                onClick={() => void loadKnowledgeBases({
+                  search: activeKnowledgeQuery,
+                  offset: knowledgeBases?.length ?? 0,
+                  append: true,
+                })}
+              >
+                {knowledgeCatalogLoading ? "正在加载…" : "加载更多知识库"}
+              </button>
+            ) : null}
+            {knowledgeCatalogError ? (
+              <span className="chat-catalog-error" role="status">
+                知识库列表加载失败；当前对话仍可继续。{knowledgeCatalogError}
+              </span>
+            ) : null}
             <span className="chat-status" data-state={serviceState} aria-live="polite"><span />{serviceHint}</span>
             <button className="button secondary small" type="button" onClick={startNewConversation}>
               <Icon name="plus" /> 新对话
@@ -253,8 +354,12 @@ export function ChatWorkspace() {
           {messages.length === 0 ? (
             <div className="chat-welcome">
               <span className="chat-orb"><Icon name="spark" /></span>
-              <h2>{knowledgeBases === null ? "正在读取知识库…" : knowledgeBases.length ? "今天想了解什么？" : "还没有可问答的知识库"}</h2>
-              <p>{loadError || (knowledgeBases?.length ? "先选择一个知识库，再从授权内容中检索答案与来源。" : "请联系管理员授予知识库访问权限，或先在管理控制台创建知识库。")}</p>
+              <h2>{knowledgeBases === null ? "正在读取知识库…" : knowledgeBaseId ? "今天想了解什么？" : "还没有可问答的知识库"}</h2>
+              <p>{!knowledgeBaseId && knowledgeCatalogError
+                ? knowledgeCatalogError
+                : knowledgeBaseId
+                  ? "先选择一个知识库，再从授权内容中检索答案与来源。"
+                  : "请联系管理员授予知识库访问权限，或先在管理控制台创建知识库。"}</p>
               {ready ? (
                 <div className="suggestion-grid">
                   {suggestions.map((suggestion) => (

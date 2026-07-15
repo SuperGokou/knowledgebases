@@ -320,10 +320,11 @@ def _raw_artifact_matches(
     quota = payload.get("quota_probe")
     if not all(isinstance(value, dict) for value in (result, filesystem, minio, quota)):
         return False
-    assert isinstance(result, dict)
-    assert isinstance(filesystem, dict)
-    assert isinstance(minio, dict)
-    assert isinstance(quota, dict)
+    result = cast(dict[str, object], result)
+    filesystem = cast(dict[str, object], filesystem)
+    minio = cast(dict[str, object], minio)
+    quota = cast(dict[str, object], quota)
+    filesystem_total_bytes = filesystem.get("total_bytes")
     scenario_keys = (
         "watermark_percent",
         "operation",
@@ -342,8 +343,8 @@ def _raw_artifact_matches(
         return False
     return bool(
         filesystem.get("used_percent") == raw.get("watermark_percent")
-        and isinstance(filesystem.get("total_bytes"), int)
-        and int(filesystem["total_bytes"]) > 0
+        and isinstance(filesystem_total_bytes, int)
+        and filesystem_total_bytes > 0
         and minio.get("object_count") == raw.get("object_count_after")
         and minio.get("object_bytes") == raw.get("object_bytes_after")
         and minio.get("multipart_sessions") == raw.get("multipart_sessions_after")

@@ -1,12 +1,25 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { apiRequest, formatBytes, readableError } from "@/lib/api-client";
 import { fileKnowledgePresentation } from "@/lib/file-knowledge-status";
+import {
+  candidatesWithSelection,
+  knowledgeCandidatePagePath,
+  mergeKnowledgeCandidates,
+  splitKnowledgeCandidatePage,
+} from "@/lib/knowledge-base-catalog";
+import {
+  ADMIN_LIST_PAGE_SIZE,
+  buildOffsetListPath,
+  offsetPageNumber,
+  previousOffset,
+  splitOffsetPage,
+} from "@/lib/offset-pagination";
 import type { FileRecord, KnowledgeBase, PartUrlResponse, UploadPlan } from "@/lib/types";
 
 type CompletedPart = { part_number: number; etag: string };
@@ -57,60 +70,98 @@ export function FilesPanel() {
   const [files, setFiles] = useState<FileRecord[] | null>(null);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [knowledgeBaseId, setKnowledgeBaseId] = useState("");
+  const [selectedKnowledgeBase, setSelectedKnowledgeBase] = useState<KnowledgeBase | null>(null);
+  const [knowledgeQuery, setKnowledgeQuery] = useState("");
+  const [debouncedKnowledgeQuery, setDebouncedKnowledgeQuery] = useState("");
+  const [knowledgeHasMore, setKnowledgeHasMore] = useState(false);
+  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
+  const [knowledgeError, setKnowledgeError] = useState("");
   const [selected, setSelected] = useState<File | null>(null);
   const [query, setQuery] = useState("");
+  const [activeSearch, setActiveSearch] = useState("");
+  const [fileOffset, setFileOffset] = useState(0);
+  const [hasNextFiles, setHasNextFiles] = useState(false);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const [progress, setProgress] = useState(0);
   const [phase, setPhase] = useState("");
   const [dragging, setDragging] = useState(false);
+  const knowledgeRequestId = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({
+    offset = fileOffset,
+    search = activeSearch,
+  }: { offset?: number; search?: string } = {}) => {
     if (accessLoading) return;
     setError("");
     if (!can("file:read")) {
       setFiles([]);
+      setHasNextFiles(false);
       return;
     }
     try {
-      setFiles(await apiRequest<FileRecord[]>("/api/v1/files?limit=100&offset=0"));
+      const items = await apiRequest<FileRecord[]>(
+        buildOffsetListPath("/api/v1/files", { offset, search }),
+      );
+      const page = splitOffsetPage(items);
+      setFiles(page.items);
+      setHasNextFiles(page.hasNext);
     } catch (reason) {
       setError(readableError(reason));
     }
-  }, [accessLoading, can]);
+  }, [accessLoading, activeSearch, can, fileOffset]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(timeout);
   }, [load]);
 
-  useEffect(() => {
-    if (accessLoading || !can("file:upload")) {
-      return;
+  const loadKnowledgeBases = useCallback(async (
+    search: string,
+    offset: number,
+    replace: boolean,
+  ) => {
+    if (accessLoading || !can("file:upload")) return;
+    const requestId = ++knowledgeRequestId.current;
+    setKnowledgeLoading(true);
+    setKnowledgeError("");
+    try {
+      const items = await apiRequest<KnowledgeBase[]>(knowledgeCandidatePagePath({
+        offset,
+        query: search,
+        minimumAccessLevel: "editor",
+      }));
+      if (requestId !== knowledgeRequestId.current) return;
+      const page = splitKnowledgeCandidatePage(items);
+      setKnowledgeBases((current) => mergeKnowledgeCandidates(current ?? [], page.items, replace));
+      setKnowledgeHasMore(page.hasMore);
+      setSelectedKnowledgeBase((current) => {
+        if (current) return page.items.find((item) => item.id === current.id) ?? current;
+        return page.items[0] ?? null;
+      });
+      setKnowledgeBaseId((current) => current || page.items[0]?.id || "");
+    } catch (reason) {
+      if (requestId === knowledgeRequestId.current) setKnowledgeError(readableError(reason));
+    } finally {
+      if (requestId === knowledgeRequestId.current) setKnowledgeLoading(false);
     }
-    let active = true;
-    async function loadKnowledgeBases() {
-      try {
-        const items = await apiRequest<KnowledgeBase[]>("/api/v1/knowledge-bases");
-        if (!active) return;
-        const editable = items.filter((item) => item.access_level === "editor" || item.access_level === "manager");
-        setKnowledgeBases(editable);
-        setKnowledgeBaseId((current) => current || editable[0]?.id || "");
-      } catch (reason) {
-        if (!active) return;
-        setKnowledgeBases([]);
-        setError(readableError(reason));
-      }
-    }
-    void loadKnowledgeBases();
-    return () => { active = false; };
   }, [accessLoading, can]);
 
-  const filtered = useMemo(() => {
-    if (!files) return [];
-    const needle = query.trim().toLowerCase();
-    return needle ? files.filter((file) => file.original_name.toLowerCase().includes(needle)) : files;
-  }, [files, query]);
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => setDebouncedKnowledgeQuery(knowledgeQuery.trim()),
+      300,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [knowledgeQuery]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      () => void loadKnowledgeBases(debouncedKnowledgeQuery, 0, true),
+      0,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [debouncedKnowledgeQuery, loadKnowledgeBases]);
 
   async function upload() {
     if (!selected || !knowledgeBaseId || pending || !can("file:upload")) return;
@@ -177,7 +228,10 @@ export function FilesPanel() {
       setProgress(100);
       setPhase("上传完成，正在生成知识草稿");
       setSelected(null);
-      await load();
+      setQuery("");
+      setActiveSearch("");
+      setFileOffset(0);
+      await load({ offset: 0, search: "" });
     } catch (reason) {
       setError(readableError(reason));
       setPhase("上传未完成");
@@ -206,6 +260,10 @@ export function FilesPanel() {
 
   const canReadFiles = !accessLoading && can("file:read");
   const canUploadFiles = !accessLoading && can("file:upload");
+  const selectableKnowledgeBases = candidatesWithSelection(
+    knowledgeBases ?? [],
+    selectedKnowledgeBase,
+  );
 
   return (
     <div className="page-stack">
@@ -215,11 +273,50 @@ export function FilesPanel() {
           <div className="panel-header"><div><h2>上传文件</h2><p>文件字节直接进入对象存储</p></div><Icon name="upload" /></div>
           <div className="panel-body">
             <label>目标知识库
-              <select value={knowledgeBaseId} onChange={(event) => setKnowledgeBaseId(event.target.value)} disabled={pending || !knowledgeBases?.length}>
-                {!knowledgeBases?.length ? <option value="">没有可编辑的知识库</option> : null}
-                {knowledgeBases?.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+              <select
+                value={knowledgeBaseId}
+                onChange={(event) => {
+                  const next = selectableKnowledgeBases.find((item) => item.id === event.target.value) ?? null;
+                  setKnowledgeBaseId(next?.id ?? "");
+                  setSelectedKnowledgeBase(next);
+                }}
+                disabled={pending || !selectableKnowledgeBases.length}
+              >
+                {!selectableKnowledgeBases.length ? <option value="">没有可编辑的知识库</option> : null}
+                {selectableKnowledgeBases.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
               </select>
             </label>
+            <label>搜索可编辑知识库
+              <input
+                type="search"
+                maxLength={200}
+                value={knowledgeQuery}
+                onChange={(event) => setKnowledgeQuery(event.target.value)}
+                placeholder="输入知识库名称"
+                disabled={pending}
+              />
+            </label>
+            {knowledgeError ? (
+              <ErrorState
+                message={knowledgeError}
+                onRetry={() => void loadKnowledgeBases(debouncedKnowledgeQuery, 0, true)}
+              />
+            ) : null}
+            {knowledgeLoading ? <p className="field-hint" aria-live="polite">正在加载可编辑知识库…</p> : null}
+            {knowledgeHasMore ? (
+              <button
+                className="button secondary small"
+                type="button"
+                disabled={knowledgeLoading || pending}
+                onClick={() => void loadKnowledgeBases(
+                  debouncedKnowledgeQuery,
+                  knowledgeBases?.length ?? 0,
+                  false,
+                )}
+              >
+                {knowledgeLoading ? "正在加载…" : "加载更多知识库"}
+              </button>
+            ) : null}
             <div
               className={`upload-drop${dragging ? " dragging" : ""}`}
               onDragOver={(event) => event.preventDefault()}
@@ -255,16 +352,24 @@ export function FilesPanel() {
         {canReadFiles ? <article className={`panel ${canUploadFiles ? "span-8" : "span-12"}`}>
           <div className="panel-header">
             <div><h2>文件中心</h2><p>查看上传、处理、隔离和可用状态</p></div>
-            <div className="toolbar"><div className="search-box"><Icon name="search" /><input aria-label="搜索文件名" placeholder="搜索文件名" value={query} onChange={(event) => setQuery(event.target.value)} /></div><button className="button ghost small" type="button" onClick={() => void load()}><Icon name="refresh" />刷新</button></div>
+            <form className="toolbar" role="search" onSubmit={(event) => {
+              event.preventDefault();
+              setFileOffset(0);
+              setActiveSearch(query.trim());
+            }}>
+              <div className="search-box"><Icon name="search" /><input aria-label="搜索文件名" maxLength={200} placeholder="搜索全部文件名" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
+              <button className="button secondary small" type="submit">搜索</button>
+              <button className="button ghost small" type="button" onClick={() => void load()}><Icon name="refresh" />刷新</button>
+            </form>
           </div>
           {files === null && !error ? <LoadingRows count={5} /> : null}
-          {files?.length === 0 ? <EmptyState compact icon="file" title="还没有文件" description="从左侧选择文件开始上传，上传完成后将在这里显示处理状态。" /> : null}
+          {files?.length === 0 ? <EmptyState compact icon={activeSearch ? "search" : "file"} title={activeSearch ? "没有匹配文件" : "还没有文件"} description={activeSearch ? "尝试更换搜索关键词。" : "从左侧选择文件开始上传，上传完成后将在这里显示处理状态。"} /> : null}
           {files?.length ? (
             <div className="table-wrap">
               <table>
                 <thead><tr><th>文件</th><th>大小</th><th>文件状态</th><th>知识状态</th><th>更新时间</th><th>操作</th></tr></thead>
                 <tbody>
-                  {filtered.map((file) => (
+                  {files.map((file) => (
                     <tr key={file.id}>
                       <td><div className="primary-cell"><span className="file-icon"><Icon name="file" /></span><span><strong>{file.original_name}</strong><small>{file.content_type}</small></span></div></td>
                       <td>{formatBytes(file.size_bytes)}</td>
@@ -283,7 +388,13 @@ export function FilesPanel() {
                   ))}
                 </tbody>
               </table>
-              {filtered.length === 0 ? <EmptyState compact icon="search" title="没有匹配文件" description="尝试更换搜索关键词。" /> : null}
+              <nav className="pagination-bar" aria-label="文件列表分页">
+                <span>第 {offsetPageNumber(fileOffset)} 页 · 本页 {files.length} 项</span>
+                <div className="button-row">
+                  <button className="button ghost small" type="button" disabled={fileOffset === 0} onClick={() => setFileOffset(previousOffset(fileOffset))}>上一页</button>
+                  <button className="button ghost small" type="button" disabled={!hasNextFiles} onClick={() => setFileOffset(fileOffset + ADMIN_LIST_PAGE_SIZE)}>下一页</button>
+                </div>
+              </nav>
             </div>
           ) : null}
         </article> : null}

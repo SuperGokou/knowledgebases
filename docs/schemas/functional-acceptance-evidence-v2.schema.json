@@ -34,7 +34,8 @@
       "required": ["git_head", "content_fingerprint"],
       "properties": {
         "git_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
-        "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"}
       }
     },
     "collected_at": {"type": "string", "format": "date-time"},
@@ -82,5 +83,11 @@
         "signature": {"type": "string", "minLength": 88, "maxLength": 88}
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"evidence_id": {"const": "EXT-BROWSER-E2E-001"}}},
+      "then": {"properties": {"target": {"required": ["run_id"]}}}
+    }
+  ]
 }

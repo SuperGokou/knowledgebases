@@ -427,9 +427,7 @@ async def _process_claimed_job(
     if not await _claim_is_current(session, claim=claim, lease_id=lease_id):
         return
 
-    external_allowed = (
-        settings.external_llm_enabled and claim.external_llm_processing_enabled
-    )
+    external_allowed = settings.external_llm_enabled and claim.external_llm_processing_enabled
     if external_allowed:
         if client is None or not client.configured:
             await _mark_failure(
@@ -564,9 +562,7 @@ async def _persist_result(
     file_conditions: tuple[ColumnElement[bool], ...] = (File.id == file.id,)
     if isinstance(file, _ClaimedFile):
         file_conditions = _claimed_file_identity_conditions(file)
-    locked_file = await session.scalar(
-        select(File).where(*file_conditions).with_for_update()
-    )
+    locked_file = await session.scalar(select(File).where(*file_conditions).with_for_update())
     if locked_file is None:
         await session.rollback()
         return

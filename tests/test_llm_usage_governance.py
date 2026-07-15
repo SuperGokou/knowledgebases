@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
@@ -23,10 +29,12 @@ from app.db.models import (
 from app.services.llm_provider import (
     LlmChatResult,
     LlmProviderError,
+    LlmResult,
     MeteringOutcome,
 )
 from app.services.llm_usage import (
     GovernedLlmExecutor,
+    LlmBudgetConfigurationUnavailable,
     LlmBudgetExceeded,
     LlmEgressDenied,
     LlmUsageDimensions,
@@ -169,6 +177,119 @@ async def test_reserve_and_settle_refunds_unused_budget_without_storing_content(
 
     columns = set(Base.metadata.tables["llm_usage_records"].c.keys())
     assert not columns & {"prompt", "answer", "messages", "content"}
+
+
+@pytest.mark.asyncio
+async def test_reservation_locks_all_budget_counters_in_one_bounded_query(
+    governance_session: AsyncSession,
+) -> None:
+    dimensions = await _configured_dimensions(governance_session)
+    bind = governance_session.bind
+    assert isinstance(bind, AsyncEngine)
+    counter_selects: list[str] = []
+
+    def capture_counter_select(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.lower()
+        if normalized.lstrip().startswith("select") and "from llm_budget_counters" in normalized:
+            counter_selects.append(normalized)
+
+    event.listen(bind.sync_engine, "before_cursor_execute", capture_counter_select)
+    try:
+        await LlmUsageGovernance().reserve(
+            governance_session,
+            dimensions=dimensions,
+            idempotency_key="request-batched-counter-reservation",
+            estimated_input_tokens=100,
+            maximum_output_tokens=100,
+        )
+    finally:
+        event.remove(bind.sync_engine, "before_cursor_execute", capture_counter_select)
+
+    assert len(counter_selects) == 1
+
+
+@pytest.mark.asyncio
+async def test_reservation_fails_closed_when_matching_budget_fanout_exceeds_bound(
+    governance_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dimensions = await _configured_dimensions(governance_session)
+    governance_session.add(
+        LlmBudgetPolicy(
+            name="second matching tenant budget",
+            tenant_key=dimensions.tenant_key,
+            daily_token_limit=10_000,
+            enabled=True,
+        )
+    )
+    await governance_session.flush()
+    monkeypatch.setattr("app.services.llm_usage._MAX_MATCHED_BUDGET_POLICIES", 1)
+
+    with pytest.raises(
+        LlmBudgetConfigurationUnavailable,
+        match="exceeds the safe runtime limit",
+    ):
+        await LlmUsageGovernance().reserve(
+            governance_session,
+            dimensions=dimensions,
+            idempotency_key="request-excessive-policy-fanout",
+            estimated_input_tokens=100,
+            maximum_output_tokens=100,
+        )
+
+    assert await governance_session.scalar(select(LlmUsageRecord.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_locks_all_budget_counters_in_one_bounded_query(
+    governance_session: AsyncSession,
+) -> None:
+    dimensions = await _configured_dimensions(governance_session)
+    service = LlmUsageGovernance()
+    reservation = await service.reserve(
+        governance_session,
+        dimensions=dimensions,
+        idempotency_key="request-batched-counter-settlement",
+        estimated_input_tokens=100,
+        maximum_output_tokens=100,
+    )
+    await governance_session.commit()
+
+    bind = governance_session.bind
+    assert isinstance(bind, AsyncEngine)
+    counter_selects: list[str] = []
+
+    def capture_counter_select(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.lower()
+        if normalized.lstrip().startswith("select") and "from llm_budget_counters" in normalized:
+            counter_selects.append(normalized)
+
+    event.listen(bind.sync_engine, "before_cursor_execute", capture_counter_select)
+    try:
+        await service.settle(
+            governance_session,
+            usage_id=reservation.id,
+            input_tokens=50,
+            output_tokens=25,
+        )
+    finally:
+        event.remove(bind.sync_engine, "before_cursor_execute", capture_counter_select)
+
+    assert len(counter_selects) == 1
 
 
 @pytest.mark.asyncio
@@ -366,6 +487,7 @@ async def test_active_egress_lease_is_discoverable_by_every_revocation_dimension
         maximum_output_tokens=100,
     )
     reservation.api_key_id = uuid4()
+    reservation.api_key_credential_family_id = uuid4()
     await governance_session.flush()
 
     assert (
@@ -640,6 +762,155 @@ async def test_governed_executor_retains_hold_on_unknown_transport_outcome(
     record = await governance_session.scalar(select(LlmUsageRecord))
     assert record is not None
     assert record.status is LlmUsageStatus.INDETERMINATE
+
+
+@pytest.mark.asyncio
+async def test_governed_executor_marks_cancelled_upstream_indeterminate_before_reraising(
+    governance_session: AsyncSession,
+) -> None:
+    dimensions = await _configured_dimensions(governance_session)
+    entered_provider = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+
+    class BlockingChatClient:
+        provider = "qwen"
+        model = "qwen-plus"
+
+        async def complete_chat(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            temperature: float = 0.2,
+            max_tokens: int | None = None,
+        ) -> LlmChatResult:
+            del messages, temperature, max_tokens
+            entered_provider.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                provider_cancelled.set()
+            raise AssertionError("cancelled provider call must not resume")
+
+    task = asyncio.create_task(
+        GovernedLlmExecutor().complete_chat(
+            governance_session,
+            client=BlockingChatClient(),
+            dimensions=dimensions,
+            idempotency_key="cancelled-upstream-call",
+            messages=[{"role": "user", "content": "hello"}],
+            maximum_output_tokens=100,
+        )
+    )
+    await asyncio.wait_for(entered_provider.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert provider_cancelled.is_set()
+    record = await governance_session.scalar(select(LlmUsageRecord))
+    assert record is not None
+    assert record.status is LlmUsageStatus.INDETERMINATE
+    assert record.error_code == "llm_request_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_governed_executor_releases_hold_when_egress_preflight_is_cancelled(
+    governance_session: AsyncSession,
+) -> None:
+    dimensions = await _configured_dimensions(governance_session)
+    entered_preflight = asyncio.Event()
+    preflight_cancelled = asyncio.Event()
+
+    class ProviderMustNotRun:
+        provider = "qwen"
+        model = "qwen-plus"
+
+        async def complete_chat(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            temperature: float = 0.2,
+            max_tokens: int | None = None,
+        ) -> LlmChatResult:
+            del messages, temperature, max_tokens
+            raise AssertionError("provider egress must not start after cancelled preflight")
+
+    async def blocking_preflight() -> bool:
+        entered_preflight.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            preflight_cancelled.set()
+        raise AssertionError("cancelled preflight must not resume")
+
+    task = asyncio.create_task(
+        GovernedLlmExecutor().complete_chat(
+            governance_session,
+            client=ProviderMustNotRun(),
+            dimensions=dimensions,
+            idempotency_key="cancelled-egress-preflight",
+            messages=[{"role": "user", "content": "hello"}],
+            maximum_output_tokens=100,
+            before_egress=blocking_preflight,
+        )
+    )
+    await asyncio.wait_for(entered_preflight.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert preflight_cancelled.is_set()
+    record = await governance_session.scalar(select(LlmUsageRecord))
+    assert record is not None
+    assert record.status is LlmUsageStatus.RELEASED
+    assert record.error_code == "llm_egress_preflight_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_governed_okf_executor_marks_cancelled_upstream_indeterminate_before_reraising(
+    governance_session: AsyncSession,
+) -> None:
+    dimensions = await _configured_dimensions(governance_session)
+    entered_provider = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+
+    class BlockingOkfClient:
+        provider = "qwen"
+        model = "qwen-plus"
+
+        async def compile_okf(self, source_text: str, *, user_id: str) -> LlmResult:
+            del source_text, user_id
+            entered_provider.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                provider_cancelled.set()
+            raise AssertionError("cancelled provider call must not resume")
+
+    task = asyncio.create_task(
+        GovernedLlmExecutor().compile_okf(
+            governance_session,
+            client=BlockingOkfClient(),
+            dimensions=dimensions,
+            idempotency_key="cancelled-okf-upstream-call",
+            source_text="enterprise knowledge",
+            provider_user_id=str(dimensions.user_id),
+            maximum_output_tokens=100,
+        )
+    )
+    await asyncio.wait_for(entered_provider.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert provider_cancelled.is_set()
+    record = await governance_session.scalar(select(LlmUsageRecord))
+    assert record is not None
+    assert record.status is LlmUsageStatus.INDETERMINATE
+    assert record.error_code == "llm_request_cancelled"
 
 
 @pytest.mark.asyncio

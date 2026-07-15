@@ -1,3 +1,5 @@
+import { CHAT_BFF_TIMEOUT_MS, isChatQueryPath } from "../chat-timeout-budget";
+
 const DEFAULT_BACKEND = "http://127.0.0.1:8000";
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const MIN_REQUEST_TIMEOUT_MS = 1_000;
@@ -32,6 +34,18 @@ export function backendRequestTimeoutMs(
   const parsed = Number(configured);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REQUEST_TIMEOUT_MS;
   return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, Math.trunc(parsed)));
+}
+
+export function backendRequestTimeoutMsForUrl(
+  url: URL,
+  configuredTimeoutMs?: number,
+): number {
+  if (configuredTimeoutMs !== undefined) {
+    return backendRequestTimeoutMs(String(configuredTimeoutMs));
+  }
+  return isChatQueryPath(url.pathname)
+    ? CHAT_BFF_TIMEOUT_MS
+    : backendRequestTimeoutMs();
 }
 
 export function backendOrigin(): string {
@@ -120,9 +134,7 @@ export async function safeBackendFetch(url: URL, init: SafeBackendFetchInit): Pr
     signal: callerSignal,
     ...requestInit
   } = init;
-  const timeoutMs = backendRequestTimeoutMs(
-    configuredTimeoutMs === undefined ? undefined : String(configuredTimeoutMs),
-  );
+  const timeoutMs = backendRequestTimeoutMsForUrl(url, configuredTimeoutMs);
   const controller = new AbortController();
   let timedOut = false;
   let callerCancelled = Boolean(callerSignal?.aborted);

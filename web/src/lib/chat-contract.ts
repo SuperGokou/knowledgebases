@@ -63,16 +63,40 @@ function isSourceStatus(value: unknown): value is ChatSourceStatus {
 }
 
 function isChatTable(value: unknown, citationNumbers: Set<number>): boolean {
-  if (!isRecord(value) || typeof value.title !== "string" || !value.title.trim()) return false;
+  if (
+    !isRecord(value) ||
+    typeof value.title !== "string" ||
+    !value.title.trim() ||
+    value.title.length > 200
+  ) return false;
   const columns = value.columns;
   const rows = value.rows;
   const tableCitations = value.citation_numbers;
   if (!Array.isArray(columns) || columns.length < 1 || columns.length > 8) return false;
   if (!columns.every((column) => typeof column === "string" && column.trim().length > 0 && column.length <= 80)) return false;
+  if (new Set(columns.map((column) => String(column).trim())).size !== columns.length) return false;
   if (!Array.isArray(rows) || rows.length < 1 || rows.length > 50) return false;
   if (!rows.every((row) => Array.isArray(row) && row.length === columns.length && row.every((cell) => typeof cell === "string" && cell.length <= 1_000))) return false;
   if (!Array.isArray(tableCitations) || tableCitations.length < 1 || tableCitations.length > 20) return false;
-  return tableCitations.every((number) => Number.isInteger(number) && citationNumbers.has(Number(number)));
+  if (!tableCitations.every((number) => Number.isInteger(number) && citationNumbers.has(Number(number)))) return false;
+  if (new Set(tableCitations).size !== tableCitations.length) return false;
+
+  const rowCitations = value.row_citation_numbers;
+  // Accept legacy responses without row mappings, but never represent them as row-grounded.
+  if (rowCitations === undefined || rowCitations === null) return true;
+  if (!Array.isArray(rowCitations) || rowCitations.length !== rows.length) return false;
+  const tableCitationSet = new Set(tableCitations.map(Number));
+  const mappedCitationSet = new Set<number>();
+  for (const rowSources of rowCitations) {
+    if (!Array.isArray(rowSources) || rowSources.length < 1 || rowSources.length > 20) return false;
+    if (!rowSources.every((number) => Number.isInteger(number) && tableCitationSet.has(Number(number)))) return false;
+    if (new Set(rowSources).size !== rowSources.length) return false;
+    rowSources.forEach((number) => mappedCitationSet.add(Number(number)));
+  }
+  return (
+    mappedCitationSet.size === tableCitationSet.size &&
+    [...mappedCitationSet].every((number) => tableCitationSet.has(number))
+  );
 }
 
 function isAnswerReview(value: unknown): boolean {

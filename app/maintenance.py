@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
+import signal
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -23,7 +25,9 @@ from app.db.models import (
 from app.db.session import SessionFactory
 from app.domain.files import UploadMode
 from app.services.audit import add_audit_event
-from app.services.llm_settings import resolve_provider_client
+from app.services.chat_idempotency import cleanup_chat_idempotency_records
+from app.services.llm_provider import close_shared_llm_clients
+from app.services.llm_settings import LlmConfigurationError, resolve_provider_client
 from app.services.malware_scanner import (
     ClamdScanner,
     MalwareScanner,
@@ -33,6 +37,13 @@ from app.services.malware_scanner import (
 from app.services.okf_conversion import enqueue_okf_conversion, process_okf_conversion_batch
 from app.services.quota import QuotaService
 from app.services.storage import StorageService
+
+_LOGGER = logging.getLogger(__name__)
+
+# The container grants 120 seconds for a graceful stop. A whole maintenance
+# cycle must yield before then so cancellation-aware phase cleanup and the
+# shared LLM transport shutdown retain a bounded cleanup margin.
+MAINTENANCE_CYCLE_TIMEOUT_SECONDS = 105.0
 
 
 def _single_final_object_key(staging_key: str) -> str:
@@ -416,6 +427,12 @@ async def run_maintenance_once(
     cleaned = await cleanup_expired_uploads(
         session, storage, batch_size=settings.maintenance_batch_size
     )
+    chat_idempotency = await cleanup_chat_idempotency_records(
+        session,
+        settings,
+        batch_size=settings.chat_idempotency_cleanup_batch_size,
+        max_batches=settings.chat_idempotency_cleanup_max_batches,
+    )
     scanner = ClamdScanner(
         host=settings.malware_scan_host,
         port=settings.malware_scan_port,
@@ -429,12 +446,20 @@ async def run_maintenance_once(
         settings,
         batch_size=settings.maintenance_batch_size,
     )
-    client = (
-        await resolve_provider_client(session, settings)
-        if settings.external_llm_enabled
-        else None
-    )
-    if client is None:
+    client = None
+    provider_configuration_valid = True
+    if settings.external_llm_enabled:
+        try:
+            client = await resolve_provider_client(session, settings)
+        except (LlmConfigurationError, ValueError) as error:
+            provider_configuration_valid = False
+            _LOGGER.error(
+                "LLM provider configuration rejected; OKF conversions remain queued",
+                extra={"llm_configuration_error": str(error)},
+            )
+    if not provider_configuration_valid:
+        converted = 0
+    elif client is None:
         converted = await process_okf_conversion_batch(
             session,
             storage,
@@ -451,23 +476,111 @@ async def run_maintenance_once(
                 settings,
                 batch_size=settings.okf_conversion_batch_size,
             )
-    return {"cleaned": cleaned, "scanned": scanned, "converted": converted}
+    return {
+        "cleaned": cleaned,
+        "chat_idempotency": chat_idempotency,
+        "scanned": scanned,
+        "converted": converted,
+    }
 
 
-async def run(*, once: bool, interval_seconds: int) -> None:
+async def run(
+    *,
+    once: bool,
+    interval_seconds: int,
+    shutdown_event: asyncio.Event | None = None,
+) -> None:
     settings = get_settings()
     storage = StorageService(settings)
-    while True:
-        async with SessionFactory() as session:
-            result = await run_maintenance_once(session, storage, settings)
-            if result["cleaned"] or result["scanned"] or result["converted"]:
-                print(
-                    f"Maintenance cleaned={result['cleaned']} scanned={result['scanned']} "
-                    f"converted={result['converted']}"
-                )
-        if once:
+    try:
+        while True:
+            async with SessionFactory() as session:
+                cycle_deadline = asyncio.timeout(MAINTENANCE_CYCLE_TIMEOUT_SECONDS)
+                try:
+                    async with cycle_deadline:
+                        result = await run_maintenance_once(session, storage, settings)
+                except TimeoutError:
+                    # Only translate the deadline that this worker owns. A phase
+                    # raising an unrelated TimeoutError remains an operational
+                    # failure and must not be hidden as a normal cycle expiry.
+                    if not cycle_deadline.expired():
+                        raise
+                    _LOGGER.error(
+                        "Maintenance cycle deadline exceeded",
+                        extra={
+                            "cycle_timeout_seconds": (MAINTENANCE_CYCLE_TIMEOUT_SECONDS),
+                            "shutdown_requested": bool(
+                                shutdown_event is not None and shutdown_event.is_set()
+                            ),
+                        },
+                    )
+                else:
+                    if any(result.values()):
+                        _LOGGER.info(
+                            "Maintenance batch completed",
+                            extra={
+                                "cleaned": result["cleaned"],
+                                "chat_idempotency": result["chat_idempotency"],
+                                "scanned": result["scanned"],
+                                "converted": result["converted"],
+                            },
+                        )
+            if once or (shutdown_event is not None and shutdown_event.is_set()):
+                return
+            if shutdown_event is None:
+                await asyncio.sleep(interval_seconds)
+            else:
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
+                except TimeoutError:
+                    continue
+                return
+    finally:
+        await close_shared_llm_clients()
+
+
+async def run_with_shutdown_signals(*, once: bool, interval_seconds: int) -> None:
+    """Translate Linux container stop signals into cancellable async cleanup."""
+
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+    worker = asyncio.create_task(
+        run(
+            once=once,
+            interval_seconds=interval_seconds,
+            shutdown_event=shutdown_event,
+        )
+    )
+    forced_shutdown = False
+    installed: list[signal.Signals] = []
+
+    def request_shutdown() -> None:
+        nonlocal forced_shutdown
+        if not shutdown_event.is_set():
+            # First signal stops new batches and lets the current governed provider
+            # operation finish, preserving metering and idempotency semantics.
+            shutdown_event.set()
             return
-        await asyncio.sleep(interval_seconds)
+        forced_shutdown = True
+        _LOGGER.warning("Second shutdown signal forced maintenance cancellation")
+        worker.cancel()
+
+    for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(shutdown_signal, request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Windows' event loop lacks add_signal_handler; asyncio.run still
+            # cancels the main task for KeyboardInterrupt and executes run.finally.
+            continue
+        installed.append(shutdown_signal)
+    try:
+        await worker
+    except asyncio.CancelledError:
+        if not forced_shutdown:
+            raise
+    finally:
+        for shutdown_signal in installed:
+            loop.remove_signal_handler(shutdown_signal)
 
 
 def main() -> None:
@@ -477,7 +590,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error("--interval must be positive")
-    asyncio.run(run(once=args.once, interval_seconds=args.interval))
+    asyncio.run(run_with_shutdown_signals(once=args.once, interval_seconds=args.interval))
 
 
 if __name__ == "__main__":

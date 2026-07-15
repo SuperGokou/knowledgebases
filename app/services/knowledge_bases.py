@@ -26,6 +26,7 @@ _ACCESS_RANK = {
     KnowledgeBaseAccessLevel.EDITOR: 20,
     KnowledgeBaseAccessLevel.MANAGER: 30,
 }
+_COMPLEX_QUERY_MINIMUM_RELEVANCE_SCORE = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,10 +48,18 @@ async def require_knowledge_base_access(
     *,
     minimum: KnowledgeBaseAccessLevel = KnowledgeBaseAccessLevel.READER,
     lock: bool = False,
+    refresh: bool = False,
 ) -> KnowledgeBaseAccess:
     statement = select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
     if lock:
+        # The same request may already have loaded this row during a pre-lock
+        # authorization check. Refresh it after waiting for the row lock so CAS
+        # checks observe a concurrent writer's committed version.
         statement = statement.with_for_update()
+    if lock or refresh:
+        # An authorization boundary may already have this entity in the Session
+        # identity map. Force the post-lock database state to replace that cache.
+        statement = statement.execution_options(populate_existing=True)
     knowledge_base = await session.scalar(statement)
     if knowledge_base is None:
         raise ApiError(
@@ -103,19 +112,34 @@ async def list_accessible_knowledge_bases(
     *,
     limit: int,
     offset: int,
+    query: str | None = None,
+    minimum_access_level: KnowledgeBaseAccessLevel | None = None,
 ) -> list[KnowledgeBaseAccess]:
     statement = select(KnowledgeBase)
     if not access.user.is_superuser:
-        role_access = (
-            exists()
-            .where(KnowledgeBaseRoleGrant.knowledge_base_id == KnowledgeBase.id)
-            .where(KnowledgeBaseRoleGrant.role_id.in_(access.role_ids))
-            if access.role_ids
-            else false()
-        )
-        statement = statement.where(
-            or_(KnowledgeBase.owner_id == access.user.id, role_access)
-        )
+        role_access: ColumnElement[bool]
+        if access.role_ids:
+            role_access = (
+                exists()
+                .where(KnowledgeBaseRoleGrant.knowledge_base_id == KnowledgeBase.id)
+                .where(KnowledgeBaseRoleGrant.role_id.in_(access.role_ids))
+            )
+            if minimum_access_level is not None:
+                allowed_levels = [
+                    level
+                    for level, rank in _ACCESS_RANK.items()
+                    if rank >= _ACCESS_RANK[minimum_access_level]
+                ]
+                role_access = role_access.where(
+                    KnowledgeBaseRoleGrant.access_level.in_(allowed_levels)
+                )
+        else:
+            role_access = false()
+        statement = statement.where(or_(KnowledgeBase.owner_id == access.user.id, role_access))
+    normalized_query = query.strip() if query is not None else ""
+    if normalized_query:
+        name_matches = KnowledgeBase.name.icontains(normalized_query, autoescape=True)
+        statement = statement.where(name_matches)
     statement = (
         statement.order_by(KnowledgeBase.updated_at.desc(), KnowledgeBase.id)
         .limit(limit)
@@ -165,15 +189,10 @@ def _query_terms(query: str) -> list[str]:
             else:
                 # Preserve specific intent before adding broad overlapping terms.
                 terms.append(sequence)
-                terms.extend(
-                    sequence[index : index + 3] for index in range(len(sequence) - 2)
-                )
+                terms.extend(sequence[index : index + 3] for index in range(len(sequence) - 2))
                 terms.extend(sequence[index : index + 2] for index in range(len(sequence) - 1))
         non_cjk = re.sub(r"[\u3400-\u4dbf\u4e00-\u9fff]+", " ", item)
-        terms.extend(
-            token.casefold()
-            for token in re.findall(r"[a-zA-Z0-9_-]+", non_cjk)
-        )
+        terms.extend(token.casefold() for token in re.findall(r"[a-zA-Z0-9_-]+", non_cjk))
     if not terms:
         return [query.casefold()]
     meaningful = [
@@ -206,9 +225,9 @@ def _excerpt(content: str, terms: list[str], *, maximum: int = 280) -> str:
         for term in terms
         if lowered.find(term.casefold()) >= 0
     ]
-    best_position = max(
-        matches, default=(0, 0, 0), key=lambda item: (item[0], item[1], -item[2])
-    )[2]
+    best_position = max(matches, default=(0, 0, 0), key=lambda item: (item[0], item[1], -item[2]))[
+        2
+    ]
     start = max(0, best_position - 80)
     excerpt = content[start : start + maximum].strip()
     if start:
@@ -255,9 +274,7 @@ async def search_knowledge_entries(
             else_=1,
         )
         excerpt_start = case((match_position > 80, match_position - 80), else_=1)
-        excerpt_expression: Any = func.substr(
-            KnowledgeEntry.content, excerpt_start, 280
-        )
+        excerpt_expression: Any = func.substr(KnowledgeEntry.content, excerpt_start, 280)
     else:
         # SQLite is limited to the integration-test harness. Production PostgreSQL
         # projects a bounded snippet so multi-megabyte bodies never cross the wire.
@@ -284,10 +301,17 @@ async def search_knowledge_entries(
     if not entries:
         return []
     maximum_score = int(entries[0]["relevance_score"])
-    minimum_score = max(1, math.ceil(maximum_score * 0.45))
-    entries = [
-        entry for entry in entries if int(entry["relevance_score"]) >= minimum_score
-    ][:limit]
+    # A relative-only cutoff lets one shared two-character CJK token become the
+    # best result for an otherwise unrelated question. Require at least one
+    # substantive three-character/English match (or multiple short matches)
+    # before returning any candidate.
+    # A one-term query (for example “报价”) is explicit user intent and must not
+    # be suppressed merely because two-character CJK terms carry a low weight.
+    # Multi-term questions need a stronger absolute signal to avoid treating one
+    # incidental bigram as a grounded answer.
+    absolute_floor = 1 if len(terms) == 1 else _COMPLEX_QUERY_MINIMUM_RELEVANCE_SCORE
+    minimum_score = max(absolute_floor, math.ceil(maximum_score * 0.45))
+    entries = [entry for entry in entries if int(entry["relevance_score"]) >= minimum_score][:limit]
     return [
         KnowledgeSearchHit(
             entry_id=entry["id"],

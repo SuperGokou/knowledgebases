@@ -70,9 +70,7 @@ def test_collector_on_non_linux_is_blocked_without_touching_a_disk(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(
-        "scripts.collect_host_io_evidence.platform.system", lambda: "Windows"
-    )
+    monkeypatch.setattr("scripts.collect_host_io_evidence.platform.system", lambda: "Windows")
 
     result = main(
         [

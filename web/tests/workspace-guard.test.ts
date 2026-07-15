@@ -161,6 +161,9 @@ describe("authoritative workspace proxy guard", () => {
         refreshCalls += 1;
         return refreshResponse;
       }
+      if (url.endsWith("/api/v1/auth/refresh/status")) {
+        return new Response(null, { status: 204 });
+      }
       throw new Error(`Unexpected backend request: ${url}`);
     });
 
@@ -175,7 +178,7 @@ describe("authoritative workspace proxy guard", () => {
 
     expect(oldMeCalls).toBe(2);
     expect(refreshCalls).toBe(1);
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     expect([first.status, second.status].sort()).toEqual([200, 502]);
     const successful = first.status === 200 ? first : second;
     const rejected = first.status === 502 ? first : second;

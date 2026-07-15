@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -9,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +34,7 @@ WindowKind = Literal["day", "month"]
 
 _LOGGER = logging.getLogger(__name__)
 _PRICE_DENOMINATOR = 1_000_000
+_MAX_MATCHED_BUDGET_POLICIES = 100
 
 
 class LlmUsageGovernanceError(RuntimeError):
@@ -123,6 +125,7 @@ class LlmUsageDimensions:
     provider: str
     model: str
     operation: str
+    api_key_credential_family_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,12 +169,25 @@ class LlmUsageGovernance:
             raise ValueError("idempotency_key must contain 1 to 200 characters")
         if not dimensions.tenant_key or len(dimensions.tenant_key) > 100:
             raise ValueError("tenant_key must contain 1 to 100 characters")
+        if dimensions.api_key_id is not None and dimensions.api_key_credential_family_id is None:
+            raise ValueError("api-key usage requires a credential family")
 
         idempotency_context = json.dumps(
             {
                 "tenant": dimensions.tenant_key,
                 "user": str(dimensions.user_id),
-                "api_key": str(dimensions.api_key_id) if dimensions.api_key_id else None,
+                # Keep the historical JSON field name stable.  Only its value
+                # changes from the physical key UUID to the credential-family
+                # UUID, whose migration backfill initially equals that key ID.
+                # Renaming this key would invalidate pre-0018 usage hashes and
+                # could permit duplicate provider egress after an upgrade.
+                "api_key": (
+                    str(dimensions.api_key_credential_family_id)
+                    if dimensions.api_key_credential_family_id
+                    else str(dimensions.api_key_id)
+                    if dimensions.api_key_id
+                    else None
+                ),
                 "knowledge_base": (
                     str(dimensions.knowledge_base_id) if dimensions.knowledge_base_id else None
                 ),
@@ -230,12 +246,17 @@ class LlmUsageGovernance:
                         ),
                     )
                     .order_by(LlmBudgetPolicy.id)
+                    .limit(_MAX_MATCHED_BUDGET_POLICIES + 1)
                     .with_for_update()
                 )
             ).all()
         )
         if not policies:
             raise LlmBudgetConfigurationUnavailable("at least one hard budget is required")
+        if len(policies) > _MAX_MATCHED_BUDGET_POLICIES:
+            raise LlmBudgetConfigurationUnavailable(
+                "matching hard-budget policy count exceeds the safe runtime limit"
+            )
 
         reserved_tokens = estimated_input_tokens + maximum_output_tokens
         reserved_cost = self._cost(
@@ -244,7 +265,9 @@ class LlmUsageGovernance:
             price.input_micro_usd_per_million_tokens,
             price.output_micro_usd_per_million_tokens,
         )
-        reservations: list[_WindowReservation] = []
+        reservation_specs: list[
+            tuple[LlmBudgetPolicy, WindowKind, datetime, int | None, int | None]
+        ] = []
         current = now or datetime.now(UTC)
         for policy in policies:
             for window_kind in ("day", "month"):
@@ -252,22 +275,27 @@ class LlmUsageGovernance:
                 if token_limit is None and cost_limit is None:
                     continue
                 window_start = self.window_start(window_kind, current)
-                counter = await self._locked_counter(
-                    session,
-                    policy_id=policy.id,
-                    window_kind=window_kind,
-                    window_start=window_start,
+                reservation_specs.append(
+                    (policy, window_kind, window_start, token_limit, cost_limit)
                 )
-                reservations.append(
-                    _WindowReservation(
-                        policy=policy,
-                        counter=counter,
-                        window_kind=window_kind,
-                        window_start=window_start,
-                        token_limit=token_limit,
-                        cost_limit_micro_usd=cost_limit,
-                    )
-                )
+        counters = await self._locked_counters(
+            session,
+            [
+                (policy.id, window_kind, window_start)
+                for policy, window_kind, window_start, _, _ in reservation_specs
+            ],
+        )
+        reservations = [
+            _WindowReservation(
+                policy=policy,
+                counter=counters[(policy.id, window_kind)],
+                window_kind=window_kind,
+                window_start=window_start,
+                token_limit=token_limit,
+                cost_limit_micro_usd=cost_limit,
+            )
+            for policy, window_kind, window_start, token_limit, cost_limit in reservation_specs
+        ]
 
         for item in reservations:
             if (
@@ -302,6 +330,7 @@ class LlmUsageGovernance:
             idempotency_hash=idempotency_hash,
             user_id=dimensions.user_id,
             api_key_id=dimensions.api_key_id,
+            api_key_credential_family_id=dimensions.api_key_credential_family_id,
             knowledge_base_id=dimensions.knowledge_base_id,
             provider=dimensions.provider,
             model=dimensions.model,
@@ -452,26 +481,39 @@ class LlmUsageGovernance:
         )
         return record
 
-    async def _locked_counter(
+    async def _locked_counters(
         self,
         session: AsyncSession,
-        *,
-        policy_id: UUID,
-        window_kind: WindowKind,
-        window_start: datetime,
-    ) -> LlmBudgetCounter:
-        counter = await session.scalar(
-            select(LlmBudgetCounter)
-            .where(
-                LlmBudgetCounter.policy_id == policy_id,
-                LlmBudgetCounter.window_kind == window_kind,
-                LlmBudgetCounter.window_start == window_start,
-            )
-            .with_for_update()
+        keys: list[tuple[UUID, WindowKind, datetime]],
+    ) -> dict[tuple[UUID, str], LlmBudgetCounter]:
+        if not keys:
+            return {}
+        counters = list(
+            (
+                await session.scalars(
+                    select(LlmBudgetCounter)
+                    .where(
+                        tuple_(
+                            LlmBudgetCounter.policy_id,
+                            LlmBudgetCounter.window_kind,
+                            LlmBudgetCounter.window_start,
+                        ).in_(keys)
+                    )
+                    .order_by(
+                        LlmBudgetCounter.policy_id,
+                        LlmBudgetCounter.window_kind,
+                        LlmBudgetCounter.window_start,
+                    )
+                    .with_for_update()
+                )
+            ).all()
         )
-        if counter is None:
-            # The parent policy row is already locked, serializing first-row creation on
-            # PostgreSQL without a dialect-specific upsert.
+        by_window = {(counter.policy_id, counter.window_kind): counter for counter in counters}
+        created = False
+        for policy_id, window_kind, window_start in keys:
+            key = (policy_id, window_kind)
+            if key in by_window:
+                continue
             counter = LlmBudgetCounter(
                 policy_id=policy_id,
                 window_kind=window_kind,
@@ -482,8 +524,13 @@ class LlmUsageGovernance:
                 reserved_cost_micro_usd=0,
             )
             session.add(counter)
+            by_window[key] = counter
+            created = True
+        if created:
+            # The parent policy rows are already locked in deterministic ID order,
+            # serializing first-window creation without one query per policy/window.
             await session.flush()
-        return counter
+        return by_window
 
     async def _locked_record(self, session: AsyncSession, usage_id: UUID) -> LlmUsageRecord:
         record = await session.scalar(
@@ -514,16 +561,37 @@ class LlmUsageGovernance:
                 )
             ).all()
         )
-        for hold in holds:
-            counter = await session.scalar(
-                select(LlmBudgetCounter)
-                .where(
-                    LlmBudgetCounter.policy_id == hold.policy_id,
-                    LlmBudgetCounter.window_kind == hold.window_kind,
-                    LlmBudgetCounter.window_start == hold.window_start,
-                )
-                .with_for_update()
+        counter_keys = [(hold.policy_id, hold.window_kind, hold.window_start) for hold in holds]
+        counters = (
+            list(
+                (
+                    await session.scalars(
+                        select(LlmBudgetCounter)
+                        .where(
+                            tuple_(
+                                LlmBudgetCounter.policy_id,
+                                LlmBudgetCounter.window_kind,
+                                LlmBudgetCounter.window_start,
+                            ).in_(counter_keys)
+                        )
+                        .order_by(
+                            LlmBudgetCounter.policy_id,
+                            LlmBudgetCounter.window_kind,
+                            LlmBudgetCounter.window_start,
+                        )
+                        .with_for_update()
+                    )
+                ).all()
             )
+            if counter_keys
+            else []
+        )
+        counters_by_window = {
+            (counter.policy_id, counter.window_kind, counter.window_start): counter
+            for counter in counters
+        }
+        for hold in holds:
+            counter = counters_by_window.get((hold.policy_id, hold.window_kind, hold.window_start))
             if counter is None:
                 raise LlmUsageInvalidState("budget counter for usage hold was not found")
             counter.reserved_token_count = max(
@@ -626,6 +694,17 @@ class GovernedLlmExecutor:
             return
         try:
             allowed = await before_egress()
+        except asyncio.CancelledError:
+            # Cancellation happened before provider egress, so no provider-side
+            # outcome can exist. Release the durable hold instead of leaking it.
+            await session.rollback()
+            await self._governance.release(
+                session,
+                usage_id=usage_id,
+                error_code="llm_egress_preflight_cancelled",
+            )
+            await session.commit()
+            raise
         except Exception:
             # A preflight is read-only and runs before network egress. Always clear any
             # transaction it opened, release the durable hold, and fail closed.
@@ -686,6 +765,14 @@ class GovernedLlmExecutor:
                 temperature=temperature,
                 max_tokens=maximum_output_tokens,
             )
+        except asyncio.CancelledError:
+            await self._governance.mark_indeterminate(
+                session,
+                usage_id=reservation_id,
+                error_code="llm_request_cancelled",
+            )
+            await session.commit()
+            raise
         except LlmProviderError as error:
             await self._reconcile_provider_error(session, usage_id=reservation_id, error=error)
             await session.commit()
@@ -757,6 +844,14 @@ class GovernedLlmExecutor:
         )
         try:
             result = await client.compile_okf(source_text, user_id=provider_user_id)
+        except asyncio.CancelledError:
+            await self._governance.mark_indeterminate(
+                session,
+                usage_id=reservation_id,
+                error_code="llm_request_cancelled",
+            )
+            await session.commit()
+            raise
         except LlmProviderError as error:
             await self._reconcile_provider_error(session, usage_id=reservation_id, error=error)
             await session.commit()

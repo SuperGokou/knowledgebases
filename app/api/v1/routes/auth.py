@@ -32,6 +32,9 @@ from app.services.rate_limit import RateLimiter
 
 router = APIRouter()
 
+MAX_LOGIN_EMAIL_CHARACTERS = 320
+MAX_LOGIN_PASSWORD_CHARACTERS = 256
+
 
 @router.get("/me", response_model=AuthMe)
 async def current_session(
@@ -123,6 +126,28 @@ async def login(
         key=f"auth:login:ip:{client_ip}",
         limit=settings.login_attempts_per_minute,
     )
+    if (
+        not email
+        or not form.password
+        or len(email) > MAX_LOGIN_EMAIL_CHARACTERS
+        or len(form.password) > MAX_LOGIN_PASSWORD_CHARACTERS
+    ):
+        add_audit_event(
+            session,
+            action="auth.login.denied",
+            result=AuditResult.DENIED,
+            resource_type="user",
+            request_id=getattr(request.state, "request_id", None),
+            ip_address=request.client.host if request.client else None,
+            details={"reason": "credential_shape_invalid"},
+        )
+        await session.commit()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_credentials",
+            message="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     account_key = hashlib.sha256(email.encode("utf-8")).hexdigest()
     await _check_auth_rate_limit(
         redis=redis,
@@ -306,6 +331,56 @@ async def refresh_tokens(
     return pair
 
 
+@router.post("/refresh/status", status_code=status.HTTP_204_NO_CONTENT)
+async def refresh_session_status(
+    payload: RefreshRequest,
+    response: Response,
+    session: DatabaseSession,
+    tokens: Annotated[TokenService, Depends(get_token_service)],
+) -> None:
+    """Confirm that a refresh credential is still the live member of its family."""
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    try:
+        claims = tokens.decode(payload.refresh_token, expected_type="refresh")
+    except TokenError as error:
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_refresh_token",
+            message="Refresh token is invalid or has been revoked",
+        ) from error
+
+    user = await session.get(User, claims.user_id)
+    record = await session.scalar(
+        select(RefreshToken).where(
+            RefreshToken.id == claims.token_id,
+            RefreshToken.user_id == claims.user_id,
+        )
+    )
+    now = datetime.now(UTC)
+    valid = (
+        user is not None
+        and user.status is UserStatus.ACTIVE
+        and user.token_version == claims.token_version
+        and record is not None
+        and record.revoked_at is None
+        and as_utc(record.expires_at) > now
+        and hmac.compare_digest(
+            record.token_hash,
+            tokens.fingerprint(payload.refresh_token),
+        )
+    )
+    if not valid:
+        await session.rollback()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_refresh_token",
+            message="Refresh token is invalid or has been revoked",
+        )
+    await session.rollback()
+
+
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     payload: RefreshRequest,
@@ -314,7 +389,7 @@ async def logout(
     session: DatabaseSession,
     tokens: Annotated[TokenService, Depends(get_token_service)],
 ) -> None:
-    """Revoke one refresh-token family member without exposing token validity."""
+    """Revoke the presented refresh-token family without exposing token validity."""
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     try:
@@ -322,8 +397,20 @@ async def logout(
     except TokenError:
         return
 
+    # Match refresh rotation's global lock order (user, token, then family).
+    # Revoking the whole family closes the interleaving where rotation commits
+    # a successor immediately before logout locks the presented ancestor.
+    user = await session.scalar(select(User).where(User.id == claims.user_id).with_for_update())
+    if user is None:
+        await session.rollback()
+        return
     record = await session.scalar(
-        select(RefreshToken).where(RefreshToken.id == claims.token_id).with_for_update()
+        select(RefreshToken)
+        .where(
+            RefreshToken.id == claims.token_id,
+            RefreshToken.user_id == user.id,
+        )
+        .with_for_update()
     )
     if record is None or not hmac.compare_digest(
         record.token_hash,
@@ -332,15 +419,36 @@ async def logout(
         await session.rollback()
         return
 
-    if record.revoked_at is None:
-        record.revoked_at = datetime.now(UTC)
+    family = list(
+        (
+            await session.scalars(
+                select(RefreshToken)
+                .where(
+                    RefreshToken.family_id == record.family_id,
+                    RefreshToken.user_id == user.id,
+                )
+                .order_by(RefreshToken.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    now = datetime.now(UTC)
+    revoked_count = 0
+    for family_token in family:
+        if family_token.revoked_at is None:
+            family_token.revoked_at = now
+            revoked_count += 1
+    if revoked_count:
         add_audit_event(
             session,
             action="auth.logout.succeeded",
             result=AuditResult.SUCCESS,
-            resource_type="user",
-            resource_id=str(record.user_id),
-            actor_id=record.user_id,
+            resource_type="refresh_token_family",
+            resource_id=str(record.family_id),
+            actor_id=user.id,
             request_id=getattr(request.state, "request_id", None),
+            details={"revoked_refresh_tokens": revoked_count},
         )
         await session.commit()
+    else:
+        await session.rollback()

@@ -17,7 +17,7 @@ import { GET, POST } from "../src/app/api/backend/[...path]/route";
 
 const ORIGINAL_FASTAPI_URL = process.env.FASTAPI_URL;
 const ORIGINAL_BFF_SECRET = process.env.FASTAPI_BFF_SHARED_SECRET;
-const BFF_SECRET = "0123456789abcdef0123456789abcdef"; // pragma: allowlist secret
+const BFF_SECRET = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- deterministic HMAC test fixture
 const CONTEXT = {
   params: Promise.resolve({ path: ["api", "v1", "files"] }),
 };
@@ -175,7 +175,8 @@ describe("catch-all backend BFF", () => {
         token_type: "bearer",
         expires_in: 900,
       }))
-      .mockResolvedValueOnce(Response.json({ answer: "ok", citations: [] }));
+      .mockResolvedValueOnce(Response.json({ answer: "ok", citations: [] }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
 
     const response = await POST(backendRequest({
@@ -185,11 +186,12 @@ describe("catch-all backend BFF", () => {
     }), CHAT_CONTEXT);
 
     expect(response.status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     const firstHeaders = new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit).headers);
     const replayHeaders = new Headers((fetchMock.mock.calls[2]?.[1] as RequestInit).headers);
     expect(firstHeaders.get("idempotency-key")).toBe(key);
     expect(replayHeaders.get("idempotency-key")).toBe(key);
+    expect(String(fetchMock.mock.calls[3]?.[0])).toContain("/api/v1/auth/refresh/status");
   });
 
   it("rejects an invalid idempotency header instead of forwarding it", async () => {

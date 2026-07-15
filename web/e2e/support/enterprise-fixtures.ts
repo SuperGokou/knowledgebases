@@ -163,8 +163,13 @@ export const test = base.extend<Fixtures>({
       if (dimensions.document_width > dimensions.viewport_width + 1) {
         viewportOverflow.push({ page: label, ...dimensions });
       }
+      const sensitiveContent = target.locator('[data-sensitive="true"], input[type="password"]');
       await testInfo.attach(`e2e-screenshot-${label}`, {
-        body: await target.screenshot({ fullPage: true }),
+        body: await target.screenshot({
+          fullPage: true,
+          mask: [sensitiveContent],
+          maskColor: "#111827",
+        }),
         contentType: "image/png",
       });
     }
@@ -213,17 +218,24 @@ export type BffResponse<T = unknown> = {
 export async function bffRequest<T = unknown>(
   page: Page,
   apiPath: string,
-  options: { readonly method?: string; readonly body?: unknown } = {},
+  options: {
+    readonly method?: string;
+    readonly body?: unknown;
+    readonly idempotencyKey?: string;
+  } = {},
 ): Promise<BffResponse<T>> {
   if (!apiPath.startsWith("/api/v1/")) {
     throw new Error("BFF path must start with /api/v1/");
   }
   return page.evaluate(
-    async ({ apiPath: path, method, body }) => {
+    async ({ apiPath: path, method, body, idempotencyKey }) => {
+      const headers = new Headers();
+      if (body !== undefined) headers.set("content-type", "application/json");
+      if (idempotencyKey !== undefined) headers.set("idempotency-key", idempotencyKey);
       const response = await fetch(`/api/backend${path}`, {
         method,
         credentials: "same-origin",
-        headers: body === undefined ? undefined : { "content-type": "application/json" },
+        headers: body === undefined && idempotencyKey === undefined ? undefined : headers,
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const text = await response.text();
@@ -237,6 +249,11 @@ export async function bffRequest<T = unknown>(
       }
       return { status: response.status, body: parsed };
     },
-    { apiPath, method: options.method ?? "GET", body: options.body },
+    {
+      apiPath,
+      method: options.method ?? "GET",
+      body: options.body,
+      idempotencyKey: options.idempotencyKey,
+    },
   ) as Promise<BffResponse<T>>;
 }

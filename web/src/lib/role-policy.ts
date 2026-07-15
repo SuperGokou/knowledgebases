@@ -128,7 +128,7 @@ const LIMIT_COPY: Record<string, LimitCopy> = {
   },
   storage_bytes: {
     name: "累计存储写入量",
-    description: "生命周期内累计成功上传的字节数；当前版本删除文件不会返还该额度。",
+    description: "生命周期累计：文件成功上传计入全部字节，手工知识正文仅计入 UTF-8 字节正增长；同长度替换、缩小及删除均不返还额度。“无限制”只取消角色级额度，计量仍继续且受平台硬上限约束。",
     unit: "累计字节数",
     window: "生命周期累计",
   },

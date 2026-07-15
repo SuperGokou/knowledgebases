@@ -166,7 +166,7 @@ async def test_explicit_non_billable_retry_uses_a_new_attempt_key_and_can_succee
                 )
             ]
         )
-        settings = Settings(environment="test")
+        settings = Settings(environment="test", llm_egress_mode="direct")
 
         assert (
             await process_okf_conversion_batch(
@@ -227,7 +227,7 @@ async def test_unknown_transport_outcome_is_terminal_and_never_auto_retried() ->
                 )
             ]
         )
-        settings = Settings(environment="test")
+        settings = Settings(environment="test", llm_egress_mode="direct")
 
         assert (
             await process_okf_conversion_batch(
@@ -318,7 +318,7 @@ async def test_conversion_creates_valid_okf_entry_and_is_idempotent() -> None:
             session,
             TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
             SuccessfulClient(),  # type: ignore[arg-type]
-            Settings(environment="test"),
+            Settings(environment="test", llm_egress_mode="direct"),
             batch_size=1,
         )
         assert count == 1
@@ -352,7 +352,7 @@ async def test_conversion_creates_valid_okf_entry_and_is_idempotent() -> None:
                 session,
                 TextStorage(b"unused"),  # type: ignore[arg-type]
                 SuccessfulClient(),  # type: ignore[arg-type]
-                Settings(environment="test"),
+                Settings(environment="test", llm_egress_mode="direct"),
                 batch_size=1,
             )
             == 0
@@ -392,16 +392,19 @@ async def test_conversion_releases_database_transaction_before_object_read(
                 assert not session.in_transaction()
                 return await super().compile_okf(source_text, user_id=user_id)
 
-        assert await process_okf_conversion_batch(
-            session,
-            TransactionObservingStorage(
-                b"Revenue policy: refunds require approval.",
+        assert (
+            await process_okf_conversion_batch(
                 session,
-            ),  # type: ignore[arg-type]
-            TransactionObservingClient(),  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+                TransactionObservingStorage(
+                    b"Revenue policy: refunds require approval.",
+                    session,
+                ),  # type: ignore[arg-type]
+                TransactionObservingClient(),  # type: ignore[arg-type]
+                Settings(environment="test", llm_egress_mode="direct"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.SUCCEEDED
@@ -430,13 +433,16 @@ async def test_replaced_lease_during_object_read_cannot_egress_or_publish() -> N
                 return await super().read_bytes(key=key, max_bytes=max_bytes)
 
         client = SequencedClient([])
-        assert await process_okf_conversion_batch(
-            session,
-            LeaseReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                LeaseReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test", llm_egress_mode="direct"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -479,13 +485,16 @@ async def test_replaced_file_identity_during_object_read_cannot_egress_or_publis
                 return await super().read_bytes(key=key, max_bytes=max_bytes)
 
         client = SequencedClient([])
-        assert await process_okf_conversion_batch(
-            session,
-            FileReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                FileReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test", llm_egress_mode="direct"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         assert client.calls == 0
         assert await session.scalar(select(KnowledgeEntry)) is None
@@ -535,13 +544,16 @@ async def test_lease_replaced_inside_egress_policy_cancels_provider_call(
         )
         client = SequencedClient([])
 
-        assert await process_okf_conversion_batch(
-            session,
-            TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test", llm_egress_mode="direct"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -577,13 +589,16 @@ async def test_file_identity_changed_after_provider_cannot_publish_result() -> N
                 return result
 
         client = FileReplacingClient([])
-        assert await process_okf_conversion_batch(
-            session,
-            TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test", llm_egress_mode="direct"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -627,13 +642,16 @@ async def test_active_okf_egress_lease_blocks_stale_worker_reclaim() -> None:
         )
         await session.commit()
 
-        assert await process_okf_conversion_batch(
-            session,
-            TextStorage(b"must not be read"),  # type: ignore[arg-type]
-            SuccessfulClient(),  # type: ignore[arg-type]
-            Settings(environment="test", okf_conversion_lease_seconds=60),
-            batch_size=1,
-        ) == 0
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                TextStorage(b"must not be read"),  # type: ignore[arg-type]
+                SuccessfulClient(),  # type: ignore[arg-type]
+                Settings(environment="test", okf_conversion_lease_seconds=60),
+                batch_size=1,
+            )
+            == 0
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -681,7 +699,7 @@ async def test_binary_format_is_not_sent_to_model() -> None:
                 session,
                 TextStorage(b"must not be read"),  # type: ignore[arg-type]
                 None,
-                Settings(environment="test", external_llm_enabled=False),
+                Settings(environment="test"),
                 batch_size=1,
             )
             == 1
@@ -730,7 +748,7 @@ async def test_isolated_text_conversion_uses_local_deterministic_compiler() -> N
             session,
             TextStorage("江苏和熠光显有限公司成立于2023年。".encode()),  # type: ignore[arg-type]
             None,
-            Settings(environment="test", external_llm_enabled=False),
+            Settings(environment="test"),
             batch_size=1,
         )
 

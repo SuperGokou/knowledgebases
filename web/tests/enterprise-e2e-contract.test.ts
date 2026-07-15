@@ -3,6 +3,7 @@ import {
   generateKeyPairSync,
   verify,
 } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import { describe, expect, test } from "vitest";
@@ -16,6 +17,7 @@ import {
   EVIDENCE_ID,
   EVIDENCE_KEY_ID,
   REQUIRED_CHECKS,
+  REQUIRED_PROJECTS,
   buildCompleteEvidence,
   canonicalEvidenceDigest,
   parseEvidenceChallenge,
@@ -32,8 +34,67 @@ import {
 } from "../e2e/support/enterprise-config";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const enterpriseFixtures = readFileSync(
+  path.join(process.cwd(), "e2e/support/enterprise-fixtures.ts"),
+  "utf8",
+);
+const enterpriseBusinessSpec = readFileSync(
+  path.join(process.cwd(), "e2e/enterprise-business.spec.ts"),
+  "utf8",
+);
+
+type BrowserCollectionPolicy = {
+  readonly expected_collected_tests: number;
+  readonly required_projects: readonly string[];
+  readonly required_test_titles: readonly string[];
+};
+
+function readFormalBrowserCollectionContracts(): readonly BrowserCollectionPolicy[] {
+  const repositoryRoot = path.resolve(process.cwd(), "..");
+  const policy = JSON.parse(
+    readFileSync(path.join(repositoryRoot, "docs/functional_acceptance_policy.json"), "utf8"),
+  ) as {
+    readonly external_test_collections: Readonly<Record<string, BrowserCollectionPolicy>>;
+  };
+  const manifest = JSON.parse(
+    readFileSync(path.join(repositoryRoot, "docs/functional_acceptance_manifest.json"), "utf8"),
+  ) as {
+    readonly external_evidence: readonly {
+      readonly id: string;
+      readonly collection?: BrowserCollectionPolicy;
+    }[];
+  };
+  const manifestContract = manifest.external_evidence.find(
+    (item) => item.id === "EXT-BROWSER-E2E-001",
+  )?.collection;
+  const policyContract = policy.external_test_collections["EXT-BROWSER-E2E-001"];
+  if (!manifestContract || !policyContract) {
+    throw new Error("formal browser collection contract is incomplete");
+  }
+  return [manifestContract, policyContract];
+}
 
 describe("enterprise Playwright profile", () => {
+  test("searches the complete reader knowledge catalog before selecting the chat scope", () => {
+    expect(enterpriseBusinessSpec).toContain('getByLabel("搜索可问答知识库")');
+    expect(enterpriseBusinessSpec).toContain('parameters.get("minimum_access_level") === "reader"');
+    expect(enterpriseBusinessSpec).toContain('parameters.get("q") === knowledgeBaseName');
+    expect(enterpriseBusinessSpec).toContain('getByLabel("选择知识库").selectOption(knowledgeBaseId)');
+  });
+
+  test("drives the API key lifecycle through browser controls and clears one-time secrets", () => {
+    expect(enterpriseBusinessSpec).toContain('getByRole("button", { name: "生成 API Key" })');
+    expect(enterpriseBusinessSpec).toContain('getByRole("button", { name: `轮换 ${keyName}` })');
+    expect(enterpriseBusinessSpec).toContain('getByRole("button", { name: `撤销 ${keyName}` })');
+    expect(enterpriseBusinessSpec).toContain('getByRole("button", { name: "我已保存，关闭明文" })');
+    expect(enterpriseBusinessSpec).toContain("await expect(issuedPanel).toHaveCount(0)");
+  });
+
+  test("masks one-time credentials and password fields in mandatory evidence screenshots", () => {
+    expect(enterpriseFixtures).toContain('[data-sensitive="true"], input[type="password"]');
+    expect(enterpriseFixtures).toContain("mask: [sensitiveContent]");
+  });
+
   test("uses a long-running default timeout and accepts an explicit validated override", () => {
     expect(resolveEnterpriseTestTimeoutMs({})).toBe(DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS);
     expect(DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS).toBe(30 * 60_000);
@@ -83,6 +144,21 @@ describe("enterprise Playwright profile", () => {
     ).toBe(true);
   });
 
+  test("keeps formal collection policy, runtime profile, and evidence reporter projects aligned", () => {
+    const enterprise = resolvePlaywrightProfile(
+      { KB_E2E_PROFILE: "enterprise" },
+      path.resolve(process.cwd()),
+    );
+    const runtimeProjects = enterprise.projects.map((project) => project.name);
+    const reporterProjects = [...REQUIRED_PROJECTS];
+
+    for (const contract of readFormalBrowserCollectionContracts()) {
+      expect(contract.expected_collected_tests).toBe(22);
+      expect(contract.required_projects).toEqual(runtimeProjects);
+      expect(contract.required_projects).toEqual(reporterProjects);
+    }
+  });
+
   test("rejects unknown profile names instead of silently running smoke", () => {
     expect(() =>
       resolvePlaywrightProfile({ KB_E2E_PROFILE: "entperrise" }, path.resolve("C:/repo/web")),
@@ -102,6 +178,7 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_UNSCOPED_KNOWLEDGE_BASE_ID: "unscoped",
       KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
       KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+      KB_E2E_RUN_ID: "acceptance-run-20260714",
       KB_E2E_DOCUMENT_FIXTURE_ROOT: "C:/trust/document-fixtures",
       KB_E2E_DOCUMENT_FIXTURE_MANIFEST: "C:/trust/document-fixtures/document-fixtures-v1.json",
     };
@@ -128,15 +205,21 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_MULTIPART_BYTES: "104857600",
       KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
       KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+      KB_E2E_RUN_ID: "acceptance-run-20260714",
       KB_E2E_DOCUMENT_FIXTURE_ROOT: "C:/trust/document-fixtures",
       KB_E2E_DOCUMENT_FIXTURE_MANIFEST:
         "C:/trust/document-fixtures/document-fixtures-v1.json",
     };
     expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_OBJECTS_ORIGIN");
+    expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_RUN_ID");
     expect(
       inspectEnterpriseConfig({ ...env, KB_E2E_OBJECTS_ORIGIN: undefined }).missing,
     ).toContain("KB_E2E_OBJECTS_ORIGIN");
     expect(inspectEnterpriseConfig(env)).toEqual({ missing: [], invalid: [] });
+    expect(requireEnterpriseConfig(env).runId).toBe("acceptance-run-20260714");
+    expect(
+      inspectEnterpriseConfig({ ...env, KB_E2E_RUN_ID: "short" }).invalid,
+    ).toContain("KB_E2E_RUN_ID");
     expect(requireEnterpriseConfig(env).objectsOrigin).toBe("https://objects.invalid");
 
     for (const unsafeOrigin of [
@@ -190,8 +273,9 @@ describe("enterprise evidence schema v2", () => {
       ]),
     );
     const target = {
-        git_head: "a".repeat(40),
-        content_fingerprint: "b".repeat(64),
+      git_head: "a".repeat(40),
+      content_fingerprint: "b".repeat(64),
+      run_id: "acceptance-run-20260714",
     };
     const evidence = buildCompleteEvidence({
       target,
@@ -228,6 +312,12 @@ describe("enterprise evidence schema v2", () => {
     expect(evidence.evidence_id).toBe(EVIDENCE_ID);
     expect(evidence.collector).toEqual(EVIDENCE_COLLECTOR);
     expect(evidence.status).toBe("complete");
+    expect(Object.keys(evidence.target).sort()).toEqual([
+      "content_fingerprint",
+      "git_head",
+      "run_id",
+    ]);
+    expect(evidence.target.run_id).toBe("acceptance-run-20260714");
     expect(Object.keys(evidence.checks).sort()).toEqual([...REQUIRED_CHECKS].sort());
     expect(evidence.attestation).toEqual({
       type: "ed25519-challenge-v1",
@@ -266,6 +356,22 @@ describe("enterprise evidence schema v2", () => {
         Buffer.from(evidence.attestation.signature, "base64"),
       ),
     ).toBe(false);
+    const wrongRun = {
+      ...evidence,
+      target: { ...evidence.target, run_id: "acceptance-run-20260715" },
+    };
+    expect(
+      verify(
+        null,
+        signaturePayload(wrongRun, {
+          keyId: EVIDENCE_KEY_ID,
+          challengeId: evidence.attestation.challenge_id,
+          challengeNonce: evidence.attestation.challenge_nonce,
+        }),
+        publicKey,
+        Buffer.from(evidence.attestation.signature, "base64"),
+      ),
+    ).toBe(false);
   });
 
   test("refuses incomplete, dangling, duplicated, or hash-invalid evidence", () => {
@@ -282,7 +388,11 @@ describe("enterprise evidence schema v2", () => {
       ]),
     );
     const { privateKey } = generateKeyPairSync("ed25519");
-    const target = { git_head: "a".repeat(40), content_fingerprint: "b".repeat(64) };
+    const target = {
+      git_head: "a".repeat(40),
+      content_fingerprint: "b".repeat(64),
+      run_id: "acceptance-run-20260714",
+    };
     const base = {
       target,
       collectedAt: "2026-07-13T12:00:00.000Z",
@@ -312,6 +422,14 @@ describe("enterprise evidence schema v2", () => {
     expect(() =>
       buildCompleteEvidence({
         ...base,
+        target: { ...target, run_id: "short" },
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
         artifacts: [validArtifact],
         checks: {
           ...completeChecks,
@@ -329,7 +447,11 @@ describe("enterprise evidence schema v2", () => {
   });
 
   test("validates one-time challenge scope, expiry and target binding", () => {
-    const target = { git_head: "a".repeat(40), content_fingerprint: "b".repeat(64) };
+    const target = {
+      git_head: "a".repeat(40),
+      content_fingerprint: "b".repeat(64),
+      run_id: "acceptance-run-20260714",
+    };
     const challenge = {
       schema_version: 1,
       challenge_id: "browser-challenge-20260713",
@@ -354,6 +476,13 @@ describe("enterprise evidence schema v2", () => {
       parseEvidenceChallenge(
         challenge,
         { ...target, content_fingerprint: "c".repeat(64) },
+        new Date("2026-07-13T12:00:00.000Z"),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseEvidenceChallenge(
+        challenge,
+        { ...target, run_id: "acceptance-run-20260715" },
         new Date("2026-07-13T12:00:00.000Z"),
       ),
     ).toThrow();

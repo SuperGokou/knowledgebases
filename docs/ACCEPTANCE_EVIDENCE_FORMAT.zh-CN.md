@@ -55,12 +55,47 @@
 
 ## 离线镜像证据
 
-`final` 不读取镜像清单内容进报告，而是在目标机执行：
+`final` 不读取镜像清单内容进报告。镜像验证必须复用同一个 root-only canonical contract：
 
 ```bash
-sh deploy/tencent/verify-offline-images.sh verify \
-  /srv/heyi-knowledgebases-offline/shared/offline.env \
-  /srv/heyi-knowledgebases-offline/shared/offline.env.images
+CONTRACT_RESULT=$(sudo sh deploy/tencent/create-offline-contract.sh \
+  /srv/heyi-knowledgebases-offline/shared/runtime.env \
+  /srv/heyi-knowledgebases-offline/releases/<content-sha>/release.env)
+CONTRACT_DIR=${CONTRACT_RESULT%% *}
+CONTRACT_SHA256=${CONTRACT_RESULT#* }
+trap 'sudo sh deploy/tencent/remove-offline-contract.sh \
+  "$CONTRACT_DIR" "$CONTRACT_SHA256"' EXIT
+
+sudo sh deploy/tencent/verify-offline-images.sh verify \
+  --contract-dir "$CONTRACT_DIR" \
+  --contract-sha256 "$CONTRACT_SHA256"
 ```
 
-清单缺失、与 `docker compose config --images` 不一致、任一镜像未 `docker load` 或无法 `docker image inspect` 时记为 `blocked`。`local`/`ci` 的 Compose 解析只属于开发 Smoke。
+`create-offline-contract.sh` 会输出 `CONTRACT_DIR CONTRACT_SHA256`；示例的退出 trap 只会在重新核验摘要后删除该 contract。上面的手工 `verify-offline-images.sh verify` **只验证镜像清单、Compose 渲染与本机镜像身份，不读取 Registry 导入收据，也不读取 `highest-release.json`**。清单缺失、与 `docker compose config --images` 不一致，或任一精确 RepoDigest/config image ID/`linux/amd64` 平台无法由本机 `docker image inspect` 证明时，该手工镜像检查失败。
+
+完整 `final` 必须先通过 `OFFLINE-P0-001`：以 root 对同一 canonical contract 执行 `preflight-offline.sh`，由预检校验签名 Registry 导入收据、最高已接受发布状态、目标发布与签名资产摘要；随后 `OFFLINE-IMAGES-P0-001` 才执行上述镜像身份检查。`install-offline.sh` 与 `deploy-offline.sh` 已按该顺序调用预检与镜像验证。签名收据缺失、不安全、与目标发布不匹配或不是最高已接受发布时，由完整预检记为 `blocked`；不能用手工 `verify-offline-images.sh` 的成功替代该门禁。classic `docker load` 成功本身也不是通过条件；`local`/`ci` 的 Compose 解析只属于开发 Smoke。
+
+## 容量与灾备签名证据
+
+`CAPACITY-P0-001` 与 `DR-P0-001` 不再是不可解除的静态阻断，但也不会根据文件名、人工说明或单元测试自动放行。两项 Gate 均要求显式提供：证据 JSON、64 字节原始 Ed25519 detached signature、PEM Ed25519 公钥以及不可变 `release_id`。三类文件必须位于目标 Linux 主机的绝对路径，root 所有、不可被组或其他用户写入、不是符号链接且只有一个硬链接；公钥还必须位于证据目录和代码仓库之外的独立信任根。验收器对证据原始字节验签，并核对公钥 DER 指纹、当前 Git HEAD、工作树内容指纹、发布编号、时效、相对工件路径、字节数和 SHA-256。缺失、重复 JSON key、额外字段、旧发布、过期、未来时间、错误签名、工件替换或不安全权限一律返回 `blocked`。
+
+### 组合容量证据
+
+信封使用 [enterprise-capacity-evidence-v1.schema.json](./schemas/enterprise-capacity-evidence-v1.schema.json)，最长有效期 24 小时，并且必须恰好引用以下三个受签名信封哈希保护的 JSON 工件：
+
+1. `control_plane_report`：必须是 `scripts/enterprise_capacity_gate.py` 生成的 `PASS_CONTROL_PLANE`，所有检查通过，并继续诚实标记 `evidence_classification=not_model_capacity` 与五十亿 Token/日 `UNVERIFIED_NO_GO`；
+2. `real_model_benchmark`：必须来自真实供应商或私有推理集群，`stub_used=false`、`synthetic_responses=false`，至少 1,000 个身份、连续 1,800 秒，按实际输出 Token 计算的吞吐不低于 `5,000,000,000 / 86,400` Token/s，错误率不高于 0.1%；
+3. `provider_quota`：必须证明真实供应商或私有推理集群的每日配额不少于 50 亿 Token，且成本模型与数据驻留已复核，证据不得包含密钥。供应商类型、供应商 ID 与模型 ID 必须和真实模型压测工件完全一致，不能用另一个模型或供应商的配额替代。
+
+控制面桩流量仍然有价值，但它只能证明队列、配额、超时、数据库和对象存储控制面。桩吞吐、请求次数、理论换算或 `MODELLED_NOT_MEASURED` 均不能代替 `real_model_benchmark`。模型工件的详细字段以验收器实现和本节约束为准；任何“实测 Token 数 / 稳态秒数”不足时即使报告中的投影值较高也会被拒绝。
+
+### 全量灾备恢复证据
+
+信封使用 [enterprise-disaster-recovery-evidence-v1.schema.json](./schemas/enterprise-disaster-recovery-evidence-v1.schema.json)，最长有效期 30 天，并且必须恰好引用以下四个 JSON 工件：
+
+1. `restore_drill_report`：全新隔离主机的真实全量恢复，禁止 simulation/test double；独立备份、PostgreSQL PITR、对象版本或复制均验证通过；时间戳实算 `RPO ≤ 900 秒`、`RTO ≤ 14,400 秒`；
+2. `database_integrity`：源端与恢复端 schema head、表数、行数一致且校验通过；
+3. `object_integrity`：源端与恢复端对象总数一致，至少 1,000 个对象逐个 SHA-256 匹配，匹配率必须为 100%；工件必须携带去标识化的 `object_id_sha256 + source_sha256 + restored_sha256` 样本清单，验收器会逐项比较、拒绝重复对象，并重新计算清单摘要；
+4. `functional_smoke`：恢复环境的登录、检索、下载与来源引用闭环全部通过，且证据不含秘密。
+
+`legacy_offline_adoption.py` 产生的签名备份与隔离恢复工件可以作为原始恢复材料，但旧版 `offline-upgrade-backup` 顶层证据本身没有当前最终发布的 `git_head + content_fingerprint + release_id` 三重绑定，也没有完整 RPO/RTO 与 1,000 对象抽检契约，因此不能直接让 `DR-P0-001` 通过。必须由独立验收签署方复核原始工件后生成上述严格信封；不得修改旧证据伪造缺失字段。

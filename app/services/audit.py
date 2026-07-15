@@ -44,11 +44,7 @@ async def list_audit_events(
         statement = statement.where(AuditLog.id < cursor)
 
     events = list(
-        (
-            await session.scalars(
-                statement.order_by(AuditLog.id.desc()).limit(limit + 1)
-            )
-        ).all()
+        (await session.scalars(statement.order_by(AuditLog.id.desc()).limit(limit + 1))).all()
     )
     has_more = len(events) > limit
     page = events[:limit]

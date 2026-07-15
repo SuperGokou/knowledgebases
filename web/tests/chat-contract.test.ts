@@ -18,6 +18,7 @@ const validReply = {
     columns: ["项目", "要求"],
     rows: [["发布", "必须先审批"]],
     citation_numbers: [1],
+    row_citation_numbers: [[1]],
   },
   citations: [
     {
@@ -86,6 +87,18 @@ describe("parseChatReply", () => {
     },
     {
       ...validReply,
+      table: { ...validReply.table, row_citation_numbers: [] },
+    },
+    {
+      ...validReply,
+      table: { ...validReply.table, row_citation_numbers: [[99]] },
+    },
+    {
+      ...validReply,
+      table: { ...validReply.table, row_citation_numbers: [[1, 1]] },
+    },
+    {
+      ...validReply,
       answer_review: { status: "passed", reason: "retrieval_only" },
     },
     {
@@ -99,5 +112,36 @@ describe("parseChatReply", () => {
     } catch (error) {
       expect(error).toMatchObject({ status: 502, code: "invalid_chat_response" });
     }
+  });
+
+  it("accepts the pre-upgrade table contract without a row evidence map", () => {
+    const legacyTable = { ...validReply.table };
+    delete (legacyTable as Partial<typeof validReply.table>).row_citation_numbers;
+
+    expect(parseChatReply({ ...validReply, table: legacyTable })).toEqual({
+      ...validReply,
+      table: legacyTable,
+    });
+  });
+
+  it("rejects a multi-source table when the row map does not use every declared source", () => {
+    const secondCitation = {
+      ...validReply.citations[0],
+      entry_id: "00000000-0000-4000-8000-000000000003",
+      citation_number: 2,
+      marker: "[2]",
+    };
+    const payload = {
+      ...validReply,
+      citations: [...validReply.citations, secondCitation],
+      table: {
+        ...validReply.table,
+        citation_numbers: [1, 2],
+        row_citation_numbers: [[1]],
+      },
+      source_status: { ...validReply.source_status, citation_count: 2 },
+    };
+
+    expect(() => parseChatReply(payload)).toThrowError(ApiClientError);
   });
 });

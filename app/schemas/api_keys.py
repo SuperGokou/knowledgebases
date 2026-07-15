@@ -40,6 +40,7 @@ class ApiKeyRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    credential_family_id: UUID
     user_id: UUID
     created_by: UUID | None
     name: str

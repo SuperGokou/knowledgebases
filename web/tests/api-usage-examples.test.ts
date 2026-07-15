@@ -18,6 +18,7 @@ describe("buildApiUsageExample", () => {
       expect(example).toContain(`${LAN_API_ORIGIN}/api/v1/public/chat/query`);
       expect(example).toContain("KNOWLEDGEBASES_API_KEY");
       expect(example).toContain("X-API-Key");
+      expect(example).toContain("Idempotency-Key");
       expect(example).not.toMatch(/vercel\.app/i);
       expect(example).not.toMatch(/kb_[A-Za-z0-9_-]{20,}/);
     },
@@ -29,6 +30,23 @@ describe("buildApiUsageExample", () => {
     expect(example).toContain(
       "/api/v1/public/knowledge-bases/YOUR_KNOWLEDGE_BASE_ID/search",
     );
+    expect(example).not.toContain("Idempotency-Key");
+  });
+
+  it.each([
+    ["curl", "--max-time 115"],
+    ["python", "timeout=(10, 115)"],
+    ["node", "AbortSignal.timeout(115000)"],
+  ] as const)("gives the %s chat example the audited client budget", (language, marker) => {
+    expect(buildApiUsageExample(language, "chat", LAN_API_ORIGIN)).toContain(marker);
+  });
+
+  it.each([
+    ["curl", "--max-time 30"],
+    ["python", "timeout=(10, 30)"],
+    ["node", "AbortSignal.timeout(30000)"],
+  ] as const)("keeps the %s search example on the short control-plane budget", (language, marker) => {
+    expect(buildApiUsageExample(language, "search", LAN_API_ORIGIN)).toContain(marker);
   });
 
   it("normalizes a trailing slash without creating a double slash", () => {

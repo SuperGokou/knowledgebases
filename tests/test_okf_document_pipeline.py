@@ -89,7 +89,7 @@ async def test_docx_runs_through_okf_and_persists_parser_provenance() -> None:
             session,
             MemoryStorage(payload),  # type: ignore[arg-type]
             None,
-            Settings(environment="test", external_llm_enabled=False),
+            Settings(environment="test"),
             batch_size=1,
         )
 

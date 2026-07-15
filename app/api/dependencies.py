@@ -154,6 +154,18 @@ async def _enforce_access_rate_limit(
         )
 
 
+async def require_authenticated_access(
+    response: Response,
+    access: Annotated[AccessContext, Depends(get_access_context)],
+    redis: Annotated[Redis, Depends(redis_dependency)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AccessContext:
+    """Resolve a live principal and enforce effective limits without requiring an RBAC grant."""
+
+    await _enforce_access_rate_limit(response, access, redis, settings)
+    return access
+
+
 def require_permission(permission: str) -> Callable[..., object]:
     async def dependency(
         response: Response,
@@ -240,7 +252,7 @@ def require_api_key_permission(permission: str) -> Callable[..., object]:
         await _enforce_access_rate_limit(response, key_access.access, redis, settings)
         try:
             decision = await RateLimiter(redis).check(
-                key=f"rate:api-key:{key_access.api_key.id}",
+                key=f"rate:api-key-family:{key_access.api_key.credential_family_id}",
                 limit=key_access.api_key.requests_per_minute,
             )
         except Exception as error:

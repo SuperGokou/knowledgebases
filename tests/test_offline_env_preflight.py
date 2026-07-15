@@ -1,413 +1,758 @@
 from __future__ import annotations
 
-import os
+import importlib.util
 import subprocess
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-PREFLIGHT = REPOSITORY / "deploy/tencent/preflight-offline.sh"
-EXAMPLE_ENV = REPOSITORY / "deploy/tencent/offline.env.example"
-PINNED_IMAGE = "example/app@sha256:" + "a" * 64
+DEPLOY = REPOSITORY / "deploy/tencent"
+EXAMPLE_RUNTIME_ENV = DEPLOY / "offline.env.example"
+EXAMPLE_RELEASE_ENV = DEPLOY / "release.env.example"
 
 
-def _write_executable(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8", newline="\n")
-    path.chmod(0o755)
+def _validator() -> ModuleType:
+    path = DEPLOY / "validate-offline-environment.py"
+    spec = importlib.util.spec_from_file_location("offline_environment_validator", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _fake_command_directory(tmp_path: Path) -> Path:
-    commands = tmp_path / "commands"
-    commands.mkdir()
-    _write_executable(
-        commands / "id",
-        """#!/usr/bin/env sh
-if [ "${1:-}" = "-u" ]; then
-  printf '%s\\n' "${FAKE_EFFECTIVE_UID:-0}"
-else
-  exit 64
-fi
-""",
-    )
-    _write_executable(
-        commands / "stat",
-        """#!/usr/bin/env sh
-case "$*" in
-  *%u*) printf '%s\\n' "${FAKE_FILE_UID:-0}" ;;
-  *%a*) printf '%s\\n' "${FAKE_FILE_MODE:-600}" ;;
-  *) exit 64 ;;
-esac
-""",
-    )
-    _write_executable(
-        commands / "getconf",
-        """#!/usr/bin/env sh
-printf '8\\n'
-""",
-    )
-    _write_executable(
-        commands / "awk",
-        """#!/usr/bin/env sh
-case "$*" in
-  *MemTotal*) printf '16000000\\n' ;;
-  *) printf '300000000\\n' ;;
-esac
-""",
-    )
-    _write_executable(
-        commands / "ss",
-        """#!/usr/bin/env sh
-case "$*" in
-  *":${FAKE_PORT_IN_USE:-none}"*) printf 'LISTEN fake\\n' ;;
-esac
-""",
-    )
-    _write_executable(
-        commands / "python3",
-        "#!/usr/bin/env sh\nexit 0\n",
-    )
-    _write_executable(commands / "install", "#!/usr/bin/env sh\nexit 0\n")
-    _write_executable(
-        commands / "realpath",
-        """#!/usr/bin/env sh
-for argument in "$@"; do result=$argument; done
-printf '%s\\n' "${FAKE_CANONICAL_DATA_ROOT:-$result}"
-""",
-    )
-    _write_executable(
-        commands / "df",
-        """#!/usr/bin/env sh
-printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'
-printf '/dev/fake 300000000 0 300000000 0%% /srv\\n'
-""",
-    )
-    _write_executable(
-        commands / "docker",
-        f"""#!/usr/bin/env sh
-set -eu
-case "$*" in
-  *'config --images'*) printf '%s\\n' "${{FAKE_COMPOSE_IMAGE:-{PINNED_IMAGE}}}" ;;
-  *'image inspect'*) printf '%s\\n' "${{FAKE_REPO_DIGEST:-{PINNED_IMAGE}}}" ;;
-  *'ps -aq'*com.docker.compose.project*)
-    [ "${{FAKE_PROJECT_RESOURCE:-0}}" = 1 ] && printf 'unverified-resource\\n' || :
-    ;;
-  *'network ls -q'*|*'volume ls -q'*) ;;
-  *'volume inspect --format'*io.heyi.knowledgebases.owner*)
-    printf '%s\\n' "${{FAKE_MARKER_OWNER:-jiangsu-heyi-knowledgebases}}"
-    ;;
-  *'volume inspect --format'*io.heyi.knowledgebases.compose-project*)
-    printf '%s\\n' "${{FAKE_MARKER_PROJECT:-heyi-kb-offline}}"
-    ;;
-  *'volume inspect heyi-kb-offline-owner-marker'*)
-    [ "${{FAKE_MARKER_MISSING:-0}}" = 1 ] && exit 1 || exit 0
-    ;;
-  *'volume create'*) printf 'heyi-kb-offline-owner-marker\\n' ;;
-  *'ps -q'*com.docker.compose.service=proxy*) printf 'proxy123\\n' ;;
-  *'ps -q'*publish=*)
-    [ "${{FAKE_PROXY_OWNS_PORT:-1}}" = 1 ] && printf 'proxy123\\n' || printf 'other123\\n'
-    ;;
-  *'inspect --format'*com.docker.compose.project*) printf 'heyi-kb-offline\\n' ;;
-  *'inspect --format'*com.docker.compose.service*) printf 'proxy\\n' ;;
-  *'port proxy123 8443/tcp'*) printf '0.0.0.0:19443\\n' ;;
-  *'port proxy123 9443/tcp'*) printf '0.0.0.0:19444\\n' ;;
-  *) exit 0 ;;
-esac
-""",
-    )
-    return commands
+def _network_validator() -> ModuleType:
+    path = DEPLOY / "verify-offline-network-cidrs.py"
+    spec = importlib.util.spec_from_file_location("offline_network_validator", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _write_env(
-    tmp_path: Path,
-    *,
-    extra: str = "",
-    replacements: dict[str, str] | None = None,
-) -> Path:
-    content = EXAMPLE_ENV.read_text(encoding="utf-8")
-    for before, after in (replacements or {}).items():
-        content = content.replace(before, after)
-    env_file = tmp_path / "offline.env"
-    env_file.write_text(content + extra, encoding="utf-8", newline="\n")
-    env_file.chmod(0o600)
-    (tmp_path / "offline.env.images").write_text(
-        PINNED_IMAGE + "\n", encoding="utf-8", newline="\n"
-    )
-    return env_file
-
-
-def _run_preflight(
-    tmp_path: Path,
-    env_file: Path,
-    *,
-    file_uid: int = 0,
-    file_mode: str = "600",
-    environment_overrides: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    _fake_command_directory(tmp_path)
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "FAKE_EFFECTIVE_UID": "0",
-            "FAKE_FILE_UID": str(file_uid),
-            "FAKE_FILE_MODE": file_mode,
-            "KB_PREFLIGHT_LOCK_HELD": "heyi-kb-offline-preflight-v1",
-        }
-    )
-    environment.update(environment_overrides or {})
-    return subprocess.run(  # noqa: S603
-        [
-            "sh",
-            "-c",
-            'PATH="$1:$PATH"; export PATH; exec sh "$2" "$3"',
-            "preflight-test",
-            "commands",
-            str(PREFLIGHT),
-            str(env_file),
-        ],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        check=False,
-        shell=False,
-        text=True,
-        timeout=30,
+def _valid_runtime() -> str:
+    return EXAMPLE_RUNTIME_ENV.read_text(encoding="utf-8").replace(
+        "REPLACE_WITH_32_BYTE_BASE64URL_KEY",
+        "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=",
     )
 
 
-def test_preflight_rejects_symlinked_environment_file_before_parsing(
-    tmp_path: Path,
-) -> None:
-    marker = tmp_path / "command-was-executed"
-    target = _write_env(
-        tmp_path,
-        replacements={
-            "POSTGRES_PASSWORD=REPLACE_WITH_URL_SAFE_RANDOM_VALUE": (
-                "POSTGRES_PASSWORD=$(touch command-was-executed)"
-            )
+def _valid_release() -> str:
+    return (
+        EXAMPLE_RELEASE_ENV.read_text(encoding="utf-8")
+        .replace(
+            "127.0.0.1:5000/heyi-release/api@sha256:" + "0" * 64,
+            "127.0.0.1:5000/heyi-release/api@sha256:" + "a" * 64,
+        )
+        .replace(
+            "127.0.0.1:5000/heyi-release/migration@sha256:" + "0" * 64,
+            "127.0.0.1:5000/heyi-release/migration@sha256:" + "b" * 64,
+        )
+        .replace(
+            "127.0.0.1:5000/heyi-release/web@sha256:" + "0" * 64,
+            "127.0.0.1:5000/heyi-release/web@sha256:" + "c" * 64,
+        )
+    )
+
+
+def _parse_and_validate(runtime: str, release: str) -> None:
+    validator = _validator()
+    parsed_runtime = validator._parse(  # noqa: SLF001
+        _TextPath(runtime),
+        accepted_keys=validator._RUNTIME_KEYS,  # noqa: SLF001
+        release=False,
+    )
+    parsed_release = validator._parse(  # noqa: SLF001
+        _TextPath(release),
+        accepted_keys=validator._RELEASE_KEYS,  # noqa: SLF001
+        release=True,
+    )
+    validator._validate(parsed_runtime, parsed_release)  # noqa: SLF001
+
+
+class _TextPath:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def read_text(self, *, encoding: str) -> str:
+        assert encoding == "utf-8"
+        return self._value
+
+
+def test_validator_accepts_the_reviewed_private_runtime_and_release_contract() -> None:
+    _parse_and_validate(_valid_runtime(), _valid_release())
+
+
+def test_existing_offline_network_must_preserve_driver_internal_ipam_and_owner() -> None:
+    validator = _network_validator()
+    requested = {item[0] for item in validator.EXPECTED_NETWORKS.values()}
+    network = {
+        "Id": "a" * 64,
+        "Name": "heyi-kb-offline_backend",
+        "Driver": "bridge",
+        "Internal": True,
+        "IPAM": {"Config": [{"Subnet": "172.30.241.0/24"}]},
+        "Labels": {
+            "com.docker.compose.project": "heyi-kb-offline",
+            "com.docker.compose.network": "backend",
+            "io.heyi.knowledgebases.owner": "jiangsu-heyi-knowledgebases",
+            "io.heyi.knowledgebases.stack": "offline",
         },
+    }
+
+    subnet, _device = validator._validate_owned_network(  # noqa: SLF001
+        "heyi-kb-offline", network, requested
     )
-    link = tmp_path / "offline-link.env"
-    try:
-        link.symlink_to(target)
-    except OSError as exc:  # pragma: no cover - host capability is a test prerequisite
-        pytest.fail(f"test host cannot create the required symlink fixture: {exc}")
+    assert str(subnet) == "172.30.241.0/24"
 
-    result = _run_preflight(tmp_path, link)
-
-    assert result.returncode != 0
-    assert "symbolic link" in result.stderr
-    assert not marker.exists()
-
-
-@pytest.mark.parametrize(
-    ("file_uid", "file_mode", "expected"),
-    [
-        (1000, "600", "owned by root"),
-        (0, "640", "permissions must be 0600 or 0400"),
-        (0, "700", "permissions must be 0600 or 0400"),
-    ],
-)
-def test_preflight_rejects_unsafe_owner_or_mode_before_parsing(
-    tmp_path: Path,
-    file_uid: int,
-    file_mode: str,
-    expected: str,
-) -> None:
-    env_file = _write_env(tmp_path)
-
-    result = _run_preflight(tmp_path, env_file, file_uid=file_uid, file_mode=file_mode)
-
-    assert result.returncode != 0
-    assert expected in result.stderr
-
-
-def test_preflight_rejects_unknown_environment_keys(tmp_path: Path) -> None:
-    env_file = _write_env(tmp_path, extra="UNREVIEWED_ENDPOINT=https://example.com\n")
-
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode != 0
-    assert "unknown environment key: UNREVIEWED_ENDPOINT" in result.stderr
-
-
-def test_preflight_treats_environment_as_data_and_rejects_command_substitution(
-    tmp_path: Path,
-) -> None:
-    marker = tmp_path / "command-was-executed"
-    env_file = _write_env(
-        tmp_path,
-        replacements={
-            "POSTGRES_PASSWORD=REPLACE_WITH_URL_SAFE_RANDOM_VALUE": (
-                "POSTGRES_PASSWORD=$(touch command-was-executed)"
+    for field, unsafe_value in (
+        ("Driver", "host"),
+        ("Internal", False),
+        ("Name", "foreign_backend"),
+    ):
+        unsafe = {**network, field: unsafe_value}
+        with pytest.raises(RuntimeError):
+            validator._validate_owned_network(  # noqa: SLF001
+                "heyi-kb-offline", unsafe, requested
             )
-        },
+
+    unsafe_labels = {
+        **network,
+        "Labels": {**network["Labels"], "io.heyi.knowledgebases.owner": "foreign"},
+    }
+    with pytest.raises(RuntimeError):
+        validator._validate_owned_network(  # noqa: SLF001
+            "heyi-kb-offline", unsafe_labels, requested
+        )
+
+
+def test_validator_accepts_only_the_fixed_controlled_llm_gateway_pair() -> None:
+    controlled_runtime = (
+        _valid_runtime()
+        .replace(
+            "KB_LLM_EGRESS_MODE=strict_offline",
+            "KB_LLM_EGRESS_MODE=controlled_gateway",
+        )
+        .replace(
+            "KB_LLM_EGRESS_GATEWAY_URL=",
+            "KB_LLM_EGRESS_GATEWAY_URL=http://llm-egress:8080",
+        )
+        .replace(
+            "KB_LLM_EGRESS_APPROVED_PROVIDERS=",
+            "KB_LLM_EGRESS_APPROVED_PROVIDERS=deepseek",
+        )
     )
 
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode != 0
-    assert "unsafe value for POSTGRES_PASSWORD" in result.stderr
-    assert not marker.exists()
+    _parse_and_validate(controlled_runtime, _valid_release())
 
 
 @pytest.mark.parametrize(
     ("replacements", "expected"),
     [
         (
-            {"KB_PUBLIC_HOST=10.0.0.10": "KB_PUBLIC_HOST=example.com"},
-            "KB_PUBLIC_HOST must be an approved private or local address",
+            {"KB_LLM_EGRESS_GATEWAY_URL=": ("KB_LLM_EGRESS_GATEWAY_URL=http://llm-egress:8080")},
+            "strict_offline requires",
+        ),
+        (
+            {"KB_LLM_EGRESS_MODE=strict_offline": "KB_LLM_EGRESS_MODE=direct"},
+            "must be strict_offline or controlled_gateway",
         ),
         (
             {
-                "KB_PUBLIC_ORIGIN=https://10.0.0.10:19443": (
-                    "KB_PUBLIC_ORIGIN=https://example.com:19443"
-                )
+                "KB_LLM_EGRESS_MODE=strict_offline": ("KB_LLM_EGRESS_MODE=controlled_gateway"),
+                "KB_LLM_EGRESS_GATEWAY_URL=": (
+                    "KB_LLM_EGRESS_GATEWAY_URL=http://attacker.invalid:8080"
+                ),
             },
-            "KB_PUBLIC_ORIGIN must exactly match the approved public host and port",
+            "controlled_gateway requires",
         ),
     ],
 )
-def test_preflight_rejects_external_host_or_origin(
-    tmp_path: Path,
+def test_validator_rejects_inconsistent_or_unreviewed_llm_egress_modes(
     replacements: dict[str, str],
     expected: str,
 ) -> None:
-    env_file = _write_env(tmp_path, replacements=replacements)
+    runtime = _valid_runtime()
+    for before, after in replacements.items():
+        runtime = runtime.replace(before, after)
 
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode != 0
-    assert expected in result.stderr
-
-
-def test_preflight_accepts_strict_root_owned_private_configuration(
-    tmp_path: Path,
-) -> None:
-    env_file = _write_env(tmp_path)
-
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode == 0, result.stderr
-    assert "offline deployment requirements satisfied" in result.stdout
+    with pytest.raises(ValueError, match=expected):
+        _parse_and_validate(runtime, _valid_release())
 
 
-def test_preflight_rejects_trusted_hosts_without_the_internal_api_name(
-    tmp_path: Path,
-) -> None:
-    env_file = _write_env(
-        tmp_path,
-        replacements={
-            'KB_TRUSTED_HOSTS=\'["10.0.0.10","api"]\'': (
-                'KB_TRUSTED_HOSTS=\'["10.0.0.10"]\''
+def test_validator_accepts_the_fixed_controlled_llm_gateway() -> None:
+    runtime = (
+        _valid_runtime()
+        .replace(
+            "KB_LLM_EGRESS_MODE=strict_offline",
+            "KB_LLM_EGRESS_MODE=controlled_gateway",
+        )
+        .replace(
+            "KB_LLM_EGRESS_GATEWAY_URL=",
+            "KB_LLM_EGRESS_GATEWAY_URL=http://llm-egress:8080",
+        )
+        .replace(
+            "KB_LLM_EGRESS_APPROVED_PROVIDERS=",
+            "KB_LLM_EGRESS_APPROVED_PROVIDERS=deepseek",
+        )
+    )
+
+    _parse_and_validate(runtime, _valid_release())
+
+
+def test_initial_install_requires_a_non_example_bootstrap_password() -> None:
+    validator = _validator()
+    parsed_release = validator._parse(  # noqa: SLF001
+        _TextPath(_valid_release()),
+        accepted_keys=validator._RELEASE_KEYS,  # noqa: SLF001
+        release=True,
+    )
+    placeholder_runtime = validator._parse(  # noqa: SLF001
+        _TextPath(_valid_runtime()),
+        accepted_keys=validator._RUNTIME_KEYS,  # noqa: SLF001
+        release=False,
+    )
+    with pytest.raises(ValueError, match="initial installation requires"):
+        validator._validate(  # noqa: SLF001
+            placeholder_runtime,
+            parsed_release,
+            require_bootstrap_password=True,
+        )
+
+    reviewed_runtime = validator._parse(  # noqa: SLF001
+        _TextPath(
+            _valid_runtime().replace(
+                "REPLACE_WITH_A_UNIQUE_ADMIN_PASSWORD",
+                "Reviewed-Admin-Password-2026",
             )
-        },
+        ),
+        accepted_keys=validator._RUNTIME_KEYS,  # noqa: SLF001
+        release=False,
     )
-
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode != 0
-    assert "must contain only KB_PUBLIC_HOST and the internal api service" in result.stderr
-
-
-def test_preflight_rejects_identical_https_ports(tmp_path: Path) -> None:
-    env_file = _write_env(
-        tmp_path,
-        replacements={"KB_OBJECTS_HTTPS_PORT=19444": "KB_OBJECTS_HTTPS_PORT=19443"},
+    validator._validate(  # noqa: SLF001
+        reviewed_runtime,
+        parsed_release,
+        require_bootstrap_password=True,
     )
-
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode != 0
-    assert "HTTPS and object HTTPS ports must be different" in result.stderr
-
-
-@pytest.mark.parametrize("delimiter", ["@", ":", "/", "?", "#", "%"])
-def test_preflight_rejects_url_delimiters_in_database_passwords(
-    tmp_path: Path,
-    delimiter: str,
-) -> None:
-    env_file = _write_env(
-        tmp_path,
-        replacements={
-            "POSTGRES_APP_PASSWORD=REPLACE_WITH_A_DIFFERENT_URL_SAFE_RANDOM_VALUE": (
-                f"POSTGRES_APP_PASSWORD=safe{delimiter}host"
-            )
-        },
-    )
-
-    result = _run_preflight(tmp_path, env_file)
-
-    assert result.returncode != 0
-    assert "unsafe URL component for POSTGRES_APP_PASSWORD" in result.stderr
-
-
-def test_preflight_rejects_symlink_resolved_data_parent(tmp_path: Path) -> None:
-    env_file = _write_env(tmp_path)
-
-    result = _run_preflight(
-        tmp_path,
-        env_file,
-        environment_overrides={"FAKE_CANONICAL_DATA_ROOT": "/redirected/data"},
-    )
-
-    assert result.returncode != 0
-    assert "one of its parents must not be symbolic" in result.stderr
-
-
-def test_preflight_rejects_unmarked_existing_compose_project(tmp_path: Path) -> None:
-    env_file = _write_env(tmp_path)
-
-    result = _run_preflight(
-        tmp_path,
-        env_file,
-        environment_overrides={
-            "FAKE_MARKER_MISSING": "1",
-            "FAKE_PROJECT_RESOURCE": "1",
-        },
-    )
-
-    assert result.returncode != 0
-    assert "already owned by an unverified deployment" in result.stderr
 
 
 @pytest.mark.parametrize(
-    ("proxy_owns_port", "expected_returncode"),
-    [("1", 0), ("0", 69)],
+    ("keyring", "active_version", "expected"),
+    [
+        ("{}", "1", "non-empty object"),
+        ('{"1":"too-short"}', "1", "32-byte base64url"),
+        (
+            '{"1":"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI=",'
+            '"1":"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI="}',
+            "1",
+            "duplicated",
+        ),
+        (
+            '{"01":"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI="}',
+            "1",
+            "positive integer strings",
+        ),
+        (
+            '{"2":"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI="}',
+            "1",
+            "active chat replay key version",
+        ),
+    ],
 )
-def test_preflight_only_allows_verified_project_proxy_during_upgrade(
-    tmp_path: Path,
-    proxy_owns_port: str,
-    expected_returncode: int,
+def test_validator_rejects_missing_weak_or_inactive_chat_replay_keys(
+    keyring: str,
+    active_version: str,
+    expected: str,
 ) -> None:
-    env_file = _write_env(tmp_path)
-
-    result = _run_preflight(
-        tmp_path,
-        env_file,
-        environment_overrides={
-            "FAKE_PORT_IN_USE": "19443",
-            "FAKE_PROXY_OWNS_PORT": proxy_owns_port,
-        },
+    runtime = (
+        _valid_runtime()
+        .replace(
+            '{"1":"cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnI="}',
+            keyring,
+        )
+        .replace(
+            "KB_CHAT_REPLAY_ACTIVE_KEY_VERSION=1",
+            f"KB_CHAT_REPLAY_ACTIVE_KEY_VERSION={active_version}",
+        )
     )
-
-    assert result.returncode == expected_returncode, result.stderr
-    if expected_returncode:
-        assert "occupied by an unverified process" in result.stderr
+    with pytest.raises(ValueError, match=expected):
+        _parse_and_validate(runtime, _valid_release())
 
 
-def test_preflight_serializes_and_forbids_network_pulls_for_run_commands() -> None:
-    script = PREFLIGHT.read_text(encoding="utf-8")
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ("UNREVIEWED_ENDPOINT=https://example.com\n", "unknown environment key"),
+        ("KB_API_IMAGE=example/override@sha256:" + "d" * 64 + "\n", "unknown environment key"),
+        ("POSTGRES_PASSWORD=duplicate\n", "duplicate environment key"),
+    ],
+)
+def test_validator_rejects_unknown_cross_boundary_or_duplicate_runtime_keys(
+    extra: str,
+    expected: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected):
+        _parse_and_validate(_valid_runtime() + extra, _valid_release())
 
-    assert 'lock_file=$lock_directory/heyi-kb-offline.preflight.lock' in script
-    assert 'exec 9>"$lock_file"' in script
-    assert "flock -n 9" in script
+
+def test_validator_rejects_unknown_release_environment_keys() -> None:
+    with pytest.raises(ValueError, match="unknown release environment key"):
+        _parse_and_validate(
+            _valid_runtime(),
+            _valid_release() + "POSTGRES_PASSWORD=must-not-be-in-release\n",
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_reference",
+    [
+        "example/migration:latest",
+        "example/migration@sha256:" + "0" * 64,
+        "example/migration@sha256:" + "g" * 64,
+    ],
+)
+def test_validator_rejects_unpinned_or_placeholder_migration_images(
+    bad_reference: str,
+) -> None:
+    release = _valid_release().replace(
+        "127.0.0.1:5000/heyi-release/migration@sha256:" + "b" * 64,
+        bad_reference,
+    )
+    with pytest.raises(ValueError, match="KB_MIGRATION_IMAGE"):
+        _parse_and_validate(_valid_runtime(), release)
+
+
+def test_validator_treats_environment_as_data_and_rejects_command_substitution() -> None:
+    runtime = _valid_runtime().replace(
+        "POSTGRES_PASSWORD=REPLACE_WITH_URL_SAFE_RANDOM_VALUE",
+        "POSTGRES_PASSWORD=$(touch should-never-run)",
+        1,
+    )
+    with pytest.raises(ValueError, match="unsafe value for POSTGRES_PASSWORD"):
+        _parse_and_validate(runtime, _valid_release())
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        (
+            "KB_PUBLIC_HOST=10.0.0.10",
+            "KB_PUBLIC_HOST=example.com",
+            "KB_PUBLIC_HOST must be an approved private or local address",
+        ),
+        (
+            "KB_BIND_ADDRESS=10.0.0.10",
+            "KB_BIND_ADDRESS=0.0.0.0",
+            "KB_BIND_ADDRESS must be an approved private or local address",
+        ),
+        (
+            "KB_PUBLIC_ORIGIN=https://10.0.0.10:19443",
+            "KB_PUBLIC_ORIGIN=https://example.com:19443",
+            "KB_PUBLIC_ORIGIN must exactly match",
+        ),
+        (
+            'KB_TRUSTED_HOSTS=\'["10.0.0.10","api"]\'',
+            "KB_TRUSTED_HOSTS='[\"10.0.0.10\"]'",
+            "KB_TRUSTED_HOSTS must contain only",
+        ),
+        ("KB_CORS_ORIGINS='[]'", "KB_CORS_ORIGINS='[\"*\"]'", "must remain empty"),
+        ("KB_OBJECTS_HTTPS_PORT=19444", "KB_OBJECTS_HTTPS_PORT=19443", "must be different"),
+    ],
+)
+def test_validator_rejects_external_or_ambiguous_network_boundaries(
+    before: str,
+    after: str,
+    expected: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected):
+        _parse_and_validate(_valid_runtime().replace(before, after), _valid_release())
+
+
+@pytest.mark.parametrize("delimiter", ["@", ":", "/", "?", "#", "%"])
+def test_validator_rejects_url_delimiters_in_database_passwords(delimiter: str) -> None:
+    runtime = _valid_runtime().replace(
+        "POSTGRES_APP_PASSWORD=REPLACE_WITH_A_DIFFERENT_URL_SAFE_RANDOM_VALUE",
+        f"POSTGRES_APP_PASSWORD=safe{delimiter}host",
+    )
+    with pytest.raises(ValueError, match="unsafe URL component for POSTGRES_APP_PASSWORD"):
+        _parse_and_validate(runtime, _valid_release())
+
+
+def test_contract_snapshot_rejects_unsafe_sources_and_detects_toctou() -> None:
+    script = (DEPLOY / "prepare-offline-contract.sh").read_text(encoding="utf-8")
+
+    assert 'case "$source_path" in' in script and "path must be absolute" in script
+    assert 'canonical_source=$(realpath -e -- "$source_path"' in script
+    assert "contain no symbolic links" in script
+    assert "every ancestor must be owned by root" in script
+    assert "ancestor is group or world writable" in script
+    assert "NUL data or an overlong line" in script
+    assert 'before_digest=$(sha256sum "$source_path"' in script
+    assert 'after_digest=$(sha256sum "$source_path"' in script
+    assert 'snapshot_digest=$(sha256sum "$destination"' in script
+    assert '"$before_digest" != "$after_digest"' in script
+    assert '"$before_digest" != "$snapshot_digest"' in script
+
+
+def test_contract_snapshot_has_one_derived_manifest_and_root_only_runtime() -> None:
+    prepare = (DEPLOY / "prepare-offline-contract.sh").read_text(encoding="utf-8")
+    common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+
+    assert "manifest_source=$release_source.images" in prepare
+    assert "OFFLINE_CONTRACT_ROOT=$OFFLINE_RUNTIME_ROOT/contracts" in common
+    assert "install -d -o root -g root -m 0700" in common
+    assert "runtime.env\nrelease.env\nrelease.env.images" in common
+    assert "contract.sha256" in common
+    assert "contract file hashes changed after snapshot" in common
+
+
+def test_compose_environment_is_fixed_and_caller_overrides_are_cleared() -> None:
+    common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+
+    fixed_path = "OFFLINE_SYSTEM_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    assert fixed_path in common
+    for prefix in (
+        "KB_[A-Z0-9_]*",
+        "COMPOSE_[A-Z0-9_]*",
+        "DOCKER_[A-Z0-9_]*",
+        "POSTGRES_[A-Z0-9_]*",
+        "MINIO_[A-Z0-9_]*",
+        "PYTEST_ADDOPTS",
+        "PYTHONPATH",
+    ):
+        assert prefix in common
+    runtime_position = common.index('--env-file "$runtime_env_file"')
+    release_position = common.index('--env-file "$release_env_file"')
+    assert runtime_position < release_position
+    assert "offline_verify_contract" in common
+    assert "trusted release asset path is writable by non-root" in common
+    assert 'if ! offline_verify_release_assets "$prefix" "$contract_dir"; then' in common
+
+
+def test_full_preflight_uses_only_the_verified_snapshot_for_compose_and_images() -> None:
+    script = (DEPLOY / "preflight-offline.sh").read_text(encoding="utf-8")
+
+    assert "prepare-offline-contract.sh" in script
+    assert 'contract_sha256=$(offline_verify_contract preflight "$contract_dir")' in script
+    assert 'runtime_env_file=$(offline_contract_runtime_env "$contract_dir")' in script
+    assert 'release_env_file=$(offline_contract_release_env "$contract_dir")' in script
+    assert 'image_manifest=$(offline_contract_manifest "$contract_dir")' in script
+    assert 'verify-offline-images.sh" verify' in script
     assert script.count("run --pull never --rm --no-deps") == 3
+    assert "offline deployment requirements satisfied; contract_sha256=" in script
+    assert '"$KB_HTTPS_PORT:8443:proxy maintenance-page"' in script
+    assert '"$KB_OBJECTS_HTTPS_PORT:9443:proxy maintenance-page"' in script
+    assert "initial installation requires an unused project identity" in script
+    assert "upgrade requires the verified project ownership marker" in script
+    assert "upgrade requires an existing verified project deployment" in script
+    assert "--require-bootstrap-password" in script
 
 
-def test_preflight_assigns_postgres_bind_root_to_pinned_image_uid() -> None:
-    script = PREFLIGHT.read_text(encoding="utf-8")
+def test_maintenance_preflight_is_render_only_and_never_starts_app_containers() -> None:
+    script = (DEPLOY / "preflight-maintenance-offline.sh").read_text(encoding="utf-8")
 
+    assert "config --quiet" in script
+    assert "verified project ownership marker is missing" in script
+    assert "HTTPS port is occupied by an unverified process" in script
+    assert "enterprise CA root is missing or symbolic" in script
+    for forbidden in ("run --pull", "up -d", "docker start", "docker stop", "docker exec"):
+        assert forbidden not in script
+
+
+def test_maintenance_transition_records_and_restores_only_the_exact_original_proxy() -> None:
+    script = (DEPLOY / "enter-maintenance-offline.sh").read_text(encoding="utf-8")
+
+    assert "original_proxy_running=false" in script
+    assert "container_id" in script and "project_label" in script and "service_label" in script
+    assert 'if [ "$original_proxy_running" != true ]; then' in script
+    assert 'docker start "$proxy_id"' in script
+    assert "compose start proxy" not in script
+    assert "RESTORE_FAILED" in script
+    assert "preflight-maintenance-offline.sh" in script
+    assert "preflight-offline.sh" not in script
+    assert "original_maintenance_running=false" in script
+    assert "exact_original_maintenance_ready" in script
+    assert "exact_original_maintenance_preserved" in script
+    assert "proxy and maintenance cannot both be running" in script
+    assert "candidate maintenance configuration is invalid" in script
+    assert "docker run --rm --pull never --network none --read-only" in script
+    assert "offline_materialize_release maintenance" in script
+    assert "materialized maintenance worker is missing or symbolic" in script
     assert (
-        'install -d -o 999 -g 999 -m 0700 "$KB_DATA_ROOT/postgres"' in script
+        "expected_materialized_root=/srv/heyi-knowledgebases-offline/releases/$contract_sha256"
+    ) in script
+    assert "snapshot_script_dir=$expected_materialized_root/deploy/tencent" in script
+    assert "snapshot_script_dir=$contract_dir/release/deploy/tencent" not in script
+
+
+def test_one_flock_covers_snapshot_preflight_and_maintenance_switch() -> None:
+    common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+    enter = (DEPLOY / "enter-maintenance-offline.sh").read_text(encoding="utf-8")
+
+    assert "OFFLINE_LOCK_FILE=$OFFLINE_LOCK_DIRECTORY/heyi-kb-offline.preflight.lock" in common
+    assert 'exec 9>"$OFFLINE_LOCK_FILE"' in common
+    assert "flock -n 9" in common
+    assert "offline_acquire_lock maintenance" in enter
+    assert enter.index("offline_acquire_lock maintenance") < enter.index(
+        "prepare-offline-contract.sh"
     )
+    assert enter.index("prepare-offline-contract.sh") < enter.index(
+        'docker stop --time 30 "$proxy_id"'
+    )
+
+
+def test_registry_import_uses_signed_loopback_bundle_not_classic_save_load() -> None:
+    script = (DEPLOY / "import-offline-registry-bundle.sh").read_text(encoding="utf-8")
+
+    assert 'openssl dgst -sha256 -verify "$trusted_public_key"' in script
+    assert "signed checksum path escapes the bundle" in script
+    assert 'cmp -s "$operator_release" "$signed_release"' in script
+    assert 'cmp -s "$operator_manifest" "$signed_manifest"' in script
+    assert "--publish 127.0.0.1:5000:5000" in script
+    assert 'docker pull --platform linux/amd64 "$image"' in script
+    assert "RepoDigest differs" in script
+    assert "stat.S_ISREG(info.st_mode) and info.st_nlink != 1" in script
+    assert "docker network create --internal --driver bridge" in script
+    assert '--network "$registry_network_id"' in script
+    assert 'docker network rm "$registry_network_id"' in script
+    assert "docker save" not in script
+    assert "docker load" not in script
+    assert 'docker rm -f "$registry_container_id"' in script
+    assert 'for directory in ("registry", "release")' in script
+    assert "signed release asset inventory differs" in script
+    assert "RELEASE_SEQUENCE" in script
+    assert "signed release sequence is replayed or downgraded" in script
+    assert "highest-release.json" in script
+    assert "release_assets_sha256" in script
+    docker_capacity_gate = script.index("docker_root=$(docker info")
+    first_registry_pull = script.index('docker pull --platform linux/amd64 "$image"')
+    assert docker_capacity_gate < first_registry_pull
+    assert "REGISTRY_UNPACKED_BYTES" in script
+    assert "REGISTRY_UNPACKED_INODES" in script
+    assert "unpacked_image_kib + 41943040" in script
+    assert "signed unpacked-image capacity plus the 40 GiB rollback reserve" in script
+    assert "registry_unpacked_inodes + rollback_inode_reserve" in script
+
+
+def test_every_hashed_release_asset_exists_and_is_copied_into_the_contract() -> None:
+    common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+    prepare = (DEPLOY / "prepare-offline-contract.sh").read_text(encoding="utf-8")
+    contract_listing = common.split("cat <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+    release_assets = [
+        line.removeprefix("release/")
+        for line in contract_listing.splitlines()
+        if line.startswith("release/")
+    ]
+
+    assert release_assets
+    for relative_path in release_assets:
+        assert (REPOSITORY / relative_path).is_file(), relative_path
+        assert relative_path in prepare, relative_path
+
+
+def test_deploy_wrapper_keeps_one_contract_and_flock_through_verified_cutover() -> None:
+    script = (DEPLOY / "deploy-offline.sh").read_text(encoding="utf-8")
+    common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+    inventory_verifier = (DEPLOY / "verify-offline-project-inventory.py").read_text(
+        encoding="utf-8"
+    )
+
+    lock_position = script.index("offline_acquire_lock deploy")
+    snapshot_position = script.index("prepare-offline-contract.sh")
+    preflight_position = script.index('preflight-offline.sh"')
+    maintenance_position = script.index('enter-maintenance-offline.sh"')
+    migration_position = script.index("run --pull never --rm migrate")
+    cutover_position = script.index("--business-ready-compose-config-stdin")
+    final_verify_position = script.index(
+        'final_contract_sha256=$(offline_verify_contract deploy "$contract_dir")'
+    )
+
+    assert lock_position < snapshot_position < preflight_position
+    assert preflight_position < maintenance_position < migration_position < cutover_position
+    assert cutover_position < final_verify_position
+    assert '--contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"' in script
+    assert '"$runtime_env_file" "$release_env_file"' not in script
+    assert script.count('--contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"') >= 2
+    assert script.count("offline_compose deploy") >= 5
+    writer_stop = "stop --timeout 60 api maintenance web llm-egress minio-multipart-gc"
+    assert writer_stop in script
+    assert script.index(writer_stop) < migration_position
+    assert "remained active before migration" in script
+    restore_block = script.split("restore_exact_maintenance() {", 1)[1].split("\n}", 1)[0]
+    assert restore_block.index("quiesce_owned_business_writers") < restore_block.index(
+        "stop_owned_proxy_for_fail_closed_restore"
+    )
+    assert "RESTORE_FAILED business writers could not be quiesced" in restore_block
+    assert "docker compose" not in script
+    assert 'docker start "$maintenance_container_id"' in script
+    assert "RESTORE_FAILED" in script
+    assert "docker system prune" not in script
+    assert "docker compose down" not in script
+    assert "offline_materialize_release deploy" in script
+    assert "internal worker is not running from the materialized release" in script
+    assert "validate_completed_installation_state" in script
+    assert "install-in-progress.json" in script
+    assert "one verified completed-install receipt" in script
+    assert "strict_offline could not remove the exact stale LLM gateway" in script
+    assert "strict_offline could not remove the exact stale LLM uplink network" in script
+    assert "label=com.docker.compose.network=llm-uplink" in script
+    assert "{{len .Containers}}" in script
+    assert "offline_verify_project_release_labels deploy" in script
+    assert 'offline_verify_project_release_labels deploy "$contract_dir"' in script
+    assert "verify-offline-project-inventory.py" in common
+    assert common.count("--container-inspect-json") == 2
+    assert "project topology changed during final verification" in common
+    capture = common.split("offline_capture_project_inventory_snapshot() {", 1)[1].split("\n}", 1)[
+        0
+    ]
+    assert '> "$container_ids_raw"' in capture
+    assert 'sort "$container_ids_raw" > "$container_ids_file"' in capture
+    assert '> "$network_ids_raw"' in capture
+    assert 'sort "$network_ids_raw" > "$network_ids_file"' in capture
+    assert "|" not in capture.split("docker ps", 1)[1].split("; then", 1)[0]
+    assert "|" not in capture.split("docker network ls", 1)[1].split("; then", 1)[0]
+    assert "io.heyi.knowledgebases.owner" in inventory_verifier
+    assert "com.docker.compose.oneoff" in inventory_verifier
+    assert "unexpected Compose volumes remain in the final project" in common
+    assert 'sh "$OFFLINE_RELEASE_ROOT/deploy/tencent/enter-maintenance-offline.sh"' in script
+    assert "assert_no_orphan_operations" in script
+    assert "orphan $operation_service container blocks" in script
+    commit_position = script.index("deployment_committed=true")
+    provenance_position = script.index("offline_verify_project_release_labels deploy")
+    assert provenance_position < commit_position
+
+
+def test_install_wrapper_keeps_ports_closed_until_strict_business_cutover() -> None:
+    script = (DEPLOY / "install-offline.sh").read_text(encoding="utf-8")
+
+    lock_position = script.index("offline_acquire_lock install")
+    snapshot_position = script.index("prepare-offline-contract.sh")
+    preflight_position = script.index('preflight-offline.sh"')
+    migration_position = script.index("run --pull never --rm migrate")
+    bootstrap_position = script.index("write_install_state bootstrapped")
+    proxy_position = script.index("--wait --wait-timeout 120 proxy")
+    readiness_position = script.index("--business-ready-compose-config-stdin")
+    final_verify_position = script.index(
+        'final_contract_sha256=$(offline_verify_contract install "$contract_dir")'
+    )
+
+    assert lock_position < snapshot_position < preflight_position < migration_position
+    assert migration_position < bootstrap_position < proxy_position < readiness_position
+    assert readiness_position < final_verify_position
+    assert "enter-maintenance-offline.sh" not in script
+    assert "CLEANUP_FAILED" in script
+    assert "install-in-progress.json" in script
+    assert "installed-$contract_sha256.json" in script
+    assert 'preflight-offline.sh" --resume-install' in script
+    assert "installation state does not match this canonical contract" in script
+    assert "a completed installation receipt already exists" in script
+    assert 'set -- "$state_directory"/installed-*.json' in script
+    assert '[ "$install_state_owned" = true ]' in script
+    assert "remove_stopped_resume_oneoffs" in script
+    assert "api-preflight clamav-db-preflight migrate bootstrap" in script
+    assert "com.docker.compose.oneoff" in script
+    assert "running or unverified one-off operations block safe installation resume" in script
+    assert "selected_egress_profile" in script
+    assert "llm-egress api maintenance web" in script
+    assert "docker compose" not in script
+    assert "docker system prune" not in script
+    assert "docker compose down" not in script
+    assert "offline_materialize_release install" in script
+    assert "internal worker is not running from the materialized release" in script
+    assert "strict_offline could not remove the exact stale LLM gateway" in script
+    assert "offline_verify_project_release_labels install" in script
+
+
+def test_database_operation_gate_serializes_migration_and_bootstrap() -> None:
+    wrapper = (DEPLOY / "run-migration-with-lock.py").read_text(encoding="utf-8")
+    compose = (DEPLOY / "compose.offline.yml").read_text(encoding="utf-8")
+    deploy = (DEPLOY / "deploy-offline.sh").read_text(encoding="utf-8")
+    install = (DEPLOY / "install-offline.sh").read_text(encoding="utf-8")
+
+    assert "pg_try_advisory_lock" in wrapper
+    assert "pg_advisory_unlock" in wrapper
+    assert '(sys.executable, "-m", "app.bootstrap")' in wrapper
+    assert '"--migrate-and-bootstrap"' in wrapper
+    assert '"--bootstrap-only"' in wrapper
+    assert "start_new_session=True" in wrapper
+    assert "os.killpg" in wrapper
+    assert "KB_BOOTSTRAP_DATABASE_URL" in compose
+    assert "/opt/heyi/run-migration-with-lock.py:ro" in compose
+    assert "run --pull never --rm bootstrap" not in deploy
+    assert "run --pull never --rm bootstrap" not in install
+
+
+def test_upgrade_requires_signed_current_backup_and_restore_drill() -> None:
+    preflight = (DEPLOY / "preflight-offline.sh").read_text(encoding="utf-8")
+    verifier = (DEPLOY / "verify-upgrade-backup.py").read_text(encoding="utf-8")
+
+    assert 'if [ "$preflight_mode" = upgrade ]; then' in preflight
+    assert "upgrade requires signed backup and restore-drill evidence" in preflight
+    assert 'verify-upgrade-backup.py"' in preflight
+    assert "--expected-manifest-sha256" in preflight
+    assert '"status"] != "passed"' in verifier
+    assert "target_manifest_sha256" in verifier
+    assert "database_backup" in verifier
+    assert "object_manifest" in verifier
+    assert "restore_evidence" in verifier
+    assert '"/usr/bin/openssl"' in verifier
+    assert "upgrade is blocked by an incomplete installation state" in preflight
+    assert "upgrade requires exactly one completed-install receipt" in preflight
+    assert "completed-install receipt is unsafe or malformed" in preflight
+
+
+def test_preflight_parses_llm_contract_and_validates_gateway_config_offline() -> None:
+    preflight = (DEPLOY / "preflight-offline.sh").read_text(encoding="utf-8")
+
+    assert "KB_LLM_EGRESS_MODE) KB_LLM_EGRESS_MODE=$value" in preflight
+    assert "KB_LLM_EGRESS_GATEWAY_URL) KB_LLM_EGRESS_GATEWAY_URL=$value" in preflight
+    assert "controlled egress Caddy contract is invalid" in preflight
+    assert "docker run --rm --pull never --network none --read-only" in preflight
+
+
+def test_offline_shell_entry_points_are_syntactically_valid() -> None:
+    scripts = (
+        "offline-operation-common.sh",
+        "prepare-offline-contract.sh",
+        "create-offline-contract.sh",
+        "remove-offline-contract.sh",
+        "install-offline.sh",
+        "deploy-offline.sh",
+        "import-offline-registry-bundle.sh",
+        "preflight-offline.sh",
+        "preflight-maintenance-offline.sh",
+        "verify-offline-images.sh",
+        "enter-maintenance-offline.sh",
+        "rollback-offline.sh",
+    )
+    for name in scripts:
+        completed = subprocess.run(  # noqa: S603
+            ["sh", "-n", str(DEPLOY / name)],
+            capture_output=True,
+            check=False,
+            shell=False,
+            text=True,
+            timeout=10,
+        )
+        assert completed.returncode == 0, f"{name}: {completed.stderr}"
+
+
+def test_registry_import_persists_a_release_bound_receipt_required_by_preflight() -> None:
+    importer = (DEPLOY / "import-offline-registry-bundle.sh").read_text(encoding="utf-8")
+    preflight = (DEPLOY / "preflight-offline.sh").read_text(encoding="utf-8")
+
+    image_import_finished = importer.index('done < "$signed_manifest"')
+    cleanup_before_commit = importer.index("if ! cleanup_registry; then", image_import_finished)
+    receipt_commit = importer.index(
+        "# Persist a root-only, deterministic receipt", cleanup_before_commit
+    )
+
+    assert 'kind\\":\\"offline-registry-import' in importer
+    assert "registry-import-$manifest_digest.json" in importer
+    assert "existing import receipt conflicts with this signature" in importer
+    assert 'sync -f "$receipt_directory"' in importer
+    assert image_import_finished < cleanup_before_commit < receipt_commit
+    assert "temporary registry resources could not be removed before receipt commit" in importer
+    assert "signed registry import receipt is missing or unsafe" in preflight
+    assert "signed registry import receipt does not match this release" in preflight

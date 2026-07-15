@@ -308,6 +308,21 @@ def test_repository_policy_rejects_deleting_one_required_external_evidence() -> 
     assert "exact required external evidence ids" in report.results[0].summary
 
 
+def test_repository_policy_rejects_browser_collection_contract_tampering() -> None:
+    manifest = load_manifest(MANIFEST)
+    browser = next(
+        item
+        for item in manifest["external_evidence"]
+        if item["id"] == "EXT-BROWSER-E2E-001"  # type: ignore[index]
+    )
+    browser["collection"]["expected_collected_tests"] = 2  # type: ignore[index]
+
+    report = evaluate_contract(REPOSITORY, manifest)
+
+    assert report.verdict == "FAIL"
+    assert any("external test collections" in item.summary for item in report.requirements)
+
+
 def test_runner_is_bound_to_declared_test_nodes() -> None:
     manifest = _minimal_manifest()
     command = manifest["test_commands"][0]  # type: ignore[index]
@@ -323,6 +338,59 @@ def test_runner_is_bound_to_declared_test_nodes() -> None:
 
     assert report.verdict == "FAIL"
     assert "required test nodes" in report.requirements[0].summary
+
+
+def test_runner_rejects_selection_filters_in_the_manifest() -> None:
+    manifest = _minimal_manifest()
+    command = manifest["test_commands"][0]  # type: ignore[index]
+    command["command"] = [  # type: ignore[index]
+        "python",
+        "-m",
+        "pytest",
+        "-k",
+        "only_one_test",
+        "tests/test_integration_api.py",
+    ]
+
+    result = run_test_commands(REPOSITORY, manifest, enforce_policy=False)[0]
+
+    assert result.status == "failed"
+    assert "forbidden selection controls" in result.summary
+
+
+def test_runner_rejects_a_junit_report_missing_one_collected_case() -> None:
+    manifest = _minimal_manifest()
+
+    def incomplete_executor(
+        command: list[str] | tuple[str, ...], _cwd: Path, _timeout: int
+    ) -> subprocess.CompletedProcess[str]:
+        if "--collect-only" in command:
+            output = "\n".join(
+                (
+                    "tests/test_integration_api.py::test_first",
+                    "tests/test_integration_api.py::test_second",
+                    "2 tests collected in 0.01s",
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, output, "")
+        junit_argument = next(item for item in command if item.startswith("--junitxml="))
+        Path(junit_argument.split("=", 1)[1]).write_text(
+            "<testsuites><testsuite><testcase "
+            'classname="tests.test_integration_api" name="test_first" />'
+            "</testsuite></testsuites>",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "1 passed", "")
+
+    result = run_test_commands(
+        REPOSITORY,
+        manifest,
+        enforce_policy=False,
+        executor=incomplete_executor,
+    )[0]
+
+    assert result.status == "failed"
+    assert "exact collected test set" in result.summary
 
 
 def test_unrelated_one_pass_output_cannot_satisfy_runner_minimum() -> None:
@@ -364,7 +432,10 @@ def test_real_runner_emits_hashed_per_node_machine_artifact() -> None:
     document = json.loads(artifact.read_text(encoding="utf-8"))
     assert document["target"]["git_head"]
     assert document["target"]["content_fingerprint"]
+    assert len(document["target"]["run_nonce"]) >= 32
     assert document["environment"]["dependency_lock_sha256"]
+    assert document["machine_execution"]["collected"] == 1
+    assert document["machine_execution"]["node_ids"] == [node]
     assert document["required_nodes"] == [
         {
             "node": node,
@@ -376,9 +447,12 @@ def test_real_runner_emits_hashed_per_node_machine_artifact() -> None:
     ]
     assert document["result_hash"] == result.result_hash
     claimed_result_hash = document.pop("result_hash")
-    assert claimed_result_hash == hashlib.sha256(
-        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    assert (
+        claimed_result_hash
+        == hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
 
 
 def test_final_profile_marks_missing_external_evidence_as_blocked(tmp_path: Path) -> None:
@@ -459,6 +533,7 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
     raw_content = b'{"browser":"passed"}\n'
     raw_path.write_bytes(raw_content)
     identity = collect_worktree_evidence(repository)
+    run_id = "acceptance-functional-test-001"
     document: dict[str, object] = {
         "schema_version": 2,
         "evidence_id": "EXT-BROWSER-E2E-001",
@@ -467,6 +542,7 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
         "target": {
             "git_head": identity.git_head,
             "content_fingerprint": identity.content_fingerprint,
+            "run_id": run_id,
         },
         "collected_at": datetime.now(UTC).isoformat(),
         "artifacts": [
@@ -504,6 +580,11 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
                 "status": "issued",
                 "evidence_id": "EXT-BROWSER-E2E-001",
                 "nonce": challenge_nonce,
+                "target": {
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                    "run_id": run_id,
+                },
                 "issued_at": datetime.now(UTC).isoformat(),
                 "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             }
@@ -542,6 +623,11 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
                 "status": "issued",
                 "evidence_id": "EXT-BROWSER-E2E-001",
                 "nonce": challenge_nonce,
+                "target": {
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                    "run_id": run_id,
+                },
                 "issued_at": datetime.now(UTC).isoformat(),
                 "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             }
@@ -647,6 +733,35 @@ def test_runtime_functional_cli_never_outputs_an_enterprise_final_verdict(
     assert payload["runtime_functional_verdict"] == "BLOCKED"
     assert payload["verdict"] == "BLOCKED"
     assert "final_verdict" not in payload
+
+
+def test_functional_cli_writes_nonce_bound_machine_evidence(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    evidence_path = tmp_path / "functional.json"
+
+    exit_code = main(
+        [
+            "--profile",
+            "runtime-functional",
+            "--json",
+            "--evidence-file",
+            str(evidence_path),
+        ]
+    )
+    printed = json.loads(capsys.readouterr().out)
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 2
+    assert evidence == printed
+    assert evidence["schema_version"] == 2
+    assert evidence["kind"] == "functional-acceptance"
+    assert evidence["status"] == "failed"
+    assert evidence["policy_status"] == "failed"
+    assert evidence["target"]["git_head"]
+    assert len(evidence["target"]["content_fingerprint"]) == 64
+    assert len(evidence["target"]["run_nonce"]) >= 32
 
 
 def test_legacy_functional_final_profile_is_rejected() -> None:

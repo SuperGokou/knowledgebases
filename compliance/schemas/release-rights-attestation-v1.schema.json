@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledgebases.local/schemas/release-rights-attestation-v1.schema.json",
+  "title": "Release rights and supply-chain attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "release_id",
+    "status",
+    "project_license",
+    "license_reviews",
+    "asset_approvals",
+    "third_party_notices",
+    "image_sbom_index",
+    "rights_owner_approval",
+    "legal_approval"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "schemas/release-rights-attestation-v1.schema.json"
+    },
+    "schema_version": { "type": "integer", "const": 1 },
+    "release_id": { "type": "string", "minLength": 1 },
+    "status": { "$ref": "#/$defs/status" },
+    "project_license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "expression", "path", "sha256", "evidence"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "expression": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"] },
+        "sha256": { "$ref": "#/$defs/nullableSha256" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "license_reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expression", "status", "evidence"],
+        "properties": {
+          "expression": { "type": "string", "minLength": 1 },
+          "status": { "$ref": "#/$defs/status" },
+          "evidence": { "$ref": "#/$defs/evidence" }
+        }
+      }
+    },
+    "asset_approvals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset_id", "status", "evidence"],
+        "properties": {
+          "asset_id": { "type": "string", "minLength": 1 },
+          "status": { "$ref": "#/$defs/status" },
+          "evidence": { "$ref": "#/$defs/evidence" }
+        }
+      }
+    },
+    "third_party_notices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "path", "sha256", "evidence"],
+      "properties": {
+        "status": { "enum": ["draft", "pending", "approved", "rejected"] },
+        "path": { "type": ["string", "null"] },
+        "sha256": { "$ref": "#/$defs/nullableSha256" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "image_sbom_index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "path",
+        "sha256",
+        "image_manifest_path",
+        "image_manifest_sha256",
+        "bundle_checksum_manifest_path",
+        "bundle_checksum_manifest_sha256"
+      ],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "path": { "type": ["string", "null"] },
+        "sha256": { "$ref": "#/$defs/nullableSha256" },
+        "image_manifest_path": { "type": ["string", "null"] },
+        "image_manifest_sha256": { "$ref": "#/$defs/nullableSha256" },
+        "bundle_checksum_manifest_path": { "type": ["string", "null"] },
+        "bundle_checksum_manifest_sha256": { "$ref": "#/$defs/nullableSha256" }
+      }
+    },
+    "rights_owner_approval": { "$ref": "#/$defs/approval" },
+    "legal_approval": { "$ref": "#/$defs/approval" }
+  },
+  "$defs": {
+    "status": { "enum": ["pending", "approved", "rejected"] },
+    "nullableSha256": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "sha256"],
+      "properties": {
+        "reference": { "type": ["string", "null"] },
+        "sha256": { "$ref": "#/$defs/nullableSha256" }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "name", "organization", "role", "signed_at", "evidence"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "name": { "type": ["string", "null"] },
+        "organization": { "type": ["string", "null"] },
+        "role": { "type": ["string", "null"] },
+        "signed_at": { "type": ["string", "null"] },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    }
+  }
+}

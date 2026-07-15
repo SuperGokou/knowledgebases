@@ -176,6 +176,44 @@ async def test_postgres_refresh_rotation_persists_a_valid_token_chain(
 
 
 @pytest.mark.asyncio
+async def test_postgres_logout_of_rotated_ancestor_revokes_the_successor_family(
+    postgres_auth_harness: _PostgresAuthHarness,
+) -> None:
+    original = await postgres_auth_harness.login()
+    rotated = await postgres_auth_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": original["refresh_token"]},
+    )
+    assert rotated.status_code == 200, rotated.text
+
+    logout = await postgres_auth_harness.client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": original["refresh_token"]},
+    )
+    assert logout.status_code == 204, logout.text
+
+    successor_refresh = await postgres_auth_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": rotated.json()["refresh_token"]},
+    )
+    assert successor_refresh.status_code == 401
+    assert successor_refresh.json()["error"]["code"] == "refresh_token_reuse_detected"
+
+    async with postgres_auth_harness.session_factory() as session:
+        records = list(
+            (
+                await session.scalars(
+                    select(RefreshToken).where(
+                        RefreshToken.user_id == postgres_auth_harness.user_id
+                    )
+                )
+            ).all()
+        )
+    assert len(records) == 2
+    assert all(record.revoked_at is not None for record in records)
+
+
+@pytest.mark.asyncio
 async def test_postgres_concurrent_refresh_has_one_winner_and_revokes_the_family(
     postgres_auth_harness: _PostgresAuthHarness,
 ) -> None:

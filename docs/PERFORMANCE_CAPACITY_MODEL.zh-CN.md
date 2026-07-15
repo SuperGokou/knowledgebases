@@ -67,25 +67,27 @@
 
 ### 3.3 当前调用路径的容量风险
 
-`UNVERIFIED`：一次对话先生成答案，再使用同一 Provider 进行语义审核；两次调用串行执行。单次模型默认超时为 45 秒，理论最坏路径约 90 秒，而 BFF 默认超时 60 秒、浏览器聊天请求超时 70 秒。这会产生客户端已经失败、后端仍消耗模型与连接资源的风险。
+`UNVERIFIED`（容量）/ 已实现（代码）：一次对话先生成答案，再由独立审核客户端进行语义审核；两次调用仍串行执行。端到端超时链已统一为服务端 95 秒、BFF 105 秒、浏览器 115 秒，客户端取消会传播到活动操作。该设计消除了明显的下游早退窗口，但不能证明供应商在目标负载下能在预算内稳定完成两次调用。
 
-`MEASURED`（代码级回归）：Provider 适配器已经改为在一次回答及审核流程中复用 HTTP 连接池，并在完成后确定性关闭；相关单元测试通过。
+`UNVERIFIED`（容量）/ 已实现（代码）：Provider 传输使用每进程、按事件循环共享的有界 HTTP 连接池；凭据代际更新会退休旧客户端，应用生命周期结束时 drain/close，不再为每次回答创建并立即关闭连接池。单元回归不能替代真实长稳连接、DNS、TLS 与供应商限额测试。
 
 `MEASURED（代码级回归）`：外部模型调用现已具备调用前 PostgreSQL 原子预留、日/月 token 与微美元硬预算、供应商实际 usage 结算、幂等防双花和内容无关账本；RAG 的答案生成与语义审核以及 OKF 转换均进入同一治理入口。真实 PostgreSQL 并发测试已证明同一幂等键只有一个胜者，且并发请求不能突破同一预算计数器。
 
-`UNVERIFIED`：跨请求的全局并发信号量、bounded queue、熔断和供应商级令牌桶仍不存在；账本在 50 亿 token/日对应的记录增长、热点计数器锁等待、归档保留期和 300GB 磁盘水位下也尚未完成压力实测。控制面功能回归不能替代目标吞吐与长稳验证。
+`UNVERIFIED`（容量）/ 已实现（代码）：模型调用已具备 provider-wide bulkhead、有界 active/queue 和取消安全准入；队列满时失败关闭，不允许无界占用连接与内存。供应商级熔断器和独立 token bucket 尚未实现，账本在 50 亿 token/日对应的记录增长、热点计数器锁等待、归档保留期和 300GB 磁盘水位下也尚未完成压力实测。控制面功能回归不能替代目标吞吐与长稳验证。
 
 ## 4. 离线边界与推理可行性
 
 `MEASURED`：无目标硬件推理实测。
 
-`MODELLED`：离线 Compose 设置 `KB_EXTERNAL_LLM_ENABLED=false`，配置校验也禁止隔离环境启用外部 LLM；仓库当前没有 Ollama、vLLM、llama.cpp 或其他本地 Provider。因此当前离线运行方式的外部 LLM token 消耗能力是 **0 token/日**，问答只能使用确定性检索降级。
+`MODELLED`：默认 `KB_LLM_EGRESS_MODE=strict_offline`，不创建模型网关或公网 uplink；仓库当前没有 Ollama、vLLM、llama.cpp 或其他本地 Provider，因此严格离线模式的外部 LLM 消耗能力是 **0 token/日**，问答使用确定性检索降级。经审批的 `controlled_gateway` 只允许 API/Maintenance 通过固定 `http://llm-egress:8080` 访问规范化供应商白名单；`direct` 在 `deployment_profile=isolated` 中被禁止。受控网关不是本地推理，也不证明供应商容量、成本或跨境合规。
 
 8C16G 无 GPU 主机不能合理承诺持续 57,870 token/s，更不能承诺 868,056 token/s 峰值。完整目标必须选择一种可验收拓扑：
 
 1. **离线知识控制平面 + 企业内网 GPU 推理集群**：推理集群单独完成容量、隔离、模型版权与供应链验收；
-2. **完全检索型离线部署**：保留来源回答与人工审核，明确不承诺 50 亿 LLM token/日；
-3. **允许外部模型的非隔离环境**：必须重新完成数据驻留、脱敏、跨境、供应商合同和网络出站评审，不能复用“完全离线”结论。
+2. **完全检索型严格离线部署**：保留来源回答与人工审核，明确不承诺 50 亿 LLM token/日；
+3. **隔离控制面 + 受控外部模型网关**：只允许获批供应商、固定 HTTPS 目的地与 POST 路径，必须重新完成数据驻留、脱敏、跨境、供应商合同和网络出站评审，不能复用“完全离线”结论。
+
+当前 `controlled_gateway` 属于第 3 类的最小出口实现：它只缩小网络出口面，不改变 50 亿 token/日必须取得供应商配额、费用上限、数据审批和目标负载证据的要求。`direct` 模式不属于隔离部署的获准拓扑。
 
 ## 5. 8C16G 主机资源模型
 
@@ -106,15 +108,17 @@
 | Caddy | 0.15 | 128 MiB |
 | **合计** | **4.80** | **8,960 MiB（8.75 GiB）** |
 
+`controlled_gateway` 模式额外启用 `llm-egress`：0.15 CPU / 128 MiB，稳态静态上限变为 **4.95 CPU / 9,088 MiB（8.875 GiB）**。该附加预算不包含供应商推理资源。
+
 整改后的稳态容器 CPU 上限合计为 4.80 核，为 8 核主机保留 3.20 核；内存理论余量为 7,424 MiB（7.25 GiB）。该静态预算满足仓库 `OPS-P1-001` 的 CPU 门禁，并为操作系统、Docker 与同机其他应用留下明确硬上限空间；但保留空间还必须覆盖其他应用的实测峰值、备份与升级临时负载，不能仅凭静态配置判定共存通过，也不能容纳本地大模型推理。
 
 `UNVERIFIED`：硬限制之和不代表实际使用量。部署前后必须保留其他 Compose 项目的容器、端口、网络、卷与健康指纹，并通过 30 分钟稳态和 8–24 小时长稳测试证明 CPU 均值、内存、上下文切换、IO wait、磁盘延迟、OOM 行为和同机应用无回归。若宿主机与其他应用无法落入 3.20 vCPU / 7.25 GiB 保留预算，部署必须阻断。
 
 ### 5.2 PostgreSQL
 
-- `MODELLED`：整改后每个非 Serverless 进程的 SQLAlchemy pool 默认为 8，overflow 为 4；一个 API 加一个 maintenance 理论峰值为 24。若横向增加进程，必须按 PostgreSQL `max_connections` 重新计算总连接预算。
+- `MODELLED`：应用通用默认值仍是 pool 8、overflow 4；离线 Compose 明确覆盖为每进程 pool 6、overflow 2，因此一个 API 加一个 maintenance 的理论应用峰值为 16。若横向增加进程，必须按 PostgreSQL `max_connections` 重新计算总连接预算。
 - `MEASURED`（配置测试）：应用与离线 PostgreSQL 已配置 `statement_timeout=15s`、`lock_timeout=5s`、`idle_in_transaction_session_timeout=30s` 和连接池等待超时 10 秒；配置/Compose 测试通过。真实锁争用与慢查询仍为 `UNVERIFIED`。
-- `MODELLED`：4 GB PostgreSQL 容器同时配置 2 GB shared buffers、512 MB maintenance work memory、100 连接和每算子 8 MB work memory；并发排序/哈希可能突破容器上限，需用真实查询计划与 RSS 曲线验证。
+- `MODELLED`：离线 PostgreSQL 容器上限为 2 GB，配置 `shared_buffers=512MB`、`effective_cache_size=1536MB`、`maintenance_work_mem=128MB`、`work_mem=4MB` 与 `max_connections=80`。并发排序/哈希、维护任务和连接开销仍可能逼近容器上限，需用真实查询计划与 RSS 曲线验证。
 - `UNVERIFIED`：中文检索会扩展多组 `%term%` `ILIKE` 条件；虽然存在 pg_trgm GIN 索引，但短中文词、无结果查询和大文档内容的真实执行计划尚未证明。
 
 ### 5.3 Redis
@@ -245,7 +249,7 @@
 ## 11. 当前结论
 
 - `MEASURED`：尚无目标场景下可用于通过终验的性能、长稳或 DR 实测；
-- `MODELLED`：50 亿 token/日、三档对话模型、4.80 CPU / 8.75 GiB 稳态上限、300GB 当前水位边界和 10TB 未来集群扩展量级已经计算；
+- `MODELLED`：50 亿 token/日、三档对话模型、严格离线 4.80 CPU / 8.75 GiB 与受控网关 4.95 CPU / 8.875 GiB 稳态上限、300GB 当前水位边界和 10TB 未来集群扩展量级已经计算；
 - `UNVERIFIED`：供应商或内部模型容量、真实检索性能、数据库饱和点、对象吞吐、告警、备份恢复和零停机升级；
 - 当前判定：**FAIL / NO-GO**。完成阻断项修复和目标环境实测后才能重新评审。
 

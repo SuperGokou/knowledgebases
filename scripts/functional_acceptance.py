@@ -9,22 +9,42 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 from scripts.acceptance import collect_worktree_evidence
+from scripts.acceptance_gate import (
+    AcceptanceGateError,
+    GateIdentity,
+    PytestJUnitEvidence,
+    add_identity_arguments,
+    assert_gate_identity,
+    atomic_write_text,
+    build_pytest_collection_command,
+    build_pytest_execution_command,
+    parse_pytest_collection,
+    parse_pytest_junit,
+    read_regular_file_nofollow,
+    reserve_machine_report,
+    sanitized_test_environment,
+    start_gate_identity,
+    write_json_evidence,
+)
 
 ContractVerdict = Literal["PASS", "FAIL"]
 ExternalVerdict = Literal["PASS", "BLOCKED"]
@@ -39,6 +59,7 @@ _SKIP_PATTERN = re.compile(r"(?im)(?:\b\d+\s+skipped\b|\btests?\s+\d+\s+skipped\
 _PASS_PATTERN = re.compile(r"(?im)(?:\b(\d+)\s+passed\b|\btests?\s+(\d+)\s+passed\b)")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SEMVER_PATTERN = re.compile(r"\d+\.\d+\.\d+")
+_BROWSER_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,80}\Z")
 _MAX_RAW_ARTIFACT_BYTES = 100 * 1024 * 1024
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _SUPPORTED_FRAMEWORK_PREFIXES: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -50,7 +71,7 @@ _SUPPORTED_FRAMEWORK_PREFIXES: dict[str, tuple[tuple[str, ...], ...]] = {
     "vitest": (("npm", "test", "--"),),
 }
 _POLICY_RELATIVE_PATH = Path("docs/functional_acceptance_policy.json")
-_POLICY_SHA256 = "66550db68a42d423b25a68c6ba9cd08a81255c92cb2ca0404d93583f84c6922c"
+_POLICY_SHA256 = "2174862a14cf4dcc1017214379fb81acfa87b2015bba97d34105fe27b95a03c1"
 
 
 class ContractError(ValueError):
@@ -97,6 +118,45 @@ class TestCommandResult:
     machine_artifact_sha256: str | None = None
     result_hash: str | None = None
     verified_nodes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class VitestMachineEvidence:
+    collected: int
+    executed: int
+    passed: int
+    failed: int
+    skipped: int
+    deselected: int
+    unexpected: int
+    node_ids: tuple[str, ...]
+    missing_node_ids: tuple[str, ...]
+    unexpected_node_ids: tuple[str, ...]
+    test_files: tuple[str, ...]
+
+    @property
+    def is_success(self) -> bool:
+        return bool(
+            self.collected > 0
+            and self.executed == self.collected
+            and self.passed == self.collected
+            and not any((self.failed, self.skipped, self.deselected, self.unexpected))
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "collected": self.collected,
+            "executed": self.executed,
+            "passed": self.passed,
+            "failed": self.failed,
+            "skipped": self.skipped,
+            "deselected": self.deselected,
+            "unexpected": self.unexpected,
+            "node_ids": list(self.node_ids),
+            "missing_node_ids": list(self.missing_node_ids),
+            "unexpected_node_ids": list(self.unexpected_node_ids),
+            "test_files": list(self.test_files),
+        }
 
 
 @dataclass(slots=True)
@@ -162,9 +222,9 @@ def load_external_trust_context(
         encoded = item.get("public_key_base64")
         if not all(isinstance(value, str) and value for value in (collector_id, key_id, encoded)):
             raise ContractError("trusted collector public-key entry is invalid")
-        assert isinstance(collector_id, str)
-        assert isinstance(key_id, str)
-        assert isinstance(encoded, str)
+        collector_id = cast(str, collector_id)
+        key_id = cast(str, key_id)
+        encoded = cast(str, encoded)
         try:
             public_key = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error) as exc:
@@ -267,6 +327,33 @@ def _policy_errors(manifest: Mapping[str, object], policy: Mapping[str, object])
         ):
             if actual.get(field) != expected.get(field):
                 errors.append(f"{runner_id} does not match trusted runner policy for {field}")
+    if manifest.get("internal_gate_bindings") != policy.get("internal_gate_bindings"):
+        errors.append("manifest internal gate bindings do not match trusted policy")
+    expected_collections = _mapping(policy.get("external_test_collections")) or {}
+    external_entries = _object_list(manifest.get("external_evidence")) or []
+    actual_collections = {
+        str(item.get("id")): item.get("collection")
+        for item in external_entries
+        if isinstance(item.get("id"), str) and item.get("collection") is not None
+    }
+    if actual_collections != expected_collections:
+        errors.append("manifest external test collections do not match trusted policy")
+    bindings = _object_list(manifest.get("internal_gate_bindings"))
+    if bindings is None or not bindings:
+        errors.append("manifest must bind the PostgreSQL acceptance gate")
+    else:
+        binding = bindings[0]
+        required_checks = _string_list(binding.get("required_checks"))
+        if (
+            len(bindings) != 1
+            or binding.get("gate_id") != "TOKEN-GOV-P0-001"
+            or binding.get("evidence_kind") != "postgres-acceptance"
+            or binding.get("test_discovery")
+            != "KB_TEST_POSTGRES_URL|KB_TEST_MIGRATION_POSTGRES_URL"
+            or required_checks is None
+            or len(required_checks) != len(set(required_checks))
+        ):
+            errors.append("manifest PostgreSQL gate binding is invalid")
     return errors
 
 
@@ -329,6 +416,43 @@ def _safe_path(repository: Path, raw_path: object, *, must_exist: bool) -> Path 
     return candidate
 
 
+def _has_selection_pollution(command: Sequence[str], framework: object) -> bool:
+    pytest_forbidden = {
+        "-k",
+        "-m",
+        "--deselect",
+        "--ignore",
+        "--ignore-glob",
+        "--lf",
+        "--last-failed",
+        "--ff",
+        "--failed-first",
+        "--sw",
+        "--stepwise",
+        "--collect-only",
+        "--runxfail",
+    }
+    vitest_forbidden = {
+        "-t",
+        "--testNamePattern",
+        "--changed",
+        "--shard",
+        "--related",
+        "--passWithNoTests",
+    }
+    forbidden = pytest_forbidden if framework == "pytest" else vitest_forbidden
+    prefixes = _SUPPORTED_FRAMEWORK_PREFIXES.get(str(framework), ())
+    prefix = next(
+        (item for item in prefixes if tuple(command[: len(item)]) == item),
+        (),
+    )
+    arguments = command[len(prefix) :]
+    return any(
+        token in forbidden or any(token.startswith(f"{item}=") for item in forbidden)
+        for token in arguments
+    )
+
+
 def _test_command_catalog(
     repository: Path,
     manifest: Mapping[str, object],
@@ -371,6 +495,9 @@ def _test_command_catalog(
             tuple(command[: len(prefix)]) == prefix for prefix in prefixes
         ):
             errors.append(f"unsupported test framework command: {command_id}")
+            continue
+        if _has_selection_pollution(command, framework):
+            errors.append(f"test command contains forbidden selection controls: {command_id}")
             continue
         if len(set(required_nodes)) != len(required_nodes) or not all(
             node in command for node in required_nodes
@@ -532,6 +659,7 @@ def _execute(
     return subprocess.run(  # noqa: S603
         [executable, *command[1:]],
         cwd=cwd,
+        env=sanitized_test_environment(),
         capture_output=True,
         check=False,
         encoding="utf-8",
@@ -544,7 +672,10 @@ def _execute(
 def _node_statuses_from_pytest(
     report_path: Path, required_nodes: Sequence[str]
 ) -> tuple[list[dict[str, object]], int, int]:
-    root = ET.parse(report_path).getroot()  # noqa: S314 - local pytest output only
+    raw = read_regular_file_nofollow(report_path, maximum_bytes=_MAX_RAW_ARTIFACT_BYTES)
+    root = ET.fromstring(raw)
+    if root is None:
+        raise ContractError("pytest JUnit report has no document element")
     cases = list(root.iter("testcase"))
     nodes: list[dict[str, object]] = []
     passed_total = 0
@@ -629,11 +760,128 @@ def _node_statuses_from_vitest(
     return nodes, passed_total, skipped_total
 
 
-def _runner_artifact_directory(repository: Path) -> Path:
-    identity = collect_worktree_evidence(repository)
+def _build_vitest_collection_command(command: Sequence[str], report_path: Path) -> tuple[str, ...]:
+    selected_files = tuple(token for token in command if token.startswith("tests/"))
+    if tuple(command[:3]) != ("npm", "test", "--") or not selected_files:
+        raise AcceptanceGateError("vitest collection command is not safely bound")
+    return (
+        "npm",
+        "exec",
+        "vitest",
+        "--",
+        "list",
+        *selected_files,
+        f"--json={report_path}",
+        "--allowOnly=false",
+    )
+
+
+def _relative_machine_test_path(cwd: Path, raw_path: object) -> str:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise AcceptanceGateError("machine test result has no file path")
+    candidate = Path(raw_path).resolve()
+    try:
+        return candidate.relative_to(cwd.resolve()).as_posix()
+    except ValueError as exc:
+        raise AcceptanceGateError("machine test result escapes its runner directory") from exc
+
+
+def _vitest_collected_nodes(report_path: Path, cwd: Path) -> tuple[str, ...]:
+    try:
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AcceptanceGateError("vitest collection report is invalid") from exc
+    if not isinstance(document, list) or not document:
+        raise AcceptanceGateError("vitest collection did not report tests")
+    nodes: list[str] = []
+    for item in document:
+        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+            raise AcceptanceGateError("vitest collection report has an invalid test")
+        relative = _relative_machine_test_path(cwd, item.get("file"))
+        nodes.append(f"{relative}::{item['name']}")
+    if len(nodes) != len(set(nodes)):
+        raise AcceptanceGateError("vitest collection contains duplicate tests")
+    return tuple(nodes)
+
+
+def _vitest_machine_evidence(
+    report_path: Path, cwd: Path, expected_nodes: Sequence[str]
+) -> VitestMachineEvidence:
+    try:
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AcceptanceGateError("vitest result report is invalid") from exc
+    suites = document.get("testResults") if isinstance(document, Mapping) else None
+    if not isinstance(suites, list):
+        raise AcceptanceGateError("vitest result report has no testResults")
+    actual_nodes: list[str] = []
+    passed = failed = skipped = 0
+    for suite in suites:
+        if not isinstance(suite, Mapping):
+            raise AcceptanceGateError("vitest result suite is invalid")
+        relative = _relative_machine_test_path(cwd, suite.get("name"))
+        assertions = suite.get("assertionResults")
+        if not isinstance(assertions, list):
+            raise AcceptanceGateError("vitest result suite has no assertions")
+        for assertion in assertions:
+            if not isinstance(assertion, Mapping):
+                raise AcceptanceGateError("vitest assertion is invalid")
+            ancestors = assertion.get("ancestorTitles")
+            title = assertion.get("title")
+            status = assertion.get("status")
+            if (
+                not isinstance(ancestors, list)
+                or not all(isinstance(item, str) and item for item in ancestors)
+                or not isinstance(title, str)
+                or not title
+            ):
+                raise AcceptanceGateError("vitest assertion identity is invalid")
+            name = " > ".join((*ancestors, title))
+            actual_nodes.append(f"{relative}::{name}")
+            passed += status == "passed"
+            skipped += status in {"pending", "skipped", "todo"}
+            failed += status not in {"passed", "pending", "skipped", "todo"}
+
+    expected = tuple(expected_nodes)
+    expected_set = set(expected)
+    actual_set = set(actual_nodes)
+    if len(expected) != len(expected_set):
+        raise AcceptanceGateError("expected vitest collection contains duplicate tests")
+    missing = tuple(sorted(expected_set - actual_set))
+    unexpected_nodes = tuple(sorted(actual_set - expected_set))
+    duplicates = len(actual_nodes) - len(actual_set)
+    return VitestMachineEvidence(
+        collected=len(expected),
+        executed=len(actual_nodes),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        deselected=len(missing),
+        unexpected=len(unexpected_nodes) + duplicates,
+        node_ids=tuple(actual_nodes),
+        missing_node_ids=missing,
+        unexpected_node_ids=unexpected_nodes,
+        test_files=tuple(sorted({node.split("::", 1)[0] for node in actual_nodes})),
+    )
+
+
+def _runner_artifact_directory(repository: Path, identity: GateIdentity) -> Path:
     root = Path(tempfile.gettempdir()) / "heyi-functional-acceptance"
-    directory = root / identity.content_fingerprint / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    directory = (
+        root
+        / identity.content_fingerprint
+        / identity.run_nonce
+        / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    )
     directory.mkdir(parents=True, exist_ok=False)
+    directory.chmod(0o700)
+    metadata = directory.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or (os.name == "posix" and (metadata.st_mode & 0o777) != 0o700)
+    ):
+        raise AcceptanceGateError("functional acceptance artifact directory is not private")
     return directory
 
 
@@ -656,6 +904,10 @@ def run_test_commands(
     *,
     executor: TestExecutor = _execute,
     enforce_policy: bool = True,
+    identity: GateIdentity | None = None,
+    expected_git_head: str | None = None,
+    expected_content_fingerprint: str | None = None,
+    run_nonce: str | None = None,
 ) -> tuple[TestCommandResult, ...]:
     repository = repository.resolve()
     try:
@@ -668,9 +920,17 @@ def run_test_commands(
     if errors:
         return (TestCommandResult("MANIFEST", "failed", 0, "; ".join(errors)),)
     try:
-        artifact_directory = _runner_artifact_directory(repository)
-        identity = collect_worktree_evidence(repository)
-    except (OSError, RuntimeError, UnicodeError) as exc:
+        if identity is None:
+            identity = start_gate_identity(
+                repository,
+                expected_git_head=expected_git_head,
+                expected_content_fingerprint=expected_content_fingerprint,
+                run_nonce=run_nonce,
+            )
+        else:
+            assert_gate_identity(repository, identity, stage="start")
+        artifact_directory = _runner_artifact_directory(repository, identity)
+    except (AcceptanceGateError, OSError, RuntimeError, UnicodeError) as exc:
         return (TestCommandResult("MANIFEST", "failed", 0, f"cannot bind run identity: {exc}"),)
     results: list[TestCommandResult] = []
     for command_id, entry in catalog.items():
@@ -686,36 +946,84 @@ def run_test_commands(
         raw_report = artifact_directory / (
             f"{command_id}.xml" if framework == "pytest" else f"{command_id}.json"
         )
-        machine_command = list(command)
-        if framework == "pytest":
-            machine_command.append(f"--junitxml={raw_report}")
-        elif framework == "vitest":
-            machine_command.extend(("--reporter=json", f"--outputFile={raw_report}"))
+        collection_report = artifact_directory / f"{command_id}.collection.json"
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
         try:
+            if framework == "pytest":
+                reserve_machine_report(raw_report)
+                collection_command = build_pytest_collection_command(command)
+            elif framework == "vitest":
+                reserve_machine_report(collection_report)
+                reserve_machine_report(raw_report)
+                collection_command = _build_vitest_collection_command(command, collection_report)
+            else:
+                raise AcceptanceGateError("unsupported machine report framework")
+            collection = executor(collection_command, cwd, timeout)
+            if collection.returncode != 0:
+                raise AcceptanceGateError(f"test collection exited {collection.returncode}")
+            if framework == "pytest":
+                expected_cases = parse_pytest_collection(
+                    "\n".join((collection.stdout, collection.stderr))
+                )
+                machine_command = build_pytest_execution_command(command, raw_report)
+            else:
+                expected_cases = _vitest_collected_nodes(collection_report, cwd)
+                machine_command = (
+                    *command,
+                    "--reporter=json",
+                    f"--outputFile={raw_report}",
+                    "--allowOnly=false",
+                )
+            assert_gate_identity(repository, identity)
             completed = executor(machine_command, cwd, timeout)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            results.append(TestCommandResult(command_id, "failed", 0, "test command unavailable"))
+        except AcceptanceGateError as exc:
+            results.append(
+                TestCommandResult(
+                    command_id,
+                    "failed",
+                    0,
+                    f"machine-readable per-node report is invalid: {exc}",
+                )
+            )
+            continue
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            results.append(
+                TestCommandResult(command_id, "failed", 0, f"test command unavailable: {exc}")
+            )
             continue
         finished_at = datetime.now(UTC)
         duration_ms = round((time.monotonic() - started_monotonic) * 1000)
+        machine_evidence: PytestJUnitEvidence | VitestMachineEvidence
         try:
             if not raw_report.is_file() or raw_report.stat().st_size <= 0:
                 raise ValueError("machine report missing")
             if raw_report.stat().st_size > _MAX_RAW_ARTIFACT_BYTES:
                 raise ValueError("machine report is too large")
             if framework == "pytest":
+                machine_evidence = parse_pytest_junit(raw_report, expected_cases)
                 node_results, passed_tests, skipped_tests = _node_statuses_from_pytest(
                     raw_report, required_nodes
                 )
             elif framework == "vitest":
+                machine_evidence = _vitest_machine_evidence(raw_report, cwd, expected_cases)
                 node_results, passed_tests, skipped_tests = _node_statuses_from_vitest(
                     raw_report, required_nodes
                 )
             else:
                 raise ValueError("unsupported machine report framework")
-        except (OSError, UnicodeError, ValueError, ET.ParseError, json.JSONDecodeError) as exc:
+            if passed_tests != machine_evidence.passed:
+                raise ValueError("machine report pass totals disagree")
+            assert_gate_identity(repository, identity)
+        except (
+            AcceptanceGateError,
+            OSError,
+            UnicodeError,
+            ValueError,
+            SyntaxError,
+            DefusedXmlException,
+            json.JSONDecodeError,
+        ) as exc:
             results.append(
                 TestCommandResult(
                     command_id,
@@ -726,8 +1034,21 @@ def run_test_commands(
             )
             continue
         raw_hash = _sha256_file(raw_report)
+        if (
+            isinstance(machine_evidence, PytestJUnitEvidence)
+            and raw_hash != machine_evidence.sha256
+        ):
+            results.append(
+                TestCommandResult(
+                    command_id,
+                    "failed",
+                    0,
+                    "machine-readable report changed after verification",
+                )
+            )
+            continue
         ledger: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "policy_sha256": _POLICY_SHA256 if policy is not None else None,
             "command_id": command_id,
             "framework": framework,
@@ -742,10 +1063,7 @@ def run_test_commands(
                 "python": platform.python_version(),
                 "dependency_lock_sha256": _dependency_fingerprint(repository, str(framework)),
             },
-            "target": {
-                "git_head": identity.git_head,
-                "content_fingerprint": identity.content_fingerprint,
-            },
+            "target": identity.target(),
             "raw_result": {
                 "path": str(raw_report),
                 "sha256": raw_hash,
@@ -753,6 +1071,11 @@ def run_test_commands(
             },
             "passed_tests": passed_tests,
             "skipped_tests": skipped_tests,
+            "machine_execution": (
+                machine_evidence.as_dict(path=str(raw_report))
+                if isinstance(machine_evidence, PytestJUnitEvidence)
+                else machine_evidence.as_dict()
+            ),
             "required_nodes": node_results,
         }
         result_hash = hashlib.sha256(
@@ -760,9 +1083,20 @@ def run_test_commands(
         ).hexdigest()
         ledger["result_hash"] = result_hash
         ledger_path = artifact_directory / f"{command_id}.acceptance.json"
-        ledger_path.write_text(
-            json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        atomic_write_text(
+            ledger_path,
+            json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
         )
+        if _sha256_file(raw_report) != raw_hash:
+            results.append(
+                TestCommandResult(
+                    command_id,
+                    "failed",
+                    passed_tests,
+                    "machine-readable report changed while writing its ledger",
+                )
+            )
+            continue
         ledger_hash = _sha256_file(ledger_path)
         all_nodes_passed = all(item["status"] == "passed" for item in node_results)
         if completed.returncode != 0:
@@ -774,13 +1108,17 @@ def run_test_commands(
                     f"test command exited {completed.returncode}",
                 )
             )
-        elif skipped_tests:
+        elif not machine_evidence.is_success:
             results.append(
                 TestCommandResult(
                     command_id,
                     "failed",
                     passed_tests,
-                    "critical test command skipped tests",
+                    "critical test command did not execute its exact collected test set",
+                    str(ledger_path),
+                    ledger_hash,
+                    result_hash,
+                    len(machine_evidence.node_ids),
                 )
             )
         elif not all_nodes_passed:
@@ -827,6 +1165,10 @@ def run_test_commands(
                     len(node_results),
                 )
             )
+    try:
+        assert_gate_identity(repository, identity)
+    except AcceptanceGateError as exc:
+        results.append(TestCommandResult("IDENTITY", "failed", 0, str(exc)))
     return tuple(results)
 
 
@@ -836,6 +1178,10 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_json_evidence(path: Path, payload: Mapping[str, object]) -> None:
+    write_json_evidence(path, payload)
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -921,6 +1267,7 @@ def _validate_external_provenance(
     *,
     policy: Mapping[str, object] | None,
     trust_context: ExternalTrustContext | None,
+    signature_payload_builder: Callable[..., bytes] = _signature_payload,
 ) -> bool:
     expected_collector = _mapping(contract.get("collector"))
     collector = _mapping(document.get("collector"))
@@ -959,10 +1306,19 @@ def _validate_external_provenance(
     except (OSError, RuntimeError, UnicodeError):
         return False
     target = _mapping(document.get("target"))
+    browser_evidence = document.get("evidence_id") == "EXT-BROWSER-E2E-001"
     if (
         target is None
         or target.get("git_head") != identity.git_head
         or target.get("content_fingerprint") != identity.content_fingerprint
+        or (
+            browser_evidence
+            and (
+                not isinstance(target.get("run_id"), str)
+                or _BROWSER_RUN_ID_PATTERN.fullmatch(str(target.get("run_id"))) is None
+                or set(target) != {"git_head", "content_fingerprint", "run_id"}
+            )
+        )
     ):
         return False
 
@@ -1021,10 +1377,10 @@ def _validate_external_provenance(
         for value in (key_id, challenge_id, challenge_nonce, encoded_signature)
     ):
         return False
-    assert isinstance(key_id, str)
-    assert isinstance(challenge_id, str)
-    assert isinstance(challenge_nonce, str)
-    assert isinstance(encoded_signature, str)
+    key_id = cast(str, key_id)
+    challenge_id = cast(str, challenge_id)
+    challenge_nonce = cast(str, challenge_nonce)
+    encoded_signature = cast(str, encoded_signature)
 
     if policy is not None:
         collectors = _mapping(policy.get("external_collectors"))
@@ -1044,12 +1400,22 @@ def _validate_external_provenance(
     challenge = trust_context.challenges.get(challenge_id)
     if challenge is None or challenge_id in trust_context.consumed_challenges:
         return False
+    target_run_id = target.get("run_id") if target is not None else None
+    challenge_target = _mapping(challenge.get("target"))
     issued_at = _parse_timestamp(challenge.get("issued_at"))
     expires_at = _parse_timestamp(challenge.get("expires_at"))
     if (
         challenge.get("status") != "issued"
         or challenge.get("evidence_id") != document.get("evidence_id")
         or challenge.get("nonce") != challenge_nonce
+        or (
+            browser_evidence
+            and (
+                not isinstance(target_run_id, str)
+                or _BROWSER_RUN_ID_PATTERN.fullmatch(target_run_id) is None
+                or challenge_target != target
+            )
+        )
         or issued_at is None
         or expires_at is None
         or issued_at > now + _MAX_CLOCK_SKEW
@@ -1066,7 +1432,7 @@ def _validate_external_provenance(
             return False
         Ed25519PublicKey.from_public_bytes(public_key).verify(
             signature,
-            _signature_payload(
+            signature_payload_builder(
                 document,
                 key_id=key_id,
                 challenge_id=challenge_id,
@@ -1094,9 +1460,7 @@ def evaluate_external_evidence(
     enforce_policy: bool = True,
 ) -> ExternalEvidenceReport:
     try:
-        policy = _trusted_policy(
-            repository.resolve(), manifest, required=enforce_policy
-        )
+        policy = _trusted_policy(repository.resolve(), manifest, required=enforce_policy)
     except ContractError as exc:
         result = ExternalEvidenceResult("TRUSTED-POLICY", "blocked", str(exc))
         return ExternalEvidenceReport("BLOCKED", (result,))
@@ -1239,7 +1603,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="root-owned 0700 directory containing one-time challenge JSON files",
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--evidence-file",
+        type=Path,
+        help="write nonce-bound functional acceptance evidence to this JSON path",
+    )
+    add_identity_arguments(parser)
     arguments = parser.parse_args(argv)
+    try:
+        identity = start_gate_identity(
+            repository,
+            expected_git_head=arguments.expected_git_head,
+            expected_content_fingerprint=arguments.expected_content_fingerprint,
+            run_nonce=arguments.acceptance_run_nonce,
+        )
+    except AcceptanceGateError as exc:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "profile": arguments.profile,
+                    "source_verdict": "FAIL",
+                    "runtime_functional_verdict": "FAIL",
+                    "verdict": "FAIL",
+                    "error": str(exc),
+                },
+                ensure_ascii=True,
+            )
+        )
+        return 1
     try:
         manifest = load_manifest(arguments.manifest)
     except ContractError as exc:
@@ -1277,8 +1669,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         if trust_error is not None
         else evaluate_external_evidence(repository, manifest, trust_context=trust_context)
     )
-    tests = run_test_commands(repository, manifest) if arguments.run_tests else ()
+    tests = (
+        run_test_commands(repository, manifest, identity=identity) if arguments.run_tests else ()
+    )
     payload = _payload(contract, external, tests, arguments.profile)
+    try:
+        assert_gate_identity(repository, identity)
+    except AcceptanceGateError as exc:
+        payload["source_verdict"] = "FAIL"
+        payload["runtime_functional_verdict"] = "FAIL"
+        payload["verdict"] = "FAIL"
+        payload["identity_error"] = str(exc)
+    payload["schema_version"] = 2
+    payload["kind"] = "functional-acceptance"
+    payload["target"] = identity.target()
+    payload["status"] = "complete" if payload["verdict"] == "PASS" else "failed"
+    payload["policy_status"] = "passed" if payload["verdict"] == "PASS" else "failed"
+    if arguments.evidence_file is not None:
+        try:
+            _write_json_evidence(arguments.evidence_file, payload)
+            assert_gate_identity(repository, identity)
+        except (AcceptanceGateError, OSError, UnicodeError) as exc:
+            payload["source_verdict"] = "FAIL"
+            payload["runtime_functional_verdict"] = "FAIL"
+            payload["verdict"] = "FAIL"
+            payload["status"] = "failed"
+            payload["policy_status"] = "failed"
+            payload["evidence_error"] = str(exc)
+            with suppress(AcceptanceGateError, OSError, UnicodeError):
+                _write_json_evidence(arguments.evidence_file, payload)
     if arguments.json:
         print(json.dumps(payload, ensure_ascii=True, indent=2))
     else:

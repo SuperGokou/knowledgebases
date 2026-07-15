@@ -106,8 +106,7 @@ def test_object_stop_line_blocks_uploads_that_reach_180_decimal_gb(
 def test_platform_upload_limit_always_caps_an_unlimited_role() -> None:
     assert effective_upload_limit(None, platform_limit_bytes=2_147_483_648) == 2_147_483_648
     assert (
-        effective_upload_limit(4_000_000_000, platform_limit_bytes=2_147_483_648)
-        == 2_147_483_648
+        effective_upload_limit(4_000_000_000, platform_limit_bytes=2_147_483_648) == 2_147_483_648
     )
     assert effective_upload_limit(1_000, platform_limit_bytes=2_147_483_648) == 1_000
     assert effective_upload_limit(0, platform_limit_bytes=2_147_483_648) == 0

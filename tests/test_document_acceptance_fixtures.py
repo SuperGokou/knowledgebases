@@ -142,9 +142,7 @@ def test_verify_rejects_tampered_hash_and_placeholder_manifest(tmp_path: Path) -
     manifest_path = verify_fixture_set(root, write_manifest=True)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 1
-    assert [item["extension"] for item in manifest["fixtures"]] == list(
-        REQUIRED_EXTENSIONS
-    )
+    assert [item["extension"] for item in manifest["fixtures"]] == list(REQUIRED_EXTENSIONS)
     assert all(len(item["sha256"]) == 64 for item in manifest["fixtures"])
 
     target = root / manifest["fixtures"][0]["relative_path"]

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   backendRequestTimeoutMs,
+  backendRequestTimeoutMsForUrl,
   publicApiOrigin,
   safeBackendFetch,
 } from "../src/lib/server/backend";
@@ -58,6 +59,37 @@ describe("safe backend fetch", () => {
     expect(backendRequestTimeoutMs("90000")).toBe(90_000);
     expect(backendRequestTimeoutMs("999999")).toBe(120_000);
     expect(backendRequestTimeoutMs("invalid")).toBe(60_000);
+  });
+
+  it("gives only chat queries the bounded two-stage BFF budget", () => {
+    expect(backendRequestTimeoutMsForUrl(
+      new URL("https://api.example.test/api/v1/chat/query"),
+    )).toBe(105_000);
+    expect(backendRequestTimeoutMsForUrl(
+      new URL("https://api.example.test/api/v1/public/chat/query"),
+    )).toBe(105_000);
+    expect(backendRequestTimeoutMsForUrl(
+      new URL("https://api.example.test/api/v1/files"),
+    )).toBe(60_000);
+  });
+
+  it("keeps the chat connection alive past the generic 60 second deadline", async () => {
+    vi.useFakeTimers();
+    const fetchMock = rejectWhenAborted();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const pending = safeBackendFetch(
+      new URL("https://api.example.test/api/v1/chat/query"),
+      { method: "POST" },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const forwardedSignal = (fetchMock.mock.calls[0]?.[1] as RequestInit).signal;
+    expect(forwardedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect((await pending).status).toBe(504);
+    expect(forwardedSignal?.aborted).toBe(true);
   });
 
   it("returns a synthetic 504 when the backend deadline elapses", async () => {

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 export const REQUIRED_ENTERPRISE_ENV = [
@@ -16,6 +15,7 @@ export const REQUIRED_ENTERPRISE_ENV = [
   "KB_E2E_DOCUMENT_FIXTURE_MANIFEST",
   "KB_E2E_SIGNING_KEY_PATH",
   "KB_E2E_CHALLENGE_PATH",
+  "KB_E2E_RUN_ID",
 ] as const;
 
 export type FaultMode =
@@ -133,6 +133,11 @@ export function inspectEnterpriseConfig(
     invalid.push("KB_E2E_MULTIPART_BYTES");
   }
 
+  const runId = env.KB_E2E_RUN_ID?.trim();
+  if (runId && !/^[a-zA-Z0-9_-]{8,80}$/.test(runId)) {
+    invalid.push("KB_E2E_RUN_ID");
+  }
+
   for (const name of [
     "KB_E2E_DOCUMENT_FIXTURE_ROOT",
     "KB_E2E_DOCUMENT_FIXTURE_MANIFEST",
@@ -175,11 +180,6 @@ export function requireEnterpriseConfig(
     throw new Error(`E2E_BLOCKED: enterprise topology is incomplete (${details})`);
   }
 
-  const runIdCandidate = env.KB_E2E_RUN_ID?.trim();
-  const runId = runIdCandidate && /^[a-zA-Z0-9_-]{8,80}$/.test(runIdCandidate)
-    ? runIdCandidate
-    : randomUUID();
-
   return {
     baseUrl: validatedOrigin("KB_E2E_BASE_URL", env.KB_E2E_BASE_URL!),
     publicApiOrigin: validatedOrigin(
@@ -200,7 +200,7 @@ export function requireEnterpriseConfig(
     multipartBytes: Number(env.KB_E2E_MULTIPART_BYTES),
     signingKeyPath: env.KB_E2E_SIGNING_KEY_PATH!.trim(),
     challengePath: env.KB_E2E_CHALLENGE_PATH!.trim(),
-    runId,
+    runId: env.KB_E2E_RUN_ID!.trim(),
     documentFixtureRoot: env.KB_E2E_DOCUMENT_FIXTURE_ROOT!.trim(),
     documentFixtureManifest: env.KB_E2E_DOCUMENT_FIXTURE_MANIFEST!.trim(),
   };

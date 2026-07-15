@@ -86,7 +86,7 @@ docker compose --env-file .env.kb logs --tail 200 app
 docker compose --env-file .env.kb logs --tail 200 minio-init
 ~~~
 
-bootstrap 是幂等的，不会因重启重复创建目录数据。管理员密码只应在首次创建前确定；不要假设修改环境变量会自动轮换数据库中既有密码。当前产品化前还应补齐受审计的密码重置或接入企业 IdP。
+bootstrap 是幂等的，不会因重启重复创建目录数据。管理员密码只应在首次创建前确定；修改环境变量不会自动轮换数据库中既有密码。既有用户必须使用受审计的自助改密或超级管理员重置接口，完成后旧密码、access token 与 refresh token 均失效；企业 IdP/OIDC 仍属于后续增强。
 
 ## 3. 登录验证
 
@@ -109,7 +109,7 @@ $env:KB_PASSWORD = "你在 .env.kb 中设置的管理员密码"
 Remove-Item Env:KB_PASSWORD
 ~~~
 
-access token 默认 15 分钟；refresh token 默认 7 天且每次 refresh 都轮换，服务端只保存 fingerprint。账户禁用、角色替换等安全变化会提高 token_version，使旧 token 失效。
+access token 默认 15 分钟；refresh token 默认 7 天且每次 refresh 都轮换，服务端只保存 fingerprint。refresh 重放会撤销整个令牌族，logout 同样撤销当前族；账户禁用、角色替换和密码更改等安全变化会提高 `token_version`，使旧 access token 失效。
 
 ## 4. 上传文件
 
@@ -177,7 +177,7 @@ python .\scripts\upload.py .\data\archive.pptx --email admin@example.com --resta
 
 <code>--restart</code> 会先调用 DELETE 中止旧服务端会话、释放 HELD 配额，再用新幂等键开始。不要只删除 checkpoint；否则旧 Multipart 与预留会留到后台回收。
 
-成功时脚本输出 File JSON，状态是 <code>processing</code>，退出码为 0。失败退出码为 2，Ctrl+C 为 130；错误会给出 checkpoint 路径。上传器禁止 HTTP 重定向，避免 Authorization 或预签名请求跨 origin；远程 HTTP API/对象存储默认拒绝，本机 loopback 开发例外。
+成功时脚本输出 File JSON，文件进入 <code>quarantined</code> 并等待恶意软件扫描，退出码为 0。失败退出码为 2，Ctrl+C 为 130；错误会给出 checkpoint 路径。上传器禁止 HTTP 重定向，避免 Authorization 或预签名请求跨 origin；远程 HTTP API/对象存储默认拒绝，本机 loopback 开发例外。
 
 只有隔离开发网确有需要时，才使用：
 
@@ -189,7 +189,7 @@ python .\scripts\upload.py .\data\manual.pdf --email admin@example.com --api-url
 
 ## 5. 审批与下载
 
-上传完成不自动可下载。管理员完成外部内容检查后：
+上传完成不自动可下载。maintenance worker 先领取扫描租约；ClamAV 返回 `CLEAN` 后，文件进入 `processing` 并启动当前版本 OKF 转换。管理员在扫描和转换均完成后批准：
 
 ~~~powershell
 $fileId = "上传脚本输出的 file id"
@@ -197,7 +197,7 @@ $approve = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/v1/fil
 $approve.status
 ~~~
 
-只有 <code>file:approve</code> 能执行该操作，且文件必须处于 <code>processing</code>。当前没有自动杀毒/解析 worker，人工 approve 不是安全扫描；不要在未检查不可信文档时直接批准。
+只有 <code>file:approve</code> 能执行该操作。审批同时要求恶意软件状态为 `CLEAN`，并且当前文件版本存在成功的 OKF 转换及草稿；随后草稿发布、文件进入 <code>available</code>。感染、扫描错误、解析失败或 OKF 未完成时均失败关闭并保持不可下载，人工 approve 不能绕过门禁。
 
 申请下载 URL：
 
@@ -254,7 +254,54 @@ $userPayload = @{
 $user = Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/users -Headers $headers -ContentType "application/json" -Body $userPayload
 ~~~
 
-替换用户角色用 <code>PUT /api/v1/users/{user_id}/roles</code>，body 为 <code>{"role_ids":[...]}</code>。替换角色会使该用户既有 token 失效。非 superuser 不能创建高于自己 priority 的角色、修改 system role，或授予自己没有的权限/更宽限额。
+替换用户角色必须携带刚读取到的 `role_assignment_version`：
+
+~~~powershell
+$roleUpdatePayload = @{
+  expected_version = $user.role_assignment_version
+  role_ids = @($role.id)
+} | ConvertTo-Json -Depth 4
+$user = Invoke-RestMethod -Method Put -Uri "http://localhost:8000/api/v1/users/$($user.id)/roles" -Headers $headers -ContentType "application/json" -Body $roleUpdatePayload
+~~~
+
+该接口使用严格 CAS。实际角色变更会令 `role_assignment_version` 单调递增并使该用户已有 token 失效；提交相同角色集合不会递增版本、不会吊销 token，也不会写入“角色已替换”审计。旧快照返回 `409 stale_role_assignment`，`details.current_version` 给出当前版本；管理员客户端必须重新读取用户及角色集合后再确认，禁止仅替换版本号并盲目重试。非 superuser 不能创建高于自己 priority 的角色、修改 system role，或授予自己没有的权限/更宽限额。
+
+修改角色元数据、优先级、权限、限额或组合策略时同样必须携带最近读取的 `RoleRead.policy_version`。例如组合策略请求为：
+
+~~~powershell
+$rolePolicyPayload = @{
+  expected_version = $role.policy_version
+  permission_codes = @("file:read", "file:upload")
+  limits = @{ max_upload_bytes = 104857600 }
+} | ConvertTo-Json -Depth 4
+$role = Invoke-RestMethod -Method Put -Uri "http://localhost:8000/api/v1/roles/$($role.id)/policy" -Headers $headers -ContentType "application/json" -Body $rolePolicyPayload
+~~~
+
+`PATCH /roles/{id}`、`PUT /permissions`、`PUT /limits` 与 `PUT /policy` 共用一个单调递增的策略版本。旧快照返回 `409 stale_role_policy` 和 `details.current_version`；客户端必须立即废弃旧草稿，重新读取完整角色后由管理员再次确认，禁止只替换版本号自动重试。完全相同的提交是无副作用操作，不递增版本、不写成功审计，也不触发外部模型撤权门禁。
+
+删除非系统角色时必须使用刚读取的策略版本：
+
+~~~powershell
+Invoke-RestMethod -Method Delete -Uri "http://localhost:8000/api/v1/roles/$($role.id)?expected_version=$($role.policy_version)" -Headers $headers
+~~~
+
+系统角色、高于操作者权限边界的角色和旧版本请求会被拒绝。角色仍被用户分配或知识库授权引用时返回 `409 role_in_use` 与引用计数；应先通过受审计 API 清理引用，再重新读取角色版本，禁止直接删数据库行。
+
+### 6.4 修改或重置密码
+
+当前用户修改密码必须提供当前密码：
+
+~~~powershell
+$passwordPayload = @{
+  current_password = $env:KB_PASSWORD
+  new_password = "Replace-With-A-New-Long-Random-Password"
+} | ConvertTo-Json
+Invoke-RestMethod -Method Put -Uri "http://localhost:8000/api/v1/users/me/password" -Headers $headers -ContentType "application/json" -Body $passwordPayload
+~~~
+
+超级管理员重置他人密码时调用 `PUT /api/v1/users/{user_id}/password`，只提交 `new_password`，不得收集或提交目标用户当前密码。两种操作都执行强密码校验、限流/权限检查、`token_version` 递增、refresh token 撤销与审计；成功后客户端必须清除本地会话并重新登录。
+
+知识库授权替换也采用 CAS。管理员先从 `GET /api/v1/knowledge-bases/{id}` 或知识库列表读取 `role_grant_version`，再向 `PUT /api/v1/knowledge-bases/{id}/role-grants` 提交同值的 `expected_version`。旧快照返回 `409 stale_knowledge_grants`；客户端必须重新加载知识库版本和完整授权集合，禁止把旧授权集合自动重放。提交相同集合不会递增版本、不会触发数据外发撤权检查，也不会写成功变更审计。
 
 ## 7. 日常检查与告警
 
@@ -333,13 +380,39 @@ docker compose --env-file .env.kb logs --tail 200 app
 
 先重跑相同上传命令。若 API 返回 <code>upload_expired</code>，使用 <code>--restart</code> 中止旧会话。Compose 默认让 Multipart GC 清理超过 2 天的不完整 part，而应用会话默认 24 小时；GC 年龄不能小于会话窗口。
 
-maintenance worker 会把过期 `INITIATED` 会话标记为 `EXPIRED`、释放 HELD reservation 并清理对象；对过期 `FINALIZING` 会先 HEAD 对账，实际对象完整时补偿提交，否则回收。生产仍需全量 reconciliation 覆盖无数据库记录的孤儿对象、跨区域复制和长期漂移。
+maintenance worker 会把过期 `INITIATED` 会话标记为 `EXPIRED`、释放 HELD reservation 并清理对象；对过期 `FINALIZING` 会先 HEAD 对账，实际对象完整时补偿提交，否则回收。它还会把超过 `KB_CHAT_IDEMPOTENCY_PROCESSING_TIMEOUT_SECONDS` 的聊天记录封闭为 `OUTCOME_UNKNOWN`，并在 `KB_CHAT_IDEMPOTENCY_TTL_SECONDS` 到期后删除 `COMPLETED` / `OUTCOME_UNKNOWN` / `INVALIDATED` 记录；处理中与过期终态使用独立批次配额，避免一类积压饿死另一类，处理中记录绝不能直接删除后重跑。生产仍需全量 reconciliation 覆盖无数据库记录的孤儿对象、跨区域复制和长期漂移。
 
-### 8.7 processing 长期积压
+### 8.7 quarantined / processing 长期积压
 
-当前没有自动扫描/解析 worker。只能由具备 <code>file:approve</code> 的管理员在完成外部扫描后批准。生产应以队列和 worker 自动推进，并对最长 processing age 告警。
+maintenance worker 使用数据库租约推进 ClamAV 扫描与 OKF 转换。`quarantined` 长期积压时检查 clamd readiness、病毒库兼容性、扫描租约与失败审计；`processing` 长期积压时检查解析器 `--require-all` 预检、OKF 作业租约、重试终态和当前版本草稿。感染或扫描错误必须保持隔离，禁止通过直接改表或跳过扫描强制批准。当前单机 worker 不是独立消息队列或高吞吐集群，生产仍需监控最老任务年龄、租约、重试与死信，并以目标机证据校准容量。
 
 ## 9. 数据库诊断
+
+只读查看聊天幂等状态（表中没有问题正文、明文 Key 或明文主体标识）：
+
+~~~sql
+SELECT status, count(*) AS records, min(created_at) AS oldest
+FROM chat_idempotency_records
+GROUP BY status
+ORDER BY status;
+~~~
+
+`PROCESSING` 超过配置超时应由 maintenance 封闭为 `OUTCOME_UNKNOWN`。不要手工删除
+处理中记录，也不要通过清空表来“解决”客户端 `409`，否则可能重复检索、外发和计费。
+`INVALIDATED` 表示知识库内容版本已经变化，旧压缩响应已被清空；它只能在 TTL 到期后由维护任务删除，不能改回 `PROCESSING`。默认 `KB_CHAT_IDEMPOTENCY_CLEANUP_BATCH_SIZE=1000`、`KB_CHAT_IDEMPOTENCY_CLEANUP_MAX_BATCHES=5`、循环间隔 60 秒：每轮分别最多处理 5,000 条超时处理中记录和 5,000 条过期终态。该数值只是理论上界，不是吞吐认证；同一 worker 还执行其他维护任务，必须用目标机 backlog、最老记录年龄和锁等待实测校准。
+
+当前采用最保守的 fail-closed 异常策略：claim 建立后 operation 抛出的任何异常都会封闭为 `OUTCOME_UNKNOWN`，包括少数可以证明尚未外发的确定性错误。这可能牺牲可用性，但不会放宽为可能二次外发；运维不得手工改状态。将错误分类为“未开始/已知结果/未知结果”属于后续优化项，在完成故障注入验收前不能宣称已经解决。
+
+聊天幂等表不保存问题正文、明文 Key 或明文主体 ID；响应先有界 zlib 压缩，再以 AES-256-GCM 加密。数据库保存密钥版本、12 字节随机 nonce、密文和原始大小，外置密钥环由 `KB_CHAT_REPLAY_ENCRYPTION_KEYS` 与 `KB_CHAT_REPLAY_ACTIVE_KEY_VERSION` 配置。旧密钥必须至少保留到相关记录超过 TTL；提前移除、AAD/密文篡改或解密失败会安全转为 `OUTCOME_UNKNOWN` 并清除密文，不会再次调用模型。完整轮换流程见[聊天幂等回放加密运维](./CHAT_REPLAY_ENCRYPTION.zh-CN.md)。
+
+应用层 AEAD 不覆盖 PostgreSQL 其他元数据、对象文件、WAL、快照或备份。上述介质仍必须采用企业访问控制、静态加密、保留和销毁策略；若无法提供静态加密及恢复演练证据，敏感知识库部署必须判定为 `NO-GO`。SHA-256、压缩或 replay 字段加密都不能充当整库匿名化/加密证明。
+
+容量按“保留期内逻辑问答数 × 实际压缩响应字节”核算，而不是按在线用户数核算。
+在每天 50 亿 token 场景中，若平均每次问答消耗 1 万 token，则约有 50 万条记录/
+日；即使采用默认 128 KiB 上限，理论响应体上界也超过 60 GiB/日，尚未计入表膨胀、
+索引、WAL 与备份。因此单机 300 GiB 不能据此宣称容量通过：正式验收必须用实测平均/
+P95 响应大小和请求数确定 TTL，并采用独立或分区 PostgreSQL、磁盘水位告警、WAL/
+备份容量预算与可验证清理。不得通过缩短处理中超时或删除未决记录换取空间。
 
 只读查看长期 HELD reservation：
 
@@ -394,6 +467,8 @@ Invoke-RestMethod http://localhost:8000/health/ready
 4. 再删除旧列/约束。
 
 不要在未验证备份与 downgrade 行为时直接执行 Alembic downgrade。大表 DDL 要评估锁、WAL、复制延迟和回滚窗口。
+
+`20260714_0018` 建立内容版本快照与 API 凭据族，`20260714_0019` 收紧角色引用删除，`20260714_0020` 把聊天 replay 升级为外置密钥的 AES-256-GCM，并销毁历史可逆正文。这些安全迁移是明确的 forward-only migration，尤其 `0020` 不可逆。回退必须在维护窗口恢复升级前的整库备份和匹配的旧应用，不能执行 Alembic downgrade 或手工恢复旧明文列语义。
 
 ## 11. 停止与清理
 

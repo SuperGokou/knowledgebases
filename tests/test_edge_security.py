@@ -120,10 +120,7 @@ def test_shipped_caddy_https_sites_enforce_hsts(
     expected_https_sites: int,
 ) -> None:
     caddyfile = (REPOSITORY / relative_path).read_text(encoding="utf-8")
-    site_offsets = [
-        match.start()
-        for match in re.finditer(r"(?m)^https://[^\r\n]+ \{$", caddyfile)
-    ]
+    site_offsets = [match.start() for match in re.finditer(r"(?m)^https://[^\r\n]+ \{$", caddyfile)]
     https_sites = [
         caddyfile[start:end]
         for start, end in zip(
@@ -135,16 +132,11 @@ def test_shipped_caddy_https_sites_enforce_hsts(
 
     assert len(https_sites) == expected_https_sites
     for site in https_sites:
-        assert (
-            'header >Strict-Transport-Security "max-age=31536000; includeSubDomains"'
-            in site
-        )
+        assert 'header >Strict-Transport-Security "max-age=31536000; includeSubDomains"' in site
 
 
 def test_offline_object_proxy_does_not_log_presigned_query_credentials() -> None:
-    caddyfile = (REPOSITORY / "deploy/tencent/Caddyfile.offline").read_text(
-        encoding="utf-8"
-    )
+    caddyfile = (REPOSITORY / "deploy/tencent/Caddyfile.offline").read_text(encoding="utf-8")
 
     object_vhost = caddyfile.split("https://{$KB_PUBLIC_HOST}:9443", 1)[1]
     assert "log {" not in object_vhost

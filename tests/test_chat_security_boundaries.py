@@ -54,6 +54,7 @@ class RecordingClient:
         self.provider = provider
         self.model = model
         self.calls: list[list[dict[str, str]]] = []
+        self.close_calls = 0
 
     async def complete_chat(
         self,
@@ -76,6 +77,9 @@ class RecordingClient:
             prompt_tokens=10,
             completion_tokens=5,
         )
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 class PassthroughExecutor:
@@ -184,6 +188,7 @@ async def test_consent_is_rechecked_at_the_provider_egress_boundary(
     assert session.scalar_count == 1
     assert session.rollback_count == 0
     assert session.commit_count == 1
+    assert client.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -194,8 +199,14 @@ async def test_same_provider_cannot_self_approve_generated_answer(
     session = ConsentSession(committed_consent=True)
     only_client = RecordingClient()
 
-    async def resolve(*_args: object, **_kwargs: object) -> RecordingClient:
-        return only_client
+    async def resolve(
+        *_args: object,
+        provider: str | None = None,
+        **_kwargs: object,
+    ) -> RecordingClient:
+        if provider is None:
+            return only_client
+        return RecordingClient(provider=only_client.provider, model=only_client.model)
 
     await _install_chat_fakes(
         monkeypatch,
@@ -218,6 +229,7 @@ async def test_same_provider_cannot_self_approve_generated_answer(
     assert response.mode == "retrieval"
     assert response.source_status.reason == "independent_reviewer_unavailable"
     assert len(only_client.calls) == 1
+    assert only_client.close_calls == 1
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,15 @@
+[Unit]
+Description=Jiangsu Heyi offline knowledge base crash reconciler
+Requires=docker.service
+After=docker.service local-fs.target
+ConditionPathIsDirectory=/srv/heyi-knowledgebases-offline
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /srv/heyi-knowledgebases-offline/recovery/offline-recovery-dispatcher.sh
+TimeoutStartSec=600
+UMask=0077
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

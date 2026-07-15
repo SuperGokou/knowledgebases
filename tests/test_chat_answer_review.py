@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
 import pytest
 
-from app.schemas.chat import ChatCitation
+from app.schemas.chat import ChatCitation, ChatDataTable
 from app.services import chat as chat_service
-from app.services.chat import _GeneratedChatResponse, _review_generated_answer
+from app.services.chat import _GeneratedChatResponse, _review_generated_answer, _review_messages
 from app.services.llm_provider import LlmChatResult, LlmProviderError
 
 
@@ -92,3 +93,22 @@ async def test_answer_review_fails_closed(client: ReviewClient, expected: str) -
 
 def test_chat_service_has_no_orphan_recursive_provider_wrapper() -> None:
     assert not hasattr(chat_service, "_answer_with_provider")
+
+
+def test_review_payload_binds_each_table_row_to_its_evidence() -> None:
+    generated = _GeneratedChatResponse(
+        answer="公司成立于 2023 年 [1]。",
+        table=ChatDataTable(
+            title="成立信息",
+            columns=["项目", "内容"],
+            rows=[["成立时间", "2023 年"]],
+            citation_numbers=[1],
+            row_citation_numbers=[[1]],
+        ),
+    )
+
+    messages = _review_messages("公司何时成立？", generated, [_citation()])
+    payload = json.loads(messages[1]["content"])
+
+    assert payload["table"]["row_citation_numbers"] == [[1]]
+    assert "only against that row's row_citation_numbers" in messages[0]["content"]

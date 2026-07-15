@@ -5,7 +5,10 @@
 - `compose.yml`：现有共享主机部署，数据层使用受管服务；
 - `compose.offline.yml`：8 核 16G、300 GB SSD 的单机离线模拟环境，PostgreSQL、Redis 与 MinIO 全部部署在本机，运行时禁止公网模型调用。
 
-离线企业方案必须先阅读[腾讯云 8 核 16G 离线企业部署](../../docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。它使用独立项目名 `heyi-kb-offline`、独立端口 `19443/19444` 和独立数据目录，不会修改当前 `heyi-kb-prod` 或其他应用。
+离线企业方案必须先阅读[腾讯云 8 核 16G 离线企业部署](../../docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。它使用独立项目名 `heyi-kb-offline`、独立端口 `19443/19444` 和独立数据目录，不会修改当前 `heyi-kb-prod` 或其他应用。终端信任、根证书分发、严格验收和轮换操作见[内网 TLS 与 Caddy 内部 CA 运维手册](../../docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)。
+
+> [!IMPORTANT]
+> 离线编排为 Web、API 和维护任务预留至少 120 秒优雅停机时间，为受控 LLM 出口预留 135 秒。该顺序覆盖单次 45 秒模型调用及 95/105 秒端到端清算预算，避免正常升级或重启过早发送 `SIGKILL`，从而留下无法判定的模型用量。运维时不得使用 `docker kill` 或缩短这些预算。
 
 本目录用于将知识库部署到共享的腾讯云主机。生产编排只运行 Web、API、维护任务和反向代理；数据库、Redis 与对象存储继续使用受管服务。
 
@@ -48,6 +51,10 @@ sudo docker compose \
 
 首次在空机部署时可顺序构建 API 与 Web 镜像。共享主机开始承载其他应用后，应由 CI 构建带 Git SHA 的不可变镜像，服务器只执行 `pull` 和项目限定的 `up -d`，避免现场构建抢占其他应用的 CPU 与内存。
 
-## HTTPS 说明
+## 内网 TLS 说明
 
-首次灰度使用 Caddy 内部 CA，为服务器 IP 提供加密访问，浏览器会显示证书未受公共机构信任。正式上线时应绑定企业域名，将本项目接入独立域名和公共 HTTPS 证书，再按变更窗口切换到 `443`。
+离线编排已经在 `19443/19444` 启用 Caddy 内部 CA 签发的 TLS；浏览器提示“不安全”可能来自根 CA 未受信任、SAN 不匹配、证书过期、终端时钟错误或访问了错误入口，不代表服务端仍在使用 HTTP。应先按运维手册诊断链路和 SAN，再决定是否安装根证书。内网部署可以继续使用独立高位端口和企业内部 CA，无须占用同机其他应用的 `80/443`。
+
+只允许通过受控渠道分发 `root.crt`。不得分发 `root.key`、`intermediate.key`、整个 `caddy-data` 目录或任何包含私钥的归档；导入前必须通过两个独立渠道核对 PEM 文件 SHA-256 与 X.509 证书 SHA-256 指纹。浏览器、`curl`、OpenSSL 和自动化验收均不得使用 `--insecure`、`-k`、`verify=False`、`ignoreHTTPSErrors` 或关闭主机名校验。
+
+若企业基线要求 CRL/OCSP、集中吊销或正式内网域名，应由企业 PKI 签发包含实际 DNS/IP SAN 的服务器证书，并按变更窗口迁移。Caddy 内部 CA 不提供完整的企业吊销服务，不能以忽略证书错误作为替代方案。

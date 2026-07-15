@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
 
@@ -16,6 +16,10 @@ import {
 import type { DocumentFixture } from "./support/document-fixtures";
 
 type Row = Record<string, unknown>;
+type SyntheticUser = {
+  readonly credentials: { readonly email: string; readonly password: string };
+  readonly user: Row;
+};
 
 function annotate(testInfo: TestInfo, check: string) {
   testInfo.annotations.push({ type: "evidence-check", description: check });
@@ -28,7 +32,10 @@ function requiredEnv(name: string): string {
 }
 
 function suffix(testInfo: TestInfo): string {
-  return `${testInfo.project.name}-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
+  const runId = requiredEnv("KB_E2E_RUN_ID").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  const runTag = runId.slice(0, 16);
+  const projectTag = testInfo.project.name.toLowerCase().replace(/[^a-z0-9]/g, "").slice(-8);
+  return `${runTag}-${projectTag}-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .slice(-48);
@@ -47,6 +54,34 @@ function row(value: unknown, operation: string): Row {
   return value as Row;
 }
 
+function roleAssignmentVersion(user: Row, operation: string): number {
+  const version = user.role_assignment_version;
+  if (!Number.isSafeInteger(version) || Number(version) < 1) {
+    throw new Error(`${operation}: user response omitted a valid role_assignment_version`);
+  }
+  return Number(version);
+}
+
+function roleGrantVersion(knowledgeBase: Row, operation: string): number {
+  const version = knowledgeBase.role_grant_version;
+  if (!Number.isSafeInteger(version) || Number(version) < 1) {
+    throw new Error(`${operation}: knowledge base response omitted a valid role_grant_version`);
+  }
+  return Number(version);
+}
+
+function rolePolicyVersion(role: Row, operation: string): number {
+  const version = role.policy_version;
+  if (!Number.isSafeInteger(version) || Number(version) < 1) {
+    throw new Error(`${operation}: role response omitted a valid policy_version`);
+  }
+  return Number(version);
+}
+
+function syntheticPassword(): string {
+  return `E2E!Aa9${randomBytes(32).toString("base64url")}`;
+}
+
 async function loginAdmin(page: Page, enterprise: EnterpriseConfig) {
   await loginAs(page, {
     email: enterprise.adminEmail,
@@ -55,14 +90,19 @@ async function loginAdmin(page: Page, enterprise: EnterpriseConfig) {
   await expect(page).toHaveURL(/\/admin(?:\/|$)/);
 }
 
-async function createRole(page: Page, testInfo: TestInfo, permissions: string[]) {
+async function createRole(
+  page: Page,
+  enterprise: EnterpriseConfig,
+  testInfo: TestInfo,
+  permissions: string[],
+) {
   const id = suffix(testInfo);
   const response = await bffRequest<Row>(page, "/api/v1/roles", {
     method: "POST",
     body: {
       code: `e2e_${id}`.replace(/-/g, "_").slice(0, 90),
-      name: `E2E 验收角色 ${id}`,
-      description: "Playwright enterprise acceptance role",
+      name: `E2E 验收角色 [run_id=${enterprise.runId}] ${id}`,
+      description: `Playwright enterprise acceptance role; run_id=${enterprise.runId}`,
       priority: -9_000,
       permission_codes: permissions,
       limits: {},
@@ -72,17 +112,22 @@ async function createRole(page: Page, testInfo: TestInfo, permissions: string[])
   return row(response.body, "create role");
 }
 
-async function createUser(page: Page, testInfo: TestInfo, roleIds: string[] = []) {
+async function createUser(
+  page: Page,
+  enterprise: EnterpriseConfig,
+  testInfo: TestInfo,
+  roleIds: string[] = [],
+) {
   const id = suffix(testInfo);
   const credentials = {
     email: `enterprise-${id}@example.com`,
-    password: `E2E!${id}Aa123456789`,
+    password: syntheticPassword(),
   };
   const response = await bffRequest<Row>(page, "/api/v1/users", {
     method: "POST",
     body: {
       ...credentials,
-      display_name: `E2E 验收成员 ${id}`,
+      display_name: `E2E 验收成员 [run_id=${enterprise.runId}] ${id}`,
       role_ids: roleIds,
     },
   });
@@ -90,19 +135,140 @@ async function createUser(page: Page, testInfo: TestInfo, roleIds: string[] = []
   return { credentials, user: row(response.body, "create user") };
 }
 
-async function createKnowledgeBase(page: Page, testInfo: TestInfo) {
+async function createKnowledgeBase(
+  page: Page,
+  enterprise: EnterpriseConfig,
+  testInfo: TestInfo,
+) {
   const id = suffix(testInfo);
   const response = await bffRequest<Row>(page, "/api/v1/knowledge-bases", {
     method: "POST",
     body: {
-      name: `E2E 验收知识库 ${id}`,
-      description: "Disposable enterprise E2E knowledge base",
+      name: `E2E 验收知识库 [run_id=${enterprise.runId}] ${id}`,
+      description: `Retained enterprise E2E knowledge base; run_id=${enterprise.runId}`,
       external_llm_processing_enabled: false,
-      custom_metadata: { source: "playwright-enterprise" },
+      custom_metadata: { source: "playwright-enterprise", e2e_run_id: enterprise.runId },
     },
   });
   assertStatus(response.status, 201, "create knowledge base");
   return row(response.body, "create knowledge base");
+}
+
+async function retireSyntheticUser(page: Page, user: Row) {
+  const userId = String(user.id ?? "");
+  if (!userId) throw new Error("retire synthetic user: response omitted user id");
+  const email = String(user.email ?? "");
+  if (!email) throw new Error("retire synthetic user: response omitted user email");
+  const query = new URLSearchParams({ limit: "10", offset: "0", search: email });
+  const listed = await bffRequest<Row[]>(page, `/api/v1/users?${query.toString()}`);
+  assertStatus(listed.status, 200, "load synthetic user for retirement");
+  const current = Array.isArray(listed.body)
+    ? listed.body.find((item) => String(item.id ?? "") === userId)
+    : undefined;
+  if (!current) throw new Error("retire synthetic user: current user is not in the bounded admin list");
+  if (Array.isArray(current.role_ids) && current.role_ids.length > 0) {
+    const revoked = await bffRequest<Row>(page, `/api/v1/users/${userId}/roles`, {
+      method: "PUT",
+      body: {
+        role_ids: [],
+        expected_version: roleAssignmentVersion(current, "retire synthetic user"),
+      },
+    });
+    assertStatus(revoked.status, 200, "remove retained synthetic user roles");
+  }
+  if (current.status !== "disabled") {
+    const disabled = await bffRequest<Row>(page, `/api/v1/users/${userId}`, {
+      method: "PATCH",
+      body: { status: "disabled" },
+    });
+    assertStatus(disabled.status, 200, "disable retained synthetic user");
+  }
+}
+
+async function deleteRoleIfPresent(page: Page, roleId: string) {
+  const current = await bffRequest<Row>(page, `/api/v1/roles/${roleId}`);
+  if (current.status === 404) return;
+  assertStatus(current.status, 200, "load synthetic role for cleanup");
+  const deleted = await bffRequest(
+    page,
+    `/api/v1/roles/${roleId}?expected_version=${rolePolicyVersion(row(current.body, "load synthetic role for cleanup"), "load synthetic role for cleanup")}`,
+    { method: "DELETE" },
+  );
+  assertStatus(deleted.status, 204, "delete unreferenced synthetic role");
+}
+
+async function clearSyntheticKnowledgeGrants(page: Page, knowledgeBase: Row) {
+  const knowledgeBaseId = String(knowledgeBase.id ?? "");
+  if (!knowledgeBaseId) {
+    throw new Error("clear synthetic knowledge grants: response omitted knowledge base id");
+  }
+  const current = await bffRequest<Row>(page, `/api/v1/knowledge-bases/${knowledgeBaseId}`);
+  assertStatus(current.status, 200, "load synthetic knowledge base for grant cleanup");
+  const cleared = await bffRequest<Row>(
+    page,
+    `/api/v1/knowledge-bases/${knowledgeBaseId}/role-grants`,
+    {
+      method: "PUT",
+      body: {
+        grants: [],
+        expected_version: roleGrantVersion(
+          row(current.body, "load synthetic knowledge base for grant cleanup"),
+          "load synthetic knowledge base for grant cleanup",
+        ),
+      },
+    },
+  );
+  assertStatus(cleared.status, 200, "clear synthetic knowledge base role grants");
+}
+
+async function cleanupSyntheticAccess(
+  page: Page,
+  resources: {
+    readonly users?: ReadonlyArray<Row | null>;
+    readonly knowledgeBases?: ReadonlyArray<Row | null>;
+    readonly roles?: ReadonlyArray<Row | null>;
+  },
+) {
+  const failures: unknown[] = [];
+  for (const user of resources.users ?? []) {
+    if (!user) continue;
+    try {
+      await retireSyntheticUser(page, user);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const knowledgeBase of resources.knowledgeBases ?? []) {
+    if (!knowledgeBase) continue;
+    try {
+      await clearSyntheticKnowledgeGrants(page, knowledgeBase);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const role of resources.roles ?? []) {
+    if (!role) continue;
+    try {
+      await deleteRoleIfPresent(page, String(role.id ?? ""));
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "synthetic access cleanup did not complete");
+  }
+}
+
+async function expectLoginRejected(
+  page: Page,
+  credentials: { readonly email: string; readonly password: string },
+) {
+  await page.goto("/login");
+  await page.getByLabel("工作邮箱").fill(credentials.email);
+  await page.getByLabel("密码").fill(credentials.password);
+  await page.getByRole("button", { name: "安全登录" }).click();
+  await expect(page).toHaveURL(/\/login(?:\?|$)/);
+  await expect(page.getByRole("alert")).toBeVisible();
 }
 
 async function setFaultMode(
@@ -141,7 +307,10 @@ async function uploadMultipartFixture(
       content_type: "text/plain",
       knowledge_base_id: knowledgeBaseId,
       idempotency_key: idempotencyKey,
-      custom_metadata: { source: "playwright-enterprise-multipart" },
+      custom_metadata: {
+        source: "playwright-enterprise-multipart",
+        e2e_run_id: enterprise.runId,
+      },
     },
   });
   assertStatus(initiated.status, 201, "initiate multipart upload");
@@ -346,6 +515,7 @@ async function uploadApproveAndGroundFixture(
 
   const chat = await bffRequest<Row>(page, "/api/v1/chat/query", {
     method: "POST",
+    idempotencyKey: `e2e-${enterprise.runId}-file-${fixture.extension}-chat`,
     body: {
       knowledge_base_id: knowledgeBaseId,
       message: `Return the documented service level for ${fixture.token}.`,
@@ -393,14 +563,14 @@ async function uploadApproveAndGroundFixture(
 test("@enterprise unified login routes accounts by effective role", async ({ page, enterprise, quality }, testInfo) => {
   annotate(testInfo, "login_role_routing");
   await loginAdmin(page, enterprise);
-  const role = await createRole(page, testInfo, ["chat:query", "knowledge:read"]);
-  const created = await createUser(page, testInfo, [String(role.id)]);
+  const role = await createRole(page, enterprise, testInfo, ["chat:query", "knowledge:read"]);
+  const created = await createUser(page, enterprise, testInfo, [String(role.id)]);
 
   const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
   await loginAs(memberPage, created.credentials);
   await expect(memberPage).toHaveURL(/\/chat(?:\?|$)/);
 
-  const contentRole = await createRole(page, testInfo, [
+  const contentRole = await createRole(page, enterprise, testInfo, [
     "knowledge:read",
     "knowledge:create",
     "knowledge:update",
@@ -408,13 +578,13 @@ test("@enterprise unified login routes accounts by effective role", async ({ pag
     "file:upload",
     "file:approve",
   ]);
-  const contentManager = await createUser(page, testInfo, [String(contentRole.id)]);
+  const contentManager = await createUser(page, enterprise, testInfo, [String(contentRole.id)]);
   const contentPage = await quality.newIsolatedPage(enterprise.baseUrl);
   await loginAs(contentPage, contentManager.credentials);
   await expect(contentPage).toHaveURL(/\/admin\/knowledge(?:\?|$)/);
   await expect(contentPage.getByRole("heading", { name: "知识库" })).toBeVisible();
 
-  const pending = await createUser(page, testInfo);
+  const pending = await createUser(page, enterprise, testInfo);
   const pendingPage = await quality.newIsolatedPage(enterprise.baseUrl);
   await loginAs(pendingPage, pending.credentials);
   await expect(pendingPage).toHaveURL(/\/access-pending(?:\?|$)/);
@@ -424,56 +594,618 @@ test("@enterprise account lifecycle rejects duplicates and revokes active access
   annotate(testInfo, "account_lifecycle");
   annotate(testInfo, "error_loading_states");
   await loginAdmin(page, enterprise);
-  const role = await createRole(page, testInfo, ["chat:query"]);
-  const created = await createUser(page, testInfo, [String(role.id)]);
-  const duplicate = await bffRequest(page, "/api/v1/users", {
-    method: "POST",
-    body: { ...created.credentials, display_name: "duplicate", role_ids: [role.id] },
-  });
-  assertStatus(duplicate.status, 409, "duplicate user");
+  const role = await createRole(page, enterprise, testInfo, ["chat:query"]);
+  const id = suffix(testInfo);
+  const originalCredentials = {
+    email: `enterprise-ui-${id}@example.com`,
+    password: syntheticPassword(),
+  };
+  const resetCredentials = {
+    email: originalCredentials.email,
+    password: syntheticPassword(),
+  };
+  let createdUser: Row | null = null;
 
-  const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
-  await loginAs(memberPage, created.credentials);
-  const revoke = await bffRequest(page, `/api/v1/users/${String(created.user.id)}/roles`, {
-    method: "PUT",
-    body: { role_ids: [] },
-  });
-  assertStatus(revoke.status, 200, "revoke roles");
-  await memberPage.goto("/chat");
-  await expect(memberPage).toHaveURL(/\/access-pending(?:\?|$)/);
-  const disable = await bffRequest(page, `/api/v1/users/${String(created.user.id)}`, {
-    method: "PATCH",
-    body: { status: "disabled" },
-  });
-  assertStatus(disable.status, 200, "disable user");
-  const staleSession = await bffRequest(memberPage, "/api/v1/auth/me");
-  expect([401, 403]).toContain(staleSession.status);
+  try {
+    await page.goto("/admin/users");
+    const createDrawer = page.locator("details.drawer-form").filter({ hasText: "新建成员账号" });
+    await createDrawer.locator("summary").click();
+    await createDrawer.getByLabel("邮箱").fill(originalCredentials.email);
+    await createDrawer.getByLabel("显示名称").fill(`E2E UI 成员 [run_id=${enterprise.runId}] ${id}`);
+    await createDrawer.getByLabel("初始密码").fill(originalCredentials.password);
+    const createdResponse = page.waitForResponse(
+      (response) => response.request().method() === "POST"
+        && new URL(response.url()).pathname === "/api/backend/api/v1/users",
+    );
+    await createDrawer.getByRole("button", { name: "创建账号" }).click();
+    const created = await createdResponse;
+    assertStatus(created.status(), 201, "create member through the admin UI");
+    createdUser = row(await created.json(), "create member through the admin UI");
+    const userId = String(createdUser.id ?? "");
+    if (!userId) throw new Error("UI-created member response omitted id");
+
+    const memberSearch = page.getByRole("search");
+    await memberSearch.getByLabel("搜索成员").fill(originalCredentials.email);
+    const memberSearchResponse = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/users?")
+        && new URL(response.url()).searchParams.get("search") === originalCredentials.email,
+    );
+    await memberSearch.getByRole("button", { name: "搜索" }).click();
+    assertStatus((await memberSearchResponse).status(), 200, "search member through the admin UI");
+
+    const duplicate = await bffRequest(page, "/api/v1/users", {
+      method: "POST",
+      body: { ...originalCredentials, display_name: "duplicate", role_ids: [] },
+    });
+    assertStatus(duplicate.status, 409, "duplicate user");
+
+    let memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
+    await expect(memberRow).toHaveCount(1);
+    await memberRow.getByRole("button", { name: "修改密码" }).click();
+    const passwordDialog = page.getByRole("dialog", {
+      name: new RegExp(`重置成员密码：.*${originalCredentials.email}`),
+    });
+    await passwordDialog.getByLabel("新密码", { exact: true }).fill(resetCredentials.password);
+    await passwordDialog.getByLabel("确认新密码", { exact: true }).fill(resetCredentials.password);
+    const resetResponse = page.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes(`/api/v1/users/${userId}/password`),
+    );
+    await passwordDialog.getByRole("button", { name: "确认修改并撤销旧会话" }).click();
+    assertStatus((await resetResponse).status(), 204, "reset UI-created member password");
+    await expect(page.getByRole("status")).toContainText("全部旧会话已撤销");
+
+    memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
+    const roleCandidateQuery = String(role.name);
+    await page.getByLabel("搜索角色候选").fill(roleCandidateQuery);
+    const roleCandidateSearchResponse = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/roles?")
+        && new URL(response.url()).searchParams.get("q") === roleCandidateQuery
+        && new URL(response.url()).searchParams.get("assignable") === "true",
+    );
+    await page.getByRole("button", { name: "搜索角色" }).click();
+    assertStatus(
+      (await roleCandidateSearchResponse).status(),
+      200,
+      "search assignable role through the member administration UI",
+    );
+    await memberRow.getByRole("button", { name: "分配角色" }).click();
+    const roleDialog = page.getByRole("dialog", {
+      name: new RegExp(`分配角色：.*${originalCredentials.email}`),
+    });
+    await roleDialog.getByRole("checkbox", { name: new RegExp(String(role.name)) }).check();
+    const assignedResponse = page.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes(`/api/v1/users/${userId}/roles`),
+    );
+    await roleDialog.getByRole("button", { name: "保存角色" }).click();
+    const assigned = await assignedResponse;
+    assertStatus(assigned.status(), 200, "assign member role through the admin UI");
+    createdUser = row(await assigned.json(), "assign member role through the admin UI");
+    expect(createdUser.role_ids).toContain(String(role.id));
+
+    memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
+    await memberRow.getByRole("button", { name: "分配角色" }).click();
+    await expect(page.getByRole("dialog", { name: new RegExp("分配角色") })).toBeVisible();
+    await memberSearch.getByLabel("搜索成员").fill(`missing-${id}`);
+    const hiddenDraftSearch = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/users?")
+        && new URL(response.url()).searchParams.get("search") === `missing-${id}`,
+    );
+    await memberSearch.getByRole("button", { name: "搜索" }).click();
+    assertStatus((await hiddenDraftSearch).status(), 200, "invalidate hidden member draft on search");
+    await expect(page.getByRole("dialog", { name: new RegExp("分配角色") })).toHaveCount(0);
+    await memberSearch.getByLabel("搜索成员").fill(originalCredentials.email);
+    const restoreMemberSearch = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/users?")
+        && new URL(response.url()).searchParams.get("search") === originalCredentials.email,
+    );
+    await memberSearch.getByRole("button", { name: "搜索" }).click();
+    assertStatus((await restoreMemberSearch).status(), 200, "restore member search after draft invalidation");
+    await expect(page.locator("tbody tr").filter({ hasText: originalCredentials.email })).toHaveCount(1);
+
+    const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(memberPage, resetCredentials);
+    await expect(memberPage).toHaveURL(/\/chat(?:\?|$)/);
+
+    memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
+    const disabledResponse = page.waitForResponse(
+      (response) => response.request().method() === "PATCH"
+        && response.url().includes(`/api/v1/users/${userId}`),
+    );
+    await memberRow.getByRole("button", { name: "停用" }).click();
+    assertStatus((await disabledResponse).status(), 200, "disable member through the admin UI");
+    await expect(memberRow).toContainText("已停用");
+    const staleSession = await bffRequest(memberPage, "/api/v1/auth/me");
+    expect([401, 403]).toContain(staleSession.status);
+
+    const enabledResponse = page.waitForResponse(
+      (response) => response.request().method() === "PATCH"
+        && response.url().includes(`/api/v1/users/${userId}`),
+    );
+    await memberRow.getByRole("button", { name: "启用" }).click();
+    assertStatus((await enabledResponse).status(), 200, "enable member through the admin UI");
+    await expect(memberRow).toContainText("正常");
+    const reenabledPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(reenabledPage, resetCredentials);
+    await expect(reenabledPage).toHaveURL(/\/chat(?:\?|$)/);
+  } finally {
+    await cleanupSyntheticAccess(page, {
+      users: [createdUser],
+      roles: [role],
+    });
+  }
+});
+
+test("@enterprise password reset enforces scope and revokes old credentials and sessions", async ({ page, enterprise, quality }, testInfo) => {
+  annotate(testInfo, "account_lifecycle");
+  await loginAdmin(page, enterprise);
+  let memberRole: Row | null = null;
+  let managerRole: Row | null = null;
+  let ownerRole: Row | null = null;
+  let member: SyntheticUser | null = null;
+  let manager: SyntheticUser | null = null;
+  let owner: SyntheticUser | null = null;
+
+  try {
+    memberRole = await createRole(page, enterprise, testInfo, ["chat:query"]);
+    member = await createUser(page, enterprise, testInfo, [String(memberRole.id)]);
+    managerRole = await createRole(page, enterprise, testInfo, ["user:manage"]);
+    manager = await createUser(page, enterprise, testInfo, [String(managerRole.id)]);
+    ownerRole = await createRole(page, enterprise, testInfo, ["knowledge:create", "knowledge:read"]);
+    owner = await createUser(page, enterprise, testInfo, [String(ownerRole.id)]);
+    const memberUserId = String(member.user.id);
+    const memberNewPassword = syntheticPassword();
+    const managerNewPassword = syntheticPassword();
+    const unauthorizedPassword = syntheticPassword();
+
+    const activeMemberPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(activeMemberPage, member.credentials);
+
+    await page.goto("/admin/users");
+    const memberRow = page.locator("tbody tr").filter({ hasText: member.credentials.email });
+    await expect(memberRow).toHaveCount(1);
+    await memberRow.getByRole("button", { name: "修改密码" }).click();
+    await expect(page.getByLabel("当前密码", { exact: true })).toHaveCount(0);
+    await page.getByLabel("新密码", { exact: true }).fill(memberNewPassword);
+    await page.getByLabel("确认新密码", { exact: true }).fill(memberNewPassword);
+    const administrativeReset = page.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes(`/api/v1/users/${memberUserId}/password`),
+    );
+    await page.getByRole("button", { name: "确认修改并撤销旧会话" }).click();
+    assertStatus((await administrativeReset).status(), 204, "superuser password reset without current password");
+    await expect(page.getByRole("status")).toContainText("全部旧会话已撤销");
+
+    const revokedSession = await bffRequest(activeMemberPage, "/api/v1/auth/me");
+    expect([401, 403]).toContain(revokedSession.status);
+    const oldPasswordPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await expectLoginRejected(oldPasswordPage, member.credentials);
+    const newPasswordPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(newPasswordPage, {
+      email: member.credentials.email,
+      password: memberNewPassword,
+    });
+    await expect(newPasswordPage).toHaveURL(/\/chat(?:\?|$)/);
+
+    const ownerPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(ownerPage, owner.credentials);
+    const ownedKnowledgeBase = await createKnowledgeBase(ownerPage, enterprise, testInfo);
+    expect(String(ownedKnowledgeBase.owner_id ?? "")).toBe(String(owner.user.id));
+
+    const selfManagerPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(selfManagerPage, manager.credentials);
+    await selfManagerPage.goto("/admin/users");
+    const ownerRow = selfManagerPage.locator("tbody tr").filter({ hasText: owner.credentials.email });
+    await expect(ownerRow).toHaveCount(1);
+    await expect(ownerRow.getByRole("button", { name: "修改密码" })).toHaveCount(0);
+    const unauthorizedReset = await bffRequest(
+      selfManagerPage,
+      `/api/v1/users/${String(owner.user.id)}/password`,
+      {
+        method: "PUT",
+        body: {
+          new_password: unauthorizedPassword,
+        },
+      },
+    );
+    assertStatus(unauthorizedReset.status, 403, "non-superuser reset of knowledge owner");
+    const ownerOriginalPasswordPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(ownerOriginalPasswordPage, owner.credentials);
+    await expect(ownerOriginalPasswordPage).toHaveURL(/\/admin\/knowledge(?:\?|$)/);
+    const ownerUnauthorizedPasswordPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await expectLoginRejected(ownerUnauthorizedPasswordPage, {
+      email: owner.credentials.email,
+      password: unauthorizedPassword,
+    });
+
+    const siblingManagerPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(siblingManagerPage, manager.credentials);
+    await selfManagerPage.getByRole("button", { name: "修改登录密码" }).click();
+    await selfManagerPage.getByLabel("当前密码", { exact: true }).fill("Wrong-current-password-123!");
+    await selfManagerPage.getByLabel("新密码", { exact: true }).fill(managerNewPassword);
+    await selfManagerPage.getByLabel("确认新密码", { exact: true }).fill(managerNewPassword);
+    const rejectedChange = selfManagerPage.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes("/api/v1/users/me/password"),
+    );
+    await selfManagerPage.getByRole("button", { name: "确认修改" }).click();
+    assertStatus((await rejectedChange).status(), 401, "self password change with wrong current password");
+    await expect(selfManagerPage).toHaveURL(/\/admin\/users(?:\?|$)/);
+    await expect(selfManagerPage.getByRole("alert")).toBeVisible();
+
+    await selfManagerPage.getByLabel("当前密码", { exact: true }).fill(manager.credentials.password);
+    const acceptedChange = selfManagerPage.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes("/api/v1/users/me/password"),
+    );
+    await selfManagerPage.getByRole("button", { name: "确认修改" }).click();
+    assertStatus((await acceptedChange).status(), 204, "self password change with current password");
+    await expect(selfManagerPage).toHaveURL(/\/login(?:\?|$)/, { timeout: 30_000 });
+    const revokedSiblingSession = await bffRequest(siblingManagerPage, "/api/v1/auth/me");
+    expect([401, 403]).toContain(revokedSiblingSession.status);
+
+    const selfOldPasswordPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await expectLoginRejected(selfOldPasswordPage, manager.credentials);
+    const selfNewPasswordPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(selfNewPasswordPage, {
+      email: manager.credentials.email,
+      password: managerNewPassword,
+    });
+    await expect(selfNewPasswordPage).toHaveURL(/\/admin(?:\?|$)/);
+  } finally {
+    await cleanupSyntheticAccess(page, {
+      users: [member?.user ?? null, manager?.user ?? null, owner?.user ?? null],
+      roles: [memberRole, managerRole, ownerRole],
+    });
+  }
+});
+
+test("@enterprise role administration edits and deletes safely under references and concurrency", async ({ page, enterprise, quality }, testInfo) => {
+  annotate(testInfo, "account_lifecycle");
+  await loginAdmin(page, enterprise);
+  let idleRoleForCleanup: Row | null = null;
+  let referencedRole: Row | null = null;
+  let referencedUser: SyntheticUser | null = null;
+  let referencedKnowledgeBase: Row | null = null;
+
+  try {
+    await page.goto("/admin/roles");
+    const roleId = suffix(testInfo);
+    const roleCode = `e2e_ui_${roleId}`.replace(/-/g, "_").slice(0, 90);
+    const roleName = `E2E UI 角色 [run_id=${enterprise.runId}] ${roleId}`;
+    const roleDescription = `Created through the role administration UI; run_id=${enterprise.runId}`;
+    const roleDrawer = page.locator("details.role-create-drawer");
+    await roleDrawer.locator("summary").click();
+    await roleDrawer.getByPlaceholder("例如 knowledge_editor").fill(roleCode);
+    await roleDrawer.getByLabel("角色名称").fill(roleName);
+    await roleDrawer.getByLabel("优先级").fill("-9000");
+    await roleDrawer.getByLabel("描述").fill(roleDescription);
+    const roleCreatedResponse = page.waitForResponse(
+      (response) => response.request().method() === "POST"
+        && new URL(response.url()).pathname === "/api/backend/api/v1/roles",
+    );
+    await roleDrawer.getByRole("button", { name: "创建角色" }).click();
+    const roleCreated = await roleCreatedResponse;
+    assertStatus(roleCreated.status(), 201, "create custom role through the admin UI");
+    const idleRole = row(await roleCreated.json(), "create custom role through the admin UI");
+    idleRoleForCleanup = idleRole;
+    await expect(page.getByRole("status")).toContainText("已创建");
+    await expect(page.locator(".role-item").filter({ hasText: roleName })).toBeVisible();
+    await page.getByLabel("搜索角色目录").fill(roleName);
+    const createdRoleSearchResponse = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/roles?")
+        && new URL(response.url()).searchParams.get("q") === roleName,
+    );
+    await page.locator("form.role-catalog-toolbar").getByRole("button", { name: "搜索", exact: true }).click();
+    assertStatus((await createdRoleSearchResponse).status(), 200, "search created role through the role administration UI");
+    await expect(page.locator(".role-item").filter({ hasText: roleName })).toBeVisible();
+
+    const permissionSection = page.locator("details.policy-disclosure").filter({ hasText: "权限能力" });
+    await permissionSection.locator("summary").click();
+    await permissionSection.getByRole("checkbox", { name: /使用知识问答/ }).check();
+    const limitSection = page.locator("details.policy-disclosure").filter({ hasText: "资源与访问限额" });
+    await limitSection.locator("summary").click();
+    await limitSection.getByLabel("每分钟请求次数设置方式").selectOption("limited");
+    await limitSection.getByLabel("每分钟请求次数数值").fill("30");
+    await limitSection.getByLabel("单个文件大小上限设置方式").selectOption("unlimited");
+    const policySavedResponse = page.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes(`/api/v1/roles/${String(idleRole.id)}/policy`),
+    );
+    await page.getByRole("button", { name: "保存权限与限额" }).click();
+    const policySaved = await policySavedResponse;
+    assertStatus(policySaved.status(), 200, "save custom role policy through the admin UI");
+    const savedPolicy = row(await policySaved.json(), "save custom role policy through the admin UI");
+    expect(savedPolicy.permission_codes).toContain("chat:query");
+    const savedLimits = row(savedPolicy.limits, "saved role limits");
+    expect(savedLimits.requests_per_minute).toBe(30);
+    expect(savedLimits.max_upload_bytes).toBeNull();
+    await expect(page.getByRole("status")).toContainText("权限与限额已保存");
+
+    await page.getByLabel("搜索角色目录").fill("");
+    const resetRoleSearchResponse = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/roles?")
+        && !new URL(response.url()).searchParams.has("q"),
+    );
+    await page.locator("form.role-catalog-toolbar").getByRole("button", { name: "搜索", exact: true }).click();
+    assertStatus((await resetRoleSearchResponse).status(), 200, "reset role administration search");
+    const systemRoleButton = page.locator(".role-item").filter({ hasText: "· 系统" }).first();
+    await expect(systemRoleButton).toBeVisible();
+    const systemRoleName = (await systemRoleButton.locator("strong").innerText()).trim();
+    await systemRoleButton.click();
+    const systemDetail = page.locator(".role-detail");
+    await expect(systemDetail.getByRole("heading", { name: systemRoleName })).toBeVisible();
+    await expect(systemDetail.getByRole("button", { name: "编辑角色" })).toHaveCount(0);
+    await expect(systemDetail.getByRole("button", { name: "删除角色" })).toHaveCount(0);
+    await expect(systemDetail).toContainText("系统角色始终只读");
+
+    const roles = await bffRequest<Row[]>(page, "/api/v1/roles");
+    assertStatus(roles.status, 200, "list roles for system immutability");
+    const systemRole = Array.isArray(roles.body)
+      ? roles.body.find((item) => item.is_system === true)
+      : undefined;
+    if (!systemRole) throw new Error("system role immutability: no system role returned");
+    const systemUpdate = await bffRequest(page, `/api/v1/roles/${String(systemRole.id)}`, {
+      method: "PATCH",
+      body: {
+        expected_version: rolePolicyVersion(systemRole, "system role immutability"),
+        name: String(systemRole.name),
+      },
+    });
+    assertStatus(systemUpdate.status, 403, "reject system role edit");
+    const systemDelete = await bffRequest(
+      page,
+      `/api/v1/roles/${String(systemRole.id)}?expected_version=${rolePolicyVersion(systemRole, "system role immutability")}`,
+      { method: "DELETE" },
+    );
+    assertStatus(systemDelete.status, 403, "reject system role delete");
+
+    await page.getByLabel("搜索角色目录").fill(String(idleRole.name));
+    const idleRoleSearchResponse = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/roles?")
+        && new URL(response.url()).searchParams.get("q") === String(idleRole.name),
+    );
+    await page.locator("form.role-catalog-toolbar").getByRole("button", { name: "搜索", exact: true }).click();
+    assertStatus((await idleRoleSearchResponse).status(), 200, "restore low-priority role through server search");
+    const idleRoleButton = page.locator(".role-item").filter({ hasText: String(idleRole.name) });
+    await idleRoleButton.click();
+    await expect(page.getByRole("button", { name: "编辑角色" })).toBeEnabled();
+    const editedName = `E2E 已编辑角色 [run_id=${enterprise.runId}] ${suffix(testInfo)}`;
+    const editedDescription = `runtime edit verification; run_id=${enterprise.runId}`;
+    await page.getByRole("button", { name: "编辑角色" }).click();
+    const metadataEditor = page.getByRole("dialog", { name: "编辑角色资料" });
+    await metadataEditor.getByLabel("角色名称").fill(editedName);
+    await metadataEditor.getByLabel("描述").fill(editedDescription);
+    await metadataEditor.getByLabel("优先级").fill("-8500");
+    await metadataEditor.getByRole("button", { name: "保存角色资料" }).click();
+    await expect(page.getByRole("status")).toContainText("名称、描述和优先级已保存");
+    await expect(page.locator(".role-item").filter({ hasText: editedName })).toBeVisible();
+
+    const current = await bffRequest<Row>(page, `/api/v1/roles/${String(idleRole.id)}`);
+    assertStatus(current.status, 200, "load role before stale edit");
+    const currentRole = row(current.body, "load role before stale edit");
+    expect(currentRole.name).toBe(editedName);
+    expect(currentRole.description).toBe(editedDescription);
+    expect(currentRole.priority).toBe(-8_500);
+    await page.getByRole("button", { name: "编辑角色" }).click();
+    const staleMetadataEditor = page.getByRole("dialog", { name: "编辑角色资料" });
+    const concurrentAdminPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAdmin(concurrentAdminPage, enterprise);
+    const concurrentDescription = `concurrent runtime update; run_id=${enterprise.runId}`;
+    const staleDescription = `stale browser draft; run_id=${enterprise.runId}`;
+    const concurrentUpdate = await bffRequest<Row>(
+      concurrentAdminPage,
+      `/api/v1/roles/${String(idleRole.id)}`,
+      {
+        method: "PATCH",
+        body: {
+          expected_version: rolePolicyVersion(currentRole, "concurrent role update"),
+          description: concurrentDescription,
+        },
+      },
+    );
+    assertStatus(concurrentUpdate.status, 200, "concurrent role update");
+    const staleSaveResponse = page.waitForResponse(
+      (response) => response.request().method() === "PATCH"
+        && response.url().includes(`/api/v1/roles/${String(idleRole.id)}`),
+    );
+    await staleMetadataEditor.getByLabel("描述").fill(staleDescription);
+    await staleMetadataEditor.getByRole("button", { name: "保存角色资料" }).click();
+    assertStatus((await staleSaveResponse).status(), 409, "reject stale role metadata update");
+    await expect(page.getByRole("status")).toContainText("旧编辑草稿已关闭");
+    await expect(page.getByRole("dialog", { name: "编辑角色资料" })).toHaveCount(0);
+    const winner = await bffRequest<Row>(page, `/api/v1/roles/${String(idleRole.id)}`);
+    assertStatus(winner.status, 200, "load concurrent role winner");
+    const winnerRole = row(winner.body, "load concurrent role winner");
+    expect(winnerRole.description).toBe(concurrentDescription);
+    expect(winnerRole.description).not.toBe(staleDescription);
+    expect(rolePolicyVersion(winnerRole, "load concurrent role winner")).toBe(
+      rolePolicyVersion(row(concurrentUpdate.body, "concurrent role update"), "concurrent role update"),
+    );
+
+    await page.locator(".role-item").filter({ hasText: editedName }).click();
+    await page.getByRole("button", { name: "删除角色" }).click();
+    const idleDeleteConfirmation = page.getByLabel(`请输入角色名称“${editedName}”确认`);
+    const idleDeleteButton = page.getByRole("button", { name: "永久删除角色" });
+    await expect(idleDeleteButton).toBeDisabled();
+    await idleDeleteConfirmation.fill(`${editedName}-不匹配`);
+    await expect(idleDeleteButton).toBeDisabled();
+    await idleDeleteConfirmation.fill(editedName);
+    await expect(idleDeleteButton).toBeEnabled();
+    await idleDeleteButton.click();
+    await expect(page.getByRole("status")).toContainText("已删除");
+    await expect(page.locator(".role-item").filter({ hasText: editedName })).toHaveCount(0);
+
+    referencedRole = await createRole(page, enterprise, testInfo, ["chat:query"]);
+    referencedUser = await createUser(page, enterprise, testInfo, [String(referencedRole.id)]);
+    referencedKnowledgeBase = await createKnowledgeBase(page, enterprise, testInfo);
+    const referencedGrant = await bffRequest<Row>(
+      page,
+      `/api/v1/knowledge-bases/${String(referencedKnowledgeBase.id)}/role-grants`,
+      {
+        method: "PUT",
+        body: {
+          grants: [{ role_id: referencedRole.id, access_level: "reader" }],
+          expected_version: roleGrantVersion(
+            referencedKnowledgeBase,
+            "create referenced knowledge base",
+          ),
+        },
+      },
+    );
+    assertStatus(referencedGrant.status, 200, "grant referenced role to knowledge base");
+    await page.goto("/admin/roles");
+    await page.getByLabel("搜索角色目录").fill(String(referencedRole.name));
+    const referencedRoleSearchResponse = page.waitForResponse(
+      (response) => response.request().method() === "GET"
+        && response.url().includes("/api/v1/roles?")
+        && new URL(response.url()).searchParams.get("q") === String(referencedRole!.name),
+    );
+    await page.locator("form.role-catalog-toolbar").getByRole("button", { name: "搜索", exact: true }).click();
+    assertStatus((await referencedRoleSearchResponse).status(), 200, "find referenced role beyond the first role page");
+    await page.locator(".role-item").filter({ hasText: String(referencedRole.name) }).click();
+    await page.getByRole("button", { name: "删除角色" }).click();
+    await page.getByLabel(`请输入角色名称“${String(referencedRole.name)}”确认`).fill(String(referencedRole.name));
+    const referencedDeleteResponse = page.waitForResponse(
+      (response) => response.request().method() === "DELETE"
+        && response.url().includes(`/api/v1/roles/${String(referencedRole!.id)}`),
+    );
+    await page.getByRole("button", { name: "永久删除角色" }).click();
+    const referencedConflict = await referencedDeleteResponse;
+    assertStatus(referencedConflict.status(), 409, "reject deletion of referenced role");
+    const conflictPayload = row(await referencedConflict.json(), "referenced role delete conflict");
+    const conflictError = row(conflictPayload.error, "referenced role delete error");
+    const conflictDetails = row(conflictError.details, "referenced role delete details");
+    const conflictReferences = row(
+      conflictDetails.references,
+      "referenced role delete references",
+    );
+    expect(conflictError.code).toBe("role_in_use");
+    expect(conflictReferences.user_assignments).toBe(1);
+    expect(conflictReferences.knowledge_base_grants).toBe(1);
+    await expect(page.getByRole("alert")).toContainText("角色仍被 1 个成员账号和 1 项知识库授权");
+    assertStatus(
+      (await bffRequest(page, `/api/v1/roles/${String(referencedRole.id)}`)).status,
+      200,
+      "referenced role remains after conflict",
+    );
+    await retireSyntheticUser(page, referencedUser.user);
+    await clearSyntheticKnowledgeGrants(page, referencedKnowledgeBase);
+    const successfulDeleteResponse = page.waitForResponse(
+      (response) => response.request().method() === "DELETE"
+        && response.url().includes(`/api/v1/roles/${String(referencedRole!.id)}`),
+    );
+    await page.getByRole("button", { name: "永久删除角色" }).click();
+    assertStatus((await successfulDeleteResponse).status(), 204, "delete unreferenced role");
+    await expect(page.getByRole("status")).toContainText("已删除");
+    assertStatus(
+      (await bffRequest(page, `/api/v1/roles/${String(referencedRole.id)}`)).status,
+      404,
+      "deleted role is absent",
+    );
+  } finally {
+    await cleanupSyntheticAccess(page, {
+      users: [referencedUser?.user ?? null],
+      knowledgeBases: [referencedKnowledgeBase],
+      roles: [idleRoleForCleanup, referencedRole],
+    });
+  }
 });
 
 test("@enterprise knowledge grants are visible then fail closed immediately after revocation", async ({ page, enterprise, quality }, testInfo) => {
   annotate(testInfo, "knowledge_acl");
   await loginAdmin(page, enterprise);
-  const role = await createRole(page, testInfo, ["chat:query", "knowledge:read"]);
-  const created = await createUser(page, testInfo, [String(role.id)]);
-  const knowledgeBase = await createKnowledgeBase(page, testInfo);
-  const grant = await bffRequest(page, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}/role-grants`, {
-    method: "PUT",
-    body: { grants: [{ role_id: role.id, access_level: "reader" }] },
-  });
-  assertStatus(grant.status, 200, "grant knowledge access");
+  const role = await createRole(page, enterprise, testInfo, ["chat:query", "knowledge:read"]);
+  const created = await createUser(page, enterprise, testInfo, [String(role.id)]);
+  const knowledgeBase = await createKnowledgeBase(page, enterprise, testInfo);
+  try {
+    await page.goto("/admin/knowledge");
+    await expect(page.getByRole("heading", { name: "知识库角色授权" })).toBeVisible();
+    const knowledgeCandidateResponse = page.waitForResponse((response) => {
+      if (response.request().method() !== "GET") return false;
+      const url = new URL(response.url());
+      return url.pathname.endsWith("/api/backend/api/v1/knowledge-bases")
+        && url.searchParams.get("q") === String(knowledgeBase.name)
+        && url.searchParams.get("minimum_access_level") === "manager";
+    });
+    await page.getByLabel("搜索可管理知识库").fill(String(knowledgeBase.name));
+    assertStatus(
+      (await knowledgeCandidateResponse).status(),
+      200,
+      "search manageable knowledge base through the grant UI",
+    );
+    const knowledgeSelect = page.getByLabel("选择要授权的知识库");
+    await expect(knowledgeSelect.locator(`option[value="${String(knowledgeBase.id)}"]`)).toHaveCount(1);
+    await knowledgeSelect.selectOption(String(knowledgeBase.id));
+    const roleCandidateResponse = page.waitForResponse((response) => {
+      if (response.request().method() !== "GET") return false;
+      const url = new URL(response.url());
+      return url.pathname.endsWith("/api/backend/api/v1/roles")
+        && url.searchParams.get("q") === String(role.name);
+    });
+    await page.getByLabel("搜索角色").fill(String(role.name));
+    assertStatus(
+      (await roleCandidateResponse).status(),
+      200,
+      "search role through the grant UI",
+    );
+    const accessSelect = page.getByLabel(
+      `${String(role.name)} 在 ${String(knowledgeBase.name)} 的访问等级`,
+    );
+    await expect(accessSelect).toBeEnabled();
+    await accessSelect.selectOption("reader");
+    const grantResponse = page.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes(`/api/v1/knowledge-bases/${String(knowledgeBase.id)}/role-grants`),
+    );
+    await page.getByRole("button", { name: "保存访问等级" }).click();
+    assertStatus((await grantResponse).status(), 200, "grant knowledge access through the admin UI");
+    await expect(accessSelect).toHaveValue("reader");
 
-  const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
-  await loginAs(memberPage, created.credentials);
-  assertStatus((await bffRequest(memberPage, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}`)).status, 200, "read granted knowledge base");
-  assertStatus((await bffRequest(page, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}/role-grants`, { method: "PUT", body: { grants: [] } })).status, 200, "revoke knowledge access");
-  assertStatus((await bffRequest(memberPage, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}`)).status, 404, "conceal revoked knowledge base");
+    const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(memberPage, created.credentials);
+    assertStatus(
+      (await bffRequest(memberPage, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}`)).status,
+      200,
+      "read UI-granted knowledge base",
+    );
+
+    await expect(accessSelect).toBeEnabled();
+    await accessSelect.selectOption("none");
+    const revokeResponse = page.waitForResponse(
+      (response) => response.request().method() === "PUT"
+        && response.url().includes(`/api/v1/knowledge-bases/${String(knowledgeBase.id)}/role-grants`),
+    );
+    await page.getByRole("button", { name: "保存访问等级" }).click();
+    assertStatus((await revokeResponse).status(), 200, "revoke knowledge access through the admin UI");
+    await expect(accessSelect).toHaveValue("none");
+    assertStatus(
+      (await bffRequest(memberPage, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}`)).status,
+      404,
+      "conceal UI-revoked knowledge base",
+    );
+  } finally {
+    await cleanupSyntheticAccess(page, {
+      users: [created.user],
+      knowledgeBases: [knowledgeBase],
+      roles: [role],
+    });
+  }
 });
 
 test("@enterprise all nine document formats complete scan, OKF, approval, retrieval and cited chat", async ({ page, enterprise, enterpriseDocuments, request, quality }, testInfo) => {
   void quality;
   annotate(testInfo, "file_upload_scan_okf_approval_download");
   await loginAdmin(page, enterprise);
-  const knowledgeBase = await createKnowledgeBase(page, testInfo);
+  const knowledgeBase = await createKnowledgeBase(page, enterprise, testInfo);
   await uploadMultipartFixture(
     page,
     request,
@@ -482,7 +1214,20 @@ test("@enterprise all nine document formats complete scan, OKF, approval, retrie
     testInfo,
   );
   await page.goto("/admin/files");
-  await page.locator("select").first().selectOption(String(knowledgeBase.id));
+  const uploadCandidateResponse = page.waitForResponse((response) => {
+    if (response.request().method() !== "GET") return false;
+    const url = new URL(response.url());
+    return url.pathname.endsWith("/api/backend/api/v1/knowledge-bases")
+      && url.searchParams.get("q") === String(knowledgeBase.name)
+      && url.searchParams.get("minimum_access_level") === "editor";
+  });
+  await page.getByLabel("搜索可编辑知识库").fill(String(knowledgeBase.name));
+  assertStatus(
+    (await uploadCandidateResponse).status(),
+    200,
+    "search editable upload knowledge base through the files UI",
+  );
+  await page.getByLabel("目标知识库").selectOption(String(knowledgeBase.id));
   expect(enterpriseDocuments).toHaveLength(9);
   for (const fixture of enterpriseDocuments) {
     await uploadApproveAndGroundFixture(
@@ -493,6 +1238,18 @@ test("@enterprise all nine document formats complete scan, OKF, approval, retrie
       fixture,
     );
   }
+  const searchTarget = enterpriseDocuments.at(-1);
+  if (!searchTarget) throw new Error("enterprise document fixtures unexpectedly empty");
+  const fileSearch = page.getByRole("search");
+  await fileSearch.getByLabel("搜索文件名").fill(searchTarget.filename);
+  const searchedFiles = page.waitForResponse(
+    (response) => response.request().method() === "GET"
+      && response.url().includes("/api/v1/files?")
+      && new URL(response.url()).searchParams.get("search") === searchTarget.filename,
+  );
+  await fileSearch.getByRole("button", { name: "搜索" }).click();
+  assertStatus((await searchedFiles).status(), 200, "search uploaded file through the admin UI");
+  await expect(page.locator("tbody tr").filter({ hasText: searchTarget.filename })).toHaveCount(1);
 });
 
 test("@enterprise chat renders citations, no-answer, audited rejection and sourced table", async ({ page, enterprise, request, quality }, testInfo) => {
@@ -500,7 +1257,32 @@ test("@enterprise chat renders citations, no-answer, audited rejection and sourc
   annotate(testInfo, "chat_citations_audit_table");
   const knowledgeBaseId = requiredEnv("KB_E2E_SEEDED_KNOWLEDGE_BASE_ID");
   await loginAdmin(page, enterprise);
+  const knowledgeBase = await bffRequest<Row>(
+    page,
+    `/api/v1/knowledge-bases/${knowledgeBaseId}`,
+  );
+  assertStatus(knowledgeBase.status, 200, "read seeded chat knowledge base");
+  const knowledgeBaseNameValue = row(
+    knowledgeBase.body,
+    "seeded chat knowledge base",
+  ).name;
+  if (typeof knowledgeBaseNameValue !== "string" || !knowledgeBaseNameValue.trim()) {
+    throw new Error("seeded chat knowledge base: response omitted a valid name");
+  }
+  const knowledgeBaseName = knowledgeBaseNameValue.trim();
   await page.goto("/chat");
+  const catalogSearch = page.getByRole("search");
+  await catalogSearch.getByLabel("搜索可问答知识库").fill(knowledgeBaseName);
+  const searchedCatalog = page.waitForResponse((response) => {
+    if (response.request().method() !== "GET" || !response.url().includes("/api/v1/knowledge-bases?")) {
+      return false;
+    }
+    const parameters = new URL(response.url()).searchParams;
+    return parameters.get("q") === knowledgeBaseName
+      && parameters.get("minimum_access_level") === "reader";
+  });
+  await catalogSearch.getByRole("button", { name: "搜索" }).click();
+  assertStatus((await searchedCatalog).status(), 200, "search chat knowledge catalog");
   await page.getByLabel("选择知识库").selectOption(knowledgeBaseId);
   try {
     const grounded = await sendChatQuestion(
@@ -512,6 +1294,7 @@ test("@enterprise chat renders citations, no-answer, audited rejection and sourc
 
     const noAnswer = await bffRequest<Row>(page, "/api/v1/chat/query", {
       method: "POST",
+      idempotencyKey: `e2e-${enterprise.runId}-no-answer`,
       body: { knowledge_base_id: knowledgeBaseId, message: `NO-MATCH-${enterprise.runId}`, limit: 5 },
     });
     assertStatus(noAnswer.status, 200, "no-answer chat");
@@ -569,11 +1352,11 @@ test("@enterprise configured model switches and provider failure degrades safely
 
     const knowledgeBaseId = requiredEnv("KB_E2E_SEEDED_KNOWLEDGE_BASE_ID");
     await setFaultMode(request, enterprise, "provider_5xx");
-    const unavailable = await bffRequest<Row>(page, "/api/v1/chat/query", { method: "POST", body: { knowledge_base_id: knowledgeBaseId, message: "请总结验收样本", limit: 5 } });
+    const unavailable = await bffRequest<Row>(page, "/api/v1/chat/query", { method: "POST", idempotencyKey: `e2e-${enterprise.runId}-provider-5xx`, body: { knowledge_base_id: knowledgeBaseId, message: "请总结验收样本", limit: 5 } });
     assertStatus(unavailable.status, 200, "provider 5xx fallback");
     expect(row(row(unavailable.body, "provider 5xx fallback").source_status, "source status").strategy).toBe("retrieval_fallback");
     await setFaultMode(request, enterprise, "provider_timeout");
-    const timeout = await bffRequest<Row>(page, "/api/v1/chat/query", { method: "POST", body: { knowledge_base_id: knowledgeBaseId, message: "请总结验收样本", limit: 5 } });
+    const timeout = await bffRequest<Row>(page, "/api/v1/chat/query", { method: "POST", idempotencyKey: `e2e-${enterprise.runId}-provider-timeout`, body: { knowledge_base_id: knowledgeBaseId, message: "请总结验收样本", limit: 5 } });
     assertStatus(timeout.status, 200, "provider timeout fallback");
     expect(row(row(timeout.body, "provider timeout fallback").source_status, "source status").strategy).toBe("retrieval_fallback");
   } finally {
@@ -588,6 +1371,8 @@ test("@enterprise API key enforces knowledge scope, rate limit and revocation", 
   annotate(testInfo, "error_loading_states");
   const allowedId = requiredEnv("KB_E2E_SEEDED_KNOWLEDGE_BASE_ID");
   const deniedId = requiredEnv("KB_E2E_UNSCOPED_KNOWLEDGE_BASE_ID");
+  const keyName = `E2E API [run_id=${enterprise.runId}] ${suffix(testInfo)}`;
+  let activeKeyId: string | null = null;
   await loginAdmin(page, enterprise);
   await page.goto("/admin/api-models");
   await expect(page.getByRole("heading", { name: "API 使用说明" })).toBeVisible();
@@ -595,24 +1380,140 @@ test("@enterprise API key enforces knowledge scope, rate limit and revocation", 
   await expect(page.getByRole("group", { name: "示例语言" })).toContainText("cURL");
   await expect(page.getByRole("group", { name: "示例语言" })).toContainText("Python");
   await expect(page.getByRole("group", { name: "示例语言" })).toContainText("Node.js");
-  const created = await bffRequest<Row>(page, "/api/v1/api-keys", {
-    method: "POST",
-    body: { name: `E2E API ${suffix(testInfo)}`, permission_codes: ["knowledge:read"], knowledge_base_ids: [allowedId], requests_per_minute: 2 },
-  });
-  assertStatus(created.status, 201, "create API key");
-  const key = String(row(created.body, "create API key").key ?? "");
-  const keyId = String(row(created.body, "create API key").id ?? "");
-  if (!key || !keyId) throw new Error("API key create contract omitted one-time secret or id");
-  const headers = { "x-api-key": key };
-  const denied = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${deniedId}/search`, { headers, data: { query: "test", limit: 1 } });
-  assertStatus(denied.status(), 404, "API key knowledge scope");
-  const limited = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers, data: { query: "E2E", limit: 1 } });
-  assertStatus(limited.status(), 200, "API key allowed scope");
-  const rateLimited = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers, data: { query: "E2E", limit: 1 } });
-  assertStatus(rateLimited.status(), 429, "API key rate limit");
-  assertStatus((await bffRequest(page, `/api/v1/api-keys/${keyId}`, { method: "DELETE" })).status, 204, "revoke API key");
-  const revoked = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers, data: { query: "E2E", limit: 1 } });
-  assertStatus(revoked.status(), 401, "revoked API key");
+  const knowledgeBaseResponse = await bffRequest<Row>(page, `/api/v1/knowledge-bases/${allowedId}`);
+  assertStatus(knowledgeBaseResponse.status, 200, "load API key knowledge scope fixture");
+  const allowedName = String(row(knowledgeBaseResponse.body, "load API key knowledge scope fixture").name ?? "");
+  if (!allowedName) throw new Error("API key knowledge scope fixture omitted its name");
+
+  try {
+    const candidateResponse = page.waitForResponse((response) => {
+      if (response.request().method() !== "GET") return false;
+      const url = new URL(response.url());
+      return url.pathname.endsWith("/api/backend/api/v1/knowledge-bases")
+        && url.searchParams.get("q") === allowedName;
+    });
+    await page.getByLabel("搜索知识库").fill(allowedName);
+    assertStatus((await candidateResponse).status(), 200, "search API key knowledge scope through UI");
+
+    await page.getByLabel("凭证名称").fill(keyName);
+    await page.getByLabel("每分钟请求上限").fill("3");
+    const permissionGroup = page.getByRole("group", { name: "接口权限" });
+    const chatPermission = permissionGroup.getByRole("checkbox", { name: /知识问答/ });
+    if (await chatPermission.isChecked()) await chatPermission.uncheck();
+    await permissionGroup.getByRole("checkbox", { name: /知识检索/ }).check();
+    await page.getByRole("group", { name: "允许访问的知识库" })
+      .getByRole("checkbox", { name: allowedName })
+      .check();
+
+    const createResponse = page.waitForResponse(
+      (response) => response.request().method() === "POST"
+        && response.url().endsWith("/api/backend/api/v1/api-keys"),
+    );
+    await page.getByRole("button", { name: "生成 API Key" }).click();
+    const createdResponse = await createResponse;
+    assertStatus(createdResponse.status(), 201, "create API key through UI");
+    const createdBody = row(await createdResponse.json(), "create API key through UI");
+    const keyId = String(createdBody.id ?? "");
+    const familyId = String(createdBody.credential_family_id ?? "");
+    activeKeyId = keyId;
+    if (!keyId || !familyId) {
+      throw new Error("API key create UI response omitted id or credential family");
+    }
+
+    const issuedPanel = page.locator("[data-sensitive='true']");
+    let key = "";
+    try {
+      await expect(issuedPanel).toContainText("请立即复制并安全保存");
+      key = (await issuedPanel.locator("code").textContent())?.trim() ?? "";
+      if (!key) throw new Error("API key create UI omitted its one-time secret");
+    } finally {
+      const closeSecret = issuedPanel.getByRole("button", { name: "我已保存，关闭明文" });
+      if (await closeSecret.isVisible().catch(() => false)) await closeSecret.click();
+    }
+    await expect(issuedPanel).toHaveCount(0);
+    const keyRow = page.locator("tbody tr").filter({ hasText: keyName });
+    await expect(keyRow).toBeVisible();
+
+    const headers = { "x-api-key": key };
+    const denied = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${deniedId}/search`, { headers, data: { query: "test", limit: 1 } });
+    assertStatus(denied.status(), 404, "API key knowledge scope");
+    const limited = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers, data: { query: "E2E", limit: 1 } });
+    assertStatus(limited.status(), 200, "API key allowed scope");
+
+    page.once("dialog", async (dialog) => {
+      expect(dialog.type()).toBe("confirm");
+      expect(dialog.message()).toContain(keyName);
+      await dialog.accept();
+    });
+    const rotateResponse = page.waitForResponse(
+      (response) => response.request().method() === "POST"
+        && response.url().endsWith(`/api/backend/api/v1/api-keys/${keyId}/rotate`),
+    );
+    await keyRow.getByRole("button", { name: `轮换 ${keyName}` }).click();
+    const rotatedResponse = await rotateResponse;
+    assertStatus(rotatedResponse.status(), 201, "rotate API key through UI");
+    const rotatedBody = row(await rotatedResponse.json(), "rotate API key through UI");
+    const rotatedKeyId = String(rotatedBody.id ?? "");
+    expect(String(rotatedBody.credential_family_id ?? "")).toBe(familyId);
+    expect(rotatedKeyId).not.toBe(keyId);
+    activeKeyId = rotatedKeyId;
+    if (!rotatedKeyId) throw new Error("API key rotation UI response omitted its id");
+
+    let rotatedKey = "";
+    try {
+      await expect(issuedPanel).toContainText("轮换完成，请立即保存新 Key");
+      rotatedKey = (await issuedPanel.locator("code").textContent())?.trim() ?? "";
+      if (!rotatedKey) throw new Error("API key rotation UI omitted its one-time secret");
+    } finally {
+      const closeSecret = issuedPanel.getByRole("button", { name: "我已保存，关闭明文" });
+      if (await closeSecret.isVisible().catch(() => false)) await closeSecret.click();
+    }
+    await expect(issuedPanel).toHaveCount(0);
+
+    const oldKeyRejected = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers, data: { query: "E2E", limit: 1 } });
+    assertStatus(oldKeyRejected.status(), 401, "rotated old API key");
+    const rotatedHeaders = { "x-api-key": rotatedKey };
+    const rotatedAllowed = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers: rotatedHeaders, data: { query: "E2E", limit: 1 } });
+    assertStatus(rotatedAllowed.status(), 200, "rotated API key retains scope");
+    const rateLimited = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers: rotatedHeaders, data: { query: "E2E", limit: 1 } });
+    assertStatus(rateLimited.status(), 429, "API key rate limit");
+
+    page.once("dialog", async (dialog) => {
+      expect(dialog.type()).toBe("confirm");
+      expect(dialog.message()).toContain(keyName);
+      await dialog.accept();
+    });
+    const revokeResponse = page.waitForResponse(
+      (response) => response.request().method() === "DELETE"
+        && response.url().endsWith(`/api/backend/api/v1/api-keys/${rotatedKeyId}`),
+    );
+    await page.getByRole("button", { name: `撤销 ${keyName}` }).click();
+    assertStatus((await revokeResponse).status(), 204, "revoke API key through UI");
+    activeKeyId = null;
+    await expect(page.locator("tbody tr").filter({ hasText: keyName })).toHaveCount(0);
+    const revoked = await request.post(`${enterprise.publicApiOrigin}/api/v1/public/knowledge-bases/${allowedId}/search`, { headers: rotatedHeaders, data: { query: "E2E", limit: 1 } });
+    assertStatus(revoked.status(), 401, "revoked API key");
+  } finally {
+    const issuedPanel = page.locator("[data-sensitive='true']");
+    const closeSecret = issuedPanel.getByRole("button", { name: "我已保存，关闭明文" });
+    if (await closeSecret.isVisible().catch(() => false)) await closeSecret.click();
+    const cleanupIds = new Set<string>();
+    if (activeKeyId) cleanupIds.add(activeKeyId);
+    const activeKeys = await bffRequest<Row[]>(page, "/api/v1/api-keys?limit=100&offset=0");
+    if (activeKeys.status === 200 && Array.isArray(activeKeys.body)) {
+      for (const candidate of activeKeys.body) {
+        if (candidate.name === keyName && candidate.id) cleanupIds.add(String(candidate.id));
+      }
+    }
+    for (const cleanupId of cleanupIds) {
+      const cleanup = await bffRequest(page, `/api/v1/api-keys/${cleanupId}`, { method: "DELETE" });
+      if (![204, 404].includes(cleanup.status)) {
+        throw new Error(
+          `cleanup API key ${cleanupId}: expected HTTP 204 or 404, received ${cleanup.status}`,
+        );
+      }
+    }
+  }
 });
 
 test("@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly", async ({ page, enterprise, request, quality }, testInfo) => {
@@ -628,8 +1529,8 @@ test("@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly", 
   await anonymousPage.goto("/login");
   assertStatus((await bffRequest(anonymousPage, "/api/v1/auth/me")).status, 401, "anonymous BFF request");
 
-  const role = await createRole(page, testInfo, ["chat:query"]);
-  const created = await createUser(page, testInfo, [String(role.id)]);
+  const role = await createRole(page, enterprise, testInfo, ["chat:query"]);
+  const created = await createUser(page, enterprise, testInfo, [String(role.id)]);
   const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
   await loginAs(memberPage, created.credentials);
   assertStatus((await bffRequest(memberPage, "/api/v1/users?limit=1&offset=0")).status, 403, "forbidden BFF request");

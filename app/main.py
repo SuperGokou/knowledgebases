@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -15,9 +17,18 @@ from app.api.middleware import RequestBodyLimitMiddleware, RequestContextMiddlew
 from app.api.v1.router import router as v1_router
 from app.core.config import get_settings
 from app.domain.errors import FilePolicyViolation, QuotaExceeded
+from app.services.llm_provider import close_shared_llm_clients
 
 logger = logging.getLogger("knowledge_base")
 settings = get_settings()
+
+
+@asynccontextmanager
+async def application_lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        await close_shared_llm_clients()
 
 
 def error_body(
@@ -59,6 +70,7 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
+        lifespan=application_lifespan,
     )
     application.add_middleware(
         TrustedHostMiddleware,
@@ -81,6 +93,12 @@ def create_app() -> FastAPI:
     application.add_middleware(
         RequestBodyLimitMiddleware,
         max_bytes=settings.max_api_body_bytes,
+        path_limits={
+            f"{settings.api_prefix}/auth/token": 4 * 1024,
+            f"{settings.api_prefix}/auth/refresh": 8 * 1024,
+            f"{settings.api_prefix}/auth/refresh/status": 8 * 1024,
+            f"{settings.api_prefix}/auth/logout": 8 * 1024,
+        },
     )
     application.add_middleware(RequestContextMiddleware)
 

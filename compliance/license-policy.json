@@ -1,0 +1,40 @@
+{
+  "$schema": "schemas/license-policy-v1.schema.json",
+  "schema_version": 1,
+  "allowed": [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 OR BSD-3-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: BSD License",
+    "MIT",
+    "MIT AND PSF-2.0",
+    "MIT-0",
+    "PSF-2.0",
+    "Python-2.0",
+    "Unlicense"
+  ],
+  "manual_review": [
+    "Apache-2.0 AND LGPL-3.0-or-later",
+    "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
+    "CC-BY-4.0",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+    "MPL-2.0"
+  ],
+  "denied_substrings": [
+    "AGPL",
+    "BUSL",
+    "Commons Clause",
+    "Elastic License",
+    "SSPL"
+  ],
+  "project_license_files": [
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt"
+  ]
+}

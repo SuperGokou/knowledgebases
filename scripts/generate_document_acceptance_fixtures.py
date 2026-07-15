@@ -238,10 +238,7 @@ def _builtin_payload(extension: str, token: str) -> bytes:
         ).encode()
     if extension == ".csv":
         return (
-            "field,value\n"
-            "service_level,golden\n"
-            f"acceptance_token,{token}\n"
-            "metric,137\n"
+            f"field,value\nservice_level,golden\nacceptance_token,{token}\nmetric,137\n"
         ).encode()
     if extension == ".docx":
         return _docx(token)
@@ -286,9 +283,7 @@ def _trusted_executable(path: str) -> bool:
 
 
 def _require_legacy_toolchain() -> None:
-    unavailable = [
-        path for path in (LIBREOFFICE, BWRAP, PRLIMIT) if not _trusted_executable(path)
-    ]
+    unavailable = [path for path in (LIBREOFFICE, BWRAP, PRLIMIT) if not _trusted_executable(path)]
     if unavailable:
         raise FixtureBlocked(
             "trusted Linux legacy fixture toolchain is unavailable: " + ", ".join(unavailable)
@@ -382,17 +377,13 @@ def generate_legacy_fixtures(root: Path) -> tuple[Path, ...]:
             source.write_bytes(factory(item.token))
             _run_libreoffice(source, output, profile, item.extension.removeprefix("."))
             candidates = list(output.glob(f"source{item.extension}"))
-            if (
-                len(candidates) != 1
-                or candidates[0].is_symlink()
-                or not candidates[0].is_file()
-            ):
+            if len(candidates) != 1 or candidates[0].is_symlink() or not candidates[0].is_file():
                 raise FixtureBlocked(f"LibreOffice did not produce a real {item.extension} fixture")
             payload = candidates[0].read_bytes()
-            if not _is_valid_format(item, payload) or not _payload_has_token(
-                payload, item.token
-            ):
-                raise FixtureBlocked(f"LibreOffice output is not a real legacy {item.extension} file")
+            if not _is_valid_format(item, payload) or not _payload_has_token(payload, item.token):
+                raise FixtureBlocked(
+                    f"LibreOffice output is not a real legacy {item.extension} file"
+                )
             generated.append(_atomic_write(safe_root, item.relative_path, payload))
             candidates[0].unlink()
     return tuple(generated)
@@ -478,7 +469,11 @@ def verify_fixture_set(
     plan = build_plan(safe_root)
     missing = [item.extension for item in plan if not (safe_root / item.relative_path).is_file()]
     if missing:
-        category = "legacy fixtures are missing" if set(missing) <= set(LEGACY_EXTENSIONS) else "fixtures are missing"
+        category = (
+            "legacy fixtures are missing"
+            if set(missing) <= set(LEGACY_EXTENSIONS)
+            else "fixtures are missing"
+        )
         raise FixtureBlocked(f"{category}: {','.join(missing)}")
 
     records = []
@@ -505,9 +500,7 @@ def verify_fixture_set(
     target_manifest = manifest_path or safe_root / MANIFEST_NAME
     if not target_manifest.is_absolute():
         raise FixtureBlocked("fixture manifest path must be absolute")
-    if target_manifest.is_symlink() or (
-        target_manifest.exists() and not target_manifest.is_file()
-    ):
+    if target_manifest.is_symlink() or (target_manifest.exists() and not target_manifest.is_file()):
         raise FixtureBlocked("fixture manifest must be a regular non-symlink file")
     if not target_manifest.resolve(strict=False).is_relative_to(safe_root):
         raise FixtureBlocked("fixture manifest must remain beneath the fixture root")
@@ -538,7 +531,9 @@ def verify_fixture_set(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Plan, generate, and verify nine-format E2E fixtures")
+    parser = argparse.ArgumentParser(
+        description="Plan, generate, and verify nine-format E2E fixtures"
+    )
     parser.add_argument("action", nargs="?", choices=("plan", "generate", "verify"), default="plan")
     parser.add_argument("--root", type=Path, help="absolute acceptance-only fixture directory")
     parser.add_argument("--manifest", type=Path, help="absolute manifest path beneath --root")
@@ -559,7 +554,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             _require_legacy_toolchain()
             generate_builtin_fixtures(args.root)
             generate_legacy_fixtures(args.root)
-            manifest = verify_fixture_set(args.root, manifest_path=args.manifest, write_manifest=True)
+            manifest = verify_fixture_set(
+                args.root, manifest_path=args.manifest, write_manifest=True
+            )
         else:
             manifest = verify_fixture_set(args.root, manifest_path=args.manifest)
     except FixtureBlocked as error:

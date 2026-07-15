@@ -88,7 +88,15 @@ def test_network_validator_allows_existing_owned_project_bridge(
         lambda: [
             {
                 "Id": network_id,
-                "Labels": {module.PROJECT_LABEL: "heyi-kb-offline"},
+                "Name": "heyi-kb-offline_frontend",
+                "Driver": "bridge",
+                "Internal": True,
+                "Labels": {
+                    module.PROJECT_LABEL: "heyi-kb-offline",
+                    module.NETWORK_LABEL: "frontend",
+                    module.OWNER_LABEL: module.EXPECTED_OWNER,
+                    module.STACK_LABEL: module.EXPECTED_STACK,
+                },
                 "IPAM": {"Config": [{"Subnet": "172.30.240.0/24"}]},
             }
         ],

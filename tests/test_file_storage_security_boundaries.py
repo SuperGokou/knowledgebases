@@ -159,6 +159,62 @@ async def test_finalizing_retry_releases_database_lock_before_storage_io(
 
 
 @pytest.mark.asyncio
+async def test_multipart_completion_fails_closed_when_storage_has_no_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upload = UploadSession(
+        id=uuid4(),
+        file_id=uuid4(),
+        user_id=uuid4(),
+        idempotency_key="security-missing-object",
+        mode=UploadMode.MULTIPART.value,
+        part_size_bytes=5,
+        part_count=1,
+        expected_size_bytes=5,
+        storage_upload_id="multipart-security-test",
+        status=UploadSessionStatus.FINALIZING,
+    )
+    file = File(
+        id=upload.file_id,
+        owner_id=upload.user_id,
+        bucket="kb",
+        object_key=f"objects/{upload.file_id}.pdf",
+        original_name="large.pdf",
+        extension=".pdf",
+        content_type="application/pdf",
+        size_bytes=5,
+        status=FileStatus.UPLOADING,
+    )
+    session = MagicMock()
+    session.commit = AsyncMock()
+
+    async def owned_upload(*_args: object, **_kwargs: object) -> tuple[UploadSession, File]:
+        return upload, file
+
+    async def complete_multipart(**_kwargs: object) -> None:
+        return None
+
+    async def head(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(file_routes, "_owned_upload", owned_upload)
+    storage = SimpleNamespace(complete_multipart=complete_multipart, head=head)
+
+    with pytest.raises(ApiError) as captured:
+        await file_routes.complete_upload(
+            upload.id,
+            CompleteUploadRequest(parts=[CompletedPart(part_number=1, etag='"etag"')]),
+            _request(),  # type: ignore[arg-type]
+            session,
+            _access(),
+            storage,  # type: ignore[arg-type]
+        )
+
+    assert captured.value.status_code == 409
+    assert captured.value.code == "stored_object_missing"
+
+
+@pytest.mark.asyncio
 async def test_abort_persists_in_progress_state_before_storage_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

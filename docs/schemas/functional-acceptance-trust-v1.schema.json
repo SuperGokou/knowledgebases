@@ -32,8 +32,24 @@
         "nonce": {"type": "string", "minLength": 32},
         "issued_at": {"type": "string", "format": "date-time"},
         "expires_at": {"type": "string", "format": "date-time"},
-        "status": {"const": "issued"}
-      }
+        "status": {"const": "issued"},
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["git_head", "content_fingerprint", "run_id"],
+          "properties": {
+            "git_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+            "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"evidence_id": {"const": "EXT-BROWSER-E2E-001"}}},
+          "then": {"required": ["target"]}
+        }
+      ]
     }
   },
   "oneOf": [{"$ref": "#/$defs/keyStore"}, {"$ref": "#/$defs/challenge"}]

@@ -11,6 +11,8 @@ export type RefreshOutcome =
   | { kind: "expired" }
   | { kind: "unavailable"; status: number };
 
+export type RefreshSessionStatus = "active" | "inactive" | "unavailable";
+
 const refreshFlights = new Set<string>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -74,5 +76,27 @@ export async function refreshSessionOnce(
     return await refreshSession(refreshToken, request);
   } finally {
     refreshFlights.delete(fingerprint);
+  }
+}
+
+export async function refreshSessionStatus(
+  refreshToken: string,
+  request: NextRequest,
+): Promise<RefreshSessionStatus> {
+  try {
+    const response = await safeBackendFetch(backendUrl("/api/v1/auth/refresh/status"), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...signedClientIpHeaders(request),
+      },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    if (response.status === 204) return "active";
+    if (response.status === 401) return "inactive";
+    return "unavailable";
+  } catch {
+    return "unavailable";
   }
 }

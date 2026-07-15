@@ -118,9 +118,7 @@ async def test_audit_log_api_filters_redacts_and_uses_stable_cursor_pagination(
         },
     )
     assert failed.status_code == 200, failed.text
-    assert [item["action"] for item in failed.json()["items"]] == [
-        "okf.conversion_failed"
-    ]
+    assert [item["action"] for item in failed.json()["items"]] == ["okf.conversion_failed"]
 
     first_page = await api_harness.client.get(
         "/api/v1/audit-logs",

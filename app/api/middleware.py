@@ -28,15 +28,24 @@ class RequestBodyLimitMiddleware:
     same or a lower limit so an individual ASGI message is bounded as well.
     """
 
-    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_bytes: int,
+        path_limits: dict[str, int] | None = None,
+    ) -> None:
         self.app = app
         self._max_bytes = max_bytes
+        self._path_limits = path_limits or {}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        path = cast(str, scope.get("path", ""))
+        max_bytes = min(self._max_bytes, self._path_limits.get(path, self._max_bytes))
         content_length = next(
             (value for key, value in scope["headers"] if key.lower() == b"content-length"),
             None,
@@ -46,8 +55,8 @@ class RequestBodyLimitMiddleware:
                 declared_length = int(content_length)
             except ValueError:
                 declared_length = -1
-            if declared_length > self._max_bytes:
-                await self._too_large(scope, receive, send)
+            if declared_length > max_bytes:
+                await self._too_large(scope, receive, send, max_bytes=max_bytes)
                 return
 
         buffered: list[Message] = []
@@ -61,8 +70,8 @@ class RequestBodyLimitMiddleware:
                 continue
             body = cast(bytes, message.get("body", b""))
             received_bytes += len(body)
-            if received_bytes > self._max_bytes:
-                await self._too_large(scope, receive, send)
+            if received_bytes > max_bytes:
+                await self._too_large(scope, receive, send, max_bytes=max_bytes)
                 return
             if not message.get("more_body", False):
                 break
@@ -79,14 +88,21 @@ class RequestBodyLimitMiddleware:
 
         await self.app(scope, replay_receive, send)
 
-    async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
+    async def _too_large(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        max_bytes: int,
+    ) -> None:
         state = scope.get("state", {})
         response = JSONResponse(
             status_code=413,
             content={
                 "error": {
                     "code": "request_body_too_large",
-                    "message": f"API request bodies cannot exceed {self._max_bytes} bytes",
+                    "message": f"API request bodies cannot exceed {max_bytes} bytes",
                 },
                 "request_id": state.get("request_id") if isinstance(state, dict) else None,
             },

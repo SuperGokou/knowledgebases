@@ -87,9 +87,7 @@ async def update_budget_policy(
     access: Annotated[AccessContext, Depends(require_permission("quota:manage"))],
 ) -> LlmBudgetPolicy:
     policy = await session.scalar(
-        select(LlmBudgetPolicy)
-        .where(LlmBudgetPolicy.id == policy_id)
-        .with_for_update()
+        select(LlmBudgetPolicy).where(LlmBudgetPolicy.id == policy_id).with_for_update()
     )
     if policy is None:
         raise ApiError(status_code=404, code="llm_budget_policy_not_found", message="Not found")

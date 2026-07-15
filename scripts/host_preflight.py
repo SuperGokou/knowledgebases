@@ -22,9 +22,7 @@ MINIMUM_FILESYSTEM_AVAILABLE_BYTES = 240 * GB
 SUPPORTED_ARCHITECTURES = frozenset({"amd64", "x86_64"})
 
 Status = Literal["passed", "failed", "blocked"]
-REQUIRED_FIO_WORKLOADS = frozenset(
-    {"sequential_write", "random_read", "random_write", "fsync"}
-)
+REQUIRED_FIO_WORKLOADS = frozenset({"sequential_write", "random_read", "random_write", "fsync"})
 MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
 MAX_FIO_FILE_BYTES = 4 * GIB
 MAX_FIO_RUNTIME_SECONDS = 120
@@ -224,8 +222,7 @@ def _storage_device_matches(facts: HostFacts) -> bool:
         and "rw" in device.mount_options
         and _path_is_within(facts.disk_path, Path(device.mount_target))
         and fio.block_device == device.source
-        and Path(fio.disk_path).resolve(strict=False)
-        == facts.disk_path.resolve(strict=False)
+        and Path(fio.disk_path).resolve(strict=False) == facts.disk_path.resolve(strict=False)
     )
 
 
@@ -259,7 +256,9 @@ def _fio_verified(facts: HostFacts) -> bool:
         and set(names) == REQUIRED_FIO_WORKLOADS
         and all(
             item.observed_iops >= item.minimum_iops > 0
-            and 0 <= item.observed_p95_latency_ms <= item.observed_p99_latency_ms
+            and 0
+            <= item.observed_p95_latency_ms
+            <= item.observed_p99_latency_ms
             <= item.maximum_p99_latency_ms
             for item in fio.workloads
         )
@@ -398,9 +397,7 @@ def render_report(assessment: HostAssessment) -> str:
             if assessment.facts.storage_device is not None
             else None
         ),
-        "fio": (
-            asdict(assessment.facts.fio) if assessment.facts.fio is not None else None
-        ),
+        "fio": (asdict(assessment.facts.fio) if assessment.facts.fio is not None else None),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 

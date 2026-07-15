@@ -15,15 +15,16 @@ class RoleCreate(BaseModel):
 
     code: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,99}$")
     name: str = Field(min_length=1, max_length=200)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2_000)
     priority: int = Field(default=0, ge=-10_000, le=10_000)
     permission_codes: list[str] = Field(default_factory=list, max_length=200)
     limits: dict[str, RoleLimitValue] = Field(default_factory=dict)
 
 
 class RoleUpdate(BaseModel):
+    expected_version: int = Field(ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=200)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2_000)
     priority: int | None = Field(default=None, ge=-10_000, le=10_000)
 
     @field_validator("name", "priority")
@@ -43,6 +44,7 @@ class RoleRead(BaseModel):
     description: str | None
     priority: int
     is_system: bool
+    policy_version: int = Field(ge=1)
     created_at: datetime
     updated_at: datetime
     permission_codes: list[str] = Field(default_factory=list)
@@ -70,13 +72,16 @@ class LimitDefinitionRead(BaseModel):
 
 
 class PermissionSet(BaseModel):
+    expected_version: int = Field(ge=1)
     permission_codes: list[str] = Field(max_length=200)
 
 
 class LimitSet(BaseModel):
+    expected_version: int = Field(ge=1)
     limits: dict[str, RoleLimitValue]
 
 
 class RolePolicySet(BaseModel):
+    expected_version: int = Field(ge=1)
     permission_codes: list[str] = Field(max_length=200)
     limits: dict[str, RoleLimitValue]

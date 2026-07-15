@@ -52,9 +52,7 @@ def _verified_bff_client_ip(request: Request, settings: Settings) -> str | None:
     timestamp_value = int(timestamp)
     if abs(int(time.time()) - timestamp_value) > _BFF_CLIENT_IP_WINDOW_SECONDS:
         return None
-    if len(signature) != 64 or any(
-        character not in "0123456789abcdef" for character in signature
-    ):
+    if len(signature) != 64 or any(character not in "0123456789abcdef" for character in signature):
         return None
 
     canonical = f"v1\n{timestamp}\n{client_ip}".encode()
@@ -80,8 +78,7 @@ def request_client_ip(request: Request, settings: Settings) -> str:
 
     peer_ip = request.client.host if request.client else "unknown"
     bff_secret_configured = bool(
-        settings.bff_shared_secret is not None
-        and settings.bff_shared_secret.get_secret_value()
+        settings.bff_shared_secret is not None and settings.bff_shared_secret.get_secret_value()
     )
     signed_headers_present = any(
         request.headers.get(name) is not None for name in _BFF_CLIENT_IP_HEADERS

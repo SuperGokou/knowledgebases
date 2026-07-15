@@ -32,6 +32,7 @@ export type User = {
   display_name: string | null;
   status: UserStatus;
   is_superuser: boolean;
+  role_assignment_version: number;
   created_at: string;
   updated_at: string;
   role_ids: string[];
@@ -44,6 +45,7 @@ export type Role = {
   description: string | null;
   priority: number;
   is_system: boolean;
+  policy_version: number;
   created_at: string;
   updated_at: string;
   permission_codes: string[];
@@ -123,6 +125,7 @@ export type KnowledgeBase = {
   custom_metadata: Record<string, unknown>;
   external_llm_processing_enabled: boolean;
   access_level: "reader" | "editor" | "manager";
+  role_grant_version: number;
   created_at: string;
   updated_at: string;
 };
@@ -188,6 +191,8 @@ export type ChatDataTable = {
   columns: string[];
   rows: string[][];
   citation_numbers: number[];
+  /** Per-row evidence map. Optional only for compatibility with pre-upgrade responses. */
+  row_citation_numbers?: number[][] | null;
 };
 
 export type ChatReply = {
@@ -219,6 +224,7 @@ export type ChatMessage = {
 
 export type ManagedApiKey = {
   id: string;
+  credential_family_id: string;
   user_id: string;
   created_by: string | null;
   name: string;

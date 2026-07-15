@@ -151,9 +151,12 @@ async def test_postgres_stale_malware_result_cannot_overwrite_a_new_lease() -> N
         assert persisted.status is FileStatus.QUARANTINED
         assert persisted.malware_scan_status is MalwareScanStatus.PROCESSING
         assert persisted.malware_scan_lease_id == replacement_lease
-        assert await session.scalar(
-            select(OkfConversionJob).where(OkfConversionJob.file_id == file.id)
-        ) is None
+        assert (
+            await session.scalar(
+                select(OkfConversionJob).where(OkfConversionJob.file_id == file.id)
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -166,9 +169,7 @@ async def test_postgres_runtime_role_upgrade_is_idempotent_and_append_only() -> 
         async with engine.begin() as connection:
             await assert_acceptance_database(connection)
             await connection.execute(text(f"CREATE ROLE {quoted_role}"))
-            await connection.execute(
-                text(f"GRANT ALL ON TABLE public.audit_logs TO {quoted_role}")
-            )
+            await connection.execute(text(f"GRANT ALL ON TABLE public.audit_logs TO {quoted_role}"))
             await reconcile_runtime_role_privileges(connection, role_name)
             await reconcile_runtime_role_privileges(connection, role_name)
 
@@ -209,13 +210,13 @@ async def test_postgres_runtime_role_upgrade_is_idempotent_and_append_only() -> 
             await connection.execute(
                 text("ALTER TABLE public.audit_logs ADD COLUMN reconciliation_probe integer")
             )
-            assert await connection.scalar(
-                text(
-                    "SELECT has_table_privilege("
-                    ":role_name, 'public.audit_logs', 'UPDATE')"
-                ),
-                {"role_name": role_name},
-            ) is False
+            assert (
+                await connection.scalar(
+                    text("SELECT has_table_privilege(:role_name, 'public.audit_logs', 'UPDATE')"),
+                    {"role_name": role_name},
+                )
+                is False
+            )
     finally:
         async with engine.begin() as connection:
             await assert_acceptance_database(connection)

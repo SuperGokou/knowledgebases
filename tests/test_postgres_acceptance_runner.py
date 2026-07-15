@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from scripts.postgres_acceptance import (
+    POSTGRES_MAPPED_TESTS,
     UnsafePostgresTarget,
     build_pytest_command,
     ensure_container_identity,
@@ -68,6 +69,9 @@ def test_module_entry_exposes_postgres_acceptance_cli() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--image" in completed.stdout
+    assert "--expected-git-head" in completed.stdout
+    assert "--expected-content-fingerprint" in completed.stdout
+    assert "--acceptance-run-nonce" in completed.stdout
 
 
 def test_database_identity_requires_random_acceptance_database_and_marker() -> None:
@@ -100,24 +104,16 @@ def test_postgres_gate_runs_only_real_postgres_tests_without_skip_escape_hatch()
     command = build_pytest_command(REPOSITORY)
 
     assert command[:3] == ("uv", "run", "pytest")
-    assert "tests/test_llm_usage_postgres.py" in command
-    assert "tests/test_scan_audit_postgres.py" in command
-    assert "tests/test_rbac_acl_revocation_postgres.py" in command
-    assert "tests/test_migration_0011_postgres.py" in command
-    assert "tests/test_auth_refresh_postgres.py" in command
-    assert "--runxfail" in command
-    assert "-rs" in command
+    selected = tuple(item for item in command if item.startswith("tests/"))
+    assert selected == POSTGRES_MAPPED_TESTS
+    assert len(selected) == len(set(selected))
+    assert "--runxfail" not in command
+    assert "-rA" in command
     assert not any("sqlite" in item.lower() for item in command)
 
 
 def test_postgres_tests_never_recreate_an_arbitrary_database() -> None:
-    for relative in (
-        "tests/test_llm_usage_postgres.py",
-        "tests/test_scan_audit_postgres.py",
-        "tests/test_rbac_acl_revocation_postgres.py",
-        "tests/test_migration_0011_postgres.py",
-        "tests/test_auth_refresh_postgres.py",
-    ):
+    for relative in POSTGRES_MAPPED_TESTS:
         source = (REPOSITORY / relative).read_text(encoding="utf-8")
         assert "Base.metadata.drop_all" not in source
         assert "Base.metadata.create_all" not in source
@@ -152,4 +148,8 @@ def test_container_cleanup_requires_exact_id_name_and_marker() -> None:
 def test_postgres_test_gate_fails_on_any_skip_or_nonzero_exit() -> None:
     assert pytest_result_passed(returncode=0, output="5 passed") is True
     assert pytest_result_passed(returncode=0, output="4 passed, 1 skipped") is False
+    assert pytest_result_passed(returncode=0, output="4 passed, 1 deselected") is False
+    assert pytest_result_passed(returncode=0, output="4 passed, 1 xfailed") is False
+    assert pytest_result_passed(returncode=0, output="4 passed, 1 xpassed") is False
+    assert pytest_result_passed(returncode=0, output="4 passed, 1 error") is False
     assert pytest_result_passed(returncode=1, output="1 failed") is False
