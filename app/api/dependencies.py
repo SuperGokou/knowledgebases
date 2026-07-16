@@ -42,6 +42,7 @@ def get_token_service() -> TokenService:
         algorithm=settings.jwt_algorithm,
         access_minutes=settings.access_token_minutes,
         refresh_days=settings.refresh_token_days,
+        clock_skew_seconds=settings.jwt_clock_skew_seconds,
     )
 
 

@@ -35,6 +35,20 @@ def production_settings(**overrides: object) -> Settings:
     return Settings(**values)
 
 
+def test_jwt_clock_skew_has_a_small_bounded_default() -> None:
+    assert Settings(_env_file=None).jwt_clock_skew_seconds == 3
+    assert Settings(_env_file=None, jwt_clock_skew_seconds=0).jwt_clock_skew_seconds == 0
+    assert Settings(_env_file=None, jwt_clock_skew_seconds=30).jwt_clock_skew_seconds == 30
+
+
+@pytest.mark.parametrize("clock_skew_seconds", [-1, 31])
+def test_jwt_clock_skew_rejects_values_outside_the_security_boundary(
+    clock_skew_seconds: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, jwt_clock_skew_seconds=clock_skew_seconds)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,8 +15,10 @@ import pytest
 from scripts.acceptance_gate import (
     AcceptanceGateError,
     GateIdentity,
+    TrustedExecutableBinding,
     assert_gate_identity,
     atomic_write_bytes,
+    bind_trusted_executable,
     build_pytest_collection_command,
     build_pytest_execution_command,
     discover_postgres_test_files,
@@ -26,6 +31,7 @@ from scripts.acceptance_gate import (
     start_gate_identity,
     validate_postgres_test_mapping,
     verify_file_artifact,
+    verify_trusted_executable_binding,
     write_json_evidence,
 )
 
@@ -34,6 +40,139 @@ from scripts.acceptance_gate import (
 class _Identity:
     git_head: str
     content_fingerprint: str
+
+
+@pytest.fixture
+def private_external_executable() -> Path:
+    """Copy an executable below a private, repository-external directory."""
+
+    with tempfile.TemporaryDirectory(prefix="kb-node-binding-", dir=Path.home()) as raw_directory:
+        directory = Path(raw_directory)
+        if os.name == "posix":
+            directory.chmod(0o700)
+        executable = directory / ("trusted-node.exe" if os.name == "nt" else "trusted-node")
+        shutil.copy2(Path(sys.executable).resolve(), executable)
+        if os.name == "posix":
+            executable.chmod(0o700)
+        yield executable
+
+
+def test_trusted_executable_binding_round_trip_uses_external_canonical_file(
+    private_external_executable: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+
+    binding = bind_trusted_executable(
+        repository,
+        private_external_executable.name,
+        search_path=str(private_external_executable.parent),
+    )
+
+    assert binding.path == str(private_external_executable.resolve())
+    assert len(binding.sha256) == 64
+    assert verify_trusted_executable_binding(repository, binding) == binding.path
+
+
+def test_trusted_executable_binding_rejects_digest_tampering(
+    private_external_executable: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    binding = bind_trusted_executable(
+        repository,
+        private_external_executable.name,
+        search_path=str(private_external_executable.parent),
+    )
+
+    with pytest.raises(AcceptanceGateError, match="digest"):
+        verify_trusted_executable_binding(
+            repository,
+            TrustedExecutableBinding(binding.path, "0" * 64),
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership contract")
+def test_trusted_executable_binding_can_require_root_ownership(
+    private_external_executable: Path,
+) -> None:
+    if private_external_executable.stat().st_uid == 0:
+        pytest.skip("fixture is already root-owned")
+
+    with pytest.raises(AcceptanceGateError, match="root-owned"):
+        bind_trusted_executable(
+            Path(__file__).resolve().parents[1],
+            private_external_executable.name,
+            search_path=str(private_external_executable.parent),
+            require_root_owner=True,
+        )
+
+
+def test_trusted_executable_binding_rejects_repository_file(
+    private_external_executable: Path,
+) -> None:
+    with pytest.raises(AcceptanceGateError, match="outside the repository"):
+        bind_trusted_executable(
+            private_external_executable.parent,
+            private_external_executable.name,
+            search_path=str(private_external_executable.parent),
+        )
+
+
+def test_trusted_executable_binding_rejects_symbolic_link(
+    private_external_executable: Path,
+) -> None:
+    link = private_external_executable.with_name(f"{private_external_executable.name}-link")
+    try:
+        link.symlink_to(private_external_executable)
+    except (NotImplementedError, OSError):
+        pytest.skip("symbolic links are unavailable on this host")
+
+    with pytest.raises(AcceptanceGateError, match="symbolic link"):
+        verify_trusted_executable_binding(
+            Path(__file__).resolve().parents[1],
+            TrustedExecutableBinding(str(link), "0" * 64),
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_trusted_executable_binding_rejects_world_writable_ancestor(
+    private_external_executable: Path,
+) -> None:
+    private_external_executable.parent.chmod(0o777)
+
+    with pytest.raises(AcceptanceGateError, match="writable ancestor"):
+        bind_trusted_executable(
+            Path(__file__).resolve().parents[1],
+            private_external_executable.name,
+            search_path=str(private_external_executable.parent),
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inode replacement contract")
+def test_trusted_executable_binding_rejects_replacement_between_lstat_and_open(
+    private_external_executable: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_open = os.open
+    replacement = private_external_executable.with_name("replacement-node")
+    shutil.copy2(Path(sys.executable).resolve(), replacement)
+    replacement.chmod(0o700)
+    swapped = False
+
+    def replacing_open(path: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+        nonlocal swapped
+        if Path(path) == private_external_executable and not swapped:
+            os.replace(replacement, private_external_executable)
+            swapped = True
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", replacing_open)
+
+    with pytest.raises(AcceptanceGateError, match="changed before hashing"):
+        bind_trusted_executable(
+            Path(__file__).resolve().parents[1],
+            private_external_executable.name,
+            search_path=str(private_external_executable.parent),
+        )
 
 
 def test_postgres_discovery_and_declared_mapping_must_be_identical(tmp_path: Path) -> None:
@@ -85,6 +224,13 @@ def test_pytest_environment_and_commands_cannot_inherit_selection_controls() -> 
             "NODE_OPTIONS": "--require=/attacker/hook.js",
             "COMPOSE_FILE": "/attacker/compose.yml",
             "DOCKER_HOST": "tcp://attacker.invalid:2375",
+            "LD_PRELOAD": "/attacker/preload.so",
+            "LD_LIBRARY_PATH": "/attacker/lib",
+            "LD_AUDIT": "/attacker/audit.so",
+            "DYLD_INSERT_LIBRARIES": "/attacker/dyld.dylib",
+            "DYLD_LIBRARY_PATH": "/attacker/dyld",
+            "LIBPATH": "/attacker/aix",
+            "SHLIB_PATH": "/attacker/hpux",
             "KB_DATABASE_URL": "postgresql://attacker.invalid/db",
             "KEEP_ME": "yes",
         }
@@ -102,6 +248,13 @@ def test_pytest_environment_and_commands_cannot_inherit_selection_controls() -> 
         "NODE_OPTIONS",
         "COMPOSE_FILE",
         "DOCKER_HOST",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "LIBPATH",
+        "SHLIB_PATH",
         "KB_DATABASE_URL",
     ):
         assert name not in environment

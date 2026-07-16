@@ -216,12 +216,19 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             bubblewrap libreoffice-nogui poppler-utils procps
 
+      - name: Pin trusted Node executable
+        run: |
+          sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
+          sudo install -o root -g root -m 0755 "$(command -v node)" /usr/local/lib/heyi-acceptance/node
+          echo /usr/local/lib/heyi-acceptance >> "$GITHUB_PATH"
+
       - name: Run enterprise acceptance profile
         run: >-
           uv run --frozen python scripts/acceptance.py
           --profile ci
           --report-dir artifacts/acceptance
+          --node-executable /usr/local/lib/heyi-acceptance/node
 
       - name: Publish redacted acceptance summary
         if: always() && hashFiles('artifacts/acceptance/acceptance.md') != ''
-        run: cat artifacts/acceptance/acceptance.md >> "$GITHUB_STEP_SUMMARY"
+        run: tee -a "$GITHUB_STEP_SUMMARY" < artifacts/acceptance/acceptance.md

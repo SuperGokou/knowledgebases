@@ -20,10 +20,10 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from app.api.dependencies import get_storage_service, redis_dependency
+from app.api.dependencies import get_storage_service, get_token_service, redis_dependency
 from app.api.v1.routes import knowledge_bases as knowledge_base_routes
 from app.core.config import Settings, get_settings
-from app.core.security import PasswordService
+from app.core.security import PasswordService, TokenService
 from app.db.base import Base
 from app.db.models import (
     ApiKey,
@@ -311,7 +311,18 @@ async def api_harness() -> ApiHarness:
         chat_replay_encryption_keys={1: base64.urlsafe_b64encode(b"i" * 32).decode("ascii")},
         chat_replay_active_key_version=1,
     )
+    test_token_service = TokenService(
+        secret=test_settings.jwt_secret.get_secret_value(),
+        issuer=test_settings.jwt_issuer,
+        audience=test_settings.jwt_audience,
+        algorithm=test_settings.jwt_algorithm,
+        access_minutes=test_settings.access_token_minutes,
+        refresh_days=test_settings.refresh_token_days,
+        clock_skew_seconds=test_settings.jwt_clock_skew_seconds,
+    )
+    get_token_service.cache_clear()
     app.dependency_overrides[get_settings] = lambda: test_settings
+    app.dependency_overrides[get_token_service] = lambda: test_token_service
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield ApiHarness(
@@ -322,6 +333,7 @@ async def api_harness() -> ApiHarness:
         )
 
     app.dependency_overrides.clear()
+    get_token_service.cache_clear()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
     await engine.dispose()
@@ -1901,13 +1913,12 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
         },
     )
     completed_file_id = completed_upload.json()["file_id"]
-    assert (
-        await api_harness.client.post(
-            f"/api/v1/files/uploads/{completed_upload.json()['upload_session_id']}/complete",
-            headers=editor_headers,
-            json={"parts": []},
-        )
-    ).status_code == 200
+    completed = await api_harness.client.post(
+        f"/api/v1/files/uploads/{completed_upload.json()['upload_session_id']}/complete",
+        headers=editor_headers,
+        json={"parts": []},
+    )
+    assert completed.status_code == 200, completed.text
     async with api_harness.session_factory() as session:
         assert (
             await process_malware_scan_batch(
@@ -1942,11 +1953,10 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
         persisted.knowledge_status = KnowledgeIngestionStatus.DRAFT_READY
         persisted.knowledge_error_code = None
         await session.commit()
-    assert (
-        await api_harness.client.post(
-            f"/api/v1/files/{completed_file_id}/approve", headers=admin_headers
-        )
-    ).status_code == 200
+    approval = await api_harness.client.post(
+        f"/api/v1/files/{completed_file_id}/approve", headers=admin_headers
+    )
+    assert approval.status_code == 200, approval.text
 
     multipart_size = get_settings().multipart_threshold_bytes + 1
     api_harness.storage.head_size = multipart_size

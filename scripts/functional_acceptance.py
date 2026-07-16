@@ -32,9 +32,11 @@ from scripts.acceptance_gate import (
     AcceptanceGateError,
     GateIdentity,
     PytestJUnitEvidence,
+    TrustedExecutableBinding,
     add_identity_arguments,
     assert_gate_identity,
     atomic_write_text,
+    bind_trusted_executable,
     build_pytest_collection_command,
     build_pytest_execution_command,
     parse_pytest_collection,
@@ -43,6 +45,7 @@ from scripts.acceptance_gate import (
     reserve_machine_report,
     sanitized_test_environment,
     start_gate_identity,
+    verify_trusted_executable_binding,
     write_json_evidence,
 )
 
@@ -69,7 +72,7 @@ _SUPPORTED_FRAMEWORK_PREFIXES: dict[str, tuple[tuple[str, ...], ...]] = {
         ("python", "-m", "pytest"),
         ("python3", "-m", "pytest"),
     ),
-    "vitest": (("npm", "test", "--"),),
+    "vitest": (("node", "node_modules/vitest/vitest.mjs", "run"),),
 }
 _POLICY_RELATIVE_PATH = Path("docs/functional_acceptance_policy.json")
 _POLICY_SHA256 = "1b83360e3eadc66e86fb422a43f2151103840db8a84168dc91867df41d93228e"
@@ -665,13 +668,23 @@ def evaluate_contract(
 
 
 def _execute(
-    command: Sequence[str], cwd: Path, timeout_seconds: int
+    command: Sequence[str],
+    cwd: Path,
+    timeout_seconds: int,
+    *,
+    node_binding: TrustedExecutableBinding | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    executable = (
-        sys.executable
-        if tuple(command[:2]) in {("python", "-m"), ("python3", "-m")}
-        else shutil.which(command[0]) or command[0]
-    )
+    if tuple(command[:2]) in {("python", "-m"), ("python3", "-m")}:
+        executable = sys.executable
+    elif command and command[0] == "node":
+        if node_binding is None:
+            raise AcceptanceGateError("trusted Node executable binding is required")
+        executable = verify_trusted_executable_binding(
+            Path(__file__).resolve().parents[1],
+            node_binding,
+        )
+    else:
+        executable = shutil.which(command[0]) or command[0]
     return subprocess.run(  # noqa: S603
         [executable, *command[1:]],
         cwd=cwd,
@@ -778,13 +791,14 @@ def _node_statuses_from_vitest(
 
 def _build_vitest_collection_command(command: Sequence[str], report_path: Path) -> tuple[str, ...]:
     selected_files = tuple(token for token in command if token.startswith("tests/"))
-    if tuple(command[:3]) != ("npm", "test", "--") or not selected_files:
+    if (
+        tuple(command[:3]) != ("node", "node_modules/vitest/vitest.mjs", "run")
+        or not selected_files
+    ):
         raise AcceptanceGateError("vitest collection command is not safely bound")
     return (
-        "npm",
-        "exec",
-        "vitest",
-        "--",
+        "node",
+        "node_modules/vitest/vitest.mjs",
         "list",
         *selected_files,
         f"--json={report_path}",
@@ -919,6 +933,7 @@ def run_test_commands(
     manifest: Mapping[str, object],
     *,
     executor: TestExecutor = _execute,
+    node_binding: TrustedExecutableBinding | None = None,
     enforce_policy: bool = True,
     identity: GateIdentity | None = None,
     expected_git_head: str | None = None,
@@ -948,6 +963,19 @@ def run_test_commands(
         artifact_directory = _runner_artifact_directory(repository, identity)
     except (AcceptanceGateError, OSError, RuntimeError, UnicodeError) as exc:
         return (TestCommandResult("MANIFEST", "failed", 0, f"cannot bind run identity: {exc}"),)
+    effective_executor = executor
+    if executor is _execute:
+
+        def effective_executor(
+            command: Sequence[str], cwd: Path, timeout_seconds: int
+        ) -> subprocess.CompletedProcess[str]:
+            return _execute(
+                command,
+                cwd,
+                timeout_seconds,
+                node_binding=node_binding,
+            )
+
     results: list[TestCommandResult] = []
     for command_id, entry in catalog.items():
         command = _string_list(entry.get("command")) or []
@@ -975,7 +1003,7 @@ def run_test_commands(
                 collection_command = _build_vitest_collection_command(command, collection_report)
             else:
                 raise AcceptanceGateError("unsupported machine report framework")
-            collection = executor(collection_command, cwd, timeout)
+            collection = effective_executor(collection_command, cwd, timeout)
             if collection.returncode != 0:
                 raise AcceptanceGateError(f"test collection exited {collection.returncode}")
             if framework == "pytest":
@@ -992,7 +1020,7 @@ def run_test_commands(
                     "--allowOnly=false",
                 )
             assert_gate_identity(repository, identity)
-            completed = executor(machine_command, cwd, timeout)
+            completed = effective_executor(machine_command, cwd, timeout)
         except AcceptanceGateError as exc:
             results.append(
                 TestCommandResult(
@@ -1635,6 +1663,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="source",
     )
     parser.add_argument("--run-tests", action="store_true")
+    parser.add_argument("--node-executable", type=Path)
+    parser.add_argument("--node-executable-sha256")
+    parser.add_argument("--node-executable-require-root-owner", action="store_true")
     parser.add_argument(
         "--trust-store",
         type=Path,
@@ -1692,6 +1723,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 1
+    node_binding: TrustedExecutableBinding | None = None
+    node_binding_error: str | None = None
+    if arguments.run_tests:
+        supplied_binding = (
+            arguments.node_executable is not None,
+            arguments.node_executable_sha256 is not None,
+        )
+        try:
+            if (any(supplied_binding) or arguments.node_executable_require_root_owner) and not all(
+                supplied_binding
+            ):
+                raise AcceptanceGateError("trusted Node executable binding is incomplete")
+            if all(supplied_binding):
+                node_binding = TrustedExecutableBinding(
+                    path=str(arguments.node_executable),
+                    sha256=arguments.node_executable_sha256,
+                    require_root_owner=arguments.node_executable_require_root_owner,
+                )
+                verify_trusted_executable_binding(repository, node_binding)
+            else:
+                node_binding = bind_trusted_executable(
+                    repository,
+                    "node",
+                    search_path=os.environ.get("PATH"),
+                )
+        except AcceptanceGateError as exc:
+            node_binding_error = str(exc)
     contract = evaluate_contract(repository, manifest)
     trust_context: ExternalTrustContext | None = None
     trust_error: str | None = None
@@ -1712,9 +1770,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         if trust_error is not None
         else evaluate_external_evidence(repository, manifest, trust_context=trust_context)
     )
-    tests = (
-        run_test_commands(repository, manifest, identity=identity) if arguments.run_tests else ()
-    )
+    tests: tuple[TestCommandResult, ...]
+    if node_binding_error is not None:
+        tests = (
+            TestCommandResult(
+                "frontend-functional",
+                "failed",
+                0,
+                f"trusted Node executable unavailable: {node_binding_error}",
+            ),
+        )
+    else:
+        tests = (
+            run_test_commands(
+                repository,
+                manifest,
+                identity=identity,
+                node_binding=node_binding,
+            )
+            if arguments.run_tests
+            else ()
+        )
     payload = _payload(contract, external, tests, arguments.profile)
     try:
         assert_gate_identity(repository, identity)

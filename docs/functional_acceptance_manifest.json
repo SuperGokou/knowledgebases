@@ -368,7 +368,7 @@
       "id": "frontend-functional",
       "cwd": "web",
       "command": [
-        "npm", "test", "--",
+        "node", "node_modules/vitest/vitest.mjs", "run",
         "tests/access-routing.test.ts", "tests/login-route.test.ts", "tests/workspace-guard.test.ts",
         "tests/role-policy.test.ts", "tests/user-role-assignment.test.ts",
         "tests/user-password-reset.test.ts", "tests/role-administration.test.ts",

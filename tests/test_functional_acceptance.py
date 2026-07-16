@@ -14,11 +14,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import scripts.functional_acceptance as functional_acceptance
 from scripts.acceptance import build_profile, collect_worktree_evidence
+from scripts.acceptance_gate import TrustedExecutableBinding
 from scripts.functional_acceptance import (
     AcceptanceGateError,
     ContractError,
     ExternalEvidenceReport,
     ExternalTrustContext,
+    _build_vitest_collection_command,
     _consume_challenge_once,
     _payload,
     _signature_payload,
@@ -50,6 +52,59 @@ def test_vitest_collection_rejects_duplicate_machine_nodes(tmp_path: Path) -> No
 
     with pytest.raises(AcceptanceGateError, match="duplicate tests"):
         _vitest_collected_nodes(report, tmp_path)
+
+
+def test_repository_frontend_runner_uses_locked_vitest_entrypoint() -> None:
+    manifest = load_manifest(MANIFEST)
+    frontend = next(
+        item
+        for item in manifest["test_commands"]
+        if item["id"] == "frontend-functional"  # type: ignore[index]
+    )
+
+    assert frontend["command"][:3] == [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+    ]
+
+
+def test_vitest_collection_uses_the_same_locked_local_entrypoint(tmp_path: Path) -> None:
+    report = tmp_path / "vitest-collection.json"
+
+    command = _build_vitest_collection_command(
+        (
+            "node",
+            "node_modules/vitest/vitest.mjs",
+            "run",
+            "tests/access-routing.test.ts",
+        ),
+        report,
+    )
+
+    assert command == (
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "list",
+        "tests/access-routing.test.ts",
+        f"--json={report}",
+        "--allowOnly=false",
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("npm", "test", "--", "tests/access-routing.test.ts"),
+        ("node", "scripts/run-tests.mjs", "run", "tests/access-routing.test.ts"),
+    ],
+)
+def test_vitest_collection_rejects_package_manager_and_arbitrary_scripts(
+    command: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(AcceptanceGateError, match="not safely bound"):
+        _build_vitest_collection_command(command, tmp_path / "collection.json")
 
 
 def _canonical_evidence_digest(document: dict[str, object]) -> str:
@@ -187,6 +242,47 @@ def test_python_runner_resolves_to_the_acceptance_interpreter(
     functional_acceptance._execute(("python", "-m", "pytest"), REPOSITORY, 30)
 
     assert captured["args"] == [functional_acceptance.sys.executable, "-m", "pytest"]
+
+
+def test_node_runner_requires_an_explicit_trusted_binding() -> None:
+    with pytest.raises(AcceptanceGateError, match="trusted Node executable binding"):
+        functional_acceptance._execute(
+            ("node", "node_modules/vitest/vitest.mjs", "list"),
+            REPOSITORY / "web",
+            30,
+        )
+
+
+def test_node_runner_revalidates_and_uses_the_bound_absolute_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    binding = TrustedExecutableBinding("/trusted/node", "a" * 64)
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args[0]
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        functional_acceptance,
+        "verify_trusted_executable_binding",
+        lambda repository, candidate: candidate.path,
+        raising=False,
+    )
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    functional_acceptance._execute(
+        ("node", "node_modules/vitest/vitest.mjs", "list"),
+        REPOSITORY / "web",
+        30,
+        node_binding=binding,
+    )
+
+    assert captured["args"] == ["/trusted/node", "node_modules/vitest/vitest.mjs", "list"]
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment.get("PATH") != "/trusted"
 
 
 def test_repository_policy_digest_is_stable_and_manifest_cannot_drop_required_id() -> None:

@@ -50,15 +50,19 @@ class TokenService:
         algorithm: str = "HS256",
         access_minutes: int = 15,
         refresh_days: int = 7,
+        clock_skew_seconds: int = 0,
     ) -> None:
         if len(secret) < 32:
             raise ValueError("JWT secret must contain at least 32 characters")
+        if not 0 <= clock_skew_seconds <= 30:
+            raise ValueError("JWT clock skew must be between 0 and 30 seconds")
         self._secret = secret
         self._issuer = issuer
         self._audience = audience
         self._algorithm = algorithm
         self._access_lifetime = timedelta(minutes=access_minutes)
         self._refresh_lifetime = timedelta(days=refresh_days)
+        self._clock_skew_seconds = clock_skew_seconds
 
     def create_access_token(self, *, user_id: UUID, token_version: int) -> str:
         return self._create(user_id, token_version, "access", self._access_lifetime)
@@ -95,6 +99,7 @@ class TokenService:
                 algorithms=[self._algorithm],
                 audience=self._audience,
                 issuer=self._issuer,
+                leeway=self._clock_skew_seconds,
                 options={"require": ["sub", "ver", "typ", "jti", "iat", "nbf", "exp"]},
             )
             token_type = payload["typ"]

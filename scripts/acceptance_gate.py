@@ -32,9 +32,13 @@ _UNTRUSTED_ENVIRONMENT_NAMES = frozenset(
         "VIRTUAL_ENV",
         "NODE_OPTIONS",
         "NODE_PATH",
+        "LIBPATH",
+        "SHLIB_PATH",
     }
 )
 _UNTRUSTED_ENVIRONMENT_PREFIXES = (
+    "LD_",
+    "DYLD_",
     "PYTEST_",
     "UV_",
     "COVERAGE_",
@@ -77,6 +81,191 @@ _RUNNER_OWNED_ENVIRONMENT_OVERRIDES = frozenset(
 
 class AcceptanceGateError(RuntimeError):
     """Raised when an acceptance run cannot prove its execution contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedExecutableBinding:
+    """Canonical executable identity carried across a sanitized process boundary."""
+
+    path: str
+    sha256: str
+    require_root_owner: bool = False
+
+
+_EXECUTABLE_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_size",
+    "st_mtime_ns",
+)
+_POSIX_EXECUTABLE_SECURITY_FIELDS = ("st_mode", "st_uid", "st_gid", "st_ctime_ns")
+
+
+def _same_executable_metadata(left: os.stat_result, right: os.stat_result) -> bool:
+    fields = _EXECUTABLE_IDENTITY_FIELDS + (
+        _POSIX_EXECUTABLE_SECURITY_FIELDS if os.name == "posix" else ()
+    )
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
+def _trusted_executable_digest(path: Path, expected_metadata: os.stat_result) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AcceptanceGateError(
+            "trusted executable cannot be opened without following links"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not _same_executable_metadata(expected_metadata, before):
+            raise AcceptanceGateError("trusted executable changed before hashing")
+        if not stat.S_ISREG(before.st_mode):
+            raise AcceptanceGateError("trusted executable must be a regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if not _same_executable_metadata(before, after):
+            raise AcceptanceGateError("trusted executable changed while hashing")
+        try:
+            final_metadata = path.lstat()
+        except OSError as exc:
+            raise AcceptanceGateError("trusted executable changed after hashing") from exc
+        if not _same_executable_metadata(after, final_metadata):
+            raise AcceptanceGateError("trusted executable changed after hashing")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _inspect_trusted_executable(
+    repository: Path,
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    require_root_owner: bool = False,
+) -> tuple[Path, str]:
+    repository = repository.resolve(strict=True)
+    if not path.is_absolute():
+        raise AcceptanceGateError("trusted executable path must be absolute")
+    try:
+        supplied_metadata = path.lstat()
+    except OSError as exc:
+        raise AcceptanceGateError("trusted executable is unavailable") from exc
+    if stat.S_ISLNK(supplied_metadata.st_mode):
+        raise AcceptanceGateError("trusted executable cannot be a symbolic link")
+    try:
+        canonical = path.resolve(strict=True)
+        metadata = canonical.lstat()
+    except OSError as exc:
+        raise AcceptanceGateError("trusted executable cannot be resolved") from exc
+    if canonical != path or stat.S_ISLNK(metadata.st_mode):
+        raise AcceptanceGateError("trusted executable cannot be a symbolic link")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AcceptanceGateError("trusted executable must be a regular file")
+    if canonical == repository or repository in canonical.parents:
+        raise AcceptanceGateError("trusted executable must be outside the repository")
+    if os.name == "posix":
+        effective_user = os.geteuid()  # type: ignore[attr-defined, unused-ignore]
+        trusted_owners = {0} if require_root_owner else {0, effective_user}
+        if not metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            raise AcceptanceGateError("trusted executable is not executable")
+        if metadata.st_uid not in trusted_owners:
+            message = (
+                "trusted executable must be root-owned"
+                if require_root_owner
+                else "trusted executable has an untrusted owner"
+            )
+            raise AcceptanceGateError(message)
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise AcceptanceGateError("trusted executable is group/world writable")
+        for ancestor in canonical.parents:
+            ancestor_metadata = ancestor.stat()
+            if ancestor_metadata.st_uid not in trusted_owners:
+                message = (
+                    "trusted executable ancestors must be root-owned"
+                    if require_root_owner
+                    else "trusted executable has an untrusted ancestor owner"
+                )
+                raise AcceptanceGateError(message)
+            if ancestor_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise AcceptanceGateError("trusted executable has a writable ancestor")
+    digest = _trusted_executable_digest(canonical, metadata)
+    if expected_sha256 is not None and not secrets.compare_digest(digest, expected_sha256):
+        raise AcceptanceGateError("trusted executable digest does not match its binding")
+    return canonical, digest
+
+
+def bind_trusted_executable(
+    repository: Path,
+    executable: str,
+    *,
+    search_path: str | None = None,
+    require_root_owner: bool = False,
+) -> TrustedExecutableBinding:
+    """Resolve and attest one executable before sanitizing the child environment."""
+
+    located = shutil.which(executable, path=search_path)
+    if located is None:
+        raise AcceptanceGateError("trusted executable is unavailable")
+    candidate = Path(located)
+    if not candidate.is_absolute():
+        candidate = candidate.absolute()
+    try:
+        if stat.S_ISLNK(candidate.lstat().st_mode):
+            raise AcceptanceGateError("trusted executable cannot be a symbolic link")
+        candidate = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise AcceptanceGateError("trusted executable cannot be resolved") from exc
+    canonical, digest = _inspect_trusted_executable(
+        repository,
+        candidate,
+        require_root_owner=require_root_owner,
+    )
+    return TrustedExecutableBinding(
+        path=str(canonical),
+        sha256=digest,
+        require_root_owner=require_root_owner,
+    )
+
+
+def bind_trusted_executable_path(
+    repository: Path,
+    executable: Path,
+    *,
+    require_root_owner: bool = False,
+) -> TrustedExecutableBinding:
+    """Attest an explicitly selected executable without consulting PATH."""
+
+    canonical, digest = _inspect_trusted_executable(
+        repository,
+        executable,
+        require_root_owner=require_root_owner,
+    )
+    return TrustedExecutableBinding(
+        path=str(canonical),
+        sha256=digest,
+        require_root_owner=require_root_owner,
+    )
+
+
+def verify_trusted_executable_binding(
+    repository: Path,
+    binding: TrustedExecutableBinding,
+) -> str:
+    """Revalidate executable metadata and content immediately before execution."""
+
+    if _SHA256_PATTERN.fullmatch(binding.sha256) is None:
+        raise AcceptanceGateError("trusted executable digest is invalid")
+    canonical, _ = _inspect_trusted_executable(
+        repository,
+        Path(binding.path),
+        expected_sha256=binding.sha256,
+        require_root_owner=binding.require_root_owner,
+    )
+    return str(canonical)
 
 
 class WorktreeIdentity(Protocol):

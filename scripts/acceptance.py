@@ -39,9 +39,12 @@ from scripts.acceptance_gate import (  # noqa: E402 - direct script bootstrap ab
     AcceptanceGateError,
     GateIdentity,
     IdentityCollector,
+    TrustedExecutableBinding,
     add_identity_arguments,
     assert_gate_identity,
     atomic_write_text,
+    bind_trusted_executable,
+    bind_trusted_executable_path,
     sanitized_test_environment,
     start_gate_identity,
 )
@@ -741,6 +744,8 @@ def build_profile(
     disaster_recovery_evidence_public_key_path: str | None = None,
     supply_chain_attestation_path: str | None = None,
     supply_chain_artifact_root: str | None = None,
+    functional_node_binding: TrustedExecutableBinding | None = None,
+    functional_node_blocker: str | None = None,
     acceptance_identity: GateIdentity | None = None,
 ) -> tuple[AcceptanceGate, ...]:
     repository = Path(__file__).resolve().parents[1]
@@ -767,6 +772,21 @@ def build_profile(
                 str(repository / "scripts/functional_acceptance.py"),
                 "--run-tests",
                 "--json",
+                *(
+                    (
+                        "--node-executable",
+                        functional_node_binding.path,
+                        "--node-executable-sha256",
+                        functional_node_binding.sha256,
+                        *(
+                            ("--node-executable-require-root-owner",)
+                            if functional_node_binding.require_root_owner
+                            else ()
+                        ),
+                    )
+                    if functional_node_binding is not None
+                    else ()
+                ),
                 *_child_evidence_cli_arguments(
                     acceptance_identity,
                     "functional-acceptance",
@@ -774,6 +794,7 @@ def build_profile(
             ),
             str(repository),
             900,
+            blocked_reason=functional_node_blocker,
             child_evidence_path=(
                 _MACHINE_EVIDENCE_PATHS["functional-acceptance"]
                 if acceptance_identity is not None
@@ -3232,10 +3253,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--supply-chain-artifact-root",
         help="Absolute target-host root containing the release image SBOM artifacts",
     )
+    parser.add_argument(
+        "--node-executable",
+        type=Path,
+        help="Explicit trusted Node executable outside the repository",
+    )
     add_identity_arguments(parser)
     arguments = parser.parse_args(argv)
 
     repository = Path(__file__).resolve().parents[1]
+    require_root_node = os.name == "posix" and arguments.profile in {"ci", "final"}
+    try:
+        functional_node_binding = (
+            bind_trusted_executable_path(
+                repository,
+                arguments.node_executable,
+                require_root_owner=require_root_node,
+            )
+            if arguments.node_executable is not None
+            else bind_trusted_executable(
+                repository,
+                "node",
+                search_path=os.environ.get("PATH"),
+                require_root_owner=require_root_node,
+            )
+        )
+        functional_node_blocker = None
+    except AcceptanceGateError as exc:
+        functional_node_binding = None
+        functional_node_blocker = f"trusted Node executable unavailable: {exc}"
     identity_collector = cast(IdentityCollector, collect_worktree_evidence)
     if arguments.run_browser_e2e:
         if not all(
@@ -3579,6 +3625,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         supply_chain_attestation_path=arguments.supply_chain_attestation,
         supply_chain_artifact_root=arguments.supply_chain_artifact_root,
+        functional_node_binding=functional_node_binding,
+        functional_node_blocker=functional_node_blocker,
         acceptance_identity=acceptance_identity,
     )
     results: list[AcceptanceResult] = []

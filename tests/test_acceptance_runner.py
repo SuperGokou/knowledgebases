@@ -41,7 +41,7 @@ from scripts.acceptance import (
     verify_offline_runtime_evidence,
     write_reports,
 )
-from scripts.acceptance_gate import GateIdentity
+from scripts.acceptance_gate import GateIdentity, TrustedExecutableBinding
 from scripts.functional_acceptance import ExternalTrustContext, _signature_payload
 
 
@@ -200,6 +200,49 @@ def test_gate_subprocess_inherits_the_single_parent_deployment_lock(
     environment = captured["env"]
     assert isinstance(environment, dict)
     assert environment["KB_OFFLINE_LOCK_HELD"] == "heyi-kb-offline-operation-v2"
+
+
+def test_functional_gate_passes_only_the_bound_node_path_and_digest() -> None:
+    binding = TrustedExecutableBinding("/opt/trusted/node", "b" * 64, require_root_owner=True)
+
+    gate = next(
+        item
+        for item in build_profile("ci", functional_node_binding=binding)
+        if item.gate_id == "FUNCTIONAL-P0-001"
+    )
+
+    assert gate.command[-5:] == (
+        "--node-executable",
+        binding.path,
+        "--node-executable-sha256",
+        binding.sha256,
+        "--node-executable-require-root-owner",
+    )
+    assert not gate.environment
+
+
+def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+    pin_step = (
+        "      - name: Pin trusted Node executable\n"
+        "        run: |\n"
+        "          sudo install -d -o root -g root -m 0755 "
+        "/usr/local/lib/heyi-acceptance\n"
+        '          sudo install -o root -g root -m 0755 "$(command -v node)" '
+        "/usr/local/lib/heyi-acceptance/node\n"
+        '          echo /usr/local/lib/heyi-acceptance >> "$GITHUB_PATH"\n'
+    )
+
+    assert pin_step in acceptance_job
+    assert acceptance_job.index("- name: Set up Node.js") < acceptance_job.index(pin_step)
+    assert (
+        acceptance_job.index("- name: Install document parser sandbox tools")
+        < (acceptance_job.index(pin_step))
+        < acceptance_job.index("- name: Run enterprise acceptance profile")
+    )
+    assert "--node-executable /usr/local/lib/heyi-acceptance/node" in acceptance_job
 
 
 def test_declared_preflight_exit_code_is_reported_as_blocked() -> None:

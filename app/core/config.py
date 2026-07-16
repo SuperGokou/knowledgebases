@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = "enterprise-knowledge-base"
     jwt_audience: str = "knowledge-base-api"
+    jwt_clock_skew_seconds: int = Field(default=3, ge=0, le=30)
     access_token_minutes: int = Field(default=15, ge=1, le=1_440)
     refresh_token_days: int = Field(default=7, ge=1, le=90)
     bff_shared_secret: SecretStr | None = None
