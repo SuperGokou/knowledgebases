@@ -323,24 +323,88 @@ jobs:
             /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12
           test -x "$python_source"
           test "$("$python_source" --version)" = "Python 3.12.13"
-          sudo install -d -o root -g root -m 0755 /opt/heyi-acceptance
+          python_prefix="${python_source%/bin/python3.12}"
+          python_runtime=/usr/local/lib/heyi-acceptance/python/bin/python3.12
+          python_trust_chain=(
+            /opt
+            /opt/hostedtoolcache
+            /opt/hostedtoolcache/Python
+            /opt/hostedtoolcache/Python/3.12.13
+            "$python_prefix"
+          )
+          for trusted_directory in "${python_trust_chain[@]}"; do
+            test -d "$trusted_directory"
+            test ! -L "$trusted_directory"
+            sudo chown root:root "$trusted_directory"
+            sudo chmod go-w "$trusted_directory"
+          done
+          sudo chown -R root:root "$python_prefix"
+          sudo chmod -R go-w "$python_prefix"
+          sudo cp -aL -- "$python_prefix" /usr/local/lib/heyi-acceptance/python
+          sudo chown -R root:root /usr/local/lib/heyi-acceptance/python
+          sudo chmod -R go-w /usr/local/lib/heyi-acceptance/python
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            "$python_source" -I -m venv --copies /opt/heyi-acceptance/venv
+            "$python_runtime" -I - <<'PY'
+          from pathlib import Path
+          import sys
+
+          expected = Path("/usr/local/lib/heyi-acceptance/python").resolve()
+          trusted_hosted_prefix = Path(
+              "/opt/hostedtoolcache/Python/3.12.13/x64"
+          ).resolve()
+          assert Path(sys.base_prefix).resolve() == expected
+          hosted_entries = [
+              line[line.index("/opt/hostedtoolcache/") :]
+              for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
+              if "/opt/hostedtoolcache/" in line
+          ]
+          assert all(not entry.endswith(" (deleted)") for entry in hosted_entries)
+          mapped_hosted_paths = {
+              Path(entry).resolve()
+              for entry in hosted_entries
+          }
+          assert all(
+              path.is_file() and path.is_relative_to(trusted_hosted_prefix)
+              for path in mapped_hosted_paths
+          )
+          assert all(
+              item.stat().st_uid == 0 and not item.stat().st_mode & 0o022
+              for path in mapped_hosted_paths
+              for item in (path, *path.parents)
+          )
+          print(f"root-protected hosted Python mappings: {len(mapped_hosted_paths)}")
+          PY
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            UV_PROJECT_ENVIRONMENT=/opt/heyi-acceptance/venv \
+            "$python_runtime" -I -m venv --copies \
+            /usr/local/lib/heyi-acceptance/venv
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            UV_PROJECT_ENVIRONMENT=/usr/local/lib/heyi-acceptance/venv \
             /usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev \
-            --no-install-project
-          sudo chown -R root:root /opt/heyi-acceptance
-          sudo chmod -R go-w /opt/heyi-acceptance
+            --no-build --no-install-project
+          for python_name in python python3 python3.12; do
+            python_target="/usr/local/lib/heyi-acceptance/venv/bin/$python_name"
+            python_staged="${python_target}.acceptance"
+            sudo install -o root -g root -m 0755 "$python_runtime" "$python_staged"
+            sudo mv -fT -- "$python_staged" "$python_target"
+          done
+          sudo chown -R root:root /usr/local/lib/heyi-acceptance
+          sudo chmod -R go-w /usr/local/lib/heyi-acceptance
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /opt/heyi-acceptance/venv/bin/python -c \
-            'import shutil, sys; from scripts.acceptance import _root_protected_executable; _root_protected_executable((sys.executable,)); _root_protected_executable((shutil.which("npm") or "",))'
+            /usr/local/lib/heyi-acceptance/venv/bin/python -c \
+            'import sys; from pathlib import Path; from scripts.acceptance import _root_protected_executable; expected = Path("/usr/local/lib/heyi-acceptance/python").resolve(); assert Path(sys.base_prefix).resolve() == expected; config = (Path(sys.prefix) / "pyvenv.cfg").read_text(encoding="utf-8"); assert "/opt/hostedtoolcache" not in config; _root_protected_executable((sys.executable,)); print("root-protected Python runtime: PASS")'
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/local/lib/heyi-acceptance/venv/bin/python -c \
+            'import shutil; from scripts.acceptance import _root_protected_executable; _root_protected_executable((shutil.which("npm") or "",)); print("root-protected npm: PASS")'
 
       - name: Install document parser sandbox tools
         run: |
@@ -350,14 +414,58 @@ jobs:
 
       - name: Install locked dependencies
         run: |
-          /usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/local/sbin/npm ci --prefix web --no-audit --no-fund
+            /usr/local/sbin/npm ci --prefix web --ignore-scripts --no-audit --no-fund
+
+      - name: Seal acceptance source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          acceptance_source=/usr/local/lib/heyi-acceptance/source
+          checked_out_sha="$(/usr/bin/git rev-parse HEAD)"
+          /usr/bin/git diff --exit-code -- .
+          /usr/bin/git diff --cached --exit-code -- .
+          test -z "$(/usr/bin/git status --porcelain=v1 --untracked-files=no)"
+          test ! -e "$acceptance_source"
+          sudo cp -a -- "$GITHUB_WORKSPACE" "$acceptance_source"
+          sudo chown -R root:root "$acceptance_source"
+          sudo chmod -R go-w "$acceptance_source"
+          test -d "$acceptance_source/.git"
+          test ! -e "$acceptance_source/.git/objects/info/alternates"
+          while IFS= read -r -d '' link_path; do
+            resolved_path="$(sudo readlink -f -- "$link_path")"
+            case "$resolved_path" in
+              "$acceptance_source"/*) ;;
+              *)
+                echo "Refusing external acceptance symlink: $link_path" >&2
+                exit 1
+                ;;
+            esac
+          done < <(sudo find "$acceptance_source" -type l -print0)
+          sealed_sha="$(
+            sudo -H /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              /usr/bin/git -C "$acceptance_source" rev-parse HEAD
+          )"
+          test "$sealed_sha" = "$checked_out_sha"
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/git -C "$acceptance_source" diff --exit-code -- .
+          test -z "$(
+            sudo -H /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              /usr/bin/git -C "$acceptance_source" \
+              status --porcelain=v1 --untracked-files=no
+          )"
 
       - name: Run enterprise acceptance profile
         shell: bash
         run: |
           set -euo pipefail
+          cd /usr/local/lib/heyi-acceptance/source
           sudo -H /usr/bin/env -i \
             HOME=/root \
             LANG=C.UTF-8 \
@@ -366,7 +474,7 @@ jobs:
             CI="$CI" \
             KB_ENVIRONMENT="$KB_ENVIRONMENT" \
             NEXT_TELEMETRY_DISABLED="$NEXT_TELEMETRY_DISABLED" \
-            /opt/heyi-acceptance/venv/bin/python scripts/acceptance.py \
+            /usr/local/lib/heyi-acceptance/venv/bin/python scripts/acceptance.py \
             --profile ci \
             --report-dir artifacts/acceptance \
             --node-executable /usr/local/lib/heyi-acceptance/node
@@ -376,7 +484,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if sudo --non-interactive test -f artifacts/acceptance/acceptance.md; then
-            sudo --non-interactive cat artifacts/acceptance/acceptance.md |
+          report=/usr/local/lib/heyi-acceptance/source/artifacts/acceptance/acceptance.md
+          if sudo --non-interactive test -f "$report"; then
+            sudo --non-interactive cat "$report" |
               tee -a "$GITHUB_STEP_SUMMARY"
           fi

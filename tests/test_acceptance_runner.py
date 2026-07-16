@@ -286,6 +286,7 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     pin_step = "- name: Pin trusted Node executable"
     runtime_step = "- name: Install root-protected acceptance runtime"
     dependency_step = "- name: Install locked dependencies"
+    seal_step = "- name: Seal acceptance source snapshot"
 
     assert 'python-version: "3.12.13"' in acceptance_job
     assert 'node-version: "24.18.0"' in acceptance_job
@@ -293,6 +294,7 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     assert pin_step in acceptance_job
     assert runtime_step in acceptance_job
     assert dependency_step in acceptance_job
+    assert seal_step in acceptance_job
     assert (
         "sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance" in acceptance_job
     )
@@ -332,6 +334,7 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     pin_index = acceptance_job.index(pin_step)
     runtime_index = acceptance_job.index(runtime_step)
     dependency_index = acceptance_job.index(dependency_step)
+    seal_index = acceptance_job.index(seal_step)
     npm_ci_index = acceptance_job.index("npm ci --prefix web")
 
     assert (
@@ -342,10 +345,11 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
         < runtime_index
         < dependency_index
         < npm_ci_index
+        < seal_index
     )
     parser_index = acceptance_job.index("- name: Install document parser sandbox tools")
     assert runtime_index < parser_index < dependency_index
-    assert npm_ci_index < acceptance_job.index("- name: Run enterprise acceptance profile")
+    assert seal_index < acceptance_job.index("- name: Run enterprise acceptance profile")
     assert "--node-executable /usr/local/lib/heyi-acceptance/node" in acceptance_job
 
 
@@ -355,7 +359,7 @@ def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
     acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
 
     assert "- name: Install root-protected acceptance runtime" in acceptance_job
-    assert "UV_PROJECT_ENVIRONMENT=/opt/heyi-acceptance/venv" in acceptance_job
+    assert "UV_PROJECT_ENVIRONMENT=/usr/local/lib/heyi-acceptance/venv" in acceptance_job
     assert "/usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev" in acceptance_job
     assert "/usr/local/sbin/npm" in acceptance_job
     assert "/usr/local/sbin/node" in acceptance_job
@@ -367,29 +371,76 @@ def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
         'test "$python_source" = \\\n'
         "            /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12" in runtime_step
     )
-    assert '"$python_source" -I -m venv --copies /opt/heyi-acceptance/venv' in runtime_step
-    assert "sudo chown -R root:root /opt/heyi-acceptance" in runtime_step
-    assert "sudo chmod -R go-w /opt/heyi-acceptance" in runtime_step
+    assert (
+        '"$python_runtime" -I -m venv --copies \\\n'
+        "            /usr/local/lib/heyi-acceptance/venv" in runtime_step
+    )
+    assert 'python_prefix="${python_source%/bin/python3.12}"' in runtime_step
+    assert "python_runtime=/usr/local/lib/heyi-acceptance/python/bin/python3.12" in runtime_step
+    assert 'sudo cp -aL -- "$python_prefix" /usr/local/lib/heyi-acceptance/python' in runtime_step
+    assert "python_trust_chain=(" in runtime_step
+    assert 'sudo chown -R root:root "$python_prefix"' in runtime_step
+    assert 'sudo chmod -R go-w "$python_prefix"' in runtime_step
+    assert "sudo chown -R root:root /usr/local/lib/heyi-acceptance/python" in runtime_step
+    assert "sudo chmod -R go-w /usr/local/lib/heyi-acceptance/python" in runtime_step
+    assert "Path(sys.base_prefix).resolve() == expected" in runtime_step
+    assert 'Path("/proc/self/maps").read_text' in runtime_step
+    assert 'assert all(not entry.endswith(" (deleted)")' in runtime_step
+    assert "path.is_relative_to(trusted_hosted_prefix)" in runtime_step
+    assert "item.stat().st_uid == 0" in runtime_step
+    assert "--no-build --no-install-project" in runtime_step
+    assert "for python_name in python python3 python3.12; do" in runtime_step
+    assert 'python_staged="${python_target}.acceptance"' in runtime_step
+    assert 'sudo install -o root -g root -m 0755 "$python_runtime" "$python_staged"' in runtime_step
+    assert 'sudo mv -fT -- "$python_staged" "$python_target"' in runtime_step
+    assert "sudo chown -R root:root /usr/local/lib/heyi-acceptance" in runtime_step
+    assert "sudo chmod -R go-w /usr/local/lib/heyi-acceptance" in runtime_step
+    assert 'assert "/opt/hostedtoolcache" not in config' in runtime_step
+    assert 'print("root-protected Python runtime: PASS")' in runtime_step
+    assert 'print("root-protected npm: PASS")' in runtime_step
+    assert "/opt/heyi-acceptance" not in runtime_step
 
     dependency_step = acceptance_job.split(
         "      - name: Install locked dependencies\n", maxsplit=1
-    )[1].split("      - name: Run enterprise acceptance profile\n", maxsplit=1)[0]
-    assert "/usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev" in dependency_step
-    assert "/usr/local/sbin/npm ci --prefix web --no-audit --no-fund" in dependency_step
+    )[1].split("      - name: Seal acceptance source snapshot\n", maxsplit=1)[0]
+    assert "uv sync" not in dependency_step
+    assert (
+        "/usr/local/sbin/npm ci --prefix web --ignore-scripts --no-audit --no-fund"
+        in dependency_step
+    )
+
+    seal_step = acceptance_job.split("      - name: Seal acceptance source snapshot\n", maxsplit=1)[
+        1
+    ].split("      - name: Run enterprise acceptance profile\n", maxsplit=1)[0]
+    assert "/usr/bin/git diff --exit-code -- ." in seal_step
+    assert "status --porcelain=v1 --untracked-files=no" in seal_step
+    assert 'sudo cp -a -- "$GITHUB_WORKSPACE" "$acceptance_source"' in seal_step
+    assert 'sudo chown -R root:root "$acceptance_source"' in seal_step
+    assert 'sudo chmod -R go-w "$acceptance_source"' in seal_step
+    assert 'test -d "$acceptance_source/.git"' in seal_step
+    assert 'test ! -e "$acceptance_source/.git/objects/info/alternates"' in seal_step
+    assert 'sudo find "$acceptance_source" -type l -print0' in seal_step
+    assert "Refusing external acceptance symlink" in seal_step
+    assert '/usr/bin/git -C "$acceptance_source" rev-parse HEAD' in seal_step
 
     run_step = acceptance_job.split(
         "      - name: Run enterprise acceptance profile\n", maxsplit=1
     )[1].split("      - name: Publish redacted acceptance summary\n", maxsplit=1)[0]
     assert "sudo -H /usr/bin/env -i" in run_step
+    assert "cd /usr/local/lib/heyi-acceptance/source" in run_step
     assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in run_step
-    assert "/opt/heyi-acceptance/venv/bin/python scripts/acceptance.py" in run_step
+    assert "/usr/local/lib/heyi-acceptance/venv/bin/python scripts/acceptance.py" in run_step
     assert "uv run" not in run_step
 
     publish_step = acceptance_job.split(
         "      - name: Publish redacted acceptance summary\n", maxsplit=1
     )[1]
     assert "if: always()" in publish_step
-    assert "sudo --non-interactive cat artifacts/acceptance/acceptance.md" in publish_step
+    assert (
+        "report=/usr/local/lib/heyi-acceptance/source/artifacts/acceptance/acceptance.md"
+        in publish_step
+    )
+    assert 'sudo --non-interactive cat "$report"' in publish_step
     assert "hashFiles('artifacts/acceptance/acceptance.md')" not in publish_step
 
 
