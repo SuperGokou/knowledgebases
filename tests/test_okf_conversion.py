@@ -667,7 +667,11 @@ async def test_active_okf_egress_lease_blocks_stale_worker_reclaim() -> None:
 
 
 @pytest.mark.asyncio
-async def test_binary_format_is_not_sent_to_model() -> None:
+async def test_binary_format_is_not_sent_to_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.services.okf_conversion.parser_capabilities",
+        lambda: {".pdf": False},
+    )
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
