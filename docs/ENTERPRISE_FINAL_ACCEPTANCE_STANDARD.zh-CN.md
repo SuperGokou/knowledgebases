@@ -94,34 +94,56 @@
 
 ## 6. 自动化入口
 
-```powershell
-$env:UV_NO_SYNC = '1'
-$env:PYTHONPATH = (Get-Location).Path
-uv run --no-sync python scripts/acceptance.py `
-  --profile final `
-  --host-disk-path /srv `
-  --host-io-evidence /srv/heyi-knowledgebases-offline/evidence/host-io.json `
-  --storage-chain-evidence /srv/heyi-knowledgebases-offline/evidence/watermark-chain.json `
-  --offline-runtime-env-file /srv/heyi-knowledgebases-offline/shared/runtime.env `
-  --offline-release-env-file /srv/heyi-knowledgebases-offline/releases/<content-sha>/release.env `
-  --offline-image-manifest /srv/heyi-knowledgebases-offline/evidence/offline-images.txt `
-  --offline-runtime-evidence /srv/heyi-knowledgebases-offline/evidence/offline-runtime/offline-runtime-evidence.json `
-  --e2e-evidence /srv/heyi-knowledgebases-offline/evidence/browser-e2e.json `
-  --functional-trust-store /etc/heyi-acceptance/functional-trust.json `
-  --functional-challenge-store /var/lib/heyi-acceptance/challenges `
-  --e2e-signing-key-path /etc/heyi-acceptance/browser-e2e-ed25519.key `
-  --e2e-signing-key-id browser-e2e-ed25519 `
-  --malware-evidence /srv/heyi-knowledgebases-offline/evidence/malware.json `
-  --security-scan-evidence /srv/heyi-knowledgebases-offline/evidence/security-scan.json `
-  --release-id <immutable-release-id> `
-  --capacity-evidence /srv/heyi-knowledgebases-offline/evidence/capacity/enterprise-capacity.json `
-  --capacity-evidence-signature /srv/heyi-knowledgebases-offline/evidence/capacity/enterprise-capacity.sig `
-  --capacity-evidence-public-key /etc/heyi-acceptance/operational-ed25519.pub `
-  --disaster-recovery-evidence /srv/heyi-knowledgebases-offline/evidence/dr/enterprise-disaster-recovery.json `
-  --disaster-recovery-evidence-signature /srv/heyi-knowledgebases-offline/evidence/dr/enterprise-disaster-recovery.sig `
-  --disaster-recovery-evidence-public-key /etc/heyi-acceptance/operational-ed25519.pub `
-  --report-dir artifacts/acceptance/final
+```bash
+sudo -H bash <<'ROOT'
+set -euo pipefail
+umask 077
+
+RELEASE='/srv/heyi-knowledgebases-offline/releases/REPLACE_WITH_CONTENT_SHA'
+RUNTIME_ENV='/srv/heyi-knowledgebases-offline/shared/runtime.env'
+RELEASE_ENV="$RELEASE/release.env"
+EVIDENCE_ROOT='/srv/heyi-knowledgebases-offline/evidence'
+TRUST_ROOT='/etc/heyi-acceptance'
+RELEASE_ID='REPLACE_WITH_IMMUTABLE_RELEASE_ID'
+NODE_EXECUTABLE='/usr/local/lib/heyi-acceptance/node'
+
+test -d "$RELEASE/.git" || test -f "$RELEASE/.git"
+test "$RELEASE_ID" != 'REPLACE_WITH_IMMUTABLE_RELEASE_ID'
+cd -- "$RELEASE"
+
+install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
+install -o root -g root -m 0755 "$(command -v node)" "$NODE_EXECUTABLE"
+
+PYTHONPATH="$RELEASE" /usr/bin/python3 scripts/acceptance.py \
+  --profile final \
+  --host-disk-path /srv \
+  --host-io-evidence "$EVIDENCE_ROOT/host-io.json" \
+  --storage-chain-evidence "$EVIDENCE_ROOT/watermark-chain.json" \
+  --offline-runtime-env-file "$RUNTIME_ENV" \
+  --offline-release-env-file "$RELEASE_ENV" \
+  --offline-runtime-evidence "$EVIDENCE_ROOT/offline-runtime/offline-runtime-evidence.json" \
+  --e2e-evidence "$EVIDENCE_ROOT/browser-e2e.json" \
+  --functional-trust-store "$TRUST_ROOT/functional-trust.json" \
+  --functional-challenge-store /var/lib/heyi-acceptance/challenges \
+  --e2e-signing-key-path "$TRUST_ROOT/browser-e2e-ed25519.key" \
+  --e2e-signing-key-id browser-e2e-ed25519 \
+  --malware-evidence "$EVIDENCE_ROOT/malware.json" \
+  --security-scan-evidence "$EVIDENCE_ROOT/security-scan.json" \
+  --release-id "$RELEASE_ID" \
+  --capacity-evidence "$EVIDENCE_ROOT/capacity/enterprise-capacity.json" \
+  --capacity-evidence-signature "$EVIDENCE_ROOT/capacity/enterprise-capacity.sig" \
+  --capacity-evidence-public-key "$TRUST_ROOT/operational-ed25519.pub" \
+  --disaster-recovery-evidence "$EVIDENCE_ROOT/dr/enterprise-disaster-recovery.json" \
+  --disaster-recovery-evidence-signature "$EVIDENCE_ROOT/dr/enterprise-disaster-recovery.sig" \
+  --disaster-recovery-evidence-public-key "$TRUST_ROOT/operational-ed25519.pub" \
+  --supply-chain-attestation "$TRUST_ROOT/release-rights-attestation.json" \
+  --supply-chain-artifact-root "$EVIDENCE_ROOT/supply-chain" \
+  --node-executable "$NODE_EXECUTABLE" \
+  --report-dir "$RELEASE/artifacts/acceptance/final"
+ROOT
 ```
+
+上面是 `final` Profile 的唯一完整入口示例；只需替换发布目录名和与容量/灾备签名信封一致的 `RELEASE_ID`。镜像清单不单独传参，验收器只从 `"$RELEASE_ENV.images"` 派生；若为兼容调用显式提供 `--offline-image-manifest`，其值也必须逐字等于该路径。`--supply-chain-attestation` 中的发布身份必须绑定当前 Git HEAD，而 `--release-id` 必须同时匹配容量与灾备证据中的不可变发布令牌。
 
 `final` Profile 必须在目标 Linux 主机执行，并把 `HOST-P0-001` 作为 P0。脚本只读取操作系统、架构、CPU、内存和指定路径所在文件系统，不读取 `.env`、IP 或凭据。Windows 或非目标环境返回 `blocked` 和退出码 2；目标 Linux 不符合规格返回退出码 1；通过返回 0。存在任何 P0 `failed/blocked` 时最终 verdict 必须为 `FAIL`。
 
@@ -130,6 +152,8 @@ uv run --no-sync python scripts/acceptance.py `
 `E2E-P0-001` 固定运行 enterprise Profile，必须运行 24 项企业桌面/移动业务检查（每个项目 12 项，包含严格 TLS 身份与有效期验证）以及桌面、移动各 1 项失败关闭预检，共 26 个测试实例；默认 4 项 Smoke 不能满足终验。Playwright 退出 0 后仍必须通过 `scripts.functional_acceptance` 对唯一 `EXT-BROWSER-E2E-001` 执行正式 `ed25519-challenge-v1` 验签并原子消费一次性 challenge；只有两步都成功才可通过。缺拓扑、缺证据、SHA-only、自签名、签名/指纹/工件不匹配或 challenge 重放均为 `blocked`，普通业务断言失败为 `failed`。签名私钥路径、固定 key id 和选中的 browser challenge 文件只通过显式子进程环境 `KB_E2E_SIGNING_KEY_PATH`、`KB_E2E_SIGNING_KEY_ID`、`KB_E2E_CHALLENGE_PATH` 交给 reporter，不读取项目 `.env`、不输出私钥内容。
 
 `--functional-trust-store` 必须是仓库外 root 所有的 `0400/0600` 非符号链接普通文件；`--functional-challenge-store` 必须是仓库外 root 所有的 `0700` 非符号链接目录，内部 challenge 为 `0400/0600` 普通文件；`--e2e-signing-key-path` 同样必须是仓库外 root 所有的受保护普通文件。`HOST-P0-001` 和 `STORAGE-WATERMARK-P0-001` 分别以模块入口消费显式的 `--host-io-evidence` 与 `--storage-chain-evidence`。`OFFLINE-P0-001` 必须先以 root 执行 `preflight-offline.sh`，`OFFLINE-IMAGES-P0-001` 再执行 `verify-offline-images.sh verify`；`OFFLINE-RUNTIME-P0-001` 独立验签 `--offline-runtime-evidence` 中的断网冷启动、业务闭环、持久化和网络恢复证据。只完成 RepoDigest、Compose 渲染或单元测试 fake runner 不能通过离线终验。`FORMAT-P0-001` 必须在内容寻址 API 镜像内执行 `python -m app.document_parser_preflight --require-all`；缺少 PDF/旧版 Office 工具或隔离沙箱时返回码 2 并记为 `blocked`。
+
+`--node-executable` 必须指向仓库外的绝对规范路径。`final`/`ci` 会要求该 Node 普通文件及全部祖先目录由 root 所有、不可被组或其他用户写入，并拒绝符号链接；验收器在净化子进程环境前计算可执行文件 SHA-256，再把规范路径和摘要传给功能验收器，并在实际启动 Node 前复核文件身份与摘要。绑定缺失、路径不可信或运行期间被替换时，`FUNCTIONAL-P0-001` 必须 `blocked`。
 
 所有目标证据路径必须由命令行显式给出为 Linux 绝对路径。验收器不读取开发机 `.env` 推断路径或秘密；输入证据在运行前必须存在且是非符号链接的普通文件，下游验证器还会核对数据挂载、采集范围、原始工件哈希与目标内容指纹。离线运行态证据还必须来自 `subprocess-v1`、`result=passed`，匹配当前 Git、内容和同一次 Linux 启动的主机指纹，全部 11 项检查与原始工件 SHA-256/字节数/整体 attestation 均有效且不超过 24 小时。缺参数、Windows、非 root、test-only/fake、证据缺失或证据不属于目标运行均为 `blocked`，不得误报 `PASS`。`MALWARE-P0-001` 与 `SECURITY-SCAN-P0-001` 使用内容寻址的正式证据文档，并要求目标 Git/工作树内容指纹完全匹配。证据格式见 [终验正式证据格式](./ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md)。
 

@@ -49,6 +49,7 @@
 | [断网冷启动验收](./OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md) | 无 GitHub、Vercel、COS、公共 Registry/npm/PyPI 依赖的真实冷启动证据 |
 | [主机隔离守卫](./HOST_ISOLATION_GUARD.zh-CN.md) | 防止部署影响同机其他应用和越界修改宿主资源 |
 | [主机与存储验收](./HOST_STORAGE_ACCEPTANCE.zh-CN.md) | 8C16G/300GB、SSD、fio、水位与证据格式 |
+| [Linux 主机正式证据采集器](./LINUX_HOST_EVIDENCE_COLLECTOR.zh-CN.md) | `EXT-LINUX-HOST-001` 的 root 采集、一次性 challenge、Ed25519 签名、TLS/CA 持久化与续期证据操作手册 |
 | [旧离线部署纳管](./LEGACY_OFFLINE_ADOPTION.zh-CN.md) | 对既有部署进行失败关闭的受控接管 |
 
 > [!NOTE]

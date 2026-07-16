@@ -1,11 +1,11 @@
-# 腾讯云隔离部署运行手册
+# 国内云 Linux 隔离部署运行手册
 
 本目录提供两套互不覆盖的编排：
 
 - `compose.yml`：现有共享主机部署，数据层使用受管服务；
 - `compose.offline.yml`：8 核 16G、300 GB SSD 的单机隔离环境，PostgreSQL、Redis 与 MinIO 全部部署在本机。默认 `KB_LLM_EGRESS_MODE=strict_offline`，不创建公网模型出口；只有完成数据出境、供应商、固定目的地、费用/配额和 L3/L4 出口审批后，才允许切换为 `controlled_gateway`。
 
-离线企业方案必须先阅读[腾讯云 8 核 16G 离线企业部署](../../docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。它使用独立项目名 `heyi-kb-offline`、独立端口 `19443/19444` 和独立数据目录，不会修改当前 `heyi-kb-prod` 或其他应用。终端信任、根证书分发、严格验收和轮换操作见[内网 TLS 与 Caddy 内部 CA 运维手册](../../docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)。
+离线企业方案必须先阅读[通用 Linux 8 核 16G 离线企业部署](../../docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。它使用独立项目名 `heyi-kb-offline`、独立端口 `19443/19444` 和独立数据目录，不会修改当前 `heyi-kb-prod` 或其他应用。终端信任、根证书分发、严格验收和轮换操作见[内网 TLS 与 Caddy 内部 CA 运维手册](../../docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)。
 
 > [!IMPORTANT]
 > 目标发布的安装清理、升级和维护切换对业务写入者使用 150 秒优雅停机预算；旧栈 `prepare`、`retire` 与恢复使用 140 秒。两者都覆盖单次 45 秒模型调用及 95/105 秒端到端清算链，避免正常变更过早发送 `SIGKILL`，从而留下无法判定的模型用量。运维时不得使用 `docker kill`、`docker rm -f` 或缩短预算。
@@ -15,7 +15,7 @@
 
 `compose.yml` 用于保留的共享主机/受管数据层部署；`compose.offline.yml` 则把 Web、API、维护任务、反向代理、PostgreSQL、Redis、MinIO 与 ClamAV 全部纳入本机隔离项目。两套入口、环境文件和数据边界不能混用。
 
-同一台服务器继续部署其他应用前，必须先阅读并填写[腾讯云共享服务器应用部署基线](../../docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)中的资源登记、预检与回滚清单。本应用已经占用 Compose 项目名 `heyi-kb-prod`、目录 `/srv/heyi-knowledgebases` 和 `18443/tcp`，其他应用不得复用。
+同一台服务器继续部署其他应用前，必须先阅读并填写[共享服务器应用部署基线](../../docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)中的资源登记、预检与回滚清单。本应用已经占用 Compose 项目名 `heyi-kb-prod`、目录 `/srv/heyi-knowledgebases` 和 `18443/tcp`，其他应用不得复用。
 
 ## `compose.yml` 共享主机边界
 

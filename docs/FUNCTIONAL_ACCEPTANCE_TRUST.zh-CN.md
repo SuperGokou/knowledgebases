@@ -10,12 +10,23 @@
 
 私钥不得进入仓库、镜像、`.env`、日志或验收工件。公钥轮换必须更新独立策略并重新固定策略 digest，且接受双人复核。
 
+前端测试使用的 Node 也属于信任边界。正式 `final`/`ci` 必须把 Node 固定为仓库外、root 所有、非符号链接、不可被组或其他用户写入的绝对规范路径；其全部祖先目录同样必须由 root 所有且不可被组或其他用户写入。顶层 `scripts.acceptance` 会对该文件做无跟随打开与 SHA-256 绑定，只把规范路径、摘要和 root 所有权要求传入功能验收子进程；子进程在执行每个 Node 命令前重新核对元数据和摘要，防止 PATH 劫持、符号链接替换或运行中换包。
+
+直接调用 `scripts.functional_acceptance` 时必须同时提供 Node 路径、SHA-256 和 root 所有权标志，不能只传路径或依赖可写 PATH。任一字段缺失、文件位于仓库内、存在可写祖先、摘要不匹配或文件被替换时，运行必须失败关闭；Node 二进制本身不得复制进验收证据包。
+
 目标 Linux 主机调用示例：
 
 ```bash
-python -m scripts.functional_acceptance \
+test "$(id -u)" -eq 0
+NODE_EXECUTABLE=/usr/local/lib/heyi-acceptance/node
+NODE_SHA256=$(sha256sum "$NODE_EXECUTABLE" | awk '{print $1}')
+
+/usr/bin/python3 -m scripts.functional_acceptance \
   --profile runtime-functional \
   --run-tests \
+  --node-executable "$NODE_EXECUTABLE" \
+  --node-executable-sha256 "$NODE_SHA256" \
+  --node-executable-require-root-owner \
   --trust-store /etc/heyi-acceptance/collector-public-keys.json \
   --challenge-store /var/lib/heyi-acceptance/challenges \
   --json

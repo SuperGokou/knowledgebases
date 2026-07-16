@@ -6,6 +6,12 @@
 
 正式证据中的 `target.git_head` 与 `target.content_fingerprint` 必须和验收时工作树完全一致。内容指纹由 Git HEAD、tracked binary diff SHA-256 和未跟踪文件名/内容清单 SHA-256 组合计算。最终报告只保存哈希和状态计数，不披露文件名或文件内容。工作树非干净状态时，即使其他 Gate 全部成功，`final` 仍为 `FAIL`。
 
+## 可信 Node 执行器绑定
+
+浏览器与前端测试的执行器不是不受控的 PATH 依赖。顶层 `scripts/acceptance.py --profile final` 必须通过 `--node-executable` 选择仓库外的绝对规范路径；在 Linux `final`/`ci` 中，该 Node 普通文件及其全部祖先目录必须由 root 所有、不可被组或其他用户写入，且任何符号链接都会被拒绝。验收器在净化子进程环境前以无跟随方式打开文件、核对元数据并计算 SHA-256，再把规范路径、摘要和 root 所有权要求传给 `scripts.functional_acceptance`；功能验收器会在真正执行 Node 前重新验证同一绑定。
+
+Node 二进制、可执行文件内容和可写 PATH 不属于正式证据包，也不得由证据 JSON 指定。绑定不完整、摘要变化、文件替换、仓库内路径或不安全权限均使 `FUNCTIONAL-P0-001` 保持 `blocked`，不能用已有 JUnit/Vitest JSON 或人工声明绕过。
+
 ## 恶意文件链路证据
 
 ```json

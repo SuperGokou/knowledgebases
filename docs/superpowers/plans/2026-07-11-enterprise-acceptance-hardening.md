@@ -47,7 +47,7 @@ Cover authentication, RBAC, knowledge ACL, quota/rate limits, upload/approval/do
 - [ ] **Step 3: Add a README entry**
 
 ```markdown
-[企业验收标准](docs/ENTERPRISE_ACCEPTANCE_STANDARD.zh-CN.md)：P0/P1/P2 发布门禁、测试方法、证据要求与判定规则。
+[企业验收标准](../../ENTERPRISE_ACCEPTANCE_STANDARD.zh-CN.md)：P0/P1/P2 发布门禁、测试方法、证据要求与判定规则。
 ```
 
 - [ ] **Step 4: Verify documentation integrity**
