@@ -1,7 +1,7 @@
 <div align="center">
   <h1>企业浏览器验收套件</h1>
   <p><strong>面向真实预生产拓扑的双端业务闭环、故障韧性与可审计证据采集。</strong></p>
-  <p>真实认证 · 动态 RBAC · 知识授权 · 文件处理 · 可溯源问答 · 模型降级 · API Key 边界</p>
+  <p>真实认证 · 动态 RBAC · 知识授权 · 文件处理 · 可溯源问答 · 审计导出 · 模型降级 · API Key 边界</p>
 </div>
 
 > [!IMPORTANT]
@@ -16,13 +16,21 @@
 | `login_role_routing` | 统一登录、管理员/普通成员/无权限账号按角色落地 |
 | `account_lifecycle` | 创建、重复冲突、角色撤销、停用、他人改密仅限超级管理员、自改验证当前密码并退出、旧凭据与旧会话失效、角色编辑/删除、占用保护、系统角色只读与并发版本冲突 |
 | `knowledge_acl` | 知识库授权、可见性与撤权后即时拒绝 |
-| `file_upload_scan_okf_approval_download` | 直传、扫描、OKF、审批、下载内容校验 |
+| `file_upload_scan_okf_approval_download` | 直传、扫描、OKF、可见审批按钮、可见下载按钮、对象源/文件名/字节数/SHA-256 校验 |
 | `chat_citations_audit_table` | 引用来源、无答案、审核拒绝、数据表与表格来源 |
 | `model_switch` | 已配置模型切换、真实调用、故障降级与恢复 |
+| `model_deepseek_success` | DeepSeek 返回精确 provider/model、RAG、语义审核通过与有效引用 |
+| `model_qwen_success` | Qwen 返回精确 provider/model、RAG、语义审核通过与有效引用 |
+| `model_minimax_success` | MiniMax 返回精确 provider/model、RAG、语义审核通过与有效引用 |
 | `api_key_lifecycle` | 一次性密钥、知识库 scope、限流、撤销后 401 |
-| `error_loading_states` | loading、401、403、409、429、5xx、超时 |
+| `audit_log_query_export` | 独立 55 条数据集筛选、50/5 游标分页与回退、UI CSV 下载、BOM/RFC 4180/8 列/脱敏、>5,000 条 422、撤权后的导航/路由/UI/HTTP 拒绝 |
+| `error_loading_states` | loading、401、403、409、429、5xx、超时；401/403/5xx/超时必须在页面显示错误与重试入口 |
+| `tls_ca_trust` | Node 系统信任链严格验证，禁止跳过 CA 校验 |
+| `tls_san_identity` | Web、API 与对象存储证书必须含匹配目标主机的 SAN |
+| `tls_validity_and_renewal` | 三个入口叶证书必须处于有效窗口、`notBefore` 时钟偏差不超过 5 分钟、剩余不少于 1 小时、完整生命周期与签发链合理；Caddy CA 持久化及自动证书管理/续期健康必须由 `EXT-LINUX-HOST-001` 正式主机证据单独证明 |
+| `tls_strict_client` | 仅允许协商 TLS 1.2 或 TLS 1.3；独立硬墙钟超时不受滴流活动重置，错误脱敏且 socket 只关闭一次 |
 
-上表是 **8 个证据聚合组**，不是 Playwright 的测试实例数量。正式 collection 固定为每个项目 11 个实例（10 个业务场景 + 1 个失败关闭预检），在 `enterprise-desktop` 与 `enterprise-mobile` 两个项目中合计 **22 个实例**。每个聚合组必须从真实实例结果生成截图、可访问性结果、控制台与网络异常摘要；任一项目、实例或必需工件缺失，证据采集器不会签发 `passed`。
+上表是 **16 个证据检查 ID**，不是 Playwright 的测试实例数量。正式 collection 固定为每个项目 13 个实例（12 个业务场景 + 1 个失败关闭预检），在 `enterprise-desktop` 与 `enterprise-mobile` 两个项目中合计 **26 个实例**。每个检查 ID 必须从真实实例结果生成截图、可访问性结果、控制台与网络异常摘要；任一项目、实例或必需工件缺失，证据采集器不会签发 `passed`。
 
 ## 运行档案
 
@@ -45,11 +53,14 @@ $env:KB_E2E_DOCUMENT_FIXTURE_MANIFEST = "C:\\acceptance\\document-fixtures\\docu
 $env:KB_E2E_SIGNING_KEY_PATH = "/etc/heyi-acceptance/private/browser-e2e-ed25519.pem"
 $env:KB_E2E_CHALLENGE_PATH = "/var/lib/heyi-acceptance/challenges/<challenge-id>.json"
 $env:KB_E2E_RUN_ID = "acceptance-20260714-a001"
+$env:KB_E2E_AUDIT_PAGE_ACTION = "e2e.acceptance.audit.page.<run-tag>"
+$env:KB_E2E_AUDIT_OVERSIZED_ACTION = "e2e.acceptance.audit.oversized.<run-tag>"
+$env:KB_E2E_AUDIT_REDACTION_SENTINEL = "E2E_REDACT_<run-tag>"
 
 npm run test:e2e
 ```
 
-`KB_E2E_OBJECTS_ORIGIN` 为必填项，必须配置为唯一且纯净的绝对 HTTP(S) 源（origin），不得包含用户名、密码、路径、查询参数或片段。所有签名下载 URL 的源必须与其精确一致，并且测试会拒绝任何重定向。
+`KB_E2E_OBJECTS_ORIGIN` 为必填项，必须配置为唯一且纯净的绝对 HTTPS 源（origin），不得包含用户名、密码、路径、查询参数或片段。所有签名下载 URL 的源必须与其精确一致，并且测试会拒绝任何重定向。
 
 补充变量：
 
@@ -59,6 +70,9 @@ npm run test:e2e
 | `KB_E2E_TEST_TIMEOUT_MS` | Playwright 单项企业测试上限，最低 60 秒，默认 30 分钟 |
 | `KB_E2E_SUITE_TIMEOUT_MS` | 正式验收器执行整套企业 E2E 的上限，默认 2 小时；允许 30 分钟至 12 小时，且不得短于单项测试上限 |
 | `KB_E2E_RUN_ID` | **必填**。8–80 位字母、数字、`_`、`-`，用于隔离并追踪所有合成数据；缺失或格式错误时 fail-closed |
+| `KB_E2E_AUDIT_PAGE_ACTION` | **必填**。本次运行专用且只对应 55 条审计事件的动作名；必须与其他验收运行隔离 |
+| `KB_E2E_AUDIT_OVERSIZED_ACTION` | **必填**。本次运行专用且对应超过 5,000 条审计事件的动作名；与分页动作名相同会 fail-closed |
+| `KB_E2E_AUDIT_REDACTION_SENTINEL` | **必填**。预置在审计详情/IP 等禁止导出字段中的无敏感哨兵；页面和 CSV 出现该值即失败 |
 | `KB_E2E_MULTIPART_BYTES` | 真实 Multipart 载荷字节数，必须为 100 MiB–512 MiB，并且必须达到目标拓扑的 Multipart 阈值 |
 | `KB_E2E_DOCUMENT_FIXTURE_ROOT` | 九格式黄金样本的绝对专用目录；不得指向生产上传目录 |
 | `KB_E2E_DOCUMENT_FIXTURE_MANIFEST` | 由离线生成器产生并通过 SHA-256 验证的 v1 清单绝对路径 |
@@ -70,6 +84,12 @@ npm run test:e2e
 
 > [!CAUTION]
 > 不要把任何真实员工账号、生产密钥或企业文档用于此套件。目标环境必须是一次性或可清理的预生产数据集；Playwright 企业档案关闭 trace 与 video，避免把一次性 API Key 写入工件。
+
+### 审计专用数据集
+
+验收操作员必须在运行前用受控离线工具预置两个与 `KB_E2E_RUN_ID` 唯一绑定的数据集：`KB_E2E_AUDIT_PAGE_ACTION` 精确对应 55 条可导出事件，`KB_E2E_AUDIT_OVERSIZED_ACTION` 对应至少 5,001 条事件。55 条数据集用于证明第一页 50 条、第二页 5 条及返回上一页；大数据集必须让真实导出接口返回 `422 / audit_export_too_large`。`KB_E2E_AUDIT_REDACTION_SENTINEL` 只能写入详情、来源 IP 等禁止展示/导出字段。
+
+任一动作不存在、数量不精确、数据串入其他运行、超大数据集未触发 422，测试都会产生 `E2E_BLOCKED`。套件不会临时生成、复制或截断数据来伪造边界条件。
 
 ## 合成数据生命周期
 
@@ -95,7 +115,15 @@ Content-Type: application/json
 {"mode":"provider_5xx"}
 ```
 
-允许模式：`normal`、`provider_5xx`、`provider_timeout`、`review_reject`、`table_response`、`backend_5xx`、`backend_timeout`。控制面还应提供只含计数、状态与时间的脱敏证据，不得返回提示词、文档正文、凭据或完整内部 URL。
+允许模式：`normal`、`provider_5xx`、`provider_timeout`、`review_reject`、`table_response`、`backend_5xx`、`backend_timeout`。其中后台 5xx/超时模式必须作用于已登录页面的知识空间查询，测试会确认错误文案与重试按钮可见，再恢复 `normal` 并通过同一按钮验证请求恢复。控制面还应提供只含计数、状态与时间的脱敏证据，不得返回提示词、文档正文、凭据或完整内部 URL；测试异常也不会转述底层连接错误。
+
+故障控制令牌只允许放在 `Authorization: Bearer` 请求头。非 loopback 控制面必须使用 HTTPS；只有显式 `localhost`、`127.0.0.0/8` 或 `::1` 可在本机验收时使用 HTTP，私网 IP 也不能绕过此规则。
+
+## TLS 短期证书与续期证据
+
+Caddy `tls internal` 使用短期叶证书并自动管理续期，因此不能用“剩余 30 天”作为通过条件。浏览器套件只证明当前三个入口的严格信任、SAN、协议、有效窗口、1 小时安全余量、合理完整生命周期及签发链；附件中的 `assertion_source` 固定为 `formal_host_evidence_not_socket_probe`。
+
+自动续期不是一次 TLS 握手能够证明的事实。正式结论还必须同时具备 `EXT-LINUX-HOST-001`，由目标 Linux 主机采集器验证 Caddy `/data` 使用持久绑定、内部 CA 跨重启保持一致、自动证书管理已启用且续期健康。该主机证据缺失或失败时，整体运行时验收仍为 `BLOCKED`，即使浏览器 TLS 探针通过也不能宣称续期已验收。
 
 ## 证据与判定
 
@@ -114,7 +142,8 @@ challenge 必须由验收方预先签发，并精确绑定本次 `EXT-BROWSER-E2
   "status": "issued",
   "target": {
     "git_head": "<40-64位Git HEAD>",
-    "content_fingerprint": "<64位内容指纹>"
+    "content_fingerprint": "<64位内容指纹>",
+    "run_id": "acceptance-20260714-a001"
   }
 }
 ```
@@ -127,7 +156,7 @@ challenge 必须由验收方预先签发，并精确绑定本次 `EXT-BROWSER-E2
 
 诊断结果只有三种：
 
-- `passed`：22 个 Playwright 实例（11 个场景 × 桌面/移动）全部通过，8 个证据聚合组及质量工件齐全，代码身份可计算，并成功生成受信 Ed25519 challenge 签名。
+- `passed`：26 个 Playwright 实例（13 个场景 × 桌面/移动）全部通过，16 个证据检查 ID 及质量工件齐全，代码身份可计算，并成功生成受信 Ed25519 challenge 签名；TLS 自动续期仍需配套 `EXT-LINUX-HOST-001` 正式主机证据。
 - `failed`：真实场景、断言、可访问性、控制台或网络检查失败。
 - `blocked`：配置/拓扑缺失、场景未收集、项目/工件缺失、代码身份不可得或工作树不干净。
 

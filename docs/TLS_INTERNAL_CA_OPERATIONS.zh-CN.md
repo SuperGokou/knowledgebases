@@ -20,6 +20,10 @@
 | 信任对象 | 企业受管 Windows 终端、受控 Linux 客户端和自动化执行器 |
 | 网络边界 | 仅批准的 VPN/办公 CIDR；不占用或修改同机其他应用的 `80/443` |
 
+该主机路径来自 `compose.offline.yml` 的固定映射：`${KB_DATA_ROOT}/caddy-data` 挂载到 Caddy 容器 `/data`，而 Caddy 内部 CA 位于容器 `/data/caddy/pki/authorities/local`。当 `KB_DATA_ROOT=/srv/heyi-knowledgebases-offline/data` 时，唯一正确的主机目录就是 `/srv/heyi-knowledgebases-offline/data/caddy-data/caddy/pki/authorities/local`。旧栈接管必须从受保护的 Caddy bind 自动推导并比对该路径；仅仅“位于数据根之下”不构成有效证明。
+
+旧栈闭合接管的迁移前中止与恢复不得轮换、删除或重新生成该 CA。`offline-pre-migration-abort.py` 只能清理与接管事务精确绑定的目标预检资源，并明确保留 `/srv/heyi-knowledgebases-offline/data`；只有签名 `PRE_MIGRATION_ONLY` 中止收据、资源清零和主机零漂移均复验通过后，旧 proxy 才可按原 `caddy-data` bind 恢复。没有签名中止收据或 `migration_invoked` 已持久化时只能前向修复，不能用恢复旧 CA/旧 proxy 绕过数据库边界。
+
 ```mermaid
 flowchart LR
     Caddy["本项目 Caddy · 内部 CA"] -->|"仅导出 root.crt"| Staging["受控分发区"]
@@ -40,7 +44,7 @@ flowchart LR
 
 ## 3. 只导出公开根证书
 
-以下命令固定在本项目目录内，拒绝符号链接、重复变更号、意外路径和临近过期证书。它只创建一个名为 `root.crt` 的公开文件，不安装系统信任，也不复制任何私钥。
+以下命令固定在本项目目录内，拒绝符号链接、重复变更号、意外路径和临近过期证书。它只创建一个名为 `root.crt` 的公开文件，不安装系统信任，也不复制任何私钥。导出或备份路径不得省略 `caddy-data` 层级。
 
 先设置不含空格或路径分隔符的变更单号，再执行完整代码块：
 
@@ -743,6 +747,7 @@ if ($Remaining.Count -ne 0) {
 
 - [腾讯云隔离部署运行手册](../deploy/tencent/README.md)
 - [腾讯云 8 核 16G 离线企业部署](./TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)
+- [旧版离线栈安全接管与恢复证明](./LEGACY_OFFLINE_ADOPTION.zh-CN.md)
 - [腾讯云共享服务器应用部署基线](./TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)
 - [企业验收标准](./ENTERPRISE_ACCEPTANCE_STANDARD.zh-CN.md)
 

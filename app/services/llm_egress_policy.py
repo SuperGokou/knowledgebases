@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import ApiError
@@ -18,6 +18,7 @@ from app.db.models import (
 )
 from app.services.access import AccessService
 from app.services.knowledge_bases import require_knowledge_base_access
+from app.services.rbac_mutation import acquire_authorization_advisory_lock
 
 _LOCK_NAMESPACE = b"enterprise-kb:external-llm-egress:v1\0"
 
@@ -44,13 +45,8 @@ async def acquire_llm_egress_locks(
             for scope, resource_id in scopes
         }
     )
-    if session.get_bind().dialect.name != "postgresql":
-        return
     for lock_key, _, _ in keyed_scopes:
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_key)"),
-            {"lock_key": lock_key},
-        )
+        await acquire_authorization_advisory_lock(session, lock_key)
 
 
 async def external_llm_egress_allowed(
@@ -88,7 +84,7 @@ async def external_llm_egress_allowed(
         user = await session.scalar(
             select(User).where(User.id == user_id).execution_options(populate_existing=True)
         )
-        if user is None or user.status is not UserStatus.ACTIVE:
+        if user is None or user.status is not UserStatus.ACTIVE or user.retired_at is not None:
             await session.commit()
             return False
         current = await AccessService().resolve(session, user)

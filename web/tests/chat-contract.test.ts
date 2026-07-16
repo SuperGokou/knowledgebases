@@ -67,52 +67,85 @@ describe("parseChatReply", () => {
   });
 
   it.each([
-    { ...validReply, citations: null },
-    { ...validReply, provider: { name: "deepseek" } },
+    { caseName: "null citations", payload: { ...validReply, citations: null } },
     {
+      caseName: "object provider",
+      payload: { ...validReply, provider: { name: "deepseek" } },
+    },
+    {
+      caseName: "object citation source path",
+      payload: {
       ...validReply,
       citations: [{ ...validReply.citations[0], source_path: { unsafe: true } }],
+      },
     },
     {
-      ...validReply,
-      source_status: { ...validReply.source_status, citation_count: 9 },
+      caseName: "citation count mismatch",
+      payload: {
+        ...validReply,
+        source_status: { ...validReply.source_status, citation_count: 9 },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, rows: [["缺少第二列"]] },
+      caseName: "table row width mismatch",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, rows: [["缺少第二列"]] },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, citation_numbers: [99] },
+      caseName: "unknown table citation",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, citation_numbers: [99] },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, row_citation_numbers: [] },
+      caseName: "missing table row citations",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, row_citation_numbers: [] },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, row_citation_numbers: [[99]] },
+      caseName: "unknown table row citation",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, row_citation_numbers: [[99]] },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, row_citation_numbers: [[1, 1]] },
+      caseName: "duplicate table row citation",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, row_citation_numbers: [[1, 1]] },
+      },
     },
     {
-      ...validReply,
-      answer_review: { status: "passed", reason: "retrieval_only" },
+      caseName: "invalid passed review reason",
+      payload: {
+        ...validReply,
+        answer_review: { status: "passed", reason: "retrieval_only" },
+      },
     },
     {
-      ...validReply,
-      answer_review: { status: "unknown", reason: "semantic_verified" },
+      caseName: "unknown review status",
+      payload: {
+        ...validReply,
+        answer_review: { status: "unknown", reason: "semantic_verified" },
+      },
     },
-  ])("rejects malformed successful JSON before React renders it", (payload) => {
+  ])(
+    "rejects malformed successful JSON before React renders it: $caseName",
+    ({ payload }) => {
     expect(() => parseChatReply(payload)).toThrowError(ApiClientError);
     try {
       parseChatReply(payload);
     } catch (error) {
       expect(error).toMatchObject({ status: 502, code: "invalid_chat_response" });
     }
-  });
+    },
+  );
 
   it("accepts the pre-upgrade table contract without a row evidence map", () => {
     const legacyTable = { ...validReply.table };

@@ -1,6 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
-import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
+import type {
+  APIRequestContext,
+  Download,
+  Page,
+  Response as PlaywrightResponse,
+  TestInfo,
+} from "@playwright/test";
 
 import {
   bffRequest,
@@ -8,7 +14,9 @@ import {
   loginAs,
   test,
 } from "./support/enterprise-fixtures";
+import { parseRfc4180Csv } from "./support/audit-csv";
 import {
+  probeEnterpriseTlsOrigin,
   validateObjectDownloadUrl,
   type EnterpriseConfig,
   type FaultMode,
@@ -52,6 +60,56 @@ function row(value: unknown, operation: string): Row {
     throw new Error(`${operation}: invalid response contract`);
   }
   return value as Row;
+}
+
+function isAuditListResponse(response: PlaywrightResponse, action: string): boolean {
+  if (response.request().method() !== "GET") return false;
+  const url = new URL(response.url());
+  return url.pathname === "/api/backend/api/v1/audit-logs"
+    && url.searchParams.get("action") === action;
+}
+
+function isAuditExportResponse(response: PlaywrightResponse, action: string): boolean {
+  if (response.request().method() !== "GET") return false;
+  const url = new URL(response.url());
+  return url.pathname === "/api/backend/api/v1/audit-logs/export"
+    && url.searchParams.get("action") === action;
+}
+
+function requireAuditFixturePage(
+  value: unknown,
+  action: string,
+  expectedRows: number,
+  expectsNextCursor: boolean,
+): { readonly items: Row[]; readonly nextCursor: number | null } {
+  const body = row(value, `audit fixture ${action}`);
+  if (!Array.isArray(body.items)) {
+    throw new Error(`E2E_BLOCKED: dedicated audit fixture ${action} returned no item list`);
+  }
+  const items = body.items.map((item) => row(item, `audit fixture ${action} item`));
+  const nextCursor = body.next_cursor;
+  const cursorIsValid = nextCursor === null || Number.isSafeInteger(nextCursor);
+  if (
+    items.length !== expectedRows
+    || !cursorIsValid
+    || (expectsNextCursor ? nextCursor === null : nextCursor !== null)
+    || items.some((item) => item.action !== action)
+  ) {
+    throw new Error(
+      `E2E_BLOCKED: dedicated audit fixture ${action} is not the required isolated dataset`,
+    );
+  }
+  return { items, nextCursor: nextCursor as number | null };
+}
+
+async function readDownloadPayload(download: Download): Promise<Buffer> {
+  const stream = await download.createReadStream();
+  if (!stream) throw new Error("audit CSV browser download stream is unavailable");
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 function roleAssignmentVersion(user: Row, operation: string): number {
@@ -286,8 +344,8 @@ async function setFaultMode(
       throw new Error(`HTTP ${response.status()}`);
     }
   } catch (error) {
-    const reason = error instanceof Error ? error.message.slice(0, 120) : "unavailable";
-    throw new Error(`E2E_BLOCKED: fault controller ${mode} unavailable (${reason})`);
+    void error;
+    throw new Error(`E2E_BLOCKED: fault controller ${mode} is unavailable`);
   }
 }
 
@@ -393,7 +451,6 @@ async function sendChatQuestion(page: Page, question: string) {
 
 async function uploadApproveAndGroundFixture(
   page: Page,
-  request: APIRequestContext,
   enterprise: EnterpriseConfig,
   knowledgeBaseId: string,
   fixture: DocumentFixture,
@@ -425,24 +482,55 @@ async function uploadApproveAndGroundFixture(
       : `http-${conversion.status}`;
   }, { timeout: enterprise.jobTimeoutMs }).toBe("succeeded");
 
-  assertStatus(
-    (
-      await bffRequest(page, `/api/v1/files/${String(file.id)}/approve`, {
-        method: "POST",
-        body: {},
-      })
-    ).status,
-    200,
-    `approve ${fixture.extension}`,
-  );
+  const fileCenter = page.locator("article.panel").filter({
+    has: page.getByRole("heading", { name: "文件中心" }),
+  });
+  const refreshedFiles = page.waitForResponse((response) => {
+    if (response.request().method() !== "GET") return false;
+    const url = new URL(response.url());
+    return url.pathname.endsWith("/api/backend/api/v1/files")
+      && url.searchParams.get("offset") === "0";
+  });
+  await fileCenter.getByRole("button", { name: "刷新" }).click();
+  assertStatus((await refreshedFiles).status(), 200, `refresh ${fixture.extension} file state`);
 
-  const grant = await bffRequest<Row>(
-    page,
-    `/api/v1/files/${String(file.id)}/download`,
-    { method: "POST", body: {} },
+  const fileRow = fileCenter.locator("tbody tr").filter({ hasText: fixture.filename });
+  await expect(fileRow).toContainText("草稿待审核");
+  const approveButton = fileRow.getByRole("button", {
+    name: `审批文件：${fixture.filename}`,
+  });
+  await expect(approveButton).toBeEnabled();
+  const approvalResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST"
+      && new URL(response.url()).pathname.endsWith(
+        `/api/backend/api/v1/files/${String(file!.id)}/approve`,
+      ));
+  await approveButton.click();
+  assertStatus((await approvalResponse).status(), 200, `approve ${fixture.extension} through UI`);
+  await expect(fileRow).toContainText("已入知识库");
+
+  const downloadButton = fileRow.getByRole("button", { name: "下载", exact: true });
+  await expect(downloadButton).toBeVisible();
+  const grantResponsePromise = page.waitForResponse((response) =>
+    response.request().method() === "POST"
+      && new URL(response.url()).pathname.endsWith(
+        `/api/backend/api/v1/files/${String(file!.id)}/download`,
+      ),
   );
-  assertStatus(grant.status, 200, `create ${fixture.extension} download grant`);
-  const grantBody = row(grant.body, `${fixture.extension} download grant`);
+  const objectResponsePromise = page.waitForResponse((response) => {
+    if (response.request().method() !== "GET") return false;
+    try {
+      return new URL(response.url()).origin === enterprise.objectsOrigin;
+    } catch {
+      return false;
+    }
+  });
+  const browserDownloadPromise = page.waitForEvent("download");
+  await downloadButton.click();
+
+  const grantResponse = await grantResponsePromise;
+  assertStatus(grantResponse.status(), 200, `create ${fixture.extension} download grant through UI`);
+  const grantBody = row(await grantResponse.json(), `${fixture.extension} download grant`);
   const rawDownloadUrl = String(grantBody.url ?? "");
   const expiresIn = Number(grantBody.expires_in);
   if (
@@ -454,46 +542,62 @@ async function uploadApproveAndGroundFixture(
     throw new Error(`${fixture.extension} download grant contract is invalid`);
   }
   const downloadUrl = validateObjectDownloadUrl(rawDownloadUrl, enterprise.objectsOrigin);
-
-  const download = await request.get(downloadUrl, {
-    failOnStatusCode: false,
-    maxRedirects: 0,
-  });
+  const [objectResponse, browserDownload] = await Promise.all([
+    objectResponsePromise,
+    browserDownloadPromise,
+  ]);
+  assertStatus(objectResponse.status(), 200, `download ${fixture.extension} from object storage`);
+  const disposition = objectResponse.headers()["content-disposition"] ?? "";
+  const encodedFilename = /(?:^|;\s*)filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1]
+    ?.trim()
+    .replace(/^"(.*)"$/, "$1");
+  if (!encodedFilename) {
+    throw new Error(`${fixture.extension} download omitted an RFC 5987 filename`);
+  }
+  let responseFilename: string;
   try {
-    if (download.status() >= 300 && download.status() < 400) {
-      throw new Error(`${fixture.extension} download redirect was refused`);
-    }
-    assertStatus(download.status(), 200, `download ${fixture.extension}`);
-    const disposition = download.headers()["content-disposition"] ?? "";
-    const encodedFilename = /(?:^|;\s*)filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1]
-      ?.trim()
-      .replace(/^"(.*)"$/, "$1");
-    if (!encodedFilename) {
-      throw new Error(`${fixture.extension} download omitted an RFC 5987 filename`);
-    }
-    let downloadedFilename: string;
-    try {
-      downloadedFilename = decodeURIComponent(encodedFilename);
-    } catch {
-      throw new Error(`${fixture.extension} download returned an invalid encoded filename`);
-    }
-    if (downloadedFilename !== fixture.filename) {
-      throw new Error(
-        `${fixture.extension} download filename mismatch: expected ${fixture.filename}, received ${downloadedFilename}`,
-      );
-    }
-    const payload = await download.body();
-    if (payload.byteLength !== fixture.bytes) {
-      throw new Error(
-        `${fixture.extension} download size mismatch: expected ${fixture.bytes}, received ${payload.byteLength}`,
-      );
-    }
-    const downloadedSha256 = createHash("sha256").update(payload).digest("hex");
-    if (downloadedSha256 !== fixture.sha256) {
-      throw new Error(`${fixture.extension} download SHA-256 does not match the fixture manifest`);
-    }
-  } finally {
-    await download.dispose();
+    responseFilename = decodeURIComponent(encodedFilename);
+  } catch {
+    throw new Error(`${fixture.extension} download returned an invalid encoded filename`);
+  }
+  if (responseFilename !== fixture.filename) {
+    throw new Error(
+      `${fixture.extension} response filename mismatch: expected ${fixture.filename}, received ${responseFilename}`,
+    );
+  }
+  const observedObjectUrl = validateObjectDownloadUrl(
+    objectResponse.url(),
+    enterprise.objectsOrigin,
+  );
+  if (observedObjectUrl !== downloadUrl) {
+    throw new Error(`${fixture.extension} browser download did not use the signed object URL`);
+  }
+  if (browserDownload.url() !== objectResponse.url()) {
+    throw new Error(`${fixture.extension} browser download response identity changed unexpectedly`);
+  }
+  if (await browserDownload.failure()) {
+    throw new Error(`${fixture.extension} browser download failed`);
+  }
+  if (browserDownload.suggestedFilename() !== fixture.filename) {
+    throw new Error(
+      `${fixture.extension} download filename mismatch: expected ${fixture.filename}, received ${browserDownload.suggestedFilename()}`,
+    );
+  }
+  const stream = await browserDownload.createReadStream();
+  if (!stream) throw new Error(`${fixture.extension} browser download stream is unavailable`);
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const payload = Buffer.concat(chunks);
+  if (payload.byteLength !== fixture.bytes) {
+    throw new Error(
+      `${fixture.extension} download size mismatch: expected ${fixture.bytes}, received ${payload.byteLength}`,
+    );
+  }
+  const downloadedSha256 = createHash("sha256").update(payload).digest("hex");
+  if (downloadedSha256 !== fixture.sha256) {
+    throw new Error(`${fixture.extension} download SHA-256 does not match the fixture manifest`);
   }
 
   const searched = await bffRequest<Row>(
@@ -559,6 +663,42 @@ async function uploadApproveAndGroundFixture(
     throw new Error(`${fixture.extension} entry lost source identity or grounding token`);
   }
 }
+
+test("@enterprise TLS validates trusted identity and short-lived certificate renewal architecture", async ({ page, enterprise, quality }, testInfo) => {
+  void quality;
+  annotate(testInfo, "tls_ca_trust");
+  annotate(testInfo, "tls_san_identity");
+  annotate(testInfo, "tls_validity_and_renewal");
+  annotate(testInfo, "tls_strict_client");
+
+  const tlsEvidence = Object.fromEntries(
+    await Promise.all(
+      [
+        ["web", enterprise.baseUrl],
+        ["api", enterprise.publicApiOrigin],
+        ["objects", enterprise.objectsOrigin],
+      ].map(async ([name, origin]) => [name, await probeEnterpriseTlsOrigin(origin)] as const),
+    ),
+  );
+  const response = await page.goto("/login", { waitUntil: "domcontentloaded" });
+  assertStatus(response?.status() ?? 0, 200, "strict TLS login page");
+  await expect(page.getByLabel("工作邮箱")).toBeVisible();
+  await testInfo.attach("e2e-tls-validation", {
+    body: Buffer.from(JSON.stringify({
+      leaf_certificates: tlsEvidence,
+      renewal_evidence: {
+        evidence_id: "EXT-LINUX-HOST-001",
+        required_checks: [
+          "caddy_ca_persistent_storage",
+          "caddy_automatic_certificate_management",
+          "caddy_renewal_health",
+        ],
+        assertion_source: "formal_host_evidence_not_socket_probe",
+      },
+    })),
+    contentType: "application/json",
+  });
+});
 
 test("@enterprise unified login routes accounts by effective role", async ({ page, enterprise, quality }, testInfo) => {
   annotate(testInfo, "login_role_routing");
@@ -733,6 +873,35 @@ test("@enterprise account lifecycle rejects duplicates and revokes active access
     const reenabledPage = await quality.newIsolatedPage(enterprise.baseUrl);
     await loginAs(reenabledPage, resetCredentials);
     await expect(reenabledPage).toHaveURL(/\/chat(?:\?|$)/);
+
+    memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
+    await memberRow.getByRole("button", { name: "删除账号" }).click();
+    const retirementDialog = page.getByRole("dialog", {
+      name: new RegExp(`删除成员账号：.*${originalCredentials.email}`),
+    });
+    const confirmRetirement = retirementDialog.getByRole("button", { name: "确认删除账号" });
+    await expect(confirmRetirement).toBeDisabled();
+    await retirementDialog.getByLabel("确认成员邮箱").fill(`wrong-${originalCredentials.email}`);
+    await expect(confirmRetirement).toBeDisabled();
+    await retirementDialog.getByLabel("确认成员邮箱").fill(originalCredentials.email);
+    await retirementDialog.getByLabel(/退休原因/).fill("enterprise E2E lifecycle completion");
+    await expect(confirmRetirement).toBeEnabled();
+    const retiredResponse = page.waitForResponse(
+      (response) => response.request().method() === "DELETE"
+        && response.url().includes(`/api/v1/users/${userId}`),
+    );
+    await confirmRetirement.click();
+    assertStatus((await retiredResponse).status(), 204, "retire member through the admin UI");
+    await expect(page.getByRole("status")).toContainText("成员账号已安全退休");
+    memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
+    await expect(memberRow).toContainText("已退休");
+    await expect(memberRow.getByRole("button", { name: `修改密码 ${originalCredentials.email}` })).toBeDisabled();
+    await expect(memberRow.getByRole("button", { name: `分配角色 ${originalCredentials.email}` })).toBeDisabled();
+    await expect(memberRow.getByRole("button", { name: `删除账号 ${originalCredentials.email}` })).toBeDisabled();
+    const retiredSession = await bffRequest(reenabledPage, "/api/v1/auth/me");
+    expect([401, 403]).toContain(retiredSession.status);
+    const retiredLoginPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await expectLoginRejected(retiredLoginPage, resetCredentials);
   } finally {
     await cleanupSyntheticAccess(page, {
       users: [createdUser],
@@ -1232,7 +1401,6 @@ test("@enterprise all nine document formats complete scan, OKF, approval, retrie
   for (const fixture of enterpriseDocuments) {
     await uploadApproveAndGroundFixture(
       page,
-      request,
       enterprise,
       String(knowledgeBase.id),
       fixture,
@@ -1320,6 +1488,9 @@ test("@enterprise chat renders citations, no-answer, audited rejection and sourc
 test("@enterprise configured model switches and provider failure degrades safely", async ({ page, enterprise, request, quality }, testInfo) => {
   void quality;
   annotate(testInfo, "model_switch");
+  annotate(testInfo, "model_deepseek_success");
+  annotate(testInfo, "model_qwen_success");
+  annotate(testInfo, "model_minimax_success");
   await loginAdmin(page, enterprise);
   const listed = await bffRequest<Row>(page, "/api/v1/llm/providers");
   assertStatus(listed.status, 200, "list providers");
@@ -1336,9 +1507,15 @@ test("@enterprise configured model switches and provider failure degrades safely
     throw new Error("E2E_BLOCKED: DeepSeek, Qwen and MiniMax must all be configured");
   }
   await page.goto("/admin/api-models");
+  const knowledgeBaseId = requiredEnv("KB_E2E_SEEDED_KNOWLEDGE_BASE_ID");
   try {
+    await setFaultMode(request, enterprise, "normal");
     for (const provider of requiredProviders) {
       const label = provider === "deepseek" ? "DeepSeek" : provider === "qwen" ? "Qwen 通义千问" : "MiniMax";
+      const configuredProvider = providers.find((item) => item.provider === provider);
+      if (!configuredProvider || typeof configuredProvider.model !== "string") {
+        throw new Error(`E2E_BLOCKED: ${provider} model configuration is unavailable`);
+      }
       await page.getByRole("button", { name: new RegExp(label) }).click();
       const response = page.waitForResponse(
         (candidate) =>
@@ -1348,9 +1525,48 @@ test("@enterprise configured model switches and provider failure degrades safely
       await page.getByRole("button", { name: new RegExp(`保存并切换到 ${label}`) }).click();
       assertStatus((await response).status(), 200, `switch UI to ${provider}`);
       await expect(page.getByRole("status")).toContainText(`已切换到 ${label}`);
+
+      const generated = await bffRequest<Row>(page, "/api/v1/chat/query", {
+        method: "POST",
+        idempotencyKey: `e2e-${enterprise.runId}-${provider}-success`,
+        body: {
+          knowledge_base_id: knowledgeBaseId,
+          message: "请基于验收样本给出有来源的简短总结",
+          limit: 5,
+        },
+      });
+      assertStatus(generated.status, 200, `${provider} successful chat`);
+      const generatedBody = row(generated.body, `${provider} successful chat`);
+      expect(generatedBody.knowledge_base_id).toBe(knowledgeBaseId);
+      expect(generatedBody.provider).toBe(provider);
+      expect(generatedBody.model).toBe(configuredProvider.model);
+      expect(generatedBody.mode).toBe("rag");
+      expect(row(generatedBody.answer_review, "answer review")).toMatchObject({
+        status: "passed",
+        reason: "semantic_verified",
+      });
+      const sourceStatus = row(generatedBody.source_status, "source status");
+      expect(sourceStatus).toMatchObject({
+        status: "grounded",
+        strategy: "rag",
+        reason: "llm_generated",
+      });
+      const citations = Array.isArray(generatedBody.citations)
+        ? generatedBody.citations.map((item) => row(item, `${provider} citation`))
+        : [];
+      expect(citations.length).toBeGreaterThan(0);
+      expect(sourceStatus.citation_count).toBe(citations.length);
+      const citationNumbers = citations.map((citation) => Number(citation.citation_number));
+      expect(citationNumbers.every((number) => Number.isSafeInteger(number) && number > 0)).toBe(true);
+      expect(new Set(citationNumbers).size).toBe(citations.length);
+      for (const citation of citations) {
+        expect(citation.marker).toBe(`[${String(citation.citation_number)}]`);
+        expect(String(citation.entry_id ?? "")).not.toBe("");
+        expect(String(citation.source_file_id ?? "")).not.toBe("");
+        expect(String(citation.excerpt ?? "").trim()).not.toBe("");
+      }
     }
 
-    const knowledgeBaseId = requiredEnv("KB_E2E_SEEDED_KNOWLEDGE_BASE_ID");
     await setFaultMode(request, enterprise, "provider_5xx");
     const unavailable = await bffRequest<Row>(page, "/api/v1/chat/query", { method: "POST", idempotencyKey: `e2e-${enterprise.runId}-provider-5xx`, body: { knowledge_base_id: knowledgeBaseId, message: "请总结验收样本", limit: 5 } });
     assertStatus(unavailable.status, 200, "provider 5xx fallback");
@@ -1362,6 +1578,21 @@ test("@enterprise configured model switches and provider failure degrades safely
   } finally {
     await setFaultMode(request, enterprise, "normal");
     assertStatus((await bffRequest(page, `/api/v1/llm/providers/${String(original.provider)}`, { method: "PATCH", body: { model: original.model, base_url: original.base_url, make_default: true } })).status, 200, "restore model provider");
+    const restored = await bffRequest<Row>(page, "/api/v1/llm/providers");
+    assertStatus(restored.status, 200, "verify restored model provider");
+    const restoredBody = row(restored.body, "verify restored model provider");
+    expect(restoredBody.default_provider).toBe(original.provider);
+    const restoredProviders = Array.isArray(restoredBody.providers)
+      ? restoredBody.providers.map((item) => row(item, "restored provider"))
+      : [];
+    const restoredDefault = restoredProviders.find(
+      (item) => item.provider === original.provider,
+    );
+    expect(restoredDefault).toMatchObject({
+      provider: original.provider,
+      model: original.model,
+      is_default: true,
+    });
   }
 });
 
@@ -1516,6 +1747,251 @@ test("@enterprise API key enforces knowledge scope, rate limit and revocation", 
   }
 });
 
+test("@enterprise audit query, pagination, CSV export and permission revocation fail closed", async ({ page, enterprise, quality }, testInfo) => {
+  annotate(testInfo, "audit_log_query_export");
+  await loginAdmin(page, enterprise);
+  await page.goto("/admin/audit");
+  await expect(page.getByRole("heading", { name: "审计日志" })).toBeVisible();
+
+  const actionInput = page.getByLabel("动作", { exact: true });
+  const applyFilters = page.getByRole("button", { name: "应用筛选", exact: true });
+  const auditRows = page.locator(".audit-log-panel tbody tr");
+  const auditActions = page.locator(".audit-log-panel tbody .audit-action");
+  const pagination = page.getByRole("navigation", { name: "审计日志分页" });
+
+  await actionInput.fill(enterprise.auditPageAction);
+  const firstPageResponsePromise = page.waitForResponse((response) => {
+    if (!isAuditListResponse(response, enterprise.auditPageAction)) return false;
+    return !new URL(response.url()).searchParams.has("cursor");
+  });
+  await applyFilters.click();
+  const firstPageResponse = await firstPageResponsePromise;
+  assertStatus(firstPageResponse.status(), 200, "load first dedicated audit fixture page");
+  const firstFixturePage = requireAuditFixturePage(
+    await firstPageResponse.json(),
+    enterprise.auditPageAction,
+    50,
+    true,
+  );
+  expect(firstFixturePage.nextCursor).not.toBeNull();
+  await expect(auditRows).toHaveCount(50);
+  await expect(pagination).toContainText("第 1 页 · 本页 50 项");
+  expect(await auditActions.allTextContents()).toEqual(
+    Array.from({ length: 50 }, () => enterprise.auditPageAction),
+  );
+
+  const secondPageResponsePromise = page.waitForResponse((response) => {
+    if (!isAuditListResponse(response, enterprise.auditPageAction)) return false;
+    return new URL(response.url()).searchParams.has("cursor");
+  });
+  await pagination.getByRole("button", { name: "下一页" }).click();
+  const secondPageResponse = await secondPageResponsePromise;
+  assertStatus(secondPageResponse.status(), 200, "load second dedicated audit fixture page");
+  requireAuditFixturePage(
+    await secondPageResponse.json(),
+    enterprise.auditPageAction,
+    5,
+    false,
+  );
+  await expect(auditRows).toHaveCount(5);
+  await expect(pagination).toContainText("第 2 页 · 本页 5 项");
+  await expect(pagination.getByRole("button", { name: "下一页" })).toBeDisabled();
+  expect(await auditActions.allTextContents()).toEqual(
+    Array.from({ length: 5 }, () => enterprise.auditPageAction),
+  );
+
+  const previousPageResponsePromise = page.waitForResponse((response) => {
+    if (!isAuditListResponse(response, enterprise.auditPageAction)) return false;
+    return !new URL(response.url()).searchParams.has("cursor");
+  });
+  await pagination.getByRole("button", { name: "上一页" }).click();
+  const previousPageResponse = await previousPageResponsePromise;
+  assertStatus(previousPageResponse.status(), 200, "return to first audit fixture page");
+  requireAuditFixturePage(
+    await previousPageResponse.json(),
+    enterprise.auditPageAction,
+    50,
+    true,
+  );
+  await expect(auditRows).toHaveCount(50);
+  await expect(pagination).toContainText("第 1 页 · 本页 50 项");
+
+  const exportResponsePromise = page.waitForResponse((response) =>
+    isAuditExportResponse(response, enterprise.auditPageAction),
+  );
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByLabel("导出当前筛选结果为 CSV").click();
+  const [exportResponse, download] = await Promise.all([
+    exportResponsePromise,
+    downloadPromise,
+  ]);
+  assertStatus(exportResponse.status(), 200, "export dedicated audit fixture through UI");
+  const exportHeaders = exportResponse.headers();
+  expect(exportHeaders["content-type"]?.toLowerCase()).toContain("text/csv");
+  expect(exportHeaders["content-disposition"]).toMatch(
+    /attachment; filename="audit-logs-\d{8}T\d{6}Z\.csv"/u,
+  );
+  expect(exportHeaders["cache-control"]?.toLowerCase()).toContain("no-store");
+  expect(exportHeaders["cache-control"]?.toLowerCase()).toContain("private");
+  expect(exportHeaders["x-content-type-options"]?.toLowerCase()).toBe("nosniff");
+  expect(download.suggestedFilename()).toMatch(/^audit-logs-\d{8}T\d{6}Z\.csv$/u);
+
+  const csvPayload = await readDownloadPayload(download);
+  expect(csvPayload.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf]));
+  const csvText = csvPayload.subarray(3).toString("utf8");
+  const csvRows = parseRfc4180Csv(csvText);
+  expect(csvRows).toHaveLength(56);
+  expect(csvRows[0]).toEqual([
+    "id",
+    "created_at",
+    "result",
+    "action",
+    "actor_id",
+    "resource_type",
+    "resource_id",
+    "request_id",
+  ]);
+  expect(csvRows.every((csvRow) => csvRow.length === 8)).toBe(true);
+  expect(csvRows.slice(1).every((csvRow) => csvRow[3] === enterprise.auditPageAction)).toBe(true);
+  expect(csvText.toLowerCase()).not.toContain("details");
+  expect(csvText.toLowerCase()).not.toContain("ip_address");
+  expect(csvText).not.toContain(enterprise.auditRedactionSentinel);
+  await expect(page.getByRole("status").filter({ hasText: "导出已完成" })).toBeVisible();
+
+  await actionInput.fill(enterprise.auditOversizedAction);
+  const oversizedListResponsePromise = page.waitForResponse((response) => {
+    if (!isAuditListResponse(response, enterprise.auditOversizedAction)) return false;
+    return !new URL(response.url()).searchParams.has("cursor");
+  });
+  await applyFilters.click();
+  const oversizedListResponse = await oversizedListResponsePromise;
+  assertStatus(oversizedListResponse.status(), 200, "load oversized audit fixture page");
+  const oversizedBody = row(
+    await oversizedListResponse.json(),
+    "load oversized audit fixture page",
+  );
+  if (
+    !Array.isArray(oversizedBody.items)
+    || oversizedBody.items.length !== 50
+    || oversizedBody.next_cursor === null
+    || oversizedBody.items.some(
+      (item) => row(item, "oversized audit fixture item").action
+        !== enterprise.auditOversizedAction,
+    )
+  ) {
+    throw new Error("E2E_BLOCKED: dedicated >5000 audit fixture is unavailable");
+  }
+
+  const oversizedExportResponsePromise = page.waitForResponse((response) =>
+    isAuditExportResponse(response, enterprise.auditOversizedAction),
+  );
+  await page.getByLabel("导出当前筛选结果为 CSV").click();
+  const oversizedExportResponse = await oversizedExportResponsePromise;
+  if (oversizedExportResponse.status() !== 422) {
+    throw new Error(
+      "E2E_BLOCKED: dedicated >5000 audit fixture does not exceed the export limit",
+    );
+  }
+  const oversizedProblem = row(
+    await oversizedExportResponse.json(),
+    "oversized audit export problem",
+  );
+  expect(row(oversizedProblem.error, "oversized audit export error").code).toBe(
+    "audit_export_too_large",
+  );
+  const oversizedAlert = page.getByRole("alert").filter({ hasText: "导出失败" });
+  await expect(oversizedAlert).toContainText("超过 5,000 条");
+  await expect(oversizedAlert.getByRole("button", { name: "重试导出" })).toBeVisible();
+
+  let auditRole: Row | null = null;
+  let auditUser: SyntheticUser | null = null;
+  try {
+    auditRole = await createRole(page, enterprise, testInfo, ["audit:read", "chat:query"]);
+    auditUser = await createUser(page, enterprise, testInfo, [String(auditRole.id)]);
+    const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(memberPage, auditUser.credentials);
+    await expect(memberPage).toHaveURL(/\/admin(?:\?|$)/);
+    const memberInitialList = memberPage.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname === "/api/backend/api/v1/audit-logs"
+        && response.status() === 200,
+    );
+    await memberPage.goto("/admin/audit");
+    await memberInitialList;
+    await expect(memberPage.getByRole("heading", { name: "审计日志" })).toBeVisible();
+
+    const currentRoleResponse = await bffRequest<Row>(
+      page,
+      `/api/v1/roles/${String(auditRole.id)}`,
+    );
+    assertStatus(currentRoleResponse.status, 200, "load audit role before permission revocation");
+    const currentRole = row(currentRoleResponse.body, "load audit role before revocation");
+    const permissionsRevoked = await bffRequest<Row>(
+      page,
+      `/api/v1/roles/${String(auditRole.id)}/permissions`,
+      {
+        method: "PUT",
+        body: {
+          permission_codes: ["chat:query"],
+          expected_version: rolePolicyVersion(currentRole, "revoke audit permission"),
+        },
+      },
+    );
+    assertStatus(permissionsRevoked.status, 200, "revoke audit permission");
+
+    const deniedListResponsePromise = memberPage.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname === "/api/backend/api/v1/audit-logs"
+        && response.status() === 403,
+    );
+    await memberPage.getByLabel("刷新审计日志").click();
+    await deniedListResponsePromise;
+    const deniedListAlert = memberPage.getByRole("alert").filter({
+      hasText: "暂时无法加载",
+    });
+    await expect(deniedListAlert).toBeVisible();
+    await expect(
+      deniedListAlert.getByRole("button", { name: "重新加载审计日志" }),
+    ).toBeVisible();
+
+    const deniedExportResponsePromise = memberPage.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname === "/api/backend/api/v1/audit-logs/export"
+        && response.status() === 403,
+    );
+    await memberPage.getByLabel("导出当前筛选结果为 CSV").click();
+    await deniedExportResponsePromise;
+    const deniedExportAlert = memberPage.getByRole("alert").filter({ hasText: "导出失败" });
+    await expect(deniedExportAlert).toBeVisible();
+    await expect(
+      deniedExportAlert.getByRole("button", { name: "重试导出" }),
+    ).toBeVisible();
+
+    const freshMemberPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(freshMemberPage, auditUser.credentials);
+    await expect(freshMemberPage).toHaveURL(/\/chat(?:\?|$)/);
+    await expect(freshMemberPage.getByRole("link", { name: "审计日志" })).toHaveCount(0);
+    await freshMemberPage.goto("/admin/audit");
+    await expect(freshMemberPage).toHaveURL(/\/chat(?:\?|$)/);
+
+    const deniedDirectList = await bffRequest(
+      freshMemberPage,
+      `/api/v1/audit-logs?action=${encodeURIComponent(enterprise.auditPageAction)}&limit=50`,
+    );
+    assertStatus(deniedDirectList.status, 403, "deny direct audit list HTTP request");
+    const deniedDirectExport = await bffRequest(
+      freshMemberPage,
+      `/api/v1/audit-logs/export?action=${encodeURIComponent(enterprise.auditPageAction)}`,
+    );
+    assertStatus(deniedDirectExport.status, 403, "deny direct audit export HTTP request");
+  } finally {
+    await cleanupSyntheticAccess(page, {
+      users: [auditUser?.user ?? null],
+      roles: [auditRole],
+    });
+  }
+});
+
 test("@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly", async ({ page, enterprise, request, quality }, testInfo) => {
   annotate(testInfo, "error_loading_states");
   quality.allowHttpStatus(503, "/api/backend/api/v1/knowledge-bases");
@@ -1524,22 +2000,126 @@ test("@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly", 
   const loading = page.goto("/admin/users", { waitUntil: "commit" });
   await expect(page.locator("[aria-busy=true], .loading-rows").first()).toBeVisible();
   await loading;
+  await page.goto("/admin/knowledge");
+  const knowledgeSearch = page.getByRole("search");
+  await expect(knowledgeSearch.getByLabel("搜索知识空间")).toBeVisible();
 
-  const anonymousPage = await quality.newIsolatedPage(enterprise.baseUrl);
-  await anonymousPage.goto("/login");
-  assertStatus((await bffRequest(anonymousPage, "/api/v1/auth/me")).status, 401, "anonymous BFF request");
+  const verifyVisibleBackendFailure = async (
+    mode: "backend_5xx" | "backend_timeout",
+    expectedStatus: 503 | 504,
+  ) => {
+    await setFaultMode(request, enterprise, mode);
+    const failedResponse = page.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname.endsWith("/api/backend/api/v1/knowledge-bases")
+        && response.status() === expectedStatus,
+    );
+    await knowledgeSearch.getByLabel("搜索知识空间").fill(
+      `fault-${mode}-${Date.now().toString(36)}`,
+    );
+    await knowledgeSearch.getByRole("button", { name: "搜索" }).click();
+    assertStatus((await failedResponse).status(), expectedStatus, `${mode} visible catalog failure`);
+    const alert = page.getByRole("alert");
+    await expect(alert).toContainText("后台服务暂时不可用，请稍后重试。");
+    await expect(alert.getByRole("button", { name: "重试" })).toBeVisible();
 
-  const role = await createRole(page, enterprise, testInfo, ["chat:query"]);
-  const created = await createUser(page, enterprise, testInfo, [String(role.id)]);
-  const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
-  await loginAs(memberPage, created.credentials);
-  assertStatus((await bffRequest(memberPage, "/api/v1/users?limit=1&offset=0")).status, 403, "forbidden BFF request");
+    await setFaultMode(request, enterprise, "normal");
+    const recoveredResponse = page.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname.endsWith("/api/backend/api/v1/knowledge-bases")
+        && response.status() === 200,
+    );
+    await alert.getByRole("button", { name: "重试" }).click();
+    assertStatus((await recoveredResponse).status(), 200, `${mode} retry recovery`);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  };
+
+  let role: Row | null = null;
+  let created: SyntheticUser | null = null;
   try {
-    await setFaultMode(request, enterprise, "backend_5xx");
-    assertStatus((await bffRequest(page, "/api/v1/knowledge-bases")).status, 503, "backend 5xx state");
-    await setFaultMode(request, enterprise, "backend_timeout");
-    assertStatus((await bffRequest(page, "/api/v1/knowledge-bases")).status, 504, "backend timeout state");
+    await verifyVisibleBackendFailure("backend_5xx", 503);
+    await verifyVisibleBackendFailure("backend_timeout", 504);
+
+    role = await createRole(page, enterprise, testInfo, ["file:read"]);
+    created = await createUser(page, enterprise, testInfo, [String(role.id)]);
+    const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
+    await loginAs(memberPage, created.credentials);
+    await memberPage.goto("/admin/files");
+    const fileCenter = memberPage.locator("article.panel").filter({
+      has: memberPage.getByRole("heading", { name: "文件中心" }),
+    });
+    const refreshFiles = fileCenter.getByRole("button", { name: "刷新" });
+    await expect(refreshFiles).toBeVisible();
+
+    const permissionsRevoked = await bffRequest<Row>(
+      page,
+      `/api/v1/roles/${String(role.id)}/permissions`,
+      {
+        method: "PUT",
+        body: {
+          permission_codes: [],
+          expected_version: rolePolicyVersion(role, "revoke file permission for visible 403"),
+        },
+      },
+    );
+    assertStatus(permissionsRevoked.status, 200, "revoke file permission for visible 403");
+    const forbiddenResponse = memberPage.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname.endsWith("/api/backend/api/v1/files")
+        && response.status() === 403,
+    );
+    await refreshFiles.click();
+    assertStatus((await forbiddenResponse).status(), 403, "visible forbidden file refresh");
+    const forbiddenAlert = memberPage.getByRole("alert");
+    await expect(forbiddenAlert).toContainText("当前账号没有访问此功能的权限。");
+    await expect(forbiddenAlert.getByRole("button", { name: "重试" })).toBeVisible();
+
+    const permissionsRestored = await bffRequest<Row>(
+      page,
+      `/api/v1/roles/${String(role.id)}/permissions`,
+      {
+        method: "PUT",
+        body: {
+          permission_codes: ["file:read"],
+          expected_version: rolePolicyVersion(
+            row(permissionsRevoked.body, "revoke file permission for visible 403"),
+            "restore file permission after visible 403",
+          ),
+        },
+      },
+    );
+    assertStatus(permissionsRestored.status, 200, "restore file permission after visible 403");
+    role = row(permissionsRestored.body, "restore file permission after visible 403");
+    const forbiddenRetryResponse = memberPage.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname.endsWith("/api/backend/api/v1/files")
+        && response.status() === 200,
+    );
+    await forbiddenAlert.getByRole("button", { name: "重试" }).click();
+    assertStatus((await forbiddenRetryResponse).status(), 200, "forbidden retry recovery");
+    await expect(memberPage.getByRole("alert")).toHaveCount(0);
+
+    const disabled = await bffRequest<Row>(page, `/api/v1/users/${String(created.user.id)}`, {
+      method: "PATCH",
+      body: { status: "disabled" },
+    });
+    assertStatus(disabled.status, 200, "disable member for visible 401");
+    created = { ...created, user: row(disabled.body, "disable member for visible 401") };
+    const unauthorizedResponse = memberPage.waitForResponse((response) =>
+      response.request().method() === "GET"
+        && new URL(response.url()).pathname.endsWith("/api/backend/api/v1/files")
+        && response.status() === 401,
+    );
+    await refreshFiles.click();
+    assertStatus((await unauthorizedResponse).status(), 401, "visible expired-session file refresh");
+    const unauthorizedAlert = memberPage.getByRole("alert");
+    await expect(unauthorizedAlert).toContainText("登录状态已失效，请重新登录。");
+    await expect(unauthorizedAlert.getByRole("button", { name: "重试" })).toBeVisible();
   } finally {
     await setFaultMode(request, enterprise, "normal");
+    await cleanupSyntheticAccess(page, {
+      users: [created?.user ?? null],
+      roles: [role],
+    });
   }
 });

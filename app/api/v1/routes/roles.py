@@ -19,6 +19,7 @@ from app.db.models import (
     Role,
     RoleLimit,
     RolePermission,
+    User,
     UserRole,
 )
 from app.schemas.roles import (
@@ -40,6 +41,11 @@ from app.services.rbac_mutation import (
     locked_users_statement,
     refresh_locked_actor_access,
 )
+from app.services.user_activity import (
+    ActivityLockMode,
+    acquire_user_activity_locks,
+    rbac_mutation_endpoint,
+)
 
 router = APIRouter()
 permission_router = APIRouter()
@@ -53,7 +59,24 @@ async def _lock_and_refresh_role_admin(
     target_role_ids: set[UUID] | None = None,
 ) -> tuple[AccessContext, dict[UUID, Role]]:
     await acquire_rbac_mutation_lock(session)
-    actor = await session.scalar(locked_users_statement({access.user.id}))
+    actor = await session.scalar(
+        select(User)
+        .where(User.id == access.user.id)
+        .execution_options(populate_existing=True)
+    )
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={actor.id},
+        additional_role_ids=target_role_ids or (),
+    )
+    refreshed = await refresh_locked_actor_access(session, actor, {"role:manage"})
+    await acquire_user_activity_locks(
+        session,
+        {actor.id: ActivityLockMode.SHARED},
+    )
+    actor = await session.scalar(locked_users_statement({actor.id}))
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
     locked_roles = await lock_role_union(
@@ -349,6 +372,7 @@ async def _resolve_limits(
 
 
 @router.post("", response_model=RoleRead, status_code=status.HTTP_201_CREATED)
+@rbac_mutation_endpoint
 async def create_role(
     payload: RoleCreate,
     request: Request,
@@ -404,6 +428,7 @@ async def create_role(
 
 
 @router.patch("/{role_id}", response_model=RoleRead)
+@rbac_mutation_endpoint
 async def update_role(
     role_id: UUID,
     payload: RoleUpdate,
@@ -456,6 +481,7 @@ async def update_role(
 
 
 @router.delete("/{role_id}", status_code=status.HTTP_204_NO_CONTENT)
+@rbac_mutation_endpoint
 async def delete_role(
     role_id: UUID,
     request: Request,
@@ -533,6 +559,7 @@ async def delete_role(
 
 
 @router.put("/{role_id}/permissions", response_model=RoleRead)
+@rbac_mutation_endpoint
 async def replace_permissions(
     role_id: UUID,
     payload: PermissionSet,
@@ -590,6 +617,7 @@ async def replace_permissions(
 
 
 @router.put("/{role_id}/limits", response_model=RoleRead)
+@rbac_mutation_endpoint
 async def replace_limits(
     role_id: UUID,
     payload: LimitSet,
@@ -640,6 +668,7 @@ async def replace_limits(
 
 
 @router.put("/{role_id}/policy", response_model=RoleRead)
+@rbac_mutation_endpoint
 async def replace_policy(
     role_id: UUID,
     payload: RolePolicySet,

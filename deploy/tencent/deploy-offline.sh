@@ -55,6 +55,7 @@ release_env_file=$(offline_contract_release_env "$contract_dir")
 snapshot_script_dir=$contract_dir/release/deploy/tencent
 offline_clear_inherited_environment
 
+business_writer_stop_timeout_seconds=150
 maintenance_container_id=
 maintenance_active=false
 deployment_committed=false
@@ -140,7 +141,9 @@ remove_exact_llm_egress() {
   [ "$#" -le 1 ] || return 1
   [ "$#" -eq 1 ] || return 0
   validate_exact_service "$service_ids" llm-egress || return 1
-  docker rm -f "$service_ids" >/dev/null || return 1
+  [ "$(docker inspect --format '{{.State.Running}}' \
+    "$service_ids" 2>/dev/null)" = false ] || return 1
+  docker rm "$service_ids" >/dev/null || return 1
   remaining_ids=$(docker ps -aq \
     --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \
     --filter "label=com.docker.compose.service=llm-egress") || return 1
@@ -228,28 +231,8 @@ validate_completed_installation_state() {
     [ "$(realpath -e -- "$installed_receipt")" != "$installed_receipt" ]; then
     return 1
   fi
-  python3 -I -c '
-import json, pathlib, re, sys
-path = pathlib.Path(sys.argv[1])
-document = json.loads(path.read_text(encoding="utf-8"))
-required = {
-    "schema_version", "contract_sha256", "runtime_sha256",
-    "release_sha256", "manifest_sha256", "phase",
-}
-filename_digest = path.stem.removeprefix("installed-")
-valid = (
-    set(document) == required
-    and document["schema_version"] == 1
-    and document["phase"] == "completed"
-    and document["contract_sha256"] == filename_digest
-    and re.fullmatch(r"[0-9a-f]{64}", filename_digest) is not None
-    and all(
-        re.fullmatch(r"[0-9a-f]{64}", document[key]) is not None
-        for key in ("runtime_sha256", "release_sha256", "manifest_sha256")
-    )
-)
-raise SystemExit(0 if valid else 1)
-' "$installed_receipt"
+  python3 -I "$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-recovery-state.py" \
+    validate-installed-receipt "$installed_receipt" 20260715_0021 >/dev/null
 }
 
 quiesce_owned_business_writers() {
@@ -268,7 +251,8 @@ quiesce_owned_business_writers() {
     fi
   done
   offline_compose deploy "$contract_dir" --profile controlled-egress \
-    stop --timeout 60 api maintenance web llm-egress minio-multipart-gc || return 1
+    stop --timeout "$business_writer_stop_timeout_seconds" \
+    api maintenance web llm-egress minio-multipart-gc || return 1
   for writer_service in api maintenance web llm-egress minio-multipart-gc; do
     running_writer_ids=$(docker ps -q \
       --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \

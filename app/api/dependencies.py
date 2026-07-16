@@ -21,6 +21,7 @@ from app.services.access import AccessContext, AccessService
 from app.services.api_keys import ApiKeyAccess, authenticate_api_key
 from app.services.rate_limit import RateLimiter
 from app.services.storage import StorageService
+from app.services.user_activity import acquire_authenticated_request_locks
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -55,6 +56,7 @@ async def redis_dependency() -> AsyncIterator[Redis]:
 
 async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_db)],
     tokens: Annotated[TokenService, Depends(get_token_service)],
     redis: Annotated[Redis, Depends(redis_dependency)],
@@ -93,8 +95,15 @@ async def get_current_user(
             headers={"Retry-After": str(decision.retry_after_seconds)},
         )
 
-    user = await session.scalar(select(User).where(User.id == claims.user_id))
-    if user is None or user.status is not UserStatus.ACTIVE:
+    # For ordinary requests this holds the actor's shared activity lock until
+    # the handler transaction ends. RBAC mutation routes are identified from
+    # FastAPI's matched route template and take the global exclusive lock first,
+    # then deterministic actor/target activity locks, preventing lock inversion.
+    await acquire_authenticated_request_locks(session, request, claims.user_id)
+    user = await session.scalar(
+        select(User).where(User.id == claims.user_id).execution_options(populate_existing=True)
+    )
+    if user is None or user.status is not UserStatus.ACTIVE or user.retired_at is not None:
         raise ApiError(
             status_code=status.HTTP_401_UNAUTHORIZED,
             code="inactive_user",

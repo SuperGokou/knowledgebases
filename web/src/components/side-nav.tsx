@@ -34,6 +34,7 @@ const groups: Array<{
       { href: "/admin/users", label: "账号管理", icon: "users" },
       { href: "/admin/roles", label: "角色与权限", icon: "shield" },
       { href: "/admin/api-models", label: "API 与模型", icon: "spark" },
+      { href: "/admin/audit", label: "审计日志", icon: "clock" },
     ],
   },
 ];

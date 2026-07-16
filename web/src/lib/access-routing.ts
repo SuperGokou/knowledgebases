@@ -9,6 +9,7 @@ const CONTROL_PLANE_PERMISSIONS = new Set([
   "role:read",
   "api-key:manage",
   "llm:manage",
+  "audit:read",
 ]);
 
 // The knowledge page can load its first screen with knowledge:read, or expose
@@ -83,6 +84,8 @@ export function canAccessPath(path: string, me: AccessPrincipal): boolean {
     case "/admin/api-models":
       return hasGrantedPermission(permissions, "api-key:manage")
         || hasGrantedPermission(permissions, "llm:manage");
+    case "/admin/audit":
+      return hasGrantedPermission(permissions, "audit:read");
     case "/access-pending":
       return defaultLandingPath(me) === "/access-pending";
     default:

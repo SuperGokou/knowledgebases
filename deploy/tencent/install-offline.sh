@@ -2,6 +2,10 @@
 set -eu
 
 entry_mode=external
+operation_mode=standalone
+adoption_journal=none
+adoption_binding_key=none
+adoption_transaction_id=none
 if [ "$#" -eq 2 ]; then
   runtime_source=$1
   release_source=$2
@@ -10,6 +14,81 @@ elif [ "$#" -eq 4 ] && [ "$1" = "--contract-dir" ] && \
   entry_mode=materialized
   supplied_contract_dir=$2
   supplied_contract_sha256=$4
+elif [ "$#" -eq 10 ] && [ "$1" = "--contract-dir" ] && \
+  [ "$3" = "--contract-sha256" ] && [ "$5" = "--adoption-journal" ] && \
+  [ "$7" = "--adoption-binding-key" ] && \
+  [ "$9" = "--adoption-transaction" ]; then
+  entry_mode=materialized
+  operation_mode=adoption
+  supplied_contract_dir=$2
+  supplied_contract_sha256=$4
+  adoption_journal=$6
+  adoption_binding_key=$8
+  adoption_transaction_id=${10}
+elif [ "$#" -eq 13 ] && [ "$1" = "--abort-pre-migration" ]; then
+  entry_mode=abort-pre-migration-dry-run
+  shift
+  [ "$1" = "--adoption-journal" ] || exit 64
+  abort_adoption_journal=$2
+  shift 2
+  [ "$1" = "--adoption-binding-key" ] || exit 64
+  abort_adoption_binding_key=$2
+  shift 2
+  [ "$1" = "--evidence-signing-key" ] || exit 64
+  abort_evidence_signing_key=$2
+  shift 2
+  [ "$1" = "--evidence-public-key" ] || exit 64
+  abort_evidence_public_key=$2
+  shift 2
+  [ "$1" = "--host-isolation-baseline" ] || exit 64
+  abort_host_isolation_baseline=$2
+  shift 2
+  [ "$1" = "--host-isolation-hmac-key" ] || exit 64
+  abort_host_isolation_hmac_key=$2
+  shift 2
+  [ "$#" -eq 0 ] || exit 64
+elif [ "$#" -eq 26 ] && [ "$1" = "--abort-pre-migration" ]; then
+  entry_mode=abort-pre-migration
+  shift
+  [ "$1" = "--adoption-journal" ] || exit 64
+  abort_adoption_journal=$2
+  shift 2
+  [ "$1" = "--adoption-binding-key" ] || exit 64
+  abort_adoption_binding_key=$2
+  shift 2
+  [ "$1" = "--evidence-signing-key" ] || exit 64
+  abort_evidence_signing_key=$2
+  shift 2
+  [ "$1" = "--evidence-public-key" ] || exit 64
+  abort_evidence_public_key=$2
+  shift 2
+  [ "$1" = "--host-isolation-baseline" ] || exit 64
+  abort_host_isolation_baseline=$2
+  shift 2
+  [ "$1" = "--host-isolation-hmac-key" ] || exit 64
+  abort_host_isolation_hmac_key=$2
+  shift 2
+  [ "$1" = "--execute" ] || exit 64
+  shift
+  [ "$1" = "--confirm-project" ] || exit 64
+  abort_confirm_project=$2
+  shift 2
+  [ "$1" = "--confirm-contract-sha256" ] || exit 64
+  abort_confirm_contract_sha256=$2
+  shift 2
+  [ "$1" = "--confirm-adoption-transaction" ] || exit 64
+  abort_confirm_adoption_transaction=$2
+  shift 2
+  [ "$1" = "--confirm-plan-sha256" ] || exit 64
+  abort_confirm_plan_sha256=$2
+  shift 2
+  [ "$1" = "--confirm-retirement-receipt-sha256" ] || exit 64
+  abort_confirm_retirement_receipt_sha256=$2
+  shift 2
+  [ "$1" = "--confirm-restore-boundary" ] || exit 64
+  abort_confirm_restore_boundary=$2
+  shift 2
+  [ "$#" -eq 0 ] || exit 64
 else
   echo "usage: $0 /absolute/path/to/runtime.env /absolute/path/to/release.env" >&2
   echo "install: internal contract arguments are reserved for the verified release worker" >&2
@@ -21,6 +100,55 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/offline-operation-common.sh"
 
 offline_acquire_lock install
+if [ "$entry_mode" = abort-pre-migration-dry-run ]; then
+  case "$OFFLINE_RELEASE_ROOT" in
+    /srv/heyi-knowledgebases-offline/releases/*) ;;
+    *) offline_fail install "dry-run worker is outside the materialized release" 65 ;;
+  esac
+  abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
+  offline_clear_inherited_environment
+  # shellcheck disable=SC2093
+  exec python3 -I "$abort_helper" abort-dry-run \
+    --adoption-journal "$abort_adoption_journal" \
+    --adoption-binding-key "$abort_adoption_binding_key" \
+    --evidence-signing-key "$abort_evidence_signing_key" \
+    --evidence-public-key "$abort_evidence_public_key" \
+    --host-isolation-baseline "$abort_host_isolation_baseline" \
+    --host-isolation-hmac-key "$abort_host_isolation_hmac_key"
+  offline_fail install "cannot execute the pre-migration abort dry-run" 73
+elif [ "$entry_mode" = abort-pre-migration ]; then
+  if [ "$abort_confirm_restore_boundary" != PRE_MIGRATION_ONLY ]; then
+    offline_fail install "abort confirmation is not PRE_MIGRATION_ONLY" 65
+  fi
+  expected_materialized_root=/srv/heyi-knowledgebases-offline/releases/$abort_confirm_contract_sha256
+  if [ "$OFFLINE_RELEASE_ROOT" != "$expected_materialized_root" ]; then
+    offline_fail install "abort worker is not running from the confirmed release" 65
+  fi
+  abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
+  if [ -L "$abort_helper" ] || [ ! -f "$abort_helper" ] || \
+    [ "$(realpath -e -- "$abort_helper" 2>/dev/null || true)" != "$abort_helper" ] || \
+    [ "$(stat -c %u -- "$abort_helper" 2>/dev/null || echo -1)" -ne 0 ]; then
+    offline_fail install "trusted pre-migration abort helper is unsafe" 65
+  fi
+  offline_clear_inherited_environment
+  # shellcheck disable=SC2093
+  exec python3 -I "$abort_helper" abort \
+    --adoption-journal "$abort_adoption_journal" \
+    --adoption-binding-key "$abort_adoption_binding_key" \
+    --evidence-signing-key "$abort_evidence_signing_key" \
+    --evidence-public-key "$abort_evidence_public_key" \
+    --host-isolation-baseline "$abort_host_isolation_baseline" \
+    --host-isolation-hmac-key "$abort_host_isolation_hmac_key" \
+    --execute \
+    --confirm-project "$abort_confirm_project" \
+    --confirm-contract-sha256 "$abort_confirm_contract_sha256" \
+    --confirm-adoption-transaction "$abort_confirm_adoption_transaction" \
+    --confirm-plan-sha256 "$abort_confirm_plan_sha256" \
+    --confirm-retirement-receipt-sha256 \
+      "$abort_confirm_retirement_receipt_sha256" \
+    --confirm-restore-boundary "$abort_confirm_restore_boundary"
+  offline_fail install "cannot execute the pre-migration abort helper" 73
+fi
 if [ "$entry_mode" = external ]; then
   contract_result=$(sh "$script_dir/prepare-offline-contract.sh" \
     "$runtime_source" "$release_source")
@@ -53,11 +181,60 @@ endpoint_config_file=$OFFLINE_TMPDIR/install-endpoint-$contract_sha256.json
 installation_committed=false
 install_state_owned=false
 resume_install=false
+resume_migration_invoked=false
 state_directory=/srv/heyi-knowledgebases-offline/state
 state_file=$state_directory/install-in-progress.json
 installed_receipt=$state_directory/installed-$contract_sha256.json
 offline_clear_inherited_environment
 
+adoption_journal_sha256=none
+adoption_plan_sha256=none
+retirement_receipt_sha256=none
+target_schema_head=20260715_0021
+legacy_source_schema_head=none
+if [ "$operation_mode" = adoption ]; then
+  journal_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
+  journal_result=$(python3 -I "$journal_helper" validate-journal \
+    --journal "$adoption_journal" \
+    --binding-key "$adoption_binding_key" \
+    --adoption-transaction "$adoption_transaction_id" \
+    --contract-sha256 "$contract_sha256") || \
+    offline_fail install "signed adoption transaction journal is invalid" 65
+  journal_fields=$(printf '%s\n' "$journal_result" | python3 -I -c '
+import json, sys
+document = json.load(sys.stdin)
+keys = (
+    "journal_sha256", "plan_sha256", "retirement_receipt_sha256",
+    "target_manifest_sha256", "target_schema_head", "legacy_source_schema_head",
+)
+values = [document.get(key) for key in keys]
+if not all(isinstance(value, str) and " " not in value for value in values):
+    raise SystemExit(1)
+print(*values)
+') || offline_fail install "verified adoption journal output is malformed" 65
+  # The trusted parser emits six constrained, whitespace-free fields.
+  # shellcheck disable=SC2086
+  set -- $journal_fields
+  if [ "$#" -ne 6 ]; then
+    offline_fail install "verified adoption journal fields are incomplete" 65
+  fi
+  adoption_journal_sha256=$1
+  adoption_plan_sha256=$2
+  retirement_receipt_sha256=$3
+  adoption_target_manifest_sha256=$4
+  target_schema_head=$5
+  legacy_source_schema_head=$6
+  if [ "$target_schema_head" != 20260715_0021 ]; then
+    offline_fail install "adoption journal target schema differs from this release" 65
+  fi
+  observed_manifest_sha256=$(sha256sum "$contract_dir/release.env.images" | \
+    awk '{print $1}') || exit 66
+  if [ "$observed_manifest_sha256" != "$adoption_target_manifest_sha256" ]; then
+    offline_fail install "adoption journal manifest differs from this release" 65
+  fi
+fi
+
+business_writer_stop_timeout_seconds=150
 validate_exact_service() {
   candidate_id=$1
   expected_service=$2
@@ -82,6 +259,15 @@ validate_exact_service() {
 
 write_install_state() {
   phase=$1
+  case "$phase" in
+    prepared|preflight_passed)
+      migration_invocation_field='"migration_command_invoked":false'
+      ;;
+    migration_invoked|migrated|bootstrapped|core_ready|proxy_started|completed)
+      migration_invocation_field='"migration_command_invoked":true'
+      ;;
+    *) offline_fail install "unsupported installation state phase" 70 ;;
+  esac
   temporary_state=$(mktemp "$state_directory/.install-state.XXXXXXXXXX")
   runtime_digest=$(sha256sum "$contract_dir/runtime.env" | awk '{print $1}') || {
     rm -f "$temporary_state"
@@ -96,7 +282,7 @@ write_install_state() {
     offline_fail install "cannot hash image manifest for installation state" 66
   }
   printf '%s\n' \
-    "{\"schema_version\":1,\"contract_sha256\":\"$contract_sha256\",\"runtime_sha256\":\"$runtime_digest\",\"release_sha256\":\"$release_digest\",\"manifest_sha256\":\"$manifest_digest\",\"phase\":\"$phase\"}" \
+    "{\"schema_version\":2,\"contract_sha256\":\"$contract_sha256\",\"runtime_sha256\":\"$runtime_digest\",\"release_sha256\":\"$release_digest\",\"manifest_sha256\":\"$manifest_digest\",\"phase\":\"$phase\",$migration_invocation_field,\"operation_mode\":\"$operation_mode\",\"adoption_transaction_id\":\"$adoption_transaction_id\",\"adoption_journal_sha256\":\"$adoption_journal_sha256\",\"adoption_plan_sha256\":\"$adoption_plan_sha256\",\"retirement_receipt_sha256\":\"$retirement_receipt_sha256\",\"target_schema_head\":\"$target_schema_head\",\"legacy_source_schema_head\":\"$legacy_source_schema_head\"}" \
     > "$temporary_state" || {
     rm -f "$temporary_state"
     offline_fail install "cannot write installation state" 73
@@ -157,7 +343,8 @@ validate_resume_resources() {
 
 remove_stopped_resume_oneoffs() {
   oneoff_list=$(mktemp "$OFFLINE_TMPDIR/install-oneoffs.XXXXXXXXXX") || return 1
-  for oneoff_service in api-preflight clamav-db-preflight migrate bootstrap; do
+  for oneoff_service in \
+    api-preflight clamav-db-preflight llm-egress-preflight migrate bootstrap; do
     if ! docker ps -aq \
       --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \
       --filter "label=com.docker.compose.service=$oneoff_service" > "$oneoff_list"; then
@@ -182,8 +369,40 @@ remove_stopped_resume_oneoffs() {
           oneoff_validation_failed=true
           break
         }
+      oneoff_image=$(docker inspect --format '{{.Config.Image}}' \
+        "$oneoff_id" 2>/dev/null) || {
+          oneoff_validation_failed=true
+          break
+        }
       if { [ "$oneoff_marker" != True ] && [ "$oneoff_marker" != true ]; } || \
-        [ "$oneoff_running" != false ] || ! docker rm "$oneoff_id" >/dev/null; then
+        [ "$oneoff_running" != false ] || \
+        ! printf '%s\n' "$oneoff_image" | \
+          grep -Eq '^127\.0\.0\.1:5000/.+@sha256:[0-9a-f]{64}$'; then
+        oneoff_validation_failed=true
+        break
+      fi
+      case "$oneoff_service" in
+        api-preflight|clamav-db-preflight|llm-egress-preflight)
+          oneoff_contract=$(docker inspect --format \
+            '{{ index .Config.Labels "io.heyi.knowledgebases.contract-sha256" }}' \
+            "$oneoff_id" 2>/dev/null) || {
+              oneoff_validation_failed=true
+              break
+            }
+          oneoff_adoption=$(docker inspect --format \
+            '{{ index .Config.Labels "io.heyi.knowledgebases.adoption-transaction" }}' \
+            "$oneoff_id" 2>/dev/null) || {
+              oneoff_validation_failed=true
+              break
+            }
+          if [ "$oneoff_contract" != "$contract_sha256" ] || \
+            [ "$oneoff_adoption" != "$adoption_transaction_id" ]; then
+            oneoff_validation_failed=true
+            break
+          fi
+          ;;
+      esac
+      if ! docker rm "$oneoff_id" >/dev/null; then
         oneoff_validation_failed=true
         break
       fi
@@ -231,7 +450,8 @@ stop_exact_install_services() {
       cleanup_failed=true
       continue
     fi
-    if ! docker stop --time 30 "$service_ids" >/dev/null; then
+    if ! docker stop --time "$business_writer_stop_timeout_seconds" \
+      "$service_ids" >/dev/null; then
       echo "install: CLEANUP_FAILED exact $service_name container did not stop" >&2
       cleanup_failed=true
     fi
@@ -251,7 +471,9 @@ remove_exact_llm_egress() {
   [ "$#" -le 1 ] || return 1
   [ "$#" -eq 1 ] || return 0
   validate_exact_service "$service_ids" llm-egress || return 1
-  docker rm -f "$service_ids" >/dev/null || return 1
+  [ "$(docker inspect --format '{{.State.Running}}' \
+    "$service_ids" 2>/dev/null)" = false ] || return 1
+  docker rm "$service_ids" >/dev/null || return 1
   remaining_ids=$(docker ps -aq \
     --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \
     --filter "label=com.docker.compose.service=llm-egress") || return 1
@@ -301,6 +523,96 @@ remove_exact_llm_uplink_network() {
     --filter "label=com.docker.compose.network=llm-uplink") || return 1
   [ -z "$remaining_networks" ]
 }
+
+verify_completed_install_handoff() (
+  state_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-recovery-state.py
+  completed_evidence_dir=$(mktemp -d \
+    "$OFFLINE_TMPDIR/completed-handoff.XXXXXXXXXX") || exit 66
+  trap 'rm -rf -- "$completed_evidence_dir"' EXIT HUP INT TERM
+  chmod 0700 "$completed_evidence_dir" || exit 73
+  completed_installed_evidence=$completed_evidence_dir/installed.json
+  completed_active_evidence=$completed_evidence_dir/active.json
+  completed_endpoint_config=$completed_evidence_dir/endpoint.json
+
+  [ ! -e "$state_file" ] && [ ! -L "$state_file" ] || return 1
+  python3 -I "$state_helper" validate-installed-receipt \
+    "$installed_receipt" "$target_schema_head" \
+    > "$completed_installed_evidence" || return 1
+  python3 -I "$state_helper" select > "$completed_active_evidence" || return 1
+  chmod 0600 "$completed_installed_evidence" "$completed_active_evidence" || return 1
+  python3 -I -c '
+import hashlib, json, pathlib, sys
+
+installed = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+active = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+contract = pathlib.Path(sys.argv[3])
+
+def digest(name):
+    return hashlib.sha256((contract / name).read_bytes()).hexdigest()
+
+valid = (
+    installed.get("schema_version") == 2
+    and installed.get("phase") == "completed"
+    and installed.get("migration_command_invoked") is True
+    and installed.get("contract_sha256") == sys.argv[4]
+    and installed.get("runtime_sha256") == digest("runtime.env")
+    and installed.get("release_sha256") == digest("release.env")
+    and installed.get("manifest_sha256") == digest("release.env.images")
+    and installed.get("operation_mode") == sys.argv[5]
+    and installed.get("adoption_transaction_id") == sys.argv[6]
+    and installed.get("adoption_journal_sha256") == sys.argv[7]
+    and installed.get("adoption_plan_sha256") == sys.argv[8]
+    and installed.get("retirement_receipt_sha256") == sys.argv[9]
+    and installed.get("target_schema_head") == sys.argv[10]
+    and installed.get("legacy_source_schema_head") == sys.argv[11]
+    and active.get("selection") == "active"
+    and active.get("status") == "committed"
+    and all(
+        active.get(key) == installed.get(key)
+        for key in (
+            "contract_sha256", "runtime_sha256", "release_sha256",
+            "manifest_sha256",
+        )
+    )
+)
+raise SystemExit(0 if valid else 1)
+' "$completed_installed_evidence" "$completed_active_evidence" "$contract_dir" \
+    "$contract_sha256" "$operation_mode" "$adoption_transaction_id" \
+    "$adoption_journal_sha256" "$adoption_plan_sha256" \
+    "$retirement_receipt_sha256" "$target_schema_head" \
+    "$legacy_source_schema_head" || return 1
+
+  offline_verify_release_assets install "$contract_dir" || return 1
+  offline_verify_project_release_labels install "$contract_dir" || return 1
+  offline_compose install "$contract_dir" \
+    --profile maintenance config --format json > "$completed_endpoint_config" || return 1
+  chmod 0600 "$completed_endpoint_config" || return 1
+  completed_business_ready=false
+  for _completed_attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if python3 -I "$snapshot_script_dir/verify-maintenance-endpoint.py" \
+      --business-ready-compose-config-stdin < "$completed_endpoint_config" \
+      >/dev/null 2>&1; then
+      completed_business_ready=true
+      break
+    fi
+    sleep 2
+  done
+  [ "$completed_business_ready" = true ] || return 1
+
+  if [ -e "$state_directory/cutover-intent.json" ] || \
+    [ -L "$state_directory/cutover-intent.json" ]; then
+    completed_transaction_id=$(python3 -I -c '
+import json, pathlib, re, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+transaction = document.get("transaction_id")
+if not isinstance(transaction, str) or re.fullmatch(r"[0-9a-f]{32}", transaction) is None:
+    raise SystemExit(1)
+print(transaction)
+' "$completed_active_evidence") || return 1
+    offline_clear_committed_cutover \
+      install "$contract_sha256" "$completed_transaction_id" || return 1
+  fi
+)
 
 cleanup_install_contract() {
   rm -f -- "$endpoint_config_file"
@@ -355,8 +667,19 @@ offline_validate_root_directory install "$state_directory" 700
 
 set -- "$state_directory"/installed-*.json
 if [ "$1" != "$state_directory/installed-*.json" ]; then
-  offline_fail install \
-    "a completed installation receipt already exists; use deploy-offline.sh or the audited disaster-recovery procedure" 69
+  if [ "$#" -ne 1 ] || [ "$1" != "$installed_receipt" ]; then
+    offline_fail install \
+      "a different or ambiguous completed installation receipt already exists" 69
+  fi
+  if ! verify_completed_install_handoff; then
+    offline_fail install \
+      "completed installation handoff is not exactly bound, healthy, and active" 69
+  fi
+  installation_committed=true
+  cleanup_install_contract
+  trap - EXIT HUP INT TERM
+  echo "install: existing completed offline release is healthy; contract_sha256=$contract_sha256"
+  exit 0
 fi
 if [ -e "$state_file" ]; then
   if [ -L "$state_file" ] || [ ! -f "$state_file" ] || \
@@ -371,31 +694,64 @@ import hashlib, json, pathlib, re, sys
 state_path = pathlib.Path(sys.argv[1])
 contract_dir = pathlib.Path(sys.argv[2])
 expected_contract = sys.argv[3]
+expected_operation = sys.argv[4]
+expected_adoption_transaction = sys.argv[5]
+expected_journal = sys.argv[6]
+expected_plan = sys.argv[7]
+expected_retirement = sys.argv[8]
+expected_target_head = sys.argv[9]
+expected_legacy_head = sys.argv[10]
 document = json.loads(state_path.read_text(encoding="utf-8"))
 expected_keys = {
     "schema_version", "contract_sha256", "runtime_sha256",
     "release_sha256", "manifest_sha256", "phase",
+    "migration_command_invoked", "operation_mode", "adoption_transaction_id",
+    "adoption_journal_sha256", "adoption_plan_sha256",
+    "retirement_receipt_sha256", "target_schema_head",
+    "legacy_source_schema_head",
 }
 allowed_phases = {
-    "prepared", "preflight_passed", "migrated", "bootstrapped",
+    "prepared", "preflight_passed", "migration_invoked", "migrated", "bootstrapped",
     "core_ready", "proxy_started", "completed",
 }
 def digest(name):
     return hashlib.sha256((contract_dir / name).read_bytes()).hexdigest()
 valid = (
     set(document) == expected_keys
-    and document["schema_version"] == 1
+    and document["schema_version"] == 2
     and document["contract_sha256"] == expected_contract
     and re.fullmatch(r"[0-9a-f]{64}", expected_contract) is not None
     and document["runtime_sha256"] == digest("runtime.env")
     and document["release_sha256"] == digest("release.env")
     and document["manifest_sha256"] == digest("release.env.images")
     and document["phase"] in allowed_phases
+    and document["migration_command_invoked"]
+        is (document["phase"] not in {"prepared", "preflight_passed"})
+    and document["operation_mode"] == expected_operation
+    and document["adoption_transaction_id"] == expected_adoption_transaction
+    and document["adoption_journal_sha256"] == expected_journal
+    and document["adoption_plan_sha256"] == expected_plan
+    and document["retirement_receipt_sha256"] == expected_retirement
+    and document["target_schema_head"] == expected_target_head
+    and document["legacy_source_schema_head"] == expected_legacy_head
 )
 raise SystemExit(0 if valid else 1)
-' "$state_file" "$contract_dir" "$contract_sha256"; then
+' "$state_file" "$contract_dir" "$contract_sha256" \
+    "$operation_mode" "$adoption_transaction_id" "$adoption_journal_sha256" \
+    "$adoption_plan_sha256" "$retirement_receipt_sha256" \
+    "$target_schema_head" "$legacy_source_schema_head"; then
     offline_fail install "installation state does not match this canonical contract" 65
   fi
+  resume_migration_invoked=$(python3 -I -c '
+import json, pathlib, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("true" if document["migration_command_invoked"] is True else "false")
+' "$state_file") || \
+    offline_fail install "cannot read the validated migration boundary" 65
+  case "$resume_migration_invoked" in
+    true|false) ;;
+    *) offline_fail install "validated migration boundary is malformed" 65 ;;
+  esac
   install_state_owned=true
   resume_install=true
   if ! remove_stopped_resume_oneoffs; then
@@ -443,14 +799,32 @@ cutover_transaction_id=$(offline_begin_cutover \
 # Install preflight rejects every existing Compose resource. Both TLS ports stay
 # closed until migration, bootstrap and all internal services are healthy.
 if [ "$resume_install" = true ]; then
-  sh "$snapshot_script_dir/preflight-offline.sh" --resume-install \
-    --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"
+  if [ "$operation_mode" = adoption ]; then
+    sh "$snapshot_script_dir/preflight-offline.sh" --resume-install \
+      --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256" \
+      --adoption-transaction "$adoption_transaction_id"
+  else
+    sh "$snapshot_script_dir/preflight-offline.sh" --resume-install \
+      --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"
+  fi
 else
-  sh "$snapshot_script_dir/preflight-offline.sh" \
-    --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"
+  if [ "$operation_mode" = adoption ]; then
+    sh "$snapshot_script_dir/preflight-offline.sh" \
+      --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256" \
+      --adoption-transaction "$adoption_transaction_id"
+  else
+    sh "$snapshot_script_dir/preflight-offline.sh" \
+      --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"
+  fi
 fi
-write_install_state preflight_passed
+if [ "$resume_migration_invoked" != true ]; then
+  write_install_state preflight_passed
+fi
 
+# This fsynced state is the irreversible boundary.  Once written, every
+# recovery path must forward-fix even if Compose is killed before creating the
+# migrate container, network, or PostgreSQL process.
+write_install_state migration_invoked
 offline_compose install "$contract_dir" \
   --profile ops run --pull never --rm migrate
 write_install_state migrated

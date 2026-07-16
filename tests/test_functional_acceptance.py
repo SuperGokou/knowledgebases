@@ -6,18 +6,23 @@ import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import scripts.functional_acceptance as functional_acceptance
 from scripts.acceptance import build_profile, collect_worktree_evidence
 from scripts.functional_acceptance import (
+    AcceptanceGateError,
     ContractError,
     ExternalEvidenceReport,
     ExternalTrustContext,
+    _consume_challenge_once,
     _payload,
     _signature_payload,
+    _vitest_collected_nodes,
     evaluate_contract,
     evaluate_external_evidence,
     load_manifest,
@@ -28,6 +33,23 @@ from scripts.functional_acceptance import (
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 MANIFEST = REPOSITORY / "docs/functional_acceptance_manifest.json"
+
+
+def test_vitest_collection_rejects_duplicate_machine_nodes(tmp_path: Path) -> None:
+    test_file = tmp_path / "duplicate-title.test.ts"
+    report = tmp_path / "vitest-collection.json"
+    report.write_text(
+        json.dumps(
+            [
+                {"file": str(test_file), "name": "suite > duplicate case"},
+                {"file": str(test_file), "name": "suite > duplicate case"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AcceptanceGateError, match="duplicate tests"):
+        _vitest_collected_nodes(report, tmp_path)
 
 
 def _canonical_evidence_digest(document: dict[str, object]) -> str:
@@ -224,6 +246,61 @@ def test_repository_manifest_binds_all_document_formats_to_active_parser_tests()
         "tests/test_document_parser_preflight.py",
         "tests/test_okf_document_pipeline.py",
     } <= set(backend["required_test_nodes"])
+
+
+def test_repository_manifest_binds_new_enterprise_lifecycle_and_recovery_checks() -> None:
+    manifest = load_manifest(MANIFEST)
+    runners = {
+        item["id"]: item
+        for item in manifest["test_commands"]  # type: ignore[index]
+    }
+
+    backend = runners["backend-functional"]
+    assert backend["minimum_passed_tests"] == 434
+    assert {
+        "tests/test_user_retirement.py",
+        "tests/test_user_retirement_migration.py",
+        "tests/test_user_activity_locking.py",
+        "tests/test_legacy_offline_adoption.py",
+        "tests/test_offline_adoption_transaction.py",
+        "tests/test_offline_crash_recovery.py",
+        "tests/test_offline_pre_migration_abort.py",
+        "tests/test_legacy_adoption_document_contract.py",
+        "tests/test_linux_host_evidence_collector.py",
+    } <= set(backend["required_test_nodes"])
+
+    frontend = runners["frontend-functional"]
+    assert frontend["minimum_passed_tests"] == 182
+    assert "FUNC-AUDIT-001" in frontend["covers"]
+    assert {
+        "tests/user-retirement.test.ts",
+        "tests/audit-log-console.test.ts",
+        "tests/file-approval.test.ts",
+    } <= set(frontend["required_test_nodes"])
+
+    postgres = manifest["internal_gate_bindings"][0]  # type: ignore[index]
+    assert {
+        "user_retirement_linearization",
+        "last_superuser_linearization",
+        "api_key_retirement_linearization",
+    } <= set(postgres["required_checks"])
+
+    external = {
+        item["id"]: item
+        for item in manifest["external_evidence"]  # type: ignore[index]
+    }
+    browser = external["EXT-BROWSER-E2E-001"]
+    assert browser["collection"]["expected_collected_tests"] == 26
+    assert {
+        "audit_log_query_export",
+        "tls_validity_and_renewal",
+    } <= set(browser["required_checks"])
+    assert "tls_expiry_30d" not in browser["required_checks"]
+    assert {
+        "caddy_ca_persistent_storage",
+        "caddy_automatic_certificate_management",
+        "caddy_renewal_health",
+    } <= set(external["EXT-LINUX-HOST-001"]["required_checks"])
 
 
 def test_blocking_requirement_fails_closed_on_skipped_test(tmp_path: Path) -> None:
@@ -507,7 +584,7 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
-    repository.mkdir()
+    repository.mkdir(parents=True)
     (repository / ".gitignore").write_text("artifacts/acceptance/\n", encoding="utf-8")
     (repository / "application.txt").write_text("release candidate\n", encoding="utf-8")
     for arguments in (
@@ -647,6 +724,196 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
     assert accepted.results[0].status == "passed"
     assert replayed.verdict == "BLOCKED"
     assert replayed.results[0].status == "blocked"
+
+
+def _generic_external_report(
+    tmp_path: Path,
+    *,
+    challenge_run_id: str,
+    extra_target_field: bool = False,
+) -> ExternalEvidenceReport:
+    repository = tmp_path / "generic-repository"
+    repository.mkdir(parents=True)
+    (repository / ".gitignore").write_text("artifacts/acceptance/\n", encoding="utf-8")
+    (repository / "application.txt").write_text("release candidate\n", encoding="utf-8")
+    for arguments in (
+        ("init", "-q"),
+        ("config", "user.email", "acceptance@example.invalid"),
+        ("config", "user.name", "Acceptance Test"),
+        ("add", ".gitignore", "application.txt"),
+        ("commit", "-q", "-m", "test fixture"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+    evidence_path = repository / "artifacts/acceptance/functional/linux-host.json"
+    raw_path = evidence_path.parent / "raw/host.json"
+    raw_path.parent.mkdir(parents=True)
+    raw = b'{"host":"passed"}\n'
+    raw_path.write_bytes(raw)
+    identity = collect_worktree_evidence(repository)
+    run_id = "linux-host-target-001"
+    target: dict[str, object] = {
+        "git_head": identity.git_head,
+        "content_fingerprint": identity.content_fingerprint,
+        "run_id": run_id,
+    }
+    if extra_target_field:
+        target["operator"] = "untrusted"
+    document: dict[str, object] = {
+        "schema_version": 2,
+        "evidence_id": "EXT-LINUX-HOST-001",
+        "status": "complete",
+        "collector": {"id": "heyi-linux-host", "version": "1.0.0"},
+        "target": target,
+        "collected_at": datetime.now(UTC).isoformat(),
+        "artifacts": [
+            {
+                "id": "host",
+                "path": "raw/host.json",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+            }
+        ],
+        "checks": {"linux_amd64": {"status": "passed", "artifact_ids": ["host"]}},
+    }
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    challenge_id = "challenge-linux-host-001"
+    nonce = "n" * 40
+    key_id = "linux-host-ed25519"
+    document["attestation"] = {
+        "type": "ed25519-challenge-v1",
+        "key_id": key_id,
+        "challenge_id": challenge_id,
+        "challenge_nonce": nonce,
+        "signature": base64.b64encode(
+            private_key.sign(
+                _signature_payload(
+                    document,
+                    key_id=key_id,
+                    challenge_id=challenge_id,
+                    challenge_nonce=nonce,
+                )
+            )
+        ).decode(),
+    }
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
+    manifest = {
+        "external_evidence": [
+            {
+                "id": "EXT-LINUX-HOST-001",
+                "path": "artifacts/acceptance/functional/linux-host.json",
+                "required_checks": ["linux_amd64"],
+                "evidence_schema_version": 2,
+                "collector": {"id": "heyi-linux-host", "version": "1.0.0"},
+                "max_age_seconds": 3600,
+            }
+        ]
+    }
+    context = ExternalTrustContext(
+        public_keys={("heyi-linux-host", key_id): public_key},
+        challenges={
+            challenge_id: {
+                "status": "issued",
+                "evidence_id": "EXT-LINUX-HOST-001",
+                "nonce": nonce,
+                "target": {
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                    "run_id": challenge_run_id,
+                },
+                "issued_at": datetime.now(UTC).isoformat(),
+                "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+            }
+        },
+        consumed_challenges=set(),
+    )
+    return evaluate_external_evidence(
+        repository,
+        manifest,
+        trust_context=context,
+        enforce_policy=False,
+    )
+
+
+def test_all_external_evidence_requires_exact_run_bound_challenge_target(
+    tmp_path: Path,
+) -> None:
+    matching = _generic_external_report(
+        tmp_path / "matching",
+        challenge_run_id="linux-host-target-001",
+    )
+    mismatched = _generic_external_report(
+        tmp_path / "mismatched",
+        challenge_run_id="different-linux-run-001",
+    )
+    extra_target = _generic_external_report(
+        tmp_path / "extra",
+        challenge_run_id="linux-host-target-001",
+        extra_target_field=True,
+    )
+
+    assert matching.verdict == "PASS"
+    assert mismatched.verdict == "BLOCKED"
+    assert extra_target.verdict == "BLOCKED"
+
+
+def test_challenge_consume_is_noreplace_and_fsyncs_directory() -> None:
+    events: list[object] = []
+    with (
+        patch.object(functional_acceptance.os, "open", return_value=91),
+        patch.object(
+            functional_acceptance.os,
+            "link",
+            side_effect=lambda *args, **kwargs: events.append(("link", args, kwargs)),
+        ),
+        patch.object(
+            functional_acceptance.os,
+            "fsync",
+            side_effect=lambda descriptor: events.append(("fsync", descriptor)),
+        ),
+        patch.object(
+            functional_acceptance.os,
+            "unlink",
+            side_effect=lambda *args, **kwargs: events.append(("unlink", args, kwargs)),
+        ),
+        patch.object(functional_acceptance.os, "close", return_value=None),
+    ):
+        assert _consume_challenge_once(Path("/trust/challenge-linux-host-001.json"))
+
+    assert [event[0] for event in events] == ["link", "fsync", "unlink", "fsync"]
+    link_event = events[0]
+    assert isinstance(link_event, tuple)
+    assert link_event[2]["follow_symlinks"] is False
+
+
+def test_challenge_consume_crash_marker_blocks_overwrite_and_preserves_source() -> None:
+    unlinks: list[object] = []
+    with (
+        patch.object(functional_acceptance.os, "open", return_value=92),
+        patch.object(functional_acceptance.os, "link", return_value=None),
+        patch.object(functional_acceptance.os, "fsync", side_effect=OSError("crash")),
+        patch.object(functional_acceptance.os, "unlink", side_effect=unlinks.append),
+        patch.object(functional_acceptance.os, "close", return_value=None),
+    ):
+        assert not _consume_challenge_once(Path("/trust/challenge-linux-host-001.json"))
+    assert unlinks == []
+
+    with (
+        patch.object(functional_acceptance.os, "open", return_value=93),
+        patch.object(functional_acceptance.os, "link", side_effect=FileExistsError),
+        patch.object(functional_acceptance.os, "unlink") as unlink,
+        patch.object(functional_acceptance.os, "close", return_value=None),
+    ):
+        assert not _consume_challenge_once(Path("/trust/challenge-linux-host-001.json"))
+        unlink.assert_not_called()
 
 
 def test_current_sha_chain_without_trusted_signature_is_blocked(tmp_path: Path) -> None:

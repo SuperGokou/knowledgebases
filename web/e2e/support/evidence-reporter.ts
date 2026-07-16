@@ -43,8 +43,16 @@ export const REQUIRED_CHECKS = [
   "file_upload_scan_okf_approval_download",
   "chat_citations_audit_table",
   "model_switch",
+  "model_deepseek_success",
+  "model_qwen_success",
+  "model_minimax_success",
   "api_key_lifecycle",
+  "audit_log_query_export",
   "error_loading_states",
+  "tls_ca_trust",
+  "tls_san_identity",
+  "tls_validity_and_renewal",
+  "tls_strict_client",
 ] as const;
 
 export const REQUIRED_PROJECTS = ["enterprise-desktop", "enterprise-mobile"] as const;

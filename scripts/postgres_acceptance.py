@@ -67,6 +67,7 @@ POSTGRES_BUSINESS_CHECK_NODES: dict[str, tuple[str, ...]] = {
         "tests/test_migration_0011_postgres.py::test_0011_backfills_security_outcomes_and_refuses_destructive_downgrade",
         "tests/test_migration_0011_postgres.py::test_0019_restricts_role_references_and_refuses_version_lying_downgrade",
         "tests/test_migration_0018_postgres.py::test_0018_preserves_historical_claims_and_binds_replay_to_content_version",
+        "tests/test_migration_0021_postgres.py::test_0021_adds_durable_user_retirement_evidence_and_refuses_downgrade",
     ),
     "budget_concurrency": (
         "tests/test_llm_usage_postgres.py::test_postgres_row_lock_prevents_concurrent_budget_overspend",
@@ -132,6 +133,21 @@ POSTGRES_BUSINESS_CHECK_NODES: dict[str, tuple[str, ...]] = {
     ),
     "rag_retrieval_quality": (
         "tests/test_rag_retrieval_eval_postgres.py::test_postgres_chinese_rag_retrieval_quality_gate",
+    ),
+    "user_retirement_linearization": (
+        "tests/test_user_retirement_postgres.py::test_postgres_authenticated_kb_create_finishes_before_owner_transfer_retirement",
+        "tests/test_user_retirement_postgres.py::test_postgres_retirement_commits_before_stale_kb_create_is_rejected",
+        "tests/test_user_retirement_postgres.py::test_postgres_self_password_change_does_not_deadlock_refresh_or_logout",
+        "tests/test_user_retirement_postgres.py::test_postgres_duplicate_retirement_is_idempotent_and_single_audit",
+    ),
+    "last_superuser_linearization": (
+        "tests/test_user_retirement_postgres.py::test_postgres_cross_disable_preserves_one_active_superuser",
+    ),
+    "api_key_retirement_linearization": (
+        "tests/test_user_retirement_postgres.py::test_postgres_api_key_issue_finishes_before_retirement_revokes_the_key",
+        "tests/test_user_retirement_postgres.py::test_postgres_retirement_rejects_stale_api_key_issue",
+        "tests/test_user_retirement_postgres.py::test_postgres_public_api_key_request_finishes_before_retirement",
+        "tests/test_user_retirement_postgres.py::test_postgres_retirement_rejects_stale_public_api_key_request",
     ),
 }
 POSTGRES_REQUIRED_CHECKS = tuple(POSTGRES_BUSINESS_CHECK_NODES)

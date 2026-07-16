@@ -59,7 +59,8 @@ _SKIP_PATTERN = re.compile(r"(?im)(?:\b\d+\s+skipped\b|\btests?\s+\d+\s+skipped\
 _PASS_PATTERN = re.compile(r"(?im)(?:\b(\d+)\s+passed\b|\btests?\s+(\d+)\s+passed\b)")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SEMVER_PATTERN = re.compile(r"\d+\.\d+\.\d+")
-_BROWSER_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,80}\Z")
+_EXTERNAL_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,80}\Z")
+_CHALLENGE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 _MAX_RAW_ARTIFACT_BYTES = 100 * 1024 * 1024
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _SUPPORTED_FRAMEWORK_PREFIXES: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -71,7 +72,7 @@ _SUPPORTED_FRAMEWORK_PREFIXES: dict[str, tuple[tuple[str, ...], ...]] = {
     "vitest": (("npm", "test", "--"),),
 }
 _POLICY_RELATIVE_PATH = Path("docs/functional_acceptance_policy.json")
-_POLICY_SHA256 = "2174862a14cf4dcc1017214379fb81acfa87b2015bba97d34105fe27b95a03c1"
+_POLICY_SHA256 = "1b83360e3eadc66e86fb422a43f2151103840db8a84168dc91867df41d93228e"
 
 
 class ContractError(ValueError):
@@ -234,6 +235,17 @@ def load_external_trust_context(
         public_keys[(collector_id, key_id)] = public_key
     challenges: dict[str, Mapping[str, object]] = {}
     challenge_paths: dict[str, Path] = {}
+    consumed_challenges: set[str] = set()
+    for path in challenge_store.glob("*.consumed"):
+        consumed_id = path.name.removesuffix(".consumed")
+        if (
+            not consumed_id
+            or _CHALLENGE_ID_PATTERN.fullmatch(consumed_id) is None
+            or not _secure_root_file(path)
+            or consumed_id in consumed_challenges
+        ):
+            raise ContractError("consumed challenge marker is invalid or duplicated")
+        consumed_challenges.add(consumed_id)
     for path in challenge_store.glob("*.json"):
         if not _secure_root_file(path):
             raise ContractError("challenge file is not root-owned 0400/0600")
@@ -256,7 +268,7 @@ def load_external_trust_context(
         challenge_paths[challenge_id] = path
     if not challenges:
         raise ContractError("challenge store has no issued challenge")
-    return ExternalTrustContext(public_keys, challenges, set(), challenge_paths)
+    return ExternalTrustContext(public_keys, challenges, consumed_challenges, challenge_paths)
 
 
 def policy_digest(repository: Path) -> str:
@@ -867,10 +879,10 @@ def _vitest_machine_evidence(
 
 def _runner_artifact_directory(repository: Path, identity: GateIdentity) -> Path:
     root = Path(tempfile.gettempdir()) / "heyi-functional-acceptance"
-    directory = (
+    directory: Path = Path(
         root
         / identity.content_fingerprint
-        / identity.run_nonce
+        / str(identity.run_nonce)
         / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     )
     directory.mkdir(parents=True, exist_ok=False)
@@ -1259,6 +1271,48 @@ def _signature_payload(
     )
 
 
+def _consume_challenge_once(challenge_path: Path) -> bool:
+    """Durably consume a challenge without replacing an existing replay marker.
+
+    The hard-link + directory-fsync sequence is intentionally recoverable.  If
+    the process dies after the link is durable but before the issued name is
+    removed, the ``.consumed`` marker still makes the challenge unusable on the
+    next verifier process.
+    """
+
+    challenge_name = challenge_path.name
+    if not challenge_name.endswith(".json"):
+        return False
+    consumed_name = f"{challenge_name[:-5]}.consumed"
+    directory_flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        directory_fd = os.open(challenge_path.parent, directory_flags | nofollow)
+    except OSError:
+        return False
+    linked = False
+    try:
+        try:
+            os.link(
+                challenge_name,
+                consumed_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            linked = True
+            os.fsync(directory_fd)
+            os.unlink(challenge_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except OSError:
+            # Never remove a durable marker on failure: it is the fail-closed
+            # crash-recovery record preventing cross-process replay.
+            return False
+    finally:
+        os.close(directory_fd)
+    return linked
+
+
 def _validate_external_provenance(
     repository: Path,
     evidence_path: Path,
@@ -1306,19 +1360,13 @@ def _validate_external_provenance(
     except (OSError, RuntimeError, UnicodeError):
         return False
     target = _mapping(document.get("target"))
-    browser_evidence = document.get("evidence_id") == "EXT-BROWSER-E2E-001"
     if (
         target is None
         or target.get("git_head") != identity.git_head
         or target.get("content_fingerprint") != identity.content_fingerprint
-        or (
-            browser_evidence
-            and (
-                not isinstance(target.get("run_id"), str)
-                or _BROWSER_RUN_ID_PATTERN.fullmatch(str(target.get("run_id"))) is None
-                or set(target) != {"git_head", "content_fingerprint", "run_id"}
-            )
-        )
+        or not isinstance(target.get("run_id"), str)
+        or _EXTERNAL_RUN_ID_PATTERN.fullmatch(str(target.get("run_id"))) is None
+        or set(target) != {"git_head", "content_fingerprint", "run_id"}
     ):
         return False
 
@@ -1408,14 +1456,9 @@ def _validate_external_provenance(
         challenge.get("status") != "issued"
         or challenge.get("evidence_id") != document.get("evidence_id")
         or challenge.get("nonce") != challenge_nonce
-        or (
-            browser_evidence
-            and (
-                not isinstance(target_run_id, str)
-                or _BROWSER_RUN_ID_PATTERN.fullmatch(target_run_id) is None
-                or challenge_target != target
-            )
-        )
+        or not isinstance(target_run_id, str)
+        or _EXTERNAL_RUN_ID_PATTERN.fullmatch(target_run_id) is None
+        or challenge_target != target
         or issued_at is None
         or expires_at is None
         or issued_at > now + _MAX_CLOCK_SKEW
@@ -1442,12 +1485,8 @@ def _validate_external_provenance(
     except (ValueError, binascii.Error, InvalidSignature):
         return False
     challenge_path = trust_context.challenge_paths.get(challenge_id)
-    if challenge_path is not None:
-        consumed_path = challenge_path.with_suffix(".consumed")
-        try:
-            os.replace(challenge_path, consumed_path)
-        except OSError:
-            return False
+    if challenge_path is not None and not _consume_challenge_once(challenge_path):
+        return False
     trust_context.consumed_challenges.add(challenge_id)
     return True
 

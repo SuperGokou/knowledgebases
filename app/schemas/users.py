@@ -45,6 +45,9 @@ class UserRead(BaseModel):
     updated_at: datetime
     role_assignment_version: int = Field(ge=1)
     role_ids: list[UUID] = Field(default_factory=list)
+    retired_at: datetime | None
+    retired_by_id: UUID | None
+    retirement_reason: str | None
 
 
 class RoleAssignmentUpdate(BaseModel):
@@ -76,3 +79,25 @@ class UserPasswordReset(BaseModel):
         cleartext = value.get_secret_value() if isinstance(value, SecretStr) else value
         validate_strong_password(cleartext)
         return value
+
+
+class UserRetirement(BaseModel):
+    """Explicit operator confirmation for irreversible account retirement."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation_email: EmailStr
+    reason: str | None = Field(default=None, max_length=1_000)
+    replacement_owner_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Active successor that atomically receives every knowledge base owned by "
+            "the retiring account."
+        ),
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str | None) -> str | None:
+        normalized = value.strip() if value is not None else ""
+        return normalized or None

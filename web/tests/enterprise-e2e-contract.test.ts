@@ -10,7 +10,9 @@ import { describe, expect, test } from "vitest";
 
 import {
   DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS,
+  LOCAL_MOCK_AUTH_BACKEND_URL,
   resolveEnterpriseTestTimeoutMs,
+  resolveWebServerConfig,
 } from "../playwright.config";
 import {
   EVIDENCE_COLLECTOR,
@@ -40,6 +42,14 @@ const enterpriseFixtures = readFileSync(
 );
 const enterpriseBusinessSpec = readFileSync(
   path.join(process.cwd(), "e2e/enterprise-business.spec.ts"),
+  "utf8",
+);
+const enterpriseConfigSource = readFileSync(
+  path.join(process.cwd(), "e2e/support/enterprise-config.ts"),
+  "utf8",
+);
+const standaloneLauncherSource = readFileSync(
+  path.join(process.cwd(), "e2e/support/start-standalone.mjs"),
   "utf8",
 );
 
@@ -88,6 +98,133 @@ describe("enterprise Playwright profile", () => {
     expect(enterpriseBusinessSpec).toContain('getByRole("button", { name: `撤销 ${keyName}` })');
     expect(enterpriseBusinessSpec).toContain('getByRole("button", { name: "我已保存，关闭明文" })');
     expect(enterpriseBusinessSpec).toContain("await expect(issuedPanel).toHaveCount(0)");
+  });
+
+  test("requires a real bounded audit dataset, safe CSV and fail-closed permission revocation", () => {
+    expect(REQUIRED_CHECKS).toContain("audit_log_query_export");
+    expect(enterpriseBusinessSpec).toContain(
+      'annotate(testInfo, "audit_log_query_export")',
+    );
+    expect(enterpriseBusinessSpec).toContain("requireAuditFixturePage(");
+    expect(enterpriseBusinessSpec).toContain("enterprise.auditPageAction,");
+    expect(enterpriseBusinessSpec).toContain("50,");
+    expect(enterpriseBusinessSpec).toContain("5,");
+    expect(enterpriseBusinessSpec).toContain("csvRows).toHaveLength(56)");
+    expect(enterpriseBusinessSpec).toContain("csvRow.length === 8");
+    expect(enterpriseBusinessSpec).toContain("Buffer.from([0xef, 0xbb, 0xbf])");
+    expect(enterpriseBusinessSpec).toContain('not.toContain("details")');
+    expect(enterpriseBusinessSpec).toContain('not.toContain("ip_address")');
+    expect(enterpriseBusinessSpec).toContain("enterprise.auditRedactionSentinel");
+    expect(enterpriseBusinessSpec).toContain(
+      "E2E_BLOCKED: dedicated >5000 audit fixture is unavailable",
+    );
+    expect(enterpriseBusinessSpec).toContain(
+      "E2E_BLOCKED: dedicated >5000 audit fixture does not exceed the export limit",
+    );
+    expect(enterpriseBusinessSpec).toContain('response.status() === 403');
+    expect(enterpriseBusinessSpec).toContain('name: "重试导出"');
+    expect(enterpriseBusinessSpec).not.toContain("page.route(");
+  });
+
+  test("requires a successful grounded answer from every configured model provider", () => {
+    for (const check of [
+      "model_deepseek_success",
+      "model_qwen_success",
+      "model_minimax_success",
+    ]) {
+      expect(REQUIRED_CHECKS).toContain(check);
+      expect(enterpriseBusinessSpec).toContain(`annotate(testInfo, "${check}")`);
+    }
+    expect(enterpriseBusinessSpec).toContain("expect(generatedBody.provider).toBe(provider)");
+    expect(enterpriseBusinessSpec).toContain(
+      "expect(generatedBody.model).toBe(configuredProvider.model)",
+    );
+    expect(enterpriseBusinessSpec).toContain('expect(generatedBody.mode).toBe("rag")');
+    expect(enterpriseBusinessSpec).toContain('reason: "semantic_verified"');
+    expect(enterpriseBusinessSpec).toContain('reason: "llm_generated"');
+    expect(enterpriseBusinessSpec).toContain(
+      "expect(sourceStatus.citation_count).toBe(citations.length)",
+    );
+    expect(enterpriseBusinessSpec).toContain(
+      "expect(restoredBody.default_provider).toBe(original.provider)",
+    );
+  });
+
+  test("supports short-lived TLS leaves and binds renewal claims to formal host evidence", () => {
+    for (const check of [
+      "tls_ca_trust",
+      "tls_san_identity",
+      "tls_validity_and_renewal",
+      "tls_strict_client",
+    ]) {
+      expect(REQUIRED_CHECKS).toContain(check);
+      expect(enterpriseBusinessSpec).toContain(`annotate(testInfo, "${check}")`);
+    }
+    expect(enterpriseBusinessSpec).toContain('["web", enterprise.baseUrl]');
+    expect(enterpriseBusinessSpec).toContain('["api", enterprise.publicApiOrigin]');
+    expect(enterpriseBusinessSpec).toContain('["objects", enterprise.objectsOrigin]');
+    expect(enterpriseBusinessSpec).toContain("await probeEnterpriseTlsOrigin(origin)");
+    expect(enterpriseConfigSource).toContain("rejectUnauthorized: true");
+    expect(enterpriseConfigSource).toContain('minVersion: "TLSv1.2"');
+    expect(enterpriseConfigSource).toContain('maxVersion: "TLSv1.3"');
+    expect(enterpriseConfigSource).toContain("checkServerIdentity(hostname, certificate)");
+    expect(enterpriseConfigSource).toContain("certificate.subjectaltname?.trim()");
+    expect(enterpriseConfigSource).toContain("MINIMUM_TLS_REMAINING_VALIDITY_MS");
+    expect(enterpriseConfigSource).toContain("MAXIMUM_TLS_NOT_BEFORE_SKEW_MS");
+    expect(enterpriseConfigSource).toContain("issuerCertificate");
+    expect(enterpriseConfigSource).not.toContain("30 * 24 * 60 * 60 * 1_000");
+    expect(enterpriseConfigSource).toContain("scheduler.schedule(() =>");
+    expect(enterpriseConfigSource).toContain("const closedSockets = new WeakSet<object>()");
+    expect(enterpriseConfigSource).not.toContain("socket.setTimeout(");
+    expect(enterpriseConfigSource).not.toContain("queueMicrotask(");
+    expect(enterpriseBusinessSpec).toContain('evidence_id: "EXT-LINUX-HOST-001"');
+    expect(enterpriseBusinessSpec).toContain(
+      'assertion_source: "formal_host_evidence_not_socket_probe"',
+    );
+    expect(enterpriseBusinessSpec).toContain('"caddy_ca_persistent_storage"');
+    expect(enterpriseBusinessSpec).toContain('"caddy_renewal_health"');
+  });
+
+  test("approves converted files through the visible file-center control", () => {
+    expect(enterpriseBusinessSpec).toContain('name: `审批文件：${fixture.filename}`');
+    expect(enterpriseBusinessSpec).toContain("await approveButton.click()");
+    expect(enterpriseBusinessSpec).toContain("approve ${fixture.extension} through UI");
+    expect(enterpriseBusinessSpec).not.toMatch(
+      /bffRequest\(\s*page,\s*`\/api\/v1\/files\/\$\{String\(file\.id\)\}\/approve`/,
+    );
+  });
+
+  test("downloads every approved fixture through the visible file-center control", () => {
+    expect(enterpriseBusinessSpec).toContain(
+      'fileRow.getByRole("button", { name: "下载", exact: true })',
+    );
+    expect(enterpriseBusinessSpec).toContain("await downloadButton.click()");
+    expect(enterpriseBusinessSpec).toContain('page.waitForEvent("download")');
+    expect(enterpriseBusinessSpec).toContain(
+      "const observedObjectUrl = validateObjectDownloadUrl(",
+    );
+    expect(enterpriseBusinessSpec).toContain("objectResponse.url(),");
+    expect(enterpriseBusinessSpec).toContain("browserDownload.createReadStream()");
+    expect(enterpriseBusinessSpec).not.toMatch(
+      /request\.get\(downloadUrl/,
+    );
+  });
+
+  test("renders real 401, 403, backend failure and timeout states with retry controls", () => {
+    expect(enterpriseBusinessSpec).not.toContain("page.route(");
+    expect(enterpriseBusinessSpec).toContain('verifyVisibleBackendFailure("backend_5xx", 503)');
+    expect(enterpriseBusinessSpec).toContain('verifyVisibleBackendFailure("backend_timeout", 504)');
+    expect(enterpriseBusinessSpec).toContain('response.status() === 403');
+    expect(enterpriseBusinessSpec).toContain('response.status() === 401');
+    expect(enterpriseBusinessSpec).toContain(
+      'forbiddenAlert.getByRole("button", { name: "重试" })',
+    );
+    expect(enterpriseBusinessSpec).toContain(
+      'unauthorizedAlert.getByRole("button", { name: "重试" })',
+    );
+    expect(enterpriseBusinessSpec).toContain(
+      'alert.getByRole("button", { name: "重试" }).click()',
+    );
   });
 
   test("masks one-time credentials and password fields in mandatory evidence screenshots", () => {
@@ -144,6 +281,32 @@ describe("enterprise Playwright profile", () => {
     ).toBe(true);
   });
 
+  test("runs smoke through the production standalone server and keeps mocks local-only", () => {
+    expect(resolveWebServerConfig(true)).toBeUndefined();
+    const localServers = resolveWebServerConfig(false);
+    expect(localServers).toHaveLength(2);
+    expect(localServers?.[0]).toMatchObject({
+      command: "node e2e/support/mock-auth-backend.mjs",
+      url: `${LOCAL_MOCK_AUTH_BACKEND_URL}/healthz`,
+      reuseExistingServer: false,
+    });
+    expect(localServers?.[1]).toMatchObject({
+      command: "npm run build && node e2e/support/start-standalone.mjs",
+      reuseExistingServer: false,
+      env: {
+        FASTAPI_URL: LOCAL_MOCK_AUTH_BACKEND_URL,
+        HOSTNAME: "127.0.0.1",
+        PORT: "3100",
+      },
+    });
+    expect(localServers?.[1]?.command).not.toContain("next start");
+    expect(standaloneLauncherSource).toContain('path.join(standaloneRoot, "server.js")');
+    expect(standaloneLauncherSource).toContain("cp(publicSource, publicTarget");
+    expect(standaloneLauncherSource).toContain("cp(staticSource, staticTarget");
+    expect(standaloneLauncherSource).toContain("process.chdir(standaloneRoot)");
+    expect(standaloneLauncherSource).toContain("await import(pathToFileURL(serverEntry).href)");
+  });
+
   test("keeps formal collection policy, runtime profile, and evidence reporter projects aligned", () => {
     const enterprise = resolvePlaywrightProfile(
       { KB_E2E_PROFILE: "enterprise" },
@@ -153,7 +316,7 @@ describe("enterprise Playwright profile", () => {
     const reporterProjects = [...REQUIRED_PROJECTS];
 
     for (const contract of readFormalBrowserCollectionContracts()) {
-      expect(contract.expected_collected_tests).toBe(22);
+      expect(contract.expected_collected_tests).toBe(26);
       expect(contract.required_projects).toEqual(runtimeProjects);
       expect(contract.required_projects).toEqual(reporterProjects);
     }
@@ -179,6 +342,9 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
       KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
       KB_E2E_RUN_ID: "acceptance-run-20260714",
+      KB_E2E_AUDIT_PAGE_ACTION: "e2e.audit.page.fixture",
+      KB_E2E_AUDIT_OVERSIZED_ACTION: "e2e.audit.oversized.fixture",
+      KB_E2E_AUDIT_REDACTION_SENTINEL: "E2E_REDACT_SENTINEL",
       KB_E2E_DOCUMENT_FIXTURE_ROOT: "C:/trust/document-fixtures",
       KB_E2E_DOCUMENT_FIXTURE_MANIFEST: "C:/trust/document-fixtures/document-fixtures-v1.json",
     };
@@ -206,12 +372,17 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
       KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
       KB_E2E_RUN_ID: "acceptance-run-20260714",
+      KB_E2E_AUDIT_PAGE_ACTION: "e2e.audit.page.fixture",
+      KB_E2E_AUDIT_OVERSIZED_ACTION: "e2e.audit.oversized.fixture",
+      KB_E2E_AUDIT_REDACTION_SENTINEL: "E2E_REDACT_SENTINEL",
       KB_E2E_DOCUMENT_FIXTURE_ROOT: "C:/trust/document-fixtures",
       KB_E2E_DOCUMENT_FIXTURE_MANIFEST:
         "C:/trust/document-fixtures/document-fixtures-v1.json",
     };
     expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_OBJECTS_ORIGIN");
     expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_RUN_ID");
+    expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_AUDIT_PAGE_ACTION");
+    expect(REQUIRED_ENTERPRISE_ENV).toContain("KB_E2E_AUDIT_OVERSIZED_ACTION");
     expect(
       inspectEnterpriseConfig({ ...env, KB_E2E_OBJECTS_ORIGIN: undefined }).missing,
     ).toContain("KB_E2E_OBJECTS_ORIGIN");
@@ -222,7 +393,42 @@ describe("enterprise Playwright profile", () => {
     ).toContain("KB_E2E_RUN_ID");
     expect(requireEnterpriseConfig(env).objectsOrigin).toBe("https://objects.invalid");
 
+    for (const loopbackOrigin of [
+      "http://127.0.0.1:3198",
+      "http://127.255.10.9:3198",
+      "http://localhost:3198",
+      "http://[::1]:3198",
+    ]) {
+      expect(
+        inspectEnterpriseConfig({ ...env, KB_E2E_FAULT_CONTROL_ORIGIN: loopbackOrigin }),
+      ).toEqual({ missing: [], invalid: [] });
+    }
+    for (const plaintextOrigin of [
+      "http://fault.invalid",
+      "http://10.0.14.55:3198",
+      "http://192.168.1.10:3198",
+      "http://0.0.0.0:3198",
+    ]) {
+      expect(
+        inspectEnterpriseConfig({ ...env, KB_E2E_FAULT_CONTROL_ORIGIN: plaintextOrigin }).invalid,
+      ).toContain("KB_E2E_FAULT_CONTROL_ORIGIN");
+      expect(() =>
+        requireEnterpriseConfig({ ...env, KB_E2E_FAULT_CONTROL_ORIGIN: plaintextOrigin }),
+      ).toThrow(/KB_E2E_FAULT_CONTROL_ORIGIN/);
+    }
+    const faultControlSource = enterpriseBusinessSpec.slice(
+      enterpriseBusinessSpec.indexOf("async function setFaultMode"),
+      enterpriseBusinessSpec.indexOf("async function uploadMultipartFixture"),
+    );
+    expect(faultControlSource).toContain(
+      "headers: { authorization: `Bearer ${enterprise.faultControlToken}` }",
+    );
+    expect(faultControlSource).toContain("data: { mode }");
+    expect(faultControlSource).not.toContain("faultControlToken}/");
+    expect(faultControlSource).not.toContain("data: { mode, token");
+
     for (const unsafeOrigin of [
+      "http://objects.invalid",
       "ftp://objects.invalid",
       "https://user:password@objects.invalid",
       "https://objects.invalid/path",
@@ -232,6 +438,10 @@ describe("enterprise Playwright profile", () => {
       expect(
         inspectEnterpriseConfig({ ...env, KB_E2E_OBJECTS_ORIGIN: unsafeOrigin }).invalid,
       ).toContain("KB_E2E_OBJECTS_ORIGIN");
+    }
+    for (const name of ["KB_E2E_BASE_URL", "KB_E2E_PUBLIC_API_ORIGIN"] as const) {
+      expect(inspectEnterpriseConfig({ ...env, [name]: "http://plain.invalid" }).invalid)
+        .toContain(name);
     }
 
     expect(

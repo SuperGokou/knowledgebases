@@ -22,14 +22,16 @@
         "refresh_token_rotation", "audit_append_only_runtime_role", "isolated_migration_0011",
         "chat_idempotency_concurrency", "chat_outcome_unknown_fail_closed",
         "chat_replay_lineage_upgrade", "knowledge_content_revision_trigger",
-        "credential_family_idempotency_upgrade", "rag_retrieval_quality"
+        "credential_family_idempotency_upgrade", "rag_retrieval_quality",
+        "user_retirement_linearization", "last_superuser_linearization",
+        "api_key_retirement_linearization"
       ]
     }
   ],
   "runners": {
     "backend-functional": {
       "framework": "pytest",
-      "minimum_passed_tests": 259,
+      "minimum_passed_tests": 434,
       "covers": [
         "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-KB-ACL-001",
         "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001",
@@ -72,15 +74,25 @@
         "tests/test_host_preflight.py", "tests/test_offline_compose.py", "tests/test_document_parser.py",
         "tests/test_document_parser_preflight.py", "tests/test_okf_document_pipeline.py",
         "tests/test_api_key_catalog_pagination.py",
-        "tests/test_supply_chain_gate.py"
+        "tests/test_supply_chain_gate.py",
+        "tests/test_user_retirement.py",
+        "tests/test_user_retirement_migration.py",
+        "tests/test_user_activity_locking.py",
+        "tests/test_legacy_offline_adoption.py",
+        "tests/test_offline_adoption_transaction.py",
+        "tests/test_offline_crash_recovery.py",
+        "tests/test_offline_pre_migration_abort.py",
+        "tests/test_legacy_adoption_document_contract.py",
+        "tests/test_linux_host_evidence_collector.py"
       ]
     },
     "frontend-functional": {
       "framework": "vitest",
-      "minimum_passed_tests": 137,
+      "minimum_passed_tests": 182,
       "covers": [
         "FUNC-AUTH-001", "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-FILE-001",
-        "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001", "FUNC-UXSTATE-001"
+        "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001", "FUNC-AUDIT-001",
+        "FUNC-UXSTATE-001"
       ],
       "required_test_nodes": [
         "tests/access-routing.test.ts", "tests/login-route.test.ts", "tests/workspace-guard.test.ts",
@@ -91,7 +103,10 @@
         "tests/chat-sources.test.ts",
         "tests/chat-data-table.test.ts", "tests/model-settings.test.ts", "tests/api-usage-examples.test.ts",
         "tests/error-reporting.test.ts", "tests/access-provider.test.ts", "tests/chat-service-status.test.ts",
-        "tests/file-knowledge-status.test.ts"
+        "tests/file-knowledge-status.test.ts",
+        "tests/user-retirement.test.ts",
+        "tests/audit-log-console.test.ts",
+        "tests/file-approval.test.ts"
       ]
     }
   },
@@ -101,11 +116,22 @@
   },
   "external_test_collections": {
     "EXT-BROWSER-E2E-001": {
-      "expected_collected_tests": 22,
+      "expected_collected_tests": 26,
       "required_projects": ["enterprise-desktop", "enterprise-mobile"],
       "required_test_titles": [
+        "@enterprise preflight 真实前端、API 与故障控制面必须可达",
+        "@enterprise TLS validates trusted identity and short-lived certificate renewal architecture",
+        "@enterprise unified login routes accounts by effective role",
+        "@enterprise account lifecycle rejects duplicates and revokes active access",
         "@enterprise password reset enforces scope and revokes old credentials and sessions",
-        "@enterprise role administration edits and deletes safely under references and concurrency"
+        "@enterprise role administration edits and deletes safely under references and concurrency",
+        "@enterprise knowledge grants are visible then fail closed immediately after revocation",
+        "@enterprise all nine document formats complete scan, OKF, approval, retrieval and cited chat",
+        "@enterprise chat renders citations, no-answer, audited rejection and sourced table",
+        "@enterprise configured model switches and provider failure degrades safely",
+        "@enterprise API key enforces knowledge scope, rate limit and revocation",
+        "@enterprise audit query, pagination, CSV export and permission revocation fail closed",
+        "@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly"
       ]
     }
   }

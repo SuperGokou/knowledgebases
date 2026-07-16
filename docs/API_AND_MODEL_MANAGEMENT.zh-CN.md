@@ -1,12 +1,12 @@
 # API 与模型管理手册
 
-本文说明如何在管理后台创建服务端 API Key、调用知识检索/问答接口，以及切换 DeepSeek、Qwen 和 MiniMax 模型供应商。
+本文说明如何在管理后台管理账号生命周期与审计、创建服务端 API Key、调用知识检索/问答接口，以及切换 DeepSeek、Qwen 和 MiniMax 模型供应商。
 
 ## 安全边界
 
 - 外部 API Key 只用于服务器到服务器调用，不得写入浏览器代码、移动端包、Git 或公开日志。
 - 明文 Key 只在创建或原子轮换成功时返回一次；平台仅保存不可逆摘要、可识别前缀、权限范围、稳定凭据族 ID 和审计信息。
-- 每个 Key 都绑定一个有效用户，最终权限是“用户当前 RBAC 权限 ∩ Key 权限范围 ∩ 知识库范围”。禁用用户或撤销知识库授权会立即影响该 Key。
+- 每个 Key 都绑定一个有效用户，最终权限是“用户当前 RBAC 权限 ∩ Key 权限范围 ∩ 知识库范围”。禁用/退休用户或撤销知识库授权会立即影响该 Key；账号退休会在同一事务中撤销其全部未失效 Key。
 - 每个 Key 独立配置过期时间和每分钟请求数；达到限制返回 `429` 和 `Retry-After`。
 - 模型供应商 API Key 只在 FastAPI 服务端使用。数据库中的供应商凭据使用独立主密钥加密，管理端 GET 接口永不返回明文。
 - 供应商 Base URL 仅允许官方 HTTPS 域名，HTTP 重定向默认关闭，避免把企业数据发送到非授权主机。
@@ -34,9 +34,40 @@ https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/admin/api-models
 |---|---|---|
 | 当前用户修改密码 | `PUT /api/v1/users/me/password` | 必须验证当前密码并经过限流；成功后撤销现有会话 |
 | 管理员重置密码 | `PUT /api/v1/users/{user_id}/password` | 重置他人密码仅允许仍有效的超级管理员；不得提交目标用户旧密码 |
+| 退休账号 | `DELETE /api/v1/users/{user_id}` | 不物理删除；邮箱二次确认；禁止自退休和最后活跃超级管理员；有知识库所有权时必须原子交接 |
 | 删除角色 | `DELETE /api/v1/roles/{role_id}?expected_version=N` | 严格 CAS；系统角色、高优先级越权或仍被用户/知识库引用时失败关闭 |
 
 两条密码路径都应用统一强密码策略，并在同一事务中提升 `token_version`、撤销 refresh token 和写入审计。角色存在引用时返回 `409 role_in_use`，`details.references` 只包含用户分配与知识库授权计数；清理引用后必须重新读取最新 `policy_version` 再决定是否删除。
+
+账号退休请求使用 JSON body；这不是数据库硬删除，也不是可恢复的“暂时停用”：
+
+```http
+DELETE /api/v1/users/{user_id}
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "confirmation_email": "target-user@example.com",
+  "reason": "已完成审批的离职处置单号；不得填写敏感正文",
+  "replacement_owner_id": "<active-successor-user-id>"
+}
+```
+
+`reason` 可省略，非空时最多 1,000 字符；目标账号没有知识库所有权时可省略 `replacement_owner_id`。操作者必须拥有 `user:manage`，所有权交接还受 `knowledge:grant` 与知识库管理边界约束。服务端禁止操作者退休自身、最后一个活跃超级管理员和无有效继任者的知识库 Owner，并在目标账号或其知识库仍有活动外部模型请求时失败关闭。成功后账号被标记为已退休，refresh token、API Key 与角色分配被撤销，`token_version` 提升，业务/审计历史继续保留；该账号不能重新启用、改密、分配角色或再次登录。重复退休请求保持幂等，但不会恢复账号。
+
+### 审计查询与导出
+
+拥有 `audit:read` 权限的管理员可打开：
+
+```text
+https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/admin/audit
+```
+
+`GET /api/v1/audit-logs` 支持按 `action`、`actor_id`、`resource_type`、`resource_id`、`result` 精确过滤，并以含时区的 `created_from`、`created_to` 设置包含边界的时间范围；接口使用 `cursor` 与 `limit` 稳定翻页，单页 `limit` 最大为 100。`GET /api/v1/audit-logs/export` 使用相同业务过滤条件，不接受游标或任意额外参数；结果超过 5,000 行时返回 `422 audit_export_too_large`，管理员必须缩小范围后重试。
+
+页面、列表接口和导出只返回八个脱敏字段：`id`、`created_at`、`result`、`action`、`actor_id`、`resource_type`、`resource_id`、`request_id`。CSV 使用 UTF-8 BOM、RFC 4180 行格式和电子表格公式前缀防护，并返回 `Cache-Control: no-store, private` 与 `X-Content-Type-Options: nosniff`。已认证用户的无权限、非法过滤、结果过大和成功导出都会记录 `audit.exported`；若导出审计无法持久化，接口返回 `503 audit_persistence_failed`，不会返回未经记录的文件。
+
+离线部署的应用数据库角色只能查询和追加 `audit_logs`，迁移后会再次收敛权限；该约束不能替代独立的 hash/WORM、防篡改长期归档、留存审批和恢复演练。审计原因、过滤条件和普通应用日志都不得包含密码、API Key、提示词、模型输出或知识正文。
 
 ## 服务端公共 API
 

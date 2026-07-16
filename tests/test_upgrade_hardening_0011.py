@@ -86,7 +86,7 @@ def test_hardening_migrations_form_the_current_schema_head_chain() -> None:
     assert 'revision: str = "20260714_0020"' in replay_aead_content
     assert 'down_revision: str | None = "20260714_0019"' in replay_aead_content
     assert "aesgcm-zlib-json-v1" in replay_aead_content
-    assert frozenset({"20260714_0020"}) == EXPECTED_ALEMBIC_HEADS
+    assert frozenset({"20260715_0021"}) == EXPECTED_ALEMBIC_HEADS
 
 
 def test_offline_migrate_reconciles_runtime_role_on_every_upgrade() -> None:

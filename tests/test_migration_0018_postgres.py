@@ -517,14 +517,14 @@ def test_0018_preserves_historical_claims_and_binds_replay_to_content_version() 
             )
 
         # Current application code intentionally requires the later 0020 AEAD
-        # columns. Exercise the historical namespace only after proving 0018's
-        # own forward-only boundary and then restoring the disposable database
-        # to the current head.
+        # columns plus 0021 retirement evidence. Exercise the historical
+        # namespace only after proving 0018's own forward-only boundary and
+        # then restoring the disposable database to the current head.
         upgrade_head = _alembic("head")
         assert upgrade_head.returncode == 0, upgrade_head.stderr
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260714_0020"
+                "20260715_0021"
             )
 
         asyncio.run(
@@ -637,7 +637,7 @@ def test_0018_rolls_back_after_late_failure_and_is_safely_resumable() -> None:
         assert resumed.returncode == 0, resumed.stderr
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260714_0020"
+                "20260715_0021"
             )
             migrated = connection.execute(
                 text(

@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +18,7 @@ from app.db.models import (
     RolePermission,
     User,
     UserRole,
+    UserStatus,
 )
 
 
@@ -48,6 +51,65 @@ async def test_bootstrap_is_idempotent_and_creates_a_working_superuser() -> None
             PERMISSION_CATALOG
         )
         assert await session.scalar(select(func.count()).select_from(UserRole)) == 1
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_refuses_retired_admin_without_any_recovery_side_effect() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    settings = Settings(
+        bootstrap_admin_email="retired-bootstrap@example.com",
+        bootstrap_admin_password="Retired-bootstrap-password-123!",
+    )
+    async with factory() as session:
+        administrator = await seed_database(session, settings)
+        operator = User(
+            email="retirement-operator@example.com",
+            password_hash="unused",
+            is_superuser=True,
+        )
+        session.add(operator)
+        await session.flush()
+        await session.execute(delete(UserRole).where(UserRole.user_id == administrator.id))
+        administrator.status = UserStatus.DISABLED
+        administrator.retired_at = datetime.now(UTC)
+        administrator.retired_by_id = operator.id
+        administrator.retirement_reason = "Bootstrap account deliberately retired"
+        administrator.token_version = 9
+        administrator.role_assignment_version = 5
+        await session.commit()
+        administrator_id = administrator.id
+        audit_count = int(await session.scalar(select(func.count()).select_from(AuditLog)) or 0)
+
+    async with factory() as session:
+        with pytest.raises(RuntimeError, match="inactive or retired bootstrap administrator"):
+            await seed_database(session, settings)
+        await session.rollback()
+
+    async with factory() as session:
+        administrator = await session.get(User, administrator_id)
+        assert administrator is not None
+        assert administrator.status is UserStatus.DISABLED
+        assert administrator.retired_at is not None
+        assert administrator.token_version == 9
+        assert administrator.role_assignment_version == 5
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(UserRole)
+                .where(UserRole.user_id == administrator_id)
+            )
+            == 0
+        )
+        assert (
+            int(await session.scalar(select(func.count()).select_from(AuditLog)) or 0)
+            == audit_count
+        )
 
     await engine.dispose()
 

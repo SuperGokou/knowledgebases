@@ -136,6 +136,19 @@ class User(TimestampMixin, Base):
             "role_assignment_version >= 1",
             name="role_assignment_version_positive",
         ),
+        CheckConstraint(
+            "(retired_at IS NULL AND retired_by_id IS NULL AND retirement_reason IS NULL) "
+            "OR (retired_at IS NOT NULL AND retired_by_id IS NOT NULL)",
+            name="retirement_metadata_requires_timestamp",
+        ),
+        CheckConstraint(
+            "retired_at IS NULL OR status = 'DISABLED'",
+            name="retirement_requires_disabled_status",
+        ),
+        CheckConstraint(
+            "retired_by_id IS NULL OR retired_by_id <> id",
+            name="retirement_actor_not_self",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
@@ -154,6 +167,9 @@ class User(TimestampMixin, Base):
         nullable=False,
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_by_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    retirement_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class Role(TimestampMixin, Base):

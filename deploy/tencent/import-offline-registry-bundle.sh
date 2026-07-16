@@ -167,7 +167,7 @@ for line in (root / "SHA256SUMS").read_text(encoding="ascii").splitlines():
         raise SystemExit(1)
     declared.add(match.group(1))
 actual = {"bundle.control", "release.env", "release.env.images"}
-for directory in ("registry", "release"):
+for directory in ("registry", "release", "sbom"):
     base = root / directory
     if not base.is_dir():
         raise SystemExit(1)
@@ -182,6 +182,7 @@ seen_release=false
 seen_manifest=false
 seen_registry=false
 seen_release_asset=false
+seen_sbom=false
 while IFS= read -r checksum_line || [ -n "$checksum_line" ]; do
   digest=${checksum_line%%  *}
   relative_path=${checksum_line#*  }
@@ -214,12 +215,118 @@ while IFS= read -r checksum_line || [ -n "$checksum_line" ]; do
     release.env.images) seen_manifest=true ;;
     registry/*) seen_registry=true ;;
     release/*) seen_release_asset=true ;;
+    sbom/*) seen_sbom=true ;;
   esac
 done < "$checksums"
 if [ "$seen_control" != true ] || [ "$seen_release" != true ] || \
   [ "$seen_manifest" != true ] || [ "$seen_registry" != true ] || \
-  [ "$seen_release_asset" != true ]; then
+  [ "$seen_release_asset" != true ] || [ "$seen_sbom" != true ]; then
   offline_fail registry-import "signed bundle is incomplete" 65
+fi
+if ! python3 -I -c '
+import hashlib, json, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+manifest_path = root / "release.env.images"
+manifest_bytes = manifest_path.read_bytes()
+rows = manifest_bytes.decode("utf-8").splitlines()
+images = []
+for row in rows:
+    fields = row.split("\t")
+    if len(fields) != 4:
+        raise SystemExit(1)
+    reference, config_id, operating_system, architecture = fields
+    match = re.fullmatch(r"127\.0\.0\.1:5000/.+@(sha256:[0-9a-f]{64})", reference)
+    if (
+        match is None
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", config_id) is None
+        or operating_system != "linux"
+        or architecture != "amd64"
+    ):
+        raise SystemExit(1)
+    images.append((reference, match.group(1), config_id, operating_system, architecture))
+if len(images) != 9 or len({item[0] for item in images}) != 9 or images != sorted(images):
+    raise SystemExit(1)
+
+control = {}
+for row in (root / "bundle.control").read_text(encoding="ascii").splitlines():
+    key, separator, value = row.partition("=")
+    if not separator or key in control:
+        raise SystemExit(1)
+    control[key] = value
+index = json.loads((root / "sbom/image-sbom-index.json").read_text(encoding="utf-8"))
+scanner = index.get("scanner")
+if (
+    index.get("$schema")
+    != "https://knowledgebases.local/schemas/image-sbom-index-v1.schema.json"
+    or index.get("schema_version") != 1
+    or index.get("release_git_sha") != control.get("RELEASE_GIT_SHA")
+    or index.get("release_id") != control.get("RELEASE_ID")
+    or index.get("source_manifest_path") != "release.env.images"
+    or index.get("source_manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
+    or not isinstance(scanner, dict)
+    or not isinstance(scanner.get("name"), str)
+    or re.fullmatch(r"[0-9a-f]{64}", str(scanner.get("sha256"))) is None
+):
+    raise SystemExit(1)
+records = index.get("images")
+if not isinstance(records, list) or len(records) != 9:
+    raise SystemExit(1)
+record_by_reference = {
+    record.get("reference"): record for record in records if isinstance(record, dict)
+}
+if len(record_by_reference) != 9 or set(record_by_reference) != {item[0] for item in images}:
+    raise SystemExit(1)
+for reference, manifest_digest, config_id, operating_system, architecture in images:
+    record = record_by_reference[reference]
+    sbom_relative = record.get("sbom_path")
+    expected_relative = "sbom/image-{}.cdx.json".format(manifest_digest[7:])
+    if (
+        record.get("manifest_digest") != manifest_digest
+        or record.get("config_id") != config_id
+        or record.get("os") != operating_system
+        or record.get("architecture") != architecture
+        or sbom_relative != expected_relative
+    ):
+        raise SystemExit(1)
+    sbom_path = root / expected_relative
+    if hashlib.sha256(sbom_path.read_bytes()).hexdigest() != record.get("sbom_sha256"):
+        raise SystemExit(1)
+    sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+    components = sbom.get("components")
+    metadata = sbom.get("metadata")
+    raw_properties = metadata.get("properties") if isinstance(metadata, dict) else None
+    if (
+        sbom.get("bomFormat") != "CycloneDX"
+        or sbom.get("specVersion") != "1.6"
+        or not isinstance(components, list)
+        or len(components) != record.get("component_count")
+        or not isinstance(raw_properties, list)
+    ):
+        raise SystemExit(1)
+    properties = {
+        item.get("name"): item.get("value")
+        for item in raw_properties
+        if isinstance(item, dict)
+    }
+    expected_properties = {
+        "io.heyi.image.architecture": architecture,
+        "io.heyi.image.config_id": config_id,
+        "io.heyi.image.manifest_digest": manifest_digest,
+        "io.heyi.image.os": operating_system,
+        "io.heyi.image.reference": reference,
+        "io.heyi.release.git_sha": control.get("RELEASE_GIT_SHA"),
+        "io.heyi.release.id": control.get("RELEASE_ID"),
+        "io.heyi.scanner.sha256": scanner.get("sha256"),
+        "io.heyi.source_manifest.sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    if len(properties) != len(raw_properties) or any(
+        properties.get(key) != value for key, value in expected_properties.items()
+    ):
+        raise SystemExit(1)
+' "$bundle_root"; then
+  offline_fail registry-import \
+    "image SBOM evidence does not match the signed nine-image manifest" 65
 fi
 
 # The issuer signature must cover the exact control-plane release archive, not
@@ -317,7 +424,7 @@ while IFS= read -r control_line || [ -n "$control_line" ]; do
       release_git_sha=$value
       ;;
     RELEASE_SCHEMA_HEAD)
-      if [ "$value" != 20260714_0020 ]; then
+      if [ "$value" != 20260715_0021 ]; then
         offline_fail registry-import "release schema head is not approved by this deployer" 65
       fi
       release_schema_head=$value
@@ -376,7 +483,11 @@ if [ -e "$highest_release_file" ]; then
   highest_release_sequence=$(python3 -I -c '
 import json, pathlib, re, sys
 document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+target_schema_head = sys.argv[2]
 required = {"schema_version", "release_sequence", "release_id", "release_git_sha", "release_schema_head", "manifest_sha256", "release_assets_sha256"}
+schema_head = document.get("release_schema_head")
+schema_match = re.fullmatch(r"([0-9]{8})_([0-9]{4})", schema_head) if isinstance(schema_head, str) else None
+target_match = re.fullmatch(r"([0-9]{8})_([0-9]{4})", target_schema_head)
 valid = (
     set(document) == required
     and document["schema_version"] == 1
@@ -386,13 +497,15 @@ valid = (
     and re.fullmatch(r"[A-Za-z0-9._-]+", document["release_id"])
     and isinstance(document["release_git_sha"], str)
     and re.fullmatch(r"[0-9a-f]{40}", document["release_git_sha"])
-    and document["release_schema_head"] == "20260714_0020"
+    and schema_match is not None
+    and target_match is not None
+    and tuple(map(int, schema_match.groups())) <= tuple(map(int, target_match.groups()))
     and all(re.fullmatch(r"[0-9a-f]{64}", document[key]) for key in ("manifest_sha256", "release_assets_sha256"))
 )
 if not valid:
     raise SystemExit(1)
 print(document["release_sequence"])
-' "$highest_release_file") || \
+' "$highest_release_file" "$release_schema_head") || \
     offline_fail registry-import "highest release state is invalid" 65
 fi
 if [ "$release_sequence" -le "$highest_release_sequence" ]; then

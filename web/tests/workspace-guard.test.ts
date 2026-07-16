@@ -135,6 +135,32 @@ describe("authoritative workspace proxy guard", () => {
     expect(response.headers.get("x-middleware-next")).toBeNull();
   });
 
+  it("renders the audit console only after the live profile grants audit:read", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(authMe(["audit:read"])));
+
+    const response = await proxy(workspaceRequest("/admin/audit", {
+      kb_access: "valid-access-token",
+      kb_refresh: "valid-refresh-token",
+    }));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-middleware-next")).toBe("1");
+    expect(response.headers.get("x-middleware-request-x-kb-workspace-authorized")).toBe("v1");
+  });
+
+  it("fails closed before rendering the audit console for an unrelated role", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(authMe(["chat:query"])));
+
+    const response = await proxy(workspaceRequest("/admin/audit", {
+      kb_access: "valid-access-token",
+      kb_refresh: "valid-refresh-token",
+    }));
+
+    expect(response.status).toBe(307);
+    expect(new URL(response.headers.get("location")!).pathname).toBe("/chat");
+    expect(response.headers.get("x-middleware-next")).toBeNull();
+  });
+
   it("serializes concurrent refreshes without fanning one rotated credential pair to both responses", async () => {
     let oldMeCalls = 0;
     let refreshCalls = 0;

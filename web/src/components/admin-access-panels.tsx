@@ -13,6 +13,7 @@ const features: Array<{ href: string; icon: IconName; title: string; detail: str
   { href: "/admin/users", icon: "users", title: "账号管理", detail: "成员状态与角色分配" },
   { href: "/admin/roles", icon: "shield", title: "角色与权限", detail: "动态 RBAC 与资源限额" },
   { href: "/admin/api-models", icon: "spark", title: "API 与模型", detail: "生成调用凭证并切换大模型" },
+  { href: "/admin/audit", icon: "clock", title: "审计日志", detail: "查询、筛选与受控导出安全事件" },
 ];
 
 export function AdminFeatureList() {

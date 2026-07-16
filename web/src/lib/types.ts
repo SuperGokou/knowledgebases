@@ -33,6 +33,9 @@ export type User = {
   status: UserStatus;
   is_superuser: boolean;
   role_assignment_version: number;
+  retired_at: string | null;
+  retired_by_id: string | null;
+  retirement_reason: string | null;
   created_at: string;
   updated_at: string;
   role_ids: string[];
@@ -86,6 +89,7 @@ export type FileRecord = {
     | "quarantined"
     | "failed"
     | "deleted";
+  malware_scan_status: "pending" | "processing" | "clean" | "infected" | "error";
   knowledge_status:
     | "not_requested"
     | "pending"

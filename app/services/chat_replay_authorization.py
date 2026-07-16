@@ -134,7 +134,7 @@ async def _lock_current_access(
         .with_for_update(read=True)
         .execution_options(populate_existing=True)
     )
-    if user is None or user.status is not UserStatus.ACTIVE:
+    if user is None or user.status is not UserStatus.ACTIVE or user.retired_at is not None:
         raise ApiError(
             status_code=401,
             code="inactive_user",

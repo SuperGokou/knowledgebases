@@ -73,6 +73,7 @@ script_dir=$snapshot_script_dir
 . "$snapshot_script_dir/offline-operation-common.sh"
 offline_clear_inherited_environment
 
+business_writer_stop_timeout_seconds=150
 sh "$snapshot_script_dir/preflight-maintenance-offline.sh" \
   --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"
 
@@ -316,7 +317,8 @@ quiesce_business_writers() {
         break
       }
       if [ "$operation_writer_running" = true ] && \
-        ! docker stop --time 130 "$operation_writer_id" >/dev/null; then
+        ! docker stop --time "$business_writer_stop_timeout_seconds" \
+          "$operation_writer_id" >/dev/null; then
         operation_writer_failed=true
         break
       fi
@@ -328,7 +330,8 @@ quiesce_business_writers() {
   done
   rm -f "$operation_writer_list"
   offline_compose maintenance "$contract_dir" \
-    stop --timeout 60 api maintenance web llm-egress minio-multipart-gc || return 1
+    stop --timeout "$business_writer_stop_timeout_seconds" \
+    api maintenance web llm-egress minio-multipart-gc || return 1
   for writer_service in api maintenance web llm-egress minio-multipart-gc; do
     running_writer_ids=$(docker ps -q \
       --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \

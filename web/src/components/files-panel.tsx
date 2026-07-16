@@ -6,6 +6,10 @@ import { useAccess } from "@/components/access-provider";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { apiRequest, formatBytes, readableError } from "@/lib/api-client";
+import {
+  fileApprovalErrorMessage,
+  fileApprovalPresentation,
+} from "@/lib/file-approval";
 import { fileKnowledgePresentation } from "@/lib/file-knowledge-status";
 import {
   candidatesWithSelection,
@@ -37,7 +41,7 @@ const toneByStatus: Record<FileRecord["status"], "success" | "warning" | "danger
 const labelByStatus: Record<FileRecord["status"], string> = {
   pending: "等待上传",
   uploading: "上传中",
-  processing: "等待审核",
+  processing: "处理中",
   available: "可用",
   quarantined: "已隔离",
   failed: "失败",
@@ -250,11 +254,16 @@ export function FilesPanel() {
   }
 
   async function approve(file: FileRecord) {
+    const presentation = fileApprovalPresentation(file);
+    if (presentation.action !== "approve") {
+      setError(presentation.reason || "当前文件暂不可审批，请刷新状态后重试。");
+      return;
+    }
     try {
       await apiRequest<FileRecord>(`/api/v1/files/${file.id}/approve`, { method: "POST", body: "{}" });
       await load();
     } catch (reason) {
-      setError(readableError(reason));
+      setError(fileApprovalErrorMessage(reason) ?? readableError(reason));
     }
   }
 
@@ -369,8 +378,9 @@ export function FilesPanel() {
               <table>
                 <thead><tr><th>文件</th><th>大小</th><th>文件状态</th><th>知识状态</th><th>更新时间</th><th>操作</th></tr></thead>
                 <tbody>
-                  {files.map((file) => (
-                    <tr key={file.id}>
+                  {files.map((file) => {
+                    const approval = fileApprovalPresentation(file);
+                    return <tr key={file.id}>
                       <td><div className="primary-cell"><span className="file-icon"><Icon name="file" /></span><span><strong>{file.original_name}</strong><small>{file.content_type}</small></span></div></td>
                       <td>{formatBytes(file.size_bytes)}</td>
                       <td><StatusBadge tone={toneByStatus[file.status]}>{labelByStatus[file.status]}</StatusBadge></td>
@@ -382,10 +392,32 @@ export function FilesPanel() {
                       <td>{new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(file.updated_at))}</td>
                       <td><div className="button-row">
                         {file.status === "available" && can("file:read") ? <button className="button ghost small" type="button" onClick={() => void download(file)}>下载</button> : null}
-                        {file.status === "processing" && can("file:approve") ? <button className="button secondary small" type="button" onClick={() => void approve(file)}>审批</button> : null}
+                        {approval.action === "approve" ? (
+                          can("file:approve") ? (
+                            <button
+                              aria-label={`审批文件：${file.original_name}`}
+                              className="button secondary small"
+                              type="button"
+                              title={approval.reason}
+                              onClick={() => void approve(file)}
+                            >
+                              审批
+                            </button>
+                          ) : (
+                            <span className="file-action-status" role="status">
+                              <strong>等待管理员审批</strong>
+                              <small>当前账号没有文件审批权限。</small>
+                            </span>
+                          )
+                        ) : approval.action === "status" ? (
+                          <span className="file-action-status" role="status">
+                            <strong>{approval.label}</strong>
+                            <small>{approval.reason}</small>
+                          </span>
+                        ) : null}
                       </div></td>
-                    </tr>
-                  ))}
+                    </tr>;
+                  })}
                 </tbody>
               </table>
               <nav className="pagination-bar" aria-label="文件列表分页">

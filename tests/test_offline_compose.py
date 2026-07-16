@@ -662,6 +662,21 @@ def test_offline_stack_reserves_cpu_and_graceful_shutdown_budget() -> None:
     controlled_config = offline_compose_config(profiles=("ops", "maintenance", "controlled-egress"))
     assert controlled_config["services"]["llm-egress"]["stop_grace_period"] == "2m15s"
 
+    for script_name in (
+        "deploy-offline.sh",
+        "enter-maintenance-offline.sh",
+        "install-offline.sh",
+    ):
+        script = (REPOSITORY / "deploy/tencent" / script_name).read_text(encoding="utf-8")
+        timeout_line = next(
+            line
+            for line in script.splitlines()
+            if line.startswith("business_writer_stop_timeout_seconds=")
+        )
+        timeout_seconds = int(timeout_line.partition("=")[2])
+        assert 140 <= timeout_seconds <= 300
+        assert timeout_seconds > 135
+
 
 def test_offline_one_shot_services_have_bounded_resources_and_processes() -> None:
     config = offline_compose_config()
@@ -810,7 +825,19 @@ def test_offline_preflight_requires_image_manifest_and_clamav_database_evidence(
     assert "io.heyi.knowledgebases.owner" in script
     assert "io.heyi.knowledgebases.stack" in script
     assert "com.docker.compose.project.config_files" in script
-    assert "run --pull never --rm --no-deps clamav-db-preflight" in script
+    run_blocks = [
+        block
+        for block in script.split('offline_compose preflight "$contract_dir" \\')[1:]
+        if "run --pull never --rm --no-deps" in block
+    ]
+    clamav_blocks = [block for block in run_blocks if "\n  clamav-db-preflight" in block]
+    assert len(clamav_blocks) == 1
+    for binding in (
+        "io.heyi.knowledgebases.contract-sha256",
+        "io.heyi.knowledgebases.adoption-transaction",
+        "com.docker.compose.project.config_files",
+    ):
+        assert binding in clamav_blocks[0]
 
 
 def test_offline_image_and_preflight_require_the_complete_document_parser_toolchain() -> None:
@@ -825,7 +852,17 @@ def test_offline_image_and_preflight_require_the_complete_document_parser_toolch
     ):
         assert pinned_package in dockerfile
     assert "python -m app.document_parser_preflight --require-all" in preflight
-    assert preflight.count("run --pull never --rm --no-deps api-preflight") == 2
+    run_blocks = [
+        block
+        for block in preflight.split('offline_compose preflight "$contract_dir" \\')[1:]
+        if "run --pull never --rm --no-deps" in block
+    ]
+    api_blocks = [block for block in run_blocks if "\n  api-preflight \\" in block]
+    assert len(api_blocks) == 2
+    for block in api_blocks:
+        assert "io.heyi.knowledgebases.contract-sha256" in block
+        assert "io.heyi.knowledgebases.adoption-transaction" in block
+        assert "com.docker.compose.project.config_files" in block
 
 
 def test_offline_public_api_is_routed_before_the_web_fallback() -> None:
@@ -921,7 +958,14 @@ def test_maintenance_and_rollback_scripts_enforce_safe_command_boundaries() -> N
     assert "RESTORE_FAILED" in enter
     assert "verify-maintenance-endpoint.py" in enter
     assert "quiesce_business_writers" in enter
-    assert "stop --timeout 60 api maintenance web llm-egress minio-multipart-gc" in enter
+    quiesce_block = enter.split("quiesce_business_writers() {", 1)[1].split("\n}", 1)[0]
+    normalized_quiesce = " ".join(quiesce_block.replace("\\\n", " ").split())
+    assert (
+        'stop --timeout "$business_writer_stop_timeout_seconds" '
+        "api maintenance web llm-egress minio-multipart-gc"
+    ) in normalized_quiesce
+    for forbidden in ("docker kill", "docker rm -f", "stop --timeout 30", "stop --timeout 60"):
+        assert forbidden not in quiesce_block
     assert "maintenance_ready_writers_quiesced" in enter
     assert "--compose-config-stdin" in enter
     assert 'sh "$script_dir/enter-maintenance-offline.sh"' in rollback

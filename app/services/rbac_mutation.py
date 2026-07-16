@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import Select, or_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import ApiError
@@ -15,14 +16,63 @@ from app.services.access import AccessContext, AccessService
 # row locks. Administrative writes are low volume, and serializing this domain
 # prevents cross-request User/Role lock inversions and authorization TOCTOU.
 RBAC_MUTATION_ADVISORY_LOCK = 1_262_836_039
+_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
+
+
+def _database_sqlstate(error: BaseException) -> str | None:
+    """Read a driver SQLSTATE without broad exception translation."""
+
+    pending: list[BaseException] = [error]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        for attribute in ("sqlstate", "pgcode"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, str):
+                return value
+        for attribute in ("orig", "__cause__", "__context__"):
+            nested = getattr(current, attribute, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return None
+
+
+def raise_authorization_lock_timeout(error: DBAPIError) -> None:
+    """Map only PostgreSQL lock timeout/not-available to a retryable API error."""
+
+    if _database_sqlstate(error) != _LOCK_NOT_AVAILABLE_SQLSTATE:
+        raise error
+    raise ApiError(
+        status_code=503,
+        code="authorization_change_busy",
+        message="Authorization policy is changing; retry this request shortly",
+        headers={"Retry-After": "1"},
+    ) from error
+
+
+async def acquire_authorization_advisory_lock(
+    session: AsyncSession,
+    lock_key: int,
+    *,
+    shared: bool = False,
+) -> None:
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    function = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
+    try:
+        await session.execute(
+            text(f"SELECT {function}(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+    except DBAPIError as error:
+        raise_authorization_lock_timeout(error)
 
 
 async def acquire_rbac_mutation_lock(session: AsyncSession) -> None:
-    if session.get_bind().dialect.name == "postgresql":
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_key)"),
-            {"lock_key": RBAC_MUTATION_ADVISORY_LOCK},
-        )
+    await acquire_authorization_advisory_lock(session, RBAC_MUTATION_ADVISORY_LOCK)
 
 
 async def acquire_rbac_authorization_lock(session: AsyncSession) -> None:
@@ -33,11 +83,11 @@ async def acquire_rbac_authorization_lock(session: AsyncSession) -> None:
     snapshot is consumed.
     """
 
-    if session.get_bind().dialect.name == "postgresql":
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock_shared(:lock_key)"),
-            {"lock_key": RBAC_MUTATION_ADVISORY_LOCK},
-        )
+    await acquire_authorization_advisory_lock(
+        session,
+        RBAC_MUTATION_ADVISORY_LOCK,
+        shared=True,
+    )
 
 
 def locked_users_statement(user_ids: set[UUID]) -> Select[tuple[User]]:
@@ -103,7 +153,7 @@ async def refresh_locked_actor_access(
     actor: User,
     required_permissions: set[str],
 ) -> AccessContext:
-    if actor.status is not UserStatus.ACTIVE:
+    if actor.status is not UserStatus.ACTIVE or actor.retired_at is not None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
     # lock_role_union must run first. Re-locking the active subset here is
     # intentional documentation of the authorization snapshot consumed below.

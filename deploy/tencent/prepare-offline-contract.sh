@@ -133,7 +133,9 @@ for release_asset in \
   deploy/tencent/verify-offline-images.sh \
   deploy/tencent/enter-maintenance-offline.sh \
   deploy/tencent/install-offline.sh \
+  deploy/tencent/offline-pre-migration-abort.py \
   deploy/tencent/deploy-offline.sh \
+  deploy/tencent/adopt-offline.sh \
   deploy/tencent/create-offline-contract.sh \
   deploy/tencent/remove-offline-contract.sh \
   deploy/tencent/rollback-offline.sh \
@@ -148,7 +150,9 @@ for release_asset in \
   docker/minio/init.sh \
   docker/minio/cleanup-multipart.sh \
   docker/clamav/clamd.conf \
-  docker/clamav/preflight-database.sh; do
+  docker/clamav/preflight-database.sh \
+  scripts/legacy_offline_adoption.py \
+  scripts/host_isolation_guard.py; do
   copy_release_asset "$release_asset"
 done
 

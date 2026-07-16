@@ -10,6 +10,31 @@ if (!desktopProject || !mobileProject || profile.projects.length !== 2) {
 }
 
 export const DEFAULT_ENTERPRISE_TEST_TIMEOUT_MS = 30 * 60_000;
+export const LOCAL_MOCK_AUTH_BACKEND_URL = "http://127.0.0.1:3199";
+
+export function resolveWebServerConfig(enterpriseProfile: boolean) {
+  if (enterpriseProfile) return undefined;
+  return [
+    {
+      command: "node e2e/support/mock-auth-backend.mjs",
+      url: `${LOCAL_MOCK_AUTH_BACKEND_URL}/healthz`,
+      reuseExistingServer: false,
+      timeout: 10_000,
+    },
+    {
+      command: "npm run build && node e2e/support/start-standalone.mjs",
+      url: `${profile.baseURL}/login`,
+      reuseExistingServer: false,
+      timeout: 120_000,
+      env: {
+        FASTAPI_URL: LOCAL_MOCK_AUTH_BACKEND_URL,
+        HOSTNAME: "127.0.0.1",
+        NEXT_TELEMETRY_DISABLED: "1",
+        PORT: "3100",
+      },
+    },
+  ];
+}
 
 export function resolveEnterpriseTestTimeoutMs(
   env: Readonly<Record<string, string | undefined>>,
@@ -61,15 +86,5 @@ export default defineConfig({
     { name: desktopProject.name, use: { ...devices["Desktop Chrome"] } },
     { name: mobileProject.name, use: { ...devices["Pixel 5"] } },
   ],
-  webServer: enterpriseProfile
-    ? undefined
-    : {
-        command: "npm run build && npm run start -- --hostname 127.0.0.1 --port 3100",
-        url: `${profile.baseURL}/login`,
-        reuseExistingServer: !process.env.CI,
-        timeout: 120_000,
-        env: {
-          NEXT_TELEMETRY_DISABLED: "1",
-        },
-      },
+  webServer: resolveWebServerConfig(enterpriseProfile),
 });

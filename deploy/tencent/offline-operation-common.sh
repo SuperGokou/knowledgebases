@@ -193,7 +193,9 @@ release/deploy/tencent/preflight-maintenance-offline.sh
 release/deploy/tencent/verify-offline-images.sh
 release/deploy/tencent/enter-maintenance-offline.sh
 release/deploy/tencent/install-offline.sh
+release/deploy/tencent/offline-pre-migration-abort.py
 release/deploy/tencent/deploy-offline.sh
+release/deploy/tencent/adopt-offline.sh
 release/deploy/tencent/create-offline-contract.sh
 release/deploy/tencent/remove-offline-contract.sh
 release/deploy/tencent/rollback-offline.sh
@@ -209,6 +211,8 @@ release/docker/minio/init.sh
 release/docker/minio/cleanup-multipart.sh
 release/docker/clamav/clamd.conf
 release/docker/clamav/preflight-database.sh
+release/scripts/legacy_offline_adoption.py
+release/scripts/host_isolation_guard.py
 EOF
 }
 

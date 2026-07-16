@@ -5,7 +5,7 @@ import {
   backendUrl,
   safeBackendFetch,
 } from "@/lib/server/backend";
-import { isAllowedBackendPath } from "@/lib/server/backend-path";
+import { backendAcceptHeader, isAllowedBackendPath } from "@/lib/server/backend-path";
 import { readBoundedBody, RequestBodyTooLargeError } from "@/lib/server/bounded-body";
 import {
   BackendResponseTooLargeError,
@@ -33,6 +33,7 @@ async function handleBackendRequest(
   context: { params: Promise<{ path: string[] }> },
 ): Promise<NextResponse> {
   const { path } = await context.params;
+  const isAuditExport = backendAcceptHeader(path, request.method) === "text/csv";
   if (!isAllowedBackendPath(path, request.method, request.nextUrl.pathname)) {
     return NextResponse.json(
       { error: { code: "route_not_allowed", message: "该后台路径未开放给 Web BFF。" } },
@@ -95,7 +96,7 @@ async function handleBackendRequest(
     );
   }
   const forward = async (access: string | undefined): Promise<Response> => {
-    const headers = new Headers({ Accept: "application/json" });
+    const headers = new Headers({ Accept: isAuditExport ? "text/csv" : "application/json" });
     const contentType = request.headers.get("content-type");
     if (contentType) headers.set("Content-Type", contentType);
     if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
@@ -192,7 +193,14 @@ async function handleBackendRequest(
     const value = backend.headers.get(name);
     if (value) response.headers.set(name, value);
   }
-  response.headers.set("Cache-Control", "no-store");
+  if (isAuditExport) {
+    const contentDisposition = backend.headers.get("content-disposition");
+    if (contentDisposition) response.headers.set("content-disposition", contentDisposition);
+    response.headers.set("Cache-Control", "no-store, private");
+    response.headers.set("X-Content-Type-Options", "nosniff");
+  } else {
+    response.headers.set("Cache-Control", "no-store");
+  }
 
   if (
     replacement

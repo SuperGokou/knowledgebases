@@ -26,7 +26,7 @@ def test_role_reference_restrict_precedes_the_current_schema_head() -> None:
 
     assert migration.revision == "20260714_0019"
     assert migration.down_revision == "20260714_0018"
-    assert frozenset({"20260714_0020"}) == EXPECTED_ALEMBIC_HEADS
+    assert frozenset({"20260715_0021"}) == EXPECTED_ALEMBIC_HEADS
 
 
 def test_role_reference_restrict_downgrade_fails_before_any_schema_mutation(

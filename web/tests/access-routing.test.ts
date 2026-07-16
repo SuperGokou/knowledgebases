@@ -24,6 +24,7 @@ describe("defaultLandingPath", () => {
       "role:read",
       "api-key:manage",
       "llm:manage",
+      "audit:read",
     ]) {
       expect(defaultLandingPath(principal([permission]))).toBe("/admin");
     }
@@ -55,7 +56,6 @@ describe("defaultLandingPath", () => {
     expect(defaultLandingPath(principal(["role:manage"]))).toBe("/access-pending");
     expect(defaultLandingPath(principal(["role:assign"]))).toBe("/access-pending");
     expect(defaultLandingPath(principal(["quota:manage"]))).toBe("/access-pending");
-    expect(defaultLandingPath(principal(["audit:read"]))).toBe("/access-pending");
   });
 
   it("routes accounts without a workspace capability to access pending", () => {
@@ -72,6 +72,7 @@ describe("canAccessPath", () => {
     expect(canAccessPath("/admin/accounts", principal(["user:manage"]))).toBe(true);
     expect(canAccessPath("/admin/roles", principal(["role:read"]))).toBe(true);
     expect(canAccessPath("/admin/api-models", principal(["llm:manage"]))).toBe(true);
+    expect(canAccessPath("/admin/audit", principal(["audit:read"]))).toBe(true);
   });
 
   it("requires the permission needed by each page's first API request", () => {
@@ -87,6 +88,7 @@ describe("canAccessPath", () => {
     const chatUser = principal(["chat:query"]);
     expect(canAccessPath("/admin", chatUser)).toBe(false);
     expect(canAccessPath("/admin/users", chatUser)).toBe(false);
+    expect(canAccessPath("/admin/audit", principal(["user:manage"]))).toBe(false);
     expect(canAccessPath("/unknown", chatUser)).toBe(false);
   });
 
@@ -106,6 +108,7 @@ describe("canAccessPath", () => {
       "/admin/roles",
       "/admin/accounts",
       "/admin/api-models",
+      "/admin/audit",
     ]) {
       expect(canAccessPath(path, superuser)).toBe(true);
     }

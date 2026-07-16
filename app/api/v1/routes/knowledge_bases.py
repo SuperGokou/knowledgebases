@@ -18,6 +18,7 @@ from app.db.models import (
     KnowledgeBaseRoleGrant,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    User,
 )
 from app.schemas.knowledge_bases import (
     KnowledgeBaseCreate,
@@ -46,6 +47,11 @@ from app.services.rbac_mutation import (
     lock_role_union,
     locked_users_statement,
     refresh_locked_actor_access,
+)
+from app.services.user_activity import (
+    ActivityLockMode,
+    acquire_user_activity_locks,
+    rbac_mutation_endpoint,
 )
 
 router = APIRouter()
@@ -279,6 +285,7 @@ async def list_role_grants(
     "/{knowledge_base_id}/role-grants",
     response_model=list[KnowledgeBaseRoleGrantRead],
 )
+@rbac_mutation_endpoint
 async def replace_role_grants(
     knowledge_base_id: UUID,
     payload: KnowledgeBaseRoleGrantSet,
@@ -296,7 +303,24 @@ async def replace_role_grants(
     )
     role_ids = {item.role_id for item in payload.grants}
     await acquire_rbac_mutation_lock(session)
-    actor = await session.scalar(locked_users_statement({access.user.id}))
+    actor = await session.scalar(
+        select(User)
+        .where(User.id == access.user.id)
+        .execution_options(populate_existing=True)
+    )
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={actor.id},
+        additional_role_ids=role_ids,
+    )
+    access = await refresh_locked_actor_access(session, actor, {"knowledge:grant"})
+    await acquire_user_activity_locks(
+        session,
+        {actor.id: ActivityLockMode.SHARED},
+    )
+    actor = await session.scalar(locked_users_statement({actor.id}))
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
     locked_roles = await lock_role_union(

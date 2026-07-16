@@ -17,7 +17,9 @@ import argparse
 import base64
 import hashlib
 import hmac
+import importlib.util
 import io
+import ipaddress
 import json
 import os
 import re
@@ -30,9 +32,10 @@ import sys
 import tarfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any, BinaryIO, Final, Never
 
 PROJECT: Final = "heyi-kb-offline"
@@ -41,6 +44,7 @@ STACK: Final = "offline"
 DATA_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/data")
 STATE_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/state")
 BACKUP_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/backups")
+RELEASE_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/releases")
 EXPECTED_PORTS: Final = frozenset({"19443/tcp", "19444/tcp"})
 PROTECTED_OTHER_PORT: Final = "10050"
 ALLOWED_SERVICES: Final = frozenset(
@@ -58,6 +62,9 @@ ALLOWED_SERVICES: Final = frozenset(
         "llm-egress",
         "maintenance-page",
     }
+)
+KNOWN_ONEOFF_SERVICES: Final = frozenset(
+    {"api-preflight", "clamav-db-preflight", "migrate", "bootstrap"}
 )
 REQUIRED_SERVICES: Final = frozenset(
     {"postgres", "redis", "minio", "api", "maintenance", "web", "proxy"}
@@ -82,6 +89,22 @@ START_ORDER: Final = (
     "web",
     "proxy",
 )
+LEGACY_STOP_GRACE_SECONDS: Final = 140
+LEGACY_STOP_COMMAND_TIMEOUT_SECONDS: Final = 180
+REACTIVATION_BOUNDARY: Final = "PRE_MIGRATION_ONLY"
+REACTIVATION_HEALTH_TIMEOUT_SECONDS: Final = 300
+REACTIVATION_HEALTH_POLL_SECONDS: Final = 2
+REACTIVATION_EDGE_TIMEOUT_SECONDS: Final = 120
+REACTIVATION_EDGE_POLL_SECONDS: Final = 2
+RETIREMENT_INTENT_DIRECTORY: Final = ".retirement-in-progress"
+TRUSTED_DOCKER_PROXY_PATHS: Final = frozenset(
+    {"/usr/bin/docker-proxy", "/usr/libexec/docker/docker-proxy"}
+)
+TRUSTED_DOCKER_DAEMON_PATHS: Final = frozenset({"/usr/bin/dockerd", "/usr/libexec/docker/dockerd"})
+RECONCILE_UNITS: Final = (
+    "heyi-kb-offline-reconcile.timer",
+    "heyi-kb-offline-reconcile.service",
+)
 REQUIRED_RUNTIME_KEYS: Final = frozenset(
     {
         "POSTGRES_DB",
@@ -102,7 +125,14 @@ _SCHEMA_HEAD = re.compile(r"^[0-9]{8}_[0-9]{4}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IMMUTABLE_IMAGE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
 _ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_TRANSACTION_ID = re.compile(r"^[0-9a-f]{32}$")
+_DNS_HOST = re.compile(
+    r"^(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
+)
+_HTTP_STATUS = re.compile(rb"^HTTP/1\.[01] ([0-9]{3})(?:[ \t]|$)")
 MAX_CONTROL_FILE = 8 * 1024 * 1024
 MAX_CA_PLAINTEXT = 64 * 1024 * 1024
 _ALLOWED_EXECUTABLES: Final = frozenset({"/usr/bin/docker", "/usr/bin/openssl"})
@@ -114,6 +144,40 @@ _ALLOWED_EXTRA_ENV: Final = frozenset(
         "MINIO_ROOT_USER",
         "MINIO_ROOT_PASSWORD",
         "MINIO_BUCKET",
+    }
+)
+TARGET_ABORT_RECEIPT_KEYS: Final = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "status",
+        "project",
+        "issued_at",
+        "adoption_transaction_id",
+        "journal_sha256",
+        "plan_sha256",
+        "retirement_receipt_sha256",
+        "target_contract_sha256",
+        "target_manifest_sha256",
+        "target_schema_head",
+        "legacy_source_schema_head",
+        "last_install_phase",
+        "migration_command_invoked",
+        "active_release_present",
+        "installed_receipt_present",
+        "removed_preflight_container_ids",
+        "removed_owner_marker_volume",
+        "archived_install_state",
+        "archived_cutover_intent",
+        "reconcile_baseline",
+        "reconcile_result",
+        "target_resource_counts_after",
+        "host_isolation_verification",
+        "preserved_bind_root",
+        "bind_data_deleted",
+        "named_volumes_deleted",
+        "global_actions",
+        "restore_boundary",
     }
 )
 
@@ -138,7 +202,8 @@ class ContainerRecord:
     image_id: str
     config_image: str
     config_hash: str
-    config_files: str
+    config_files: tuple[str, ...]
+    oneoff: bool
     running: bool
     restart_count: int
     mounts: tuple[tuple[str, str, bool, str], ...]
@@ -506,6 +571,21 @@ def _string(value: object, label: str) -> str:
     return value
 
 
+def _compose_label_paths(value: object) -> tuple[str, ...]:
+    raw = _string(value, "Compose config file")
+    paths: list[str] = []
+    for candidate in raw.split(","):
+        if not candidate or candidate != candidate.strip():
+            raise AdoptionError("legacy Compose config-file label is malformed")
+        path = PurePosixPath(candidate)
+        if not path.is_absolute() or str(path) != candidate:
+            raise AdoptionError("legacy Compose config-file label is not canonical absolute")
+        paths.append(candidate)
+    if not paths or len(paths) != len(set(paths)):
+        raise AdoptionError("legacy Compose config-file label is empty or duplicated")
+    return tuple(paths)
+
+
 def _container_record(document: object) -> ContainerRecord:
     container = _object(document, "container inspection")
     container_id = _string(container.get("Id"), "container id")
@@ -520,11 +600,24 @@ def _container_record(document: object) -> ContainerRecord:
     if labels.get("io.heyi.knowledgebases.stack") != STACK:
         raise AdoptionError("legacy container stack label differs")
     service = _string(labels.get("com.docker.compose.service"), "service label")
-    if service not in ALLOWED_SERVICES:
+    raw_oneoff = _string(labels.get("com.docker.compose.oneoff"), "one-off label")
+    if raw_oneoff.lower() not in {"true", "false"}:
+        raise AdoptionError("legacy container one-off label is malformed")
+    oneoff = raw_oneoff.lower() == "true"
+    if oneoff:
+        if service not in KNOWN_ONEOFF_SERVICES:
+            raise AdoptionError("legacy project contains an unknown one-off service")
+    elif service not in ALLOWED_SERVICES:
         raise AdoptionError("legacy project contains an unknown service")
     image_id = _string(container.get("Image"), "container image id")
     if _IMAGE_ID.fullmatch(image_id) is None:
         raise AdoptionError("legacy container image id is not immutable")
+    config_image = _string(config.get("Image"), "configured image")
+    if _IMMUTABLE_IMAGE.fullmatch(config_image) is None:
+        raise AdoptionError("legacy configured image is not digest-pinned")
+    config_hash = _string(labels.get("com.docker.compose.config-hash"), "config hash")
+    if _SHA256.fullmatch(config_hash) is None:
+        raise AdoptionError("legacy Compose config hash is malformed")
     state = _object(container.get("State"), "container state")
     running = state.get("Running")
     restart_count = container.get("RestartCount")
@@ -562,6 +655,8 @@ def _container_record(document: object) -> ContainerRecord:
                 ports.append(f"{host_port}/{container_port}")
     if service not in {"proxy", "maintenance-page"} and ports:
         raise AdoptionError("a non-edge legacy service publishes host ports")
+    if oneoff and (running or ports):
+        raise AdoptionError("legacy one-off container must be stopped and publish no ports")
     host_ports = {entry.split("/", 1)[0] + "/tcp" for entry in ports}
     if not host_ports <= EXPECTED_PORTS:
         raise AdoptionError("legacy edge publishes an unapproved host port")
@@ -569,11 +664,10 @@ def _container_record(document: object) -> ContainerRecord:
         service=service,
         container_id=container_id,
         image_id=image_id,
-        config_image=_string(config.get("Image"), "configured image"),
-        config_hash=_string(labels.get("com.docker.compose.config-hash"), "config hash"),
-        config_files=_string(
-            labels.get("com.docker.compose.project.config_files"), "Compose config file"
-        ),
+        config_image=config_image,
+        config_hash=config_hash,
+        config_files=_compose_label_paths(labels.get("com.docker.compose.project.config_files")),
+        oneoff=oneoff,
         running=running,
         restart_count=restart_count,
         mounts=tuple(sorted(mounts)),
@@ -599,11 +693,14 @@ def collect_inventory(runner: Runner) -> LegacyInventory:
     containers = tuple(
         sorted(
             (_container_record(item) for item in runner.docker_json(("inspect", *ids))),
-            key=lambda item: item.service,
+            key=lambda item: (item.oneoff, item.service, item.container_id),
         )
     )
-    services = [item.service for item in containers]
-    if len(set(services)) != len(services) or not set(services) >= REQUIRED_SERVICES:
+    primary_services = [item.service for item in containers if not item.oneoff]
+    if (
+        len(set(primary_services)) != len(primary_services)
+        or not set(primary_services) >= REQUIRED_SERVICES
+    ):
         raise AdoptionError("legacy project service inventory is incomplete or ambiguous")
     container_ids = {item.container_id for item in containers}
 
@@ -683,6 +780,17 @@ def inventory_sha256(inventory: LegacyInventory) -> str:
     return _sha256_bytes(_canonical_json(inventory_document(inventory)))
 
 
+def _source_images(inventory: LegacyInventory) -> dict[str, str]:
+    return {
+        _container_binding_key(item.service, item.oneoff, item.container_id): item.image_id
+        for item in inventory.containers
+    }
+
+
+def _container_binding_key(service: str, oneoff: bool, container_id: str) -> str:
+    return f"oneoff:{service}:{container_id}" if oneoff else service
+
+
 def topology_document(inventory: LegacyInventory) -> dict[str, Any]:
     """Return the stable identity needed to reconstruct the legacy project.
 
@@ -700,6 +808,7 @@ def topology_document(inventory: LegacyInventory) -> dict[str, Any]:
                 "config_image": item.config_image,
                 "config_hash": item.config_hash,
                 "config_files": item.config_files,
+                "oneoff": item.oneoff,
                 "mounts": item.mounts,
                 "networks": item.networks,
                 "published_ports": item.published_ports,
@@ -713,6 +822,27 @@ def topology_document(inventory: LegacyInventory) -> dict[str, Any]:
 
 def topology_sha256(inventory: LegacyInventory) -> str:
     return _sha256_bytes(_canonical_json(topology_document(inventory)))
+
+
+def _restorable_inventory(inventory: LegacyInventory) -> LegacyInventory:
+    primary_ids = {item.container_id for item in inventory.containers if not item.oneoff}
+    return LegacyInventory(
+        containers=tuple(item for item in inventory.containers if not item.oneoff),
+        networks=tuple(
+            replace(
+                item,
+                attached_container_ids=tuple(
+                    value for value in item.attached_container_ids if value in primary_ids
+                ),
+            )
+            for item in inventory.networks
+        ),
+        volumes=inventory.volumes,
+    )
+
+
+def restorable_topology_sha256(inventory: LegacyInventory) -> str:
+    return topology_sha256(_restorable_inventory(inventory))
 
 
 def _read_binding_key(path: Path) -> bytes:
@@ -733,7 +863,7 @@ def build_plan(
     inventory: LegacyInventory,
     runtime_env: Path,
     runtime_binding: str,
-    compose_file: Path,
+    compose_files: Sequence[Path],
     legacy_env_files: Sequence[Path],
     legacy_env_bindings: Mapping[str, str],
     target_manifest: Path,
@@ -741,7 +871,13 @@ def build_plan(
 ) -> dict[str, Any]:
     if _GIT_SHA.fullmatch(git_sha) is None:
         raise AdoptionError("expected Git SHA is malformed")
-    compose = protected_file(compose_file, modes=frozenset({0o400, 0o440, 0o444}))
+    if not compose_files:
+        raise AdoptionError("at least one legacy Compose file is required")
+    compose_paths = tuple(
+        protected_file(path, modes=frozenset({0o400, 0o440, 0o444})) for path in compose_files
+    )
+    if len(compose_paths) != len(set(compose_paths)):
+        raise AdoptionError("legacy Compose file argument is duplicated")
     env_files = [
         protected_file(path, modes=frozenset({0o400, 0o440, 0o444, 0o600}))
         for path in legacy_env_files
@@ -752,11 +888,23 @@ def build_plan(
         raise AdoptionError("legacy environment binding is malformed")
     manifest = protected_file(target_manifest, modes=frozenset({0o400, 0o440, 0o444}))
     protected_file(runtime_env, modes=frozenset({0o400, 0o600}))
-    compose_labels = {item.config_files for item in inventory.containers}
-    if compose_labels != {str(compose)}:
-        raise AdoptionError("legacy containers do not share one reconstructable Compose file")
+    selected_compose = {str(path) for path in compose_paths}
+    observed_compose = {path for item in inventory.containers for path in item.config_files}
+    if observed_compose != selected_compose:
+        raise AdoptionError("legacy Compose file set differs from container bindings")
+    service_bindings: dict[str, list[str]] = {}
+    for item in inventory.containers:
+        binding = list(item.config_files)
+        key = _container_binding_key(item.service, item.oneoff, item.container_id)
+        if key in service_bindings:
+            raise AdoptionError("container Compose binding key is duplicated")
+        service_bindings[key] = binding
+    guard = protected_file(
+        Path(__file__).resolve(strict=True).with_name("host_isolation_guard.py"),
+        modes=frozenset({0o400, 0o440, 0o444, 0o644}),
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "heyi-legacy-adoption-plan",
         "project": PROJECT,
         "created_at": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -767,8 +915,8 @@ def build_plan(
             "opaque_hmac_sha256": runtime_binding,
         },
         "legacy_compose": {
-            "path": str(compose),
-            "sha256": _sha256_file(compose),
+            "files": [{"path": str(path), "sha256": _sha256_file(path)} for path in compose_paths],
+            "service_bindings": service_bindings,
             "env_files": [
                 {
                     "path": str(path),
@@ -780,6 +928,10 @@ def build_plan(
         "target_manifest": {
             "path": str(manifest),
             "sha256": _sha256_file(manifest),
+        },
+        "host_isolation_guard": {
+            "path": str(guard),
+            "sha256": _sha256_file(guard),
         },
         "inventory_sha256": inventory_sha256(inventory),
         "topology_sha256": topology_sha256(inventory),
@@ -809,7 +961,9 @@ def _plan_digest(document: Mapping[str, Any]) -> str:
 
 
 def _service(inventory: LegacyInventory, name: str) -> ContainerRecord:
-    candidate = next((item for item in inventory.containers if item.service == name), None)
+    candidate = next(
+        (item for item in inventory.containers if item.service == name and not item.oneoff), None
+    )
     if candidate is None:
         raise AdoptionError(f"required legacy service is missing: {name}")
     return candidate
@@ -2095,10 +2249,9 @@ def _env_binding(path: Path, binding_key: bytes) -> str:
     )
 
 
-def _validate_plan(
-    path: Path,
-    binding_key: bytes,
-) -> tuple[dict[str, Any], str, dict[str, str], Path, tuple[Path, ...]]:
+def _load_plan_identity(
+    path: Path, *, enforce_freshness: bool = True
+) -> tuple[dict[str, Any], str]:
     plan = _read_json_file(path)
     expected = {
         "schema_version",
@@ -2109,6 +2262,7 @@ def _validate_plan(
         "data_root",
         "runtime_env",
         "legacy_compose",
+        "host_isolation_guard",
         "target_manifest",
         "inventory_sha256",
         "topology_sha256",
@@ -2118,7 +2272,7 @@ def _validate_plan(
     if set(plan) != expected:
         raise AdoptionError("legacy adoption plan schema differs")
     if (
-        plan.get("schema_version") != 1
+        plan.get("schema_version") != 2
         or plan.get("kind") != "heyi-legacy-adoption-plan"
         or plan.get("project") != PROJECT
         or plan.get("data_root") != str(DATA_ROOT)
@@ -2128,7 +2282,9 @@ def _validate_plan(
         raise AdoptionError("legacy adoption plan identity differs")
     created_at = _timestamp(plan.get("created_at"), "plan.created_at")
     now = _utc_now()
-    if not now - timedelta(days=30) <= created_at <= now + timedelta(minutes=5):
+    if enforce_freshness and not (
+        now - timedelta(days=30) <= created_at <= now + timedelta(minutes=5)
+    ):
         raise AdoptionError("legacy adoption plan is stale or future-dated")
     expected_safety = {
         "protected_other_port": 10050,
@@ -2154,6 +2310,16 @@ def _validate_plan(
         _sha256_bytes(_canonical_json(plan.get("inventory"))), inventory_digest
     ):
         raise AdoptionError("legacy adoption plan inventory was modified")
+    return plan, _plan_digest(plan)
+
+
+def _validate_plan(
+    path: Path,
+    binding_key: bytes,
+    *,
+    enforce_freshness: bool = True,
+) -> tuple[dict[str, Any], str, dict[str, str], tuple[Path, ...], tuple[Path, ...]]:
+    plan, plan_digest = _load_plan_identity(path, enforce_freshness=enforce_freshness)
 
     runtime_entry = _object(plan.get("runtime_env"), "runtime environment binding")
     if set(runtime_entry) != {"path", "opaque_hmac_sha256"}:
@@ -2167,17 +2333,52 @@ def _validate_plan(
         raise AdoptionError("runtime environment opaque binding differs")
 
     compose_entry = _object(plan.get("legacy_compose"), "legacy Compose binding")
-    if set(compose_entry) != {"path", "sha256", "env_files"}:
+    if set(compose_entry) != {"files", "service_bindings", "env_files"}:
         raise AdoptionError("legacy Compose binding schema differs")
-    compose_path = protected_file(
-        Path(_string(compose_entry.get("path"), "legacy Compose path")),
-        modes=frozenset({0o400, 0o440, 0o444}),
+    compose_paths: list[Path] = []
+    for raw_file in _list(compose_entry.get("files"), "legacy Compose files"):
+        entry = _object(raw_file, "legacy Compose file binding")
+        if set(entry) != {"path", "sha256"}:
+            raise AdoptionError("legacy Compose file binding schema differs")
+        compose_path = protected_file(
+            Path(_string(entry.get("path"), "legacy Compose path")),
+            modes=frozenset({0o400, 0o440, 0o444}),
+        )
+        compose_digest = _string(entry.get("sha256"), "legacy Compose digest")
+        if _SHA256.fullmatch(compose_digest) is None or not hmac.compare_digest(
+            _sha256_file(compose_path), compose_digest
+        ):
+            raise AdoptionError("legacy Compose file differs from its plan")
+        compose_paths.append(compose_path)
+    if not compose_paths or len(compose_paths) != len(set(compose_paths)):
+        raise AdoptionError("legacy Compose file set is empty or duplicated")
+    service_bindings = _object(compose_entry.get("service_bindings"), "service bindings")
+    planned_containers = _list(
+        _object(plan.get("inventory"), "planned inventory").get("containers"),
+        "planned containers",
     )
-    compose_digest = _string(compose_entry.get("sha256"), "legacy Compose digest")
-    if _SHA256.fullmatch(compose_digest) is None or not hmac.compare_digest(
-        _sha256_file(compose_path), compose_digest
-    ):
-        raise AdoptionError("legacy Compose file differs from its plan")
+    expected_bindings: dict[str, list[str]] = {}
+    for raw_container in planned_containers:
+        container = _object(raw_container, "planned container")
+        service = _string(container.get("service"), "planned service")
+        oneoff = container.get("oneoff")
+        container_id = _string(container.get("container_id"), "planned container id")
+        if type(oneoff) is not bool:
+            raise AdoptionError("planned one-off marker is malformed")
+        files = [
+            _string(value, "planned Compose binding")
+            for value in _list(container.get("config_files"), "planned Compose bindings")
+        ]
+        key = _container_binding_key(service, oneoff, container_id)
+        if key in expected_bindings:
+            raise AdoptionError("planned container Compose binding is duplicated")
+        expected_bindings[key] = files
+    if service_bindings != expected_bindings:
+        raise AdoptionError("legacy per-service Compose binding differs")
+    if {value for files in expected_bindings.values() for value in files} != {
+        str(value) for value in compose_paths
+    }:
+        raise AdoptionError("legacy per-service Compose binding is incomplete")
     env_paths: list[Path] = []
     seen_env_paths: set[Path] = set()
     for raw_entry in _list(compose_entry.get("env_files"), "legacy environment files"):
@@ -2209,8 +2410,155 @@ def _validate_plan(
         _sha256_file(target_path), target_digest
     ):
         raise AdoptionError("target manifest differs from its plan")
+    guard_entry = _object(plan.get("host_isolation_guard"), "host-isolation guard binding")
+    if set(guard_entry) != {"path", "sha256"}:
+        raise AdoptionError("host-isolation guard binding schema differs")
+    guard_path = protected_file(
+        Path(_string(guard_entry.get("path"), "host-isolation guard path")),
+        modes=frozenset({0o400, 0o440, 0o444, 0o644}),
+    )
+    if guard_path != Path(__file__).resolve(strict=True).with_name("host_isolation_guard.py"):
+        raise AdoptionError("host-isolation guard is not from this release")
+    guard_digest = _string(guard_entry.get("sha256"), "host-isolation guard digest")
+    if _SHA256.fullmatch(guard_digest) is None or not hmac.compare_digest(
+        _sha256_file(guard_path), guard_digest
+    ):
+        raise AdoptionError("host-isolation guard differs from its plan")
     protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
-    return plan, _plan_digest(plan), runtime, compose_path, tuple(env_paths)
+    return plan, plan_digest, runtime, tuple(compose_paths), tuple(env_paths)
+
+
+def _planned_inventory(plan: Mapping[str, Any]) -> LegacyInventory:
+    document = _object(plan.get("inventory"), "planned inventory")
+    if set(document) != {"containers", "networks", "volumes"}:
+        raise AdoptionError("planned inventory schema differs")
+    containers: list[ContainerRecord] = []
+    container_keys = {
+        "service",
+        "container_id",
+        "image_id",
+        "config_image",
+        "config_hash",
+        "config_files",
+        "oneoff",
+        "running",
+        "restart_count",
+        "mounts",
+        "networks",
+        "published_ports",
+    }
+    for raw in _list(document.get("containers"), "planned containers"):
+        item = _object(raw, "planned container")
+        if set(item) != container_keys:
+            raise AdoptionError("planned container schema differs")
+        oneoff = item.get("oneoff")
+        running = item.get("running")
+        restart_count = item.get("restart_count")
+        if type(oneoff) is not bool or type(running) is not bool or type(restart_count) is not int:
+            raise AdoptionError("planned container state is malformed")
+        service = _string(item.get("service"), "planned service")
+        if (oneoff and service not in KNOWN_ONEOFF_SERVICES) or (
+            not oneoff and service not in ALLOWED_SERVICES
+        ):
+            raise AdoptionError("planned container service is not approved")
+        if oneoff and running:
+            raise AdoptionError("planned one-off container is running")
+        mounts: list[tuple[str, str, bool, str]] = []
+        for raw_mount in _list(item.get("mounts"), "planned mounts"):
+            mount = _list(raw_mount, "planned mount")
+            if len(mount) != 4 or type(mount[2]) is not bool:
+                raise AdoptionError("planned mount schema differs")
+            mounts.append(
+                (
+                    _string(mount[0], "planned mount source"),
+                    _string(mount[1], "planned mount destination"),
+                    mount[2],
+                    _string(mount[3], "planned mount type"),
+                )
+            )
+        if any(mount[3] not in {"bind", "volume"} for mount in mounts):
+            raise AdoptionError("planned mount type is unsafe")
+        container_id = _string(item.get("container_id"), "planned container id")
+        image_id = _string(item.get("image_id"), "planned image id")
+        config_image = _string(item.get("config_image"), "planned configured image")
+        config_hash = _string(item.get("config_hash"), "planned config hash")
+        config_files = tuple(
+            _string(value, "planned Compose path")
+            for value in _list(item.get("config_files"), "planned Compose paths")
+        )
+        if (
+            _CONTAINER_ID.fullmatch(container_id) is None
+            or _IMAGE_ID.fullmatch(image_id) is None
+            or _IMMUTABLE_IMAGE.fullmatch(config_image) is None
+            or _SHA256.fullmatch(config_hash) is None
+            or config_files != _compose_label_paths(",".join(config_files))
+        ):
+            raise AdoptionError("planned container immutable identity is malformed")
+        containers.append(
+            ContainerRecord(
+                service=service,
+                container_id=container_id,
+                image_id=image_id,
+                config_image=config_image,
+                config_hash=config_hash,
+                config_files=config_files,
+                oneoff=oneoff,
+                running=running,
+                restart_count=restart_count,
+                mounts=tuple(mounts),
+                networks=tuple(
+                    _string(value, "planned network")
+                    for value in _list(item.get("networks"), "planned networks")
+                ),
+                published_ports=tuple(
+                    _string(value, "planned published port")
+                    for value in _list(item.get("published_ports"), "planned ports")
+                ),
+            )
+        )
+    networks: list[NetworkRecord] = []
+    for raw in _list(document.get("networks"), "planned networks"):
+        item = _object(raw, "planned network")
+        if set(item) != {"name", "network_id", "internal", "attached_container_ids"}:
+            raise AdoptionError("planned network schema differs")
+        internal = item.get("internal")
+        if type(internal) is not bool:
+            raise AdoptionError("planned network isolation is malformed")
+        networks.append(
+            NetworkRecord(
+                name=_string(item.get("name"), "planned network name"),
+                network_id=_string(item.get("network_id"), "planned network id"),
+                internal=internal,
+                attached_container_ids=tuple(
+                    _string(value, "planned network endpoint")
+                    for value in _list(
+                        item.get("attached_container_ids"), "planned network endpoints"
+                    )
+                ),
+            )
+        )
+    volumes: list[VolumeRecord] = []
+    for raw in _list(document.get("volumes"), "planned volumes"):
+        item = _object(raw, "planned volume")
+        if set(item) != {"name", "mountpoint"}:
+            raise AdoptionError("planned volume schema differs")
+        volumes.append(
+            VolumeRecord(
+                name=_string(item.get("name"), "planned volume name"),
+                mountpoint=_string(item.get("mountpoint"), "planned volume mountpoint"),
+            )
+        )
+    result = LegacyInventory(tuple(containers), tuple(networks), tuple(volumes))
+    primary_services = [item.service for item in containers if not item.oneoff]
+    if (
+        len({item.container_id for item in containers}) != len(containers)
+        or len(set(primary_services)) != len(primary_services)
+        or not set(primary_services) >= REQUIRED_SERVICES
+    ):
+        raise AdoptionError("planned primary service inventory is incomplete or ambiguous")
+    if inventory_sha256(result) != plan.get("inventory_sha256"):
+        raise AdoptionError("planned inventory does not round-trip exactly")
+    return result
 
 
 def _signature(
@@ -2311,7 +2659,70 @@ def _database_archive(source: Path, destination: Path) -> None:
 
 
 def _running_services(inventory: LegacyInventory) -> frozenset[str]:
-    return frozenset(item.service for item in inventory.containers if item.running)
+    return frozenset(
+        item.service for item in inventory.containers if item.running and not item.oneoff
+    )
+
+
+def _verify_data_bindings(inventory: LegacyInventory) -> None:
+    expectations = {
+        "postgres": (DATA_ROOT / "postgres", "/var/lib/postgresql/data"),
+        "minio": (DATA_ROOT / "minio", "/data"),
+    }
+    for service, (source, destination) in expectations.items():
+        record = _service(inventory, service)
+        matches = [
+            mount
+            for mount in record.mounts
+            if mount[1] == destination and mount[2] and mount[3] == "bind"
+        ]
+        if len(matches) != 1 or Path(matches[0][0]) != source:
+            raise AdoptionError(f"legacy {service} data bind path differs")
+
+
+def _postgres_control_value(
+    runner: Runner,
+    postgres: ContainerRecord,
+    runtime: Mapping[str, str],
+    statement: str,
+) -> str:
+    return _docker_exec_text(
+        runner,
+        postgres.container_id,
+        (
+            "psql",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--username",
+            runtime["POSTGRES_USER"],
+            "--dbname",
+            runtime["POSTGRES_DB"],
+            "--command",
+            statement,
+        ),
+    ).strip()
+
+
+def _verify_postgres_17_and_schema(
+    runner: Runner,
+    inventory: LegacyInventory,
+    runtime: Mapping[str, str],
+    expected_schema_head: str,
+) -> None:
+    postgres = _service(inventory, "postgres")
+    if not postgres.running:
+        raise AdoptionError("legacy PostgreSQL must be running for retirement validation")
+    version = _postgres_control_value(runner, postgres, runtime, "SHOW server_version_num;")
+    if not version.isdecimal() or not 170_000 <= int(version) < 180_000:
+        raise AdoptionError("legacy PostgreSQL major version is not 17")
+    schema_head = _postgres_control_value(
+        runner, postgres, runtime, "SELECT version_num FROM alembic_version;"
+    )
+    if schema_head != expected_schema_head or _SCHEMA_HEAD.fullmatch(schema_head) is None:
+        raise AdoptionError("legacy PostgreSQL schema differs from signed backup evidence")
 
 
 def _quiesce_legacy(runner: Runner, inventory: LegacyInventory) -> frozenset[str]:
@@ -2324,8 +2735,14 @@ def _quiesce_legacy(runner: Runner, inventory: LegacyInventory) -> frozenset[str
         record = records.get(service)
         if record is not None and record.running:
             runner.run(
-                (runner.docker, "stop", "--time", "60", record.container_id),
-                timeout=120,
+                (
+                    runner.docker,
+                    "stop",
+                    "--time",
+                    str(LEGACY_STOP_GRACE_SECONDS),
+                    record.container_id,
+                ),
+                timeout=LEGACY_STOP_COMMAND_TIMEOUT_SECONDS,
             )
     current = collect_inventory(runner)
     still_running = _running_services(current) - data_services
@@ -2337,7 +2754,7 @@ def _quiesce_legacy(runner: Runner, inventory: LegacyInventory) -> frozenset[str
 
 
 def _compose_argv(
-    compose_path: Path,
+    compose_paths: Sequence[Path],
     runtime_path: Path,
     env_paths: Sequence[Path],
 ) -> tuple[str, ...]:
@@ -2352,15 +2769,41 @@ def _compose_argv(
     for path in env_paths:
         if path != runtime_path:
             values.extend(("--env-file", str(path)))
-    values.extend(("--file", str(compose_path)))
+    for path in compose_paths:
+        values.extend(("--file", str(path)))
     return tuple(values)
+
+
+def _ordered_primary_services(inventory: LegacyInventory) -> tuple[str, ...]:
+    services = {item.service for item in inventory.containers if not item.oneoff}
+    ordered = [service for service in START_ORDER if service in services and service != "proxy"]
+    ordered.extend(sorted(services - set(ordered) - {"proxy"}))
+    if "proxy" in services:
+        ordered.append("proxy")
+    return tuple(ordered)
+
+
+def _compose_for_service(
+    expected: LegacyInventory,
+    service: str,
+    available_paths: Sequence[Path],
+    runtime_path: Path,
+    env_paths: Sequence[Path],
+) -> tuple[str, ...]:
+    record = _service(expected, service)
+    allowed = {str(path): path for path in available_paths}
+    if not record.config_files or any(path not in allowed for path in record.config_files):
+        raise AdoptionError("service Compose binding differs from the signed plan")
+    return _compose_argv(
+        tuple(allowed[path] for path in record.config_files), runtime_path, env_paths
+    )
 
 
 def _resume_or_recreate_legacy(
     runner: Runner,
     *,
     expected: LegacyInventory,
-    compose_path: Path,
+    compose_paths: Sequence[Path],
     runtime_path: Path,
     env_paths: Sequence[Path],
     originally_running: frozenset[str],
@@ -2379,7 +2822,7 @@ def _resume_or_recreate_legacy(
     current_ids = {line.strip() for line in raw_ids.splitlines() if line.strip()}
     if current_ids == expected_ids:
         current_inventory = collect_inventory(runner)
-        if topology_sha256(current_inventory) != topology_sha256(expected):
+        if restorable_topology_sha256(current_inventory) != restorable_topology_sha256(expected):
             raise AdoptionError("legacy topology changed while it was quiesced")
         records = {item.service: item for item in current_inventory.containers}
         ordered = list(START_ORDER)
@@ -2389,16 +2832,35 @@ def _resume_or_recreate_legacy(
             if service in originally_running and record is not None and not record.running:
                 runner.run((runner.docker, "start", record.container_id), timeout=120)
     else:
-        base = _compose_argv(compose_path, runtime_path, env_paths)
-        runner.run((*base, "config", "--quiet"), timeout=120)
-        runner.run((*base, "up", "-d", "--no-build", "--pull", "never"), timeout=900)
+        for service in _ordered_primary_services(expected):
+            base = _compose_for_service(expected, service, compose_paths, runtime_path, env_paths)
+            runner.run((*base, "config", "--quiet"), timeout=120)
+            if service in originally_running:
+                runner.run(
+                    (*base, "up", "-d", "--no-build", "--pull", "never", "--no-deps", service),
+                    timeout=900,
+                )
+            else:
+                runner.run(
+                    (
+                        *base,
+                        "up",
+                        "--no-start",
+                        "--no-deps",
+                        "--no-build",
+                        "--pull",
+                        "never",
+                        service,
+                    ),
+                    timeout=900,
+                )
 
     deadline = time.monotonic() + 900
     last_error: AdoptionError | None = None
     while time.monotonic() < deadline:
         try:
             current = collect_inventory(runner)
-            if topology_sha256(current) != topology_sha256(expected):
+            if restorable_topology_sha256(current) != restorable_topology_sha256(expected):
                 raise AdoptionError("restored legacy topology differs")
             current_running = _running_services(current)
             if originally_running <= current_running:
@@ -2407,8 +2869,14 @@ def _resume_or_recreate_legacy(
                     for record in current.containers:
                         if record.service in extras:
                             runner.run(
-                                (runner.docker, "stop", "--time", "60", record.container_id),
-                                timeout=120,
+                                (
+                                    runner.docker,
+                                    "stop",
+                                    "--time",
+                                    str(LEGACY_STOP_GRACE_SECONDS),
+                                    record.container_id,
+                                ),
+                                timeout=LEGACY_STOP_COMMAND_TIMEOUT_SECONDS,
                             )
                     current = collect_inventory(runner)
                 if _running_services(current) == originally_running:
@@ -2558,7 +3026,7 @@ def _verify_ca_attestation(
 
 def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
     binding_key = _read_binding_key(arguments.binding_key)
-    plan, plan_digest, runtime, compose_path, env_paths = _validate_plan(
+    plan, plan_digest, runtime, compose_paths, env_paths = _validate_plan(
         arguments.plan, binding_key
     )
     inventory = collect_inventory(runner)
@@ -2652,7 +3120,7 @@ def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
                 _resume_or_recreate_legacy(
                     runner,
                     expected=inventory,
-                    compose_path=compose_path,
+                    compose_paths=compose_paths,
                     runtime_path=runtime_path,
                     env_paths=env_paths,
                     originally_running=originally_running,
@@ -2697,7 +3165,7 @@ def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
         "target_manifest_sha256": plan["target_manifest"]["sha256"],
         "source_inventory_sha256": plan["inventory_sha256"],
         "source_topology_sha256": plan["topology_sha256"],
-        "source_images": {item.service: item.image_id for item in inventory.containers},
+        "source_images": _source_images(inventory),
         "originally_running": sorted(originally_running),
         "runtime": {
             "required_keys_present": True,
@@ -2985,9 +3453,7 @@ def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
     inventory = collect_inventory(runner)
     if topology_sha256(inventory) != state["source_topology_sha256"]:
         raise AdoptionError("live legacy topology differs from the prepared backup source")
-    if _object(state.get("source_images"), "source images") != {
-        item.service: item.image_id for item in inventory.containers
-    }:
+    if _object(state.get("source_images"), "source images") != _source_images(inventory):
         raise AdoptionError("live legacy images differ from the prepared backup source")
 
     execute = _confirm(arguments, plan_digest)
@@ -3209,7 +3675,12 @@ def _inspect_exact_legacy_container(
     if not isinstance(raw, list) or len(raw) != 1:
         raise AdoptionError("legacy container identity became ambiguous")
     current = _container_record(raw[0])
-    if current.service != expected.service or current.image_id != expected.image_id:
+    normalized = replace(
+        current,
+        running=expected.running,
+        restart_count=expected.restart_count,
+    )
+    if normalized != expected:
         raise AdoptionError("legacy container identity changed before retirement")
     return current
 
@@ -3237,31 +3708,125 @@ def _verify_named_volumes(
         raise AdoptionError("preserved named volume inventory differs")
 
 
+def _project_container_ids(runner: Runner) -> set[str]:
+    raw = runner.run(
+        (
+            runner.docker,
+            "ps",
+            "-aq",
+            "--no-trunc",
+            "--filter",
+            f"label=com.docker.compose.project={PROJECT}",
+        )
+    ).decode("ascii", errors="strict")
+    values = {line.strip() for line in raw.splitlines() if line.strip()}
+    if any(_CONTAINER_ID.fullmatch(value) is None for value in values):
+        raise AdoptionError("project container identity is malformed")
+    return values
+
+
+def _project_network_ids(runner: Runner) -> set[str]:
+    raw = runner.run(
+        (
+            runner.docker,
+            "network",
+            "ls",
+            "-q",
+            "--no-trunc",
+            "--filter",
+            f"label=com.docker.compose.project={PROJECT}",
+        )
+    ).decode("ascii", errors="strict")
+    values = {line.strip() for line in raw.splitlines() if line.strip()}
+    if any(_CONTAINER_ID.fullmatch(value) is None for value in values):
+        raise AdoptionError("project network identity is malformed")
+    return values
+
+
+def _remove_exact_legacy_network(runner: Runner, expected: NetworkRecord) -> None:
+    raw = runner.docker_json(("network", "inspect", expected.network_id))
+    if not isinstance(raw, list) or len(raw) != 1:
+        raise AdoptionError("legacy network identity became ambiguous")
+    network = _object(raw[0], "legacy network")
+    labels = _object(network.get("Labels"), "legacy network labels")
+    if (
+        network.get("Name") != expected.name
+        or network.get("Id") != expected.network_id
+        or labels.get("com.docker.compose.project") != PROJECT
+        or labels.get("io.heyi.knowledgebases.owner") != OWNER
+        or labels.get("io.heyi.knowledgebases.stack") != STACK
+        or _object(network.get("Containers", {}), "legacy network endpoints")
+    ):
+        raise AdoptionError("legacy network is no longer exact or exclusive")
+    runner.run((runner.docker, "network", "rm", expected.network_id), timeout=120)
+
+
 def _retire_exact_resources(
     runner: Runner,
     inventory: LegacyInventory,
+    *,
+    allow_missing: bool = False,
 ) -> tuple[list[str], list[str]]:
-    records = {item.service: item for item in inventory.containers}
+    expected_container_ids = {item.container_id for item in inventory.containers}
+    current_container_ids = _project_container_ids(runner)
+    unknown_containers = current_container_ids - expected_container_ids
+    missing_containers = expected_container_ids - current_container_ids
+    if unknown_containers:
+        raise AdoptionError("unknown project container appeared during retirement")
+    if missing_containers and not allow_missing:
+        raise AdoptionError("legacy container disappeared before retirement intent")
+    expected_network_ids = {item.network_id for item in inventory.networks}
+    current_network_ids = _project_network_ids(runner)
+    unknown_networks = current_network_ids - expected_network_ids
+    missing_networks = expected_network_ids - current_network_ids
+    if unknown_networks:
+        raise AdoptionError("unknown project network appeared during retirement")
+    if missing_networks and not allow_missing:
+        raise AdoptionError("legacy network disappeared before retirement intent")
+
+    records = {item.service: item for item in inventory.containers if not item.oneoff}
     stop_order = list(WRITER_STOP_ORDER)
     stop_order.extend(sorted(ALLOWED_SERVICES - set(stop_order) - {"postgres", "minio"}))
     stop_order.extend(("postgres", "minio"))
     stopped: set[str] = set()
-    for service in stop_order:
-        record = records.get(service)
-        if record is None or record.container_id in stopped:
+    for record in inventory.containers:
+        if not record.oneoff:
+            continue
+        if record.container_id not in current_container_ids:
+            stopped.add(record.container_id)
             continue
         current = _inspect_exact_legacy_container(runner, record)
         if current.running:
-            runner.run(
-                (runner.docker, "stop", "--time", "60", record.container_id),
-                timeout=120,
-            )
+            raise AdoptionError("legacy one-off started before retirement")
         stopped.add(record.container_id)
+    for service in stop_order:
+        expected_record = records.get(service)
+        if expected_record is None or expected_record.container_id in stopped:
+            continue
+        if expected_record.container_id not in current_container_ids:
+            stopped.add(expected_record.container_id)
+            continue
+        current = _inspect_exact_legacy_container(runner, expected_record)
+        if current.running:
+            runner.run(
+                (
+                    runner.docker,
+                    "stop",
+                    "--time",
+                    str(LEGACY_STOP_GRACE_SECONDS),
+                    expected_record.container_id,
+                ),
+                timeout=LEGACY_STOP_COMMAND_TIMEOUT_SECONDS,
+            )
+        stopped.add(expected_record.container_id)
     if stopped != {item.container_id for item in inventory.containers}:
         raise AdoptionError("not every exact legacy container was quiesced")
 
     removed_containers: list[str] = []
     for record in inventory.containers:
+        if record.container_id not in current_container_ids:
+            removed_containers.append(record.container_id)
+            continue
         current = _inspect_exact_legacy_container(runner, record)
         if current.running:
             raise AdoptionError("legacy container restarted during retirement")
@@ -3270,21 +3835,8 @@ def _retire_exact_resources(
 
     removed_networks: list[str] = []
     for expected in inventory.networks:
-        raw = runner.docker_json(("network", "inspect", expected.network_id))
-        if not isinstance(raw, list) or len(raw) != 1:
-            raise AdoptionError("legacy network identity became ambiguous")
-        network = _object(raw[0], "legacy network")
-        labels = _object(network.get("Labels"), "legacy network labels")
-        if (
-            network.get("Name") != expected.name
-            or network.get("Id") != expected.network_id
-            or labels.get("com.docker.compose.project") != PROJECT
-            or labels.get("io.heyi.knowledgebases.owner") != OWNER
-            or labels.get("io.heyi.knowledgebases.stack") != STACK
-            or _object(network.get("Containers", {}), "legacy network endpoints")
-        ):
-            raise AdoptionError("legacy network is no longer exact or exclusive")
-        runner.run((runner.docker, "network", "rm", expected.network_id), timeout=120)
+        if expected.network_id in current_network_ids:
+            _remove_exact_legacy_network(runner, expected)
         removed_networks.append(expected.network_id)
     return removed_containers, removed_networks
 
@@ -3324,126 +3876,412 @@ def _atomic_publish_receipt_directory(parent: Path, pending: Path, final: Path) 
         os.close(directory_descriptor)
 
 
-def _retire(arguments: argparse.Namespace, runner: Runner) -> None:
-    binding_key = _read_binding_key(arguments.binding_key)
-    plan, plan_digest, _, compose_path, env_paths = _validate_plan(arguments.plan, binding_key)
-    runtime_path = Path(_object(plan["runtime_env"], "runtime environment")["path"])
-    evidence, detailed, run = _verify_upgrade_evidence(
-        runner,
-        evidence_path=arguments.evidence,
-        signature_path=arguments.evidence_signature,
-        public_key=arguments.evidence_public_key,
-        plan=plan,
-        plan_digest=plan_digest,
+def _release_state_binding() -> dict[str, Any]:
+    state = protected_directory(STATE_ROOT, modes=frozenset({0o700, 0o750}))
+    control_names = {"install-in-progress.json", "active-release.json", "cutover-intent.json"}
+    control_paths = sorted(
+        {
+            *(
+                path
+                for name in control_names
+                if (path := state / name).exists() or path.is_symlink()
+            ),
+            *state.glob("installed-*.json"),
+        },
+        key=lambda path: path.name,
     )
-    inventory = collect_inventory(runner)
-    if topology_sha256(inventory) != plan["topology_sha256"]:
-        raise AdoptionError("live legacy topology differs from the approved plan")
-    if _object(detailed.get("source_images"), "evidence source images") != {
-        item.service: item.image_id for item in inventory.containers
-    }:
-        raise AdoptionError("live legacy images differ from signed restore evidence")
-    _verify_named_volumes(runner, inventory.volumes)
-    protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
-    execute = _confirm(arguments, plan_digest)
-    if execute and arguments.confirm_preserve_data != "PRESERVE_BIND_DATA_AND_NAMED_VOLUMES":
-        raise AdoptionError("retirement requires the exact preserve-data confirmation")
-    if not execute:
-        print(
-            json.dumps(
-                {
-                    "status": "dry-run",
-                    "operation": "retire",
-                    "project": PROJECT,
-                    "plan_sha256": plan_digest,
-                    "exact_container_ids": [item.container_id for item in inventory.containers],
-                    "exact_network_ids": [item.network_id for item in inventory.networks],
-                    "preserved_named_volumes": [item.name for item in inventory.volumes],
-                    "preserved_bind_root": str(DATA_ROOT),
-                    "global_actions": [],
-                },
-                sort_keys=True,
-            )
+    control_files: list[dict[str, Any]] = []
+    for path in control_paths:
+        if path.parent != state or _SAFE_NAME.fullmatch(path.name) is None:
+            raise AdoptionError("release-state control path is unsafe")
+        canonical = protected_file(
+            path,
+            modes=frozenset({0o400, 0o440, 0o444, 0o600}),
         )
-        return
-
-    public_key = protected_file(
-        arguments.evidence_public_key,
-        modes=frozenset({0o400, 0o440, 0o444}),
-        max_bytes=65_536,
-    )
-    signing_key = protected_file(
-        arguments.evidence_signing_key,
-        modes=frozenset({0o400, 0o600}),
-        max_bytes=65_536,
-    )
-    receipt_parent = protected_directory(run / "evidence", modes=frozenset({0o700}))
-    pending = _new_private_directory(receipt_parent, f".retirement-{secrets.token_hex(16)}.pending")
-    final = receipt_parent / "retirement"
-    receipt_path = pending / "receipt.json"
-    receipt_signature = pending / "receipt.sig"
-    receipt = {
+        control_files.append(
+            {
+                "name": canonical.name,
+                "sha256": _sha256_file(canonical),
+                "size_bytes": canonical.stat().st_size,
+            }
+        )
+    release_entries: list[dict[str, str]] = []
+    if RELEASE_ROOT.exists() or RELEASE_ROOT.is_symlink():
+        releases = protected_directory(RELEASE_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
+        for path in sorted(releases.iterdir(), key=lambda value: value.name):
+            if _SAFE_NAME.fullmatch(path.name) is None or path.is_symlink():
+                raise AdoptionError("materialized release entry is unsafe")
+            metadata = path.lstat()
+            if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                raise AdoptionError("materialized release entry permissions are unsafe")
+            if stat.S_ISDIR(metadata.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(metadata.st_mode):
+                kind = "file"
+            else:
+                raise AdoptionError("materialized release entry type is unsafe")
+            release_entries.append({"name": path.name, "type": kind})
+    return {
         "schema_version": 1,
-        "kind": "heyi-legacy-retirement-receipt",
-        "status": "retired",
-        "project": PROJECT,
-        "issued_at": _utc_now().isoformat().replace("+00:00", "Z"),
-        "git_sha": plan["git_sha"],
-        "plan_sha256": plan_digest,
-        "upgrade_evidence_sha256": _sha256_file(arguments.evidence),
-        "target_manifest_sha256": evidence["target_manifest_sha256"],
-        "removed_container_ids": [item.container_id for item in inventory.containers],
-        "removed_network_ids": [item.network_id for item in inventory.networks],
-        "preserved_named_volumes": [asdict(item) for item in inventory.volumes],
-        "preserved_bind_root": str(DATA_ROOT),
-        "named_volumes_deleted": False,
-        "bind_data_deleted": False,
-        "global_prune_used": False,
-        "docker_daemon_restarted": False,
-        "post_migration_rollback_policy": "forward-only",
+        "control_files": control_files,
+        "release_root_present": RELEASE_ROOT.exists(),
+        "release_entries": release_entries,
     }
+
+
+def _load_host_isolation_guard(plan: Mapping[str, Any]) -> ModuleType:
+    entry = _object(plan.get("host_isolation_guard"), "host-isolation guard binding")
+    path = Path(_string(entry.get("path"), "host-isolation guard path"))
+    name = f"heyi_host_isolation_guard_{_string(entry.get('sha256'), 'guard digest')}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise AdoptionError("host-isolation guard could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise AdoptionError("host-isolation guard failed to load") from exc
+    return module
+
+
+def _verify_host_isolation(
+    plan: Mapping[str, Any], baseline_path: Path, hmac_key_path: Path
+) -> ModuleType:
+    guard = _load_host_isolation_guard(plan)
+    try:
+        key = guard.load_hmac_key(hmac_key_path)
+        if key is None:
+            raise AdoptionError("host-isolation HMAC key is required")
+        baseline = guard.load_json_evidence(baseline_path)
+        report = guard.verify_against_baseline(baseline, integrity_key=key)
+    except AdoptionError:
+        raise
+    except Exception as exc:
+        raise AdoptionError("host-isolation verification was blocked") from exc
+    if not isinstance(report, dict) or report.get("status") != "PASS":
+        raise AdoptionError("host-isolation baseline has drifted")
+    for unit in RECONCILE_UNITS:
+        try:
+            state = guard._systemctl_show(unit)
+        except Exception as exc:
+            raise AdoptionError("offline reconcile unit state could not be verified") from exc
+        if not isinstance(state, dict):
+            raise AdoptionError("offline reconcile unit state is malformed")
+        if state.get("LoadState") == "not-found":
+            continue
+        if state.get("ActiveState") != "inactive" or state.get("UnitFileState") not in {
+            "disabled",
+            "masked",
+            "static",
+        }:
+            raise AdoptionError("offline reconcile timer/service must be inactive and disabled")
+    return guard
+
+
+def _verify_retirement_receipt(
+    runner: Runner,
+    *,
+    receipt_path: Path,
+    signature_path: Path,
+    public_key: Path,
+    plan: Mapping[str, Any],
+    plan_digest: str,
+    inventory: LegacyInventory,
+    expected_directory_name: str = "retirement",
+    enforce_freshness: bool = True,
+) -> dict[str, Any]:
+    if expected_directory_name not in {"retirement", RETIREMENT_INTENT_DIRECTORY}:
+        raise AdoptionError("retirement receipt directory contract is invalid")
+    receipt = protected_file(receipt_path, modes=frozenset({0o400}))
+    signature = protected_file(signature_path, modes=frozenset({0o400, 0o440, 0o444}))
+    if receipt.name != "receipt.json" or signature != receipt.parent / "receipt.sig":
+        raise AdoptionError("retirement receipt paths are not canonical siblings")
+    retirement = protected_directory(receipt.parent, modes=frozenset({0o700}))
+    if retirement.name != expected_directory_name or retirement.parent.name != "evidence":
+        raise AdoptionError("retirement receipt is outside its fixed evidence directory")
+    try:
+        retirement.relative_to(BACKUP_ROOT)
+    except ValueError as exc:
+        raise AdoptionError("retirement receipt is outside the backup root") from exc
+    _verify_signature(runner, payload=receipt, signature=signature, public_key=public_key)
+    document = _read_json_file(receipt, max_bytes=256 * 1024)
+    expected = {
+        "schema_version",
+        "kind",
+        "status",
+        "project",
+        "issued_at",
+        "git_sha",
+        "plan_sha256",
+        "upgrade_evidence_sha256",
+        "target_manifest_sha256",
+        "source_schema_head",
+        "source_postgres_major",
+        "source_topology_sha256",
+        "restorable_topology_sha256",
+        "release_state_binding",
+        "removed_container_ids",
+        "stopped_oneoff_container_ids_not_restored",
+        "removed_network_ids",
+        "preserved_named_volumes",
+        "preserved_bind_root",
+        "named_volumes_deleted",
+        "bind_data_deleted",
+        "global_prune_used",
+        "docker_daemon_restarted",
+        "restore_boundary",
+        "post_migration_rollback_policy",
+    }
+    if set(document) != expected:
+        raise AdoptionError("signed retirement receipt schema differs")
+    issued = _timestamp(document.get("issued_at"), "retirement receipt issued_at")
+    now = _utc_now()
+    planned_ids = [item.container_id for item in inventory.containers]
+    oneoff_ids = [item.container_id for item in inventory.containers if item.oneoff]
+    network_ids = [item.network_id for item in inventory.networks]
+    preserved_volumes = [asdict(item) for item in inventory.volumes]
+    target_digest = _object(plan.get("target_manifest"), "target manifest").get("sha256")
+    upgrade_digest = document.get("upgrade_evidence_sha256")
+    if (
+        document.get("schema_version") != 2
+        or document.get("kind") != "heyi-legacy-retirement-receipt"
+        or document.get("status") != "retired"
+        or document.get("project") != PROJECT
+        or document.get("git_sha") != plan.get("git_sha")
+        or document.get("plan_sha256") != plan_digest
+        or document.get("target_manifest_sha256") != target_digest
+        or not isinstance(upgrade_digest, str)
+        or _SHA256.fullmatch(upgrade_digest) is None
+        or document.get("source_postgres_major") != 17
+        or document.get("source_topology_sha256") != plan.get("topology_sha256")
+        or document.get("restorable_topology_sha256") != restorable_topology_sha256(inventory)
+        or document.get("removed_container_ids") != planned_ids
+        or document.get("stopped_oneoff_container_ids_not_restored") != oneoff_ids
+        or document.get("removed_network_ids") != network_ids
+        or document.get("preserved_named_volumes") != preserved_volumes
+        or document.get("preserved_bind_root") != str(DATA_ROOT)
+        or document.get("named_volumes_deleted") is not False
+        or document.get("bind_data_deleted") is not False
+        or document.get("global_prune_used") is not False
+        or document.get("docker_daemon_restarted") is not False
+        or document.get("restore_boundary") != REACTIVATION_BOUNDARY
+        or document.get("post_migration_rollback_policy") != "forward-only"
+        or (
+            enforce_freshness
+            and expected_directory_name != RETIREMENT_INTENT_DIRECTORY
+            and not now - timedelta(days=30) <= issued <= now + timedelta(minutes=5)
+        )
+    ):
+        raise AdoptionError("signed retirement receipt identity differs")
+    schema_head = document.get("source_schema_head")
+    if not isinstance(schema_head, str) or _SCHEMA_HEAD.fullmatch(schema_head) is None:
+        raise AdoptionError("signed retirement schema head is malformed")
+    return document
+
+
+def _verify_optional_abort_archive(value: object, expected_path: Path) -> None:
+    if value is None:
+        return
+    descriptor = _object(value, "target abort archived artifact")
+    if set(descriptor) != {"path", "sha256"}:
+        raise AdoptionError("target abort archived artifact schema differs")
+    path = protected_file(
+        Path(_string(descriptor.get("path"), "target abort archived artifact path")),
+        modes=frozenset({0o400}),
+        max_bytes=256 * 1024,
+    )
+    digest = _string(descriptor.get("sha256"), "target abort archived artifact digest")
+    if (
+        path != expected_path
+        or _SHA256.fullmatch(digest) is None
+        or not hmac.compare_digest(_sha256_file(path), digest)
+    ):
+        raise AdoptionError("target abort archived artifact differs")
+
+
+def _verify_target_abort_authorization(
+    runner: Runner,
+    *,
+    receipt_path: Path,
+    signature_path: Path,
+    public_key: Path,
+    adoption_transaction: str,
+    plan_digest: str,
+    retirement_receipt_path: Path,
+    retirement_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    if _TRANSACTION_ID.fullmatch(adoption_transaction) is None:
+        raise AdoptionError("adoption transaction identifier is malformed")
+    transaction_root = STATE_ROOT / "legacy-adoption" / "transactions" / adoption_transaction
+    expected_directory = transaction_root / "target-pre-migration-abort"
+    receipt = protected_file(receipt_path, modes=frozenset({0o400}), max_bytes=256 * 1024)
+    signature = protected_file(
+        signature_path,
+        modes=frozenset({0o400}),
+        max_bytes=65_536,
+    )
+    directory = protected_directory(receipt.parent, modes=frozenset({0o700}))
+    if (
+        directory != expected_directory
+        or receipt.name != "receipt.json"
+        or signature != directory / "receipt.sig"
+    ):
+        raise AdoptionError("target abort authorization is outside its fixed transaction path")
+    _verify_signature(
+        runner,
+        payload=receipt,
+        signature=signature,
+        public_key=public_key,
+    )
+    document = _read_json_file(receipt, max_bytes=256 * 1024)
+    if set(document) != TARGET_ABORT_RECEIPT_KEYS:
+        raise AdoptionError("target abort authorization schema differs")
+    _timestamp(document.get("issued_at"), "target abort authorization issued_at")
+    retirement = protected_file(
+        retirement_receipt_path,
+        modes=frozenset({0o400}),
+        max_bytes=256 * 1024,
+    )
+    retirement_digest = _sha256_file(retirement)
+    journal = protected_file(
+        transaction_root / "journal.json",
+        modes=frozenset({0o400}),
+        max_bytes=256 * 1024,
+    )
+    journal_digest = _sha256_file(journal)
+    legacy_schema = _string(
+        retirement_receipt.get("source_schema_head"), "retirement source schema head"
+    )
+    target_schema = document.get("target_schema_head")
+    removed_ids = document.get("removed_preflight_container_ids")
+    if (
+        not isinstance(removed_ids, list)
+        or any(
+            not isinstance(value, str) or _CONTAINER_ID.fullmatch(value) is None
+            for value in removed_ids
+        )
+        or len(removed_ids) != len(set(removed_ids))
+    ):
+        raise AdoptionError("target abort removed-container inventory is malformed")
+    expected_reconcile = {
+        unit: {
+            "load_state": "not-found",
+            "active_state": "inactive",
+            "unit_file_state": "not-found",
+        }
+        for unit in RECONCILE_UNITS
+    }
+    target_contract = document.get("target_contract_sha256")
+    target_manifest = document.get("target_manifest_sha256")
+    if (
+        document.get("schema_version") != 1
+        or document.get("kind") != "heyi-target-pre-migration-abort-receipt"
+        or document.get("status") != "aborted_pre_migration"
+        or document.get("project") != PROJECT
+        or document.get("adoption_transaction_id") != adoption_transaction
+        or document.get("journal_sha256") != journal_digest
+        or document.get("plan_sha256") != plan_digest
+        or document.get("retirement_receipt_sha256") != retirement_digest
+        or not isinstance(target_contract, str)
+        or _SHA256.fullmatch(target_contract) is None
+        or not isinstance(target_manifest, str)
+        or _SHA256.fullmatch(target_manifest) is None
+        or not isinstance(target_schema, str)
+        or _SCHEMA_HEAD.fullmatch(target_schema) is None
+        or document.get("legacy_source_schema_head") != legacy_schema
+        or document.get("last_install_phase") not in {"not_started", "prepared", "preflight_passed"}
+        or document.get("migration_command_invoked") is not False
+        or document.get("active_release_present") is not False
+        or document.get("installed_receipt_present") is not False
+        or type(document.get("removed_owner_marker_volume")) is not bool
+        or document.get("reconcile_baseline") != expected_reconcile
+        or document.get("reconcile_result") != expected_reconcile
+        or document.get("target_resource_counts_after")
+        != {"containers": 0, "networks": 0, "project_volumes": 0, "owner_marker": 0}
+        or document.get("preserved_bind_root") != str(DATA_ROOT)
+        or document.get("bind_data_deleted") is not False
+        or document.get("named_volumes_deleted") is not False
+        or document.get("global_actions") != []
+        or document.get("restore_boundary") != REACTIVATION_BOUNDARY
+    ):
+        raise AdoptionError("target abort authorization identity differs")
+    _verify_optional_abort_archive(
+        document.get("archived_install_state"),
+        directory / "archived" / "install-in-progress.json",
+    )
+    _verify_optional_abort_archive(
+        document.get("archived_cutover_intent"),
+        directory / "archived" / "cutover-intent.json",
+    )
+    host = _object(
+        document.get("host_isolation_verification"),
+        "target abort host-isolation verification",
+    )
+    if set(host) != {"path", "sha256", "status"}:
+        raise AdoptionError("target abort host-isolation descriptor schema differs")
+    host_path = protected_file(
+        Path(_string(host.get("path"), "target abort host-isolation path")),
+        modes=frozenset({0o400}),
+        max_bytes=8 * 1024 * 1024,
+    )
+    host_digest = _string(host.get("sha256"), "target abort host-isolation digest")
+    if (
+        host.get("status") != "PASS"
+        or host_path != directory / "host-isolation-after-abort.json"
+        or _SHA256.fullmatch(host_digest) is None
+        or not hmac.compare_digest(_sha256_file(host_path), host_digest)
+    ):
+        raise AdoptionError("target abort host-isolation verification differs")
+    return document
+
+
+def _publish_retirement_intent(
+    runner: Runner,
+    *,
+    receipt_parent: Path,
+    receipt: Mapping[str, Any],
+    signing_key: Path,
+    public_key: Path,
+) -> Path:
+    """Atomically publish the durable signed intent before any Docker mutation."""
+
+    parent = protected_directory(receipt_parent, modes=frozenset({0o700}))
+    intent = parent / RETIREMENT_INTENT_DIRECTORY
+    final = parent / "retirement"
+    if intent.exists() or intent.is_symlink() or final.exists() or final.is_symlink():
+        raise AdoptionError("retirement intent or final receipt already exists")
+    pending = _new_private_directory(
+        parent, f".{RETIREMENT_INTENT_DIRECTORY}.{secrets.token_hex(16)}.pending"
+    )
+    receipt_path = pending / "receipt.json"
+    signature_path = pending / "receipt.sig"
     _atomic_write(receipt_path, _canonical_json(receipt), mode=0o400)
     _signature(
         runner,
         payload=receipt_path,
         signing_key=signing_key,
-        destination=receipt_signature,
+        destination=signature_path,
     )
     _verify_signature(
         runner,
         payload=receipt_path,
-        signature=receipt_signature,
+        signature=signature_path,
         public_key=public_key,
     )
+    _atomic_publish_receipt_directory(parent, pending, intent)
+    return protected_directory(intent, modes=frozenset({0o700}))
 
-    originally_running = _running_services(inventory)
-    committed = False
-    try:
-        removed_containers, removed_networks = _retire_exact_resources(runner, inventory)
-        if (
-            removed_containers != receipt["removed_container_ids"]
-            or removed_networks != receipt["removed_network_ids"]
-        ):
-            raise AdoptionError("retired resource set differs from the signed receipt")
-        _verify_named_volumes(runner, inventory.volumes)
-        protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
-        _assert_legacy_resources_absent(runner)
-        _atomic_publish_receipt_directory(receipt_parent, pending, final)
-        committed = True
-    finally:
-        if not committed:
-            _resume_or_recreate_legacy(
-                runner,
-                expected=inventory,
-                compose_path=compose_path,
-                runtime_path=runtime_path,
-                env_paths=env_paths,
-                originally_running=originally_running,
-            )
+
+def _print_retirement_result(
+    *,
+    final: Path,
+    inventory: LegacyInventory,
+    already_retired: bool,
+) -> None:
     print(
         json.dumps(
             {
-                "status": "retired",
+                "status": "already-retired" if already_retired else "retired",
                 "project": PROJECT,
                 "receipt": str(final / "receipt.json"),
                 "receipt_signature": str(final / "receipt.sig"),
@@ -3451,6 +4289,1013 @@ def _retire(arguments: argparse.Namespace, runner: Runner) -> None:
                 "preserved_named_volumes": [item.name for item in inventory.volumes],
                 "next_step": "run the separate target release transaction",
                 "rollback_boundary": "after target migration use forward-only repair",
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def _locate_upgrade_evidence_run(evidence_path: Path) -> tuple[Path, Path]:
+    evidence = protected_file(
+        evidence_path,
+        modes=frozenset({0o400}),
+        max_bytes=65_536,
+    )
+    evidence_directory = protected_directory(evidence.parent, modes=frozenset({0o700}))
+    run = protected_directory(evidence_directory.parent, modes=frozenset({0o700}))
+    if evidence.name != "upgrade-backup-evidence.json" or evidence_directory.name != "evidence":
+        raise AdoptionError("upgrade evidence is outside its fixed run path")
+    try:
+        run.relative_to(BACKUP_ROOT)
+    except ValueError as exc:
+        raise AdoptionError("upgrade evidence is outside the backup root") from exc
+    return evidence, run
+
+
+def _retire(arguments: argparse.Namespace, runner: Runner) -> None:
+    binding_key = _read_binding_key(arguments.binding_key)
+    evidence_path, run = _locate_upgrade_evidence_run(arguments.evidence)
+    evidence_digest = _sha256_file(evidence_path)
+    receipt_parent = protected_directory(run / "evidence", modes=frozenset({0o700}))
+    intent = receipt_parent / RETIREMENT_INTENT_DIRECTORY
+    final = receipt_parent / "retirement"
+    intent_exists = intent.exists() or intent.is_symlink()
+    final_exists = final.exists() or final.is_symlink()
+    if intent_exists and final_exists:
+        raise AdoptionError("retirement intent and final receipt coexist ambiguously")
+    durable_receipt_exists = intent_exists or final_exists
+    if durable_receipt_exists:
+        plan, plan_digest = _load_plan_identity(
+            arguments.plan,
+            enforce_freshness=False,
+        )
+        runtime: dict[str, str] = {}
+    else:
+        plan, plan_digest, runtime, _, _ = _validate_plan(arguments.plan, binding_key)
+    planned = _planned_inventory(plan)
+    execute = _confirm(arguments, plan_digest)
+    if execute and arguments.confirm_preserve_data != "PRESERVE_BIND_DATA_AND_NAMED_VOLUMES":
+        raise AdoptionError("retirement requires the exact preserve-data confirmation")
+
+    if final_exists:
+        receipt = _verify_retirement_receipt(
+            runner,
+            receipt_path=final / "receipt.json",
+            signature_path=final / "receipt.sig",
+            public_key=arguments.evidence_public_key,
+            plan=plan,
+            plan_digest=plan_digest,
+            inventory=planned,
+            enforce_freshness=False,
+        )
+        if receipt["upgrade_evidence_sha256"] != evidence_digest:
+            raise AdoptionError("retirement receipt upgrade-evidence binding differs")
+        if _release_state_binding() != receipt["release_state_binding"]:
+            raise AdoptionError("release state differs from the signed retirement receipt")
+        _verify_named_volumes(runner, planned.volumes)
+        protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
+        _assert_legacy_resources_absent(runner)
+        _print_retirement_result(final=final, inventory=planned, already_retired=True)
+        return
+
+    if intent_exists:
+        receipt = _verify_retirement_receipt(
+            runner,
+            receipt_path=intent / "receipt.json",
+            signature_path=intent / "receipt.sig",
+            public_key=arguments.evidence_public_key,
+            plan=plan,
+            plan_digest=plan_digest,
+            inventory=planned,
+            expected_directory_name=RETIREMENT_INTENT_DIRECTORY,
+            enforce_freshness=False,
+        )
+        if receipt["upgrade_evidence_sha256"] != evidence_digest:
+            raise AdoptionError("retirement intent upgrade-evidence binding differs")
+        if _release_state_binding() != receipt["release_state_binding"]:
+            raise AdoptionError("release state differs from the signed retirement intent")
+        inventory = planned
+        _verify_named_volumes(runner, inventory.volumes)
+        protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
+        if not execute:
+            print(
+                json.dumps(
+                    {
+                        "status": "retirement-in-progress",
+                        "operation": "retire",
+                        "project": PROJECT,
+                        "plan_sha256": plan_digest,
+                        "resume_requires_execute": True,
+                        "global_actions": [],
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+    else:
+        evidence, detailed, verified_run = _verify_upgrade_evidence(
+            runner,
+            evidence_path=evidence_path,
+            signature_path=arguments.evidence_signature,
+            public_key=arguments.evidence_public_key,
+            plan=plan,
+            plan_digest=plan_digest,
+        )
+        if verified_run != run:
+            raise AdoptionError("signed upgrade evidence run path changed")
+        if _object(detailed.get("source_images"), "evidence source images") != _source_images(
+            planned
+        ):
+            raise AdoptionError("planned legacy images differ from signed restore evidence")
+        source_schema_head = _string(
+            _object(detailed.get("database"), "evidence database").get("schema_head"),
+            "source schema head",
+        )
+        inventory = collect_inventory(runner)
+        if topology_sha256(inventory) != plan["topology_sha256"]:
+            raise AdoptionError("live legacy topology differs from the approved plan")
+        if _source_images(inventory) != _source_images(planned):
+            raise AdoptionError("live legacy images differ from signed restore evidence")
+        _verify_data_bindings(inventory)
+        _verify_postgres_17_and_schema(runner, inventory, runtime, source_schema_head)
+        _verify_named_volumes(runner, inventory.volumes)
+        protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
+        if not execute:
+            print(
+                json.dumps(
+                    {
+                        "status": "dry-run",
+                        "operation": "retire",
+                        "project": PROJECT,
+                        "plan_sha256": plan_digest,
+                        "exact_container_ids": [item.container_id for item in inventory.containers],
+                        "exact_network_ids": [item.network_id for item in inventory.networks],
+                        "preserved_named_volumes": [item.name for item in inventory.volumes],
+                        "preserved_bind_root": str(DATA_ROOT),
+                        "global_actions": [],
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
+        public_key = protected_file(
+            arguments.evidence_public_key,
+            modes=frozenset({0o400, 0o440, 0o444}),
+            max_bytes=65_536,
+        )
+        signing_key = protected_file(
+            arguments.evidence_signing_key,
+            modes=frozenset({0o400, 0o600}),
+            max_bytes=65_536,
+        )
+        receipt = {
+            "schema_version": 2,
+            "kind": "heyi-legacy-retirement-receipt",
+            "status": "retired",
+            "project": PROJECT,
+            "issued_at": _utc_now().isoformat().replace("+00:00", "Z"),
+            "git_sha": plan["git_sha"],
+            "plan_sha256": plan_digest,
+            "upgrade_evidence_sha256": evidence_digest,
+            "target_manifest_sha256": evidence["target_manifest_sha256"],
+            "source_schema_head": source_schema_head,
+            "source_postgres_major": 17,
+            "source_topology_sha256": plan["topology_sha256"],
+            "restorable_topology_sha256": restorable_topology_sha256(inventory),
+            "release_state_binding": _release_state_binding(),
+            "removed_container_ids": [item.container_id for item in inventory.containers],
+            "stopped_oneoff_container_ids_not_restored": [
+                item.container_id for item in inventory.containers if item.oneoff
+            ],
+            "removed_network_ids": [item.network_id for item in inventory.networks],
+            "preserved_named_volumes": [asdict(item) for item in inventory.volumes],
+            "preserved_bind_root": str(DATA_ROOT),
+            "named_volumes_deleted": False,
+            "bind_data_deleted": False,
+            "global_prune_used": False,
+            "docker_daemon_restarted": False,
+            "restore_boundary": REACTIVATION_BOUNDARY,
+            "post_migration_rollback_policy": "forward-only",
+        }
+        intent = _publish_retirement_intent(
+            runner,
+            receipt_parent=receipt_parent,
+            receipt=receipt,
+            signing_key=signing_key,
+            public_key=public_key,
+        )
+
+    removed_containers, removed_networks = _retire_exact_resources(
+        runner, inventory, allow_missing=True
+    )
+    if (
+        removed_containers != receipt["removed_container_ids"]
+        or removed_networks != receipt["removed_network_ids"]
+    ):
+        raise AdoptionError("retired resource set differs from the signed receipt")
+    _verify_named_volumes(runner, inventory.volumes)
+    protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
+    _assert_legacy_resources_absent(runner)
+    _atomic_publish_receipt_directory(receipt_parent, intent, final)
+    _print_retirement_result(final=final, inventory=inventory, already_retired=False)
+
+
+def _collect_partial_project_inventory(runner: Runner) -> LegacyInventory:
+    container_ids = _project_container_ids(runner)
+    containers: tuple[ContainerRecord, ...] = ()
+    if container_ids:
+        inspected = runner.docker_json(("inspect", *sorted(container_ids)))
+        containers = tuple(
+            sorted(
+                (_container_record(item) for item in _list(inspected, "project containers")),
+                key=lambda item: (item.oneoff, item.service, item.container_id),
+            )
+        )
+        if {item.container_id for item in containers} != container_ids:
+            raise AdoptionError("partial project container inventory changed during inspection")
+    network_ids = _project_network_ids(runner)
+    networks: list[NetworkRecord] = []
+    if network_ids:
+        inspected_networks = runner.docker_json(("network", "inspect", *sorted(network_ids)))
+        for raw in _list(inspected_networks, "project networks"):
+            network = _object(raw, "project network")
+            labels = _object(network.get("Labels"), "project network labels")
+            network_id = _string(network.get("Id"), "project network id")
+            attached = tuple(sorted(_object(network.get("Containers", {}), "network endpoints")))
+            if (
+                labels.get("com.docker.compose.project") != PROJECT
+                or labels.get("io.heyi.knowledgebases.owner") != OWNER
+                or labels.get("io.heyi.knowledgebases.stack") != STACK
+                or network_id not in network_ids
+                or not set(attached) <= container_ids
+            ):
+                raise AdoptionError("partial project network identity differs")
+            networks.append(
+                NetworkRecord(
+                    name=_string(network.get("Name"), "project network name"),
+                    network_id=network_id,
+                    internal=bool(network.get("Internal")),
+                    attached_container_ids=attached,
+                )
+            )
+        if {item.network_id for item in networks} != network_ids:
+            raise AdoptionError("partial project network inventory changed during inspection")
+    return LegacyInventory(containers, tuple(sorted(networks, key=lambda item: item.name)), ())
+
+
+def _same_reactivation_contract(current: ContainerRecord, expected: ContainerRecord) -> bool:
+    return (
+        replace(
+            current,
+            container_id=expected.container_id,
+            running=expected.running,
+            restart_count=expected.restart_count,
+        )
+        == expected
+    )
+
+
+def _validate_reactivation_subset(current: LegacyInventory, expected: LegacyInventory) -> None:
+    expected_services = {item.service: item for item in expected.containers if not item.oneoff}
+    seen: set[str] = set()
+    for record in current.containers:
+        expected_record = expected_services.get(record.service)
+        if record.oneoff or expected_record is None:
+            raise AdoptionError("partial reactivation contains an unknown service")
+        if record.service in seen:
+            raise AdoptionError("partial reactivation service is ambiguous")
+        seen.add(record.service)
+        if not _same_reactivation_contract(record, expected_record):
+            raise AdoptionError("partial reactivation service contract differs")
+        if record.running and not expected_record.running:
+            raise AdoptionError("a signed-stopped legacy service is unexpectedly running")
+    ordered_services = _ordered_primary_services(expected)
+    expected_prefix = set(ordered_services[: len(seen)])
+    if seen != expected_prefix:
+        raise AdoptionError("partial reactivation is not an exact start-order prefix")
+    expected_networks = {item.name: item for item in expected.networks}
+    seen_networks: set[str] = set()
+    for network in current.networks:
+        expected_network = expected_networks.get(network.name)
+        if expected_network is None:
+            raise AdoptionError("partial reactivation contains an unknown network")
+        if network.name in seen_networks:
+            raise AdoptionError("partial reactivation network is ambiguous")
+        seen_networks.add(network.name)
+        if network.internal is not expected_network.internal:
+            raise AdoptionError("partial reactivation network isolation differs")
+
+
+def _edge_contracts_for_port(
+    runner: Runner, proxy: ContainerRecord, port: str
+) -> dict[tuple[str, str], frozenset[tuple[str, int]]]:
+    inspected = runner.docker_json(("inspect", proxy.container_id))
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise AdoptionError("legacy proxy inspection is ambiguous")
+    if _container_record(inspected[0]) != proxy:
+        raise AdoptionError("legacy proxy changed during edge-port verification")
+    container = _object(inspected[0], "legacy proxy inspection")
+    network = _object(container.get("NetworkSettings"), "legacy proxy network settings")
+    raw_ports = _object(network.get("Ports"), "legacy proxy port bindings")
+    raw_networks = _object(network.get("Networks"), "legacy proxy networks")
+    container_addresses: set[str] = set()
+    for raw_network in raw_networks.values():
+        network_entry = _object(raw_network, "legacy proxy network")
+        for field in ("IPAddress", "GlobalIPv6Address"):
+            raw_address = network_entry.get(field)
+            if raw_address in {None, ""}:
+                continue
+            if not isinstance(raw_address, str):
+                raise AdoptionError("legacy proxy container IP is malformed")
+            try:
+                container_addresses.add(str(ipaddress.ip_address(raw_address)))
+            except ValueError as exc:
+                raise AdoptionError("legacy proxy container IP is malformed") from exc
+    if not container_addresses:
+        raise AdoptionError("legacy proxy has no verifiable container IP")
+
+    contracts: dict[tuple[str, str], set[tuple[str, int]]] = {}
+    for raw_container_port, raw_values in raw_ports.items():
+        if not isinstance(raw_container_port, str):
+            raise AdoptionError("legacy proxy container port is malformed")
+        container_port, separator, protocol = raw_container_port.partition("/")
+        if (
+            not separator
+            or protocol != "tcp"
+            or not container_port.isdecimal()
+            or not 1 <= int(container_port) <= 65_535
+        ):
+            raise AdoptionError("legacy proxy container port is malformed")
+        if raw_values is None:
+            continue
+        for raw_binding in _list(raw_values, "legacy proxy host bindings"):
+            binding = _object(raw_binding, "legacy proxy host binding")
+            host_port = _string(binding.get("HostPort"), "legacy proxy host port")
+            if host_port != port:
+                continue
+            host_ip = _string(binding.get("HostIp"), "legacy proxy host IP")
+            try:
+                address = ipaddress.ip_address(host_ip)
+            except ValueError as exc:
+                raise AdoptionError("legacy proxy host IP is malformed") from exc
+            family = "ipv4" if address.version == 4 else "ipv6"
+            key = (family, str(address))
+            targets = {(value, int(container_port)) for value in container_addresses}
+            if key in contracts:
+                raise AdoptionError(f"legacy edge port {port} binding is ambiguous")
+            contracts[key] = targets
+    if not contracts:
+        raise AdoptionError(f"legacy edge port {port} binding is missing or ambiguous")
+    return {key: frozenset(value) for key, value in contracts.items()}
+
+
+def _listener_owner_pids(guard: ModuleType, socket_inode: int) -> tuple[int, ...]:
+    owners: list[int] = []
+    try:
+        with os.scandir("/proc") as entries:
+            pids = sorted(
+                int(entry.name)
+                for entry in entries
+                if entry.name.isdecimal() and entry.is_dir(follow_symlinks=False)
+            )
+    except OSError as exc:
+        raise AdoptionError("host process inventory could not be enumerated") from exc
+    for pid in pids:
+        try:
+            inodes = guard._socket_inodes_for_pid(pid)
+        except Exception as exc:
+            if not Path(f"/proc/{pid}").exists():
+                continue
+            raise AdoptionError("host socket ownership could not be verified") from exc
+        if not isinstance(inodes, set) or any(type(value) is not int for value in inodes):
+            raise AdoptionError("host socket ownership inventory is malformed")
+        if socket_inode in inodes:
+            owners.append(pid)
+    return tuple(owners)
+
+
+def _process_cmdline(guard: ModuleType, pid: int) -> tuple[str, ...]:
+    try:
+        before = guard._process_start_ticks(pid)
+        descriptor = os.open(
+            Path(f"/proc/{pid}/cmdline"),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            payload = os.read(descriptor, 65_537)
+        finally:
+            os.close(descriptor)
+        after = guard._process_start_ticks(pid)
+    except Exception as exc:
+        raise AdoptionError("host listener process command line could not be verified") from exc
+    if before != after or not payload or len(payload) > 65_536:
+        raise AdoptionError("host listener process changed during verification")
+    try:
+        arguments = tuple(
+            value.decode("utf-8", errors="strict") for value in payload.rstrip(b"\0").split(b"\0")
+        )
+    except UnicodeError as exc:
+        raise AdoptionError("host listener process command line is malformed") from exc
+    if not arguments or any(not value or "\x00" in value for value in arguments):
+        raise AdoptionError("host listener process command line is malformed")
+    return arguments
+
+
+def _root_process_parent(guard: ModuleType, pid: int) -> int:
+    try:
+        before = guard._process_start_ticks(pid)
+        metadata = Path(f"/proc/{pid}").stat(follow_symlinks=False)
+        descriptor = os.open(
+            Path(f"/proc/{pid}/status"),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            payload = os.read(descriptor, 65_537)
+        finally:
+            os.close(descriptor)
+        after = guard._process_start_ticks(pid)
+    except Exception as exc:
+        raise AdoptionError("host listener process provenance could not be verified") from exc
+    if before != after or metadata.st_uid != 0 or not payload or len(payload) > 65_536:
+        raise AdoptionError("host listener process provenance is unsafe")
+    try:
+        decoded = payload.decode("ascii", errors="strict")
+    except UnicodeError as exc:
+        raise AdoptionError("host listener process provenance is malformed") from exc
+    fields: dict[str, str] = {}
+    for line in decoded.splitlines():
+        name, separator, value = line.partition(":")
+        if separator:
+            fields[name] = value.strip()
+    uid_values = fields.get("Uid", "").split()
+    parent_value = fields.get("PPid", "")
+    if (
+        len(uid_values) != 4
+        or any(value != "0" for value in uid_values)
+        or not parent_value.isdecimal()
+        or int(parent_value) <= 0
+    ):
+        raise AdoptionError("host listener process is not a root Docker child")
+    return int(parent_value)
+
+
+def _verified_process_executable(
+    guard: ModuleType,
+    pid: int,
+    *,
+    allowed_paths: frozenset[str],
+    label: str,
+) -> Path:
+    try:
+        identity = guard._process_identity(pid)
+    except Exception as exc:
+        raise AdoptionError(f"{label} executable could not be verified") from exc
+    process = _object(identity, f"{label} process")
+    if process.get("pid") != pid:
+        raise AdoptionError(f"{label} process identity differs")
+    executable = _object(process.get("executable"), f"{label} executable")
+    resolved_value = _string(executable.get("resolved_path"), f"{label} executable path")
+    digest = _string(executable.get("sha256"), f"{label} executable digest")
+    if resolved_value not in allowed_paths or _SHA256.fullmatch(digest) is None:
+        raise AdoptionError(f"{label} executable is outside the trusted installation")
+    resolved_path = Path(resolved_value)
+    _validate_ancestors(resolved_path.parent)
+    return resolved_path
+
+
+def _single_process_option(arguments: Sequence[str], option: str) -> str:
+    positions = [index for index, value in enumerate(arguments) if value == option]
+    if len(positions) != 1 or positions[0] + 1 >= len(arguments):
+        raise AdoptionError("docker-proxy process contract is malformed")
+    return arguments[positions[0] + 1]
+
+
+def _verify_listener_owned_by_proxy(
+    guard: ModuleType,
+    listener: Mapping[str, Any],
+    contracts: Mapping[tuple[str, str], frozenset[tuple[str, int]]],
+) -> None:
+    inode = listener.get("socket_inode")
+    if type(inode) is not int or inode <= 0:
+        raise AdoptionError("host TCP listener identity is malformed")
+    owners = _listener_owner_pids(guard, inode)
+    if len(owners) != 1:
+        raise AdoptionError("host TCP listener is not exclusively owned by Docker proxy")
+    pid = owners[0]
+    proxy_executable = _verified_process_executable(
+        guard,
+        pid,
+        allowed_paths=TRUSTED_DOCKER_PROXY_PATHS,
+        label="docker-proxy",
+    )
+    parent_pid = _root_process_parent(guard, pid)
+    _verified_process_executable(
+        guard,
+        parent_pid,
+        allowed_paths=TRUSTED_DOCKER_DAEMON_PATHS,
+        label="Docker daemon",
+    )
+    arguments = _process_cmdline(guard, pid)
+    if Path(arguments[0]).name != proxy_executable.name:
+        raise AdoptionError("host listener process is not docker-proxy")
+    if _single_process_option(arguments, "-proto") != "tcp":
+        raise AdoptionError("docker-proxy protocol differs")
+    host_port = _single_process_option(arguments, "-host-port")
+    container_port = _single_process_option(arguments, "-container-port")
+    if not host_port.isdecimal() or not container_port.isdecimal():
+        raise AdoptionError("docker-proxy port contract is malformed")
+    try:
+        host_ip = str(ipaddress.ip_address(_single_process_option(arguments, "-host-ip")))
+        container_ip = str(ipaddress.ip_address(_single_process_option(arguments, "-container-ip")))
+    except ValueError as exc:
+        raise AdoptionError("docker-proxy address contract is malformed") from exc
+    family = _string(listener.get("family"), "host TCP listener family")
+    key = (family, host_ip)
+    if (
+        listener.get("local_port") != int(host_port)
+        or listener.get("local_address") != host_ip
+        or (container_ip, int(container_port)) not in contracts.get(key, frozenset())
+    ):
+        raise AdoptionError("docker-proxy listener differs from the exact proxy container")
+
+
+def _verify_edge_ports_available(
+    runner: Runner,
+    current: LegacyInventory,
+    expected: LegacyInventory,
+    guard: ModuleType,
+) -> None:
+    current_proxy = next(
+        (item for item in current.containers if item.service == "proxy" and not item.oneoff),
+        None,
+    )
+    expected_proxy = _service(expected, "proxy")
+    for port in sorted(value.split("/", 1)[0] for value in EXPECTED_PORTS):
+        raw_owners = runner.run(
+            (runner.docker, "ps", "-q", "--no-trunc", "--filter", f"publish={port}")
+        ).decode("ascii", errors="strict")
+        owners = {line.strip() for line in raw_owners.splitlines() if line.strip()}
+        if any(_CONTAINER_ID.fullmatch(value) is None for value in owners):
+            raise AdoptionError("edge-port Docker owner identity is malformed")
+        allowed: set[str] = set()
+        if (
+            current_proxy is not None
+            and current_proxy.running
+            and _same_reactivation_contract(current_proxy, expected_proxy)
+            and any(value.startswith(f"{port}/") for value in current_proxy.published_ports)
+        ):
+            allowed.add(current_proxy.container_id)
+        if owners - allowed:
+            raise AdoptionError(f"legacy edge port {port} has an unknown Docker owner")
+        try:
+            listeners = guard._tcp_listeners(int(port))
+        except Exception as exc:
+            raise AdoptionError("host TCP listener inventory could not be verified") from exc
+        if not isinstance(listeners, list):
+            raise AdoptionError("host TCP listener inventory is malformed")
+        if listeners and not owners:
+            raise AdoptionError(f"legacy edge port {port} has a non-Docker host listener")
+        if not listeners:
+            continue
+        if current_proxy is None:
+            raise AdoptionError(f"legacy edge port {port} has no exact proxy owner")
+        configured = _edge_contracts_for_port(runner, current_proxy, port)
+        observed: list[tuple[str, str]] = []
+        for raw_listener in listeners:
+            listener = _object(raw_listener, "host TCP listener")
+            family = _string(listener.get("family"), "host TCP listener family")
+            address_value = _string(listener.get("local_address"), "host TCP listener address")
+            local_port = listener.get("local_port")
+            state = listener.get("state")
+            inode = listener.get("socket_inode")
+            try:
+                address = ipaddress.ip_address(address_value)
+            except ValueError as exc:
+                raise AdoptionError("host TCP listener address is malformed") from exc
+            expected_family = "ipv4" if address.version == 4 else "ipv6"
+            if (
+                family != expected_family
+                or local_port != int(port)
+                or state != "LISTEN"
+                or type(inode) is not int
+                or inode <= 0
+            ):
+                raise AdoptionError("host TCP listener identity is malformed")
+            observed.append((family, str(address)))
+            _verify_listener_owned_by_proxy(guard, listener, configured)
+        if len(observed) != len(set(observed)) or not set(observed) <= set(configured):
+            raise AdoptionError(f"legacy edge port {port} has an extra non-Docker listener")
+        try:
+            after = guard._tcp_listeners(int(port))
+        except Exception as exc:
+            raise AdoptionError("host TCP listener recheck could not be verified") from exc
+        if after != listeners:
+            raise AdoptionError("host TCP listener inventory changed during verification")
+
+
+def _legacy_proxy_root_ca(inventory: LegacyInventory) -> Path:
+    proxy = _service(inventory, "proxy")
+    data_mounts = [
+        mount
+        for mount in proxy.mounts
+        if mount[1] == "/data" and mount[2] and mount[3] in {"bind", "volume"}
+    ]
+    if len(data_mounts) != 1:
+        raise AdoptionError("legacy proxy Caddy data mount is ambiguous")
+    root = Path(data_mounts[0][0]) / "caddy/pki/authorities/local/root.crt"
+    return protected_file(
+        root,
+        modes=frozenset({0o400, 0o440, 0o444, 0o644}),
+        max_bytes=256 * 1024,
+    )
+
+
+def _legacy_tls_identity(runtime: Mapping[str, str]) -> tuple[str, str, str, str]:
+    public_host = _string(runtime.get("KB_PUBLIC_HOST"), "legacy public host")
+    try:
+        public_address = ipaddress.ip_address(public_host)
+    except ValueError as exc:
+        if _DNS_HOST.fullmatch(public_host) is None:
+            raise AdoptionError("legacy public host is malformed") from exc
+        verify_option = "-verify_hostname"
+        host_header = public_host
+    else:
+        verify_option = "-verify_ip"
+        host_header = f"[{public_host}]" if public_address.version == 6 else public_host
+    bind_value = runtime.get("KB_BIND_ADDRESS", "127.0.0.1")
+    try:
+        bind_address = ipaddress.ip_address(bind_value)
+    except ValueError as exc:
+        raise AdoptionError("legacy bind address is not an IP address") from exc
+    if bind_address.is_unspecified:
+        bind_address = ipaddress.ip_address("::1" if bind_address.version == 6 else "127.0.0.1")
+    connect_host = f"[{bind_address}]" if bind_address.version == 6 else str(bind_address)
+    return public_host, verify_option, host_header, connect_host
+
+
+def _openssl_http_probe(
+    runner: Runner,
+    *,
+    ca_file: Path,
+    public_host: str,
+    verify_option: str,
+    host_header: str,
+    connect_host: str,
+    port: int,
+    path: str,
+    accepted_statuses: frozenset[int],
+) -> None:
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host_header}:{port}\r\n"
+        "Connection: close\r\n"
+        "User-Agent: heyi-legacy-reactivation-probe/1\r\n\r\n"
+    ).encode("ascii", errors="strict")
+    output = runner.run(
+        (
+            "/usr/bin/openssl",
+            "s_client",
+            "-connect",
+            f"{connect_host}:{port}",
+            "-servername",
+            public_host,
+            "-CAfile",
+            str(ca_file),
+            "-verify_return_error",
+            verify_option,
+            public_host,
+            "-quiet",
+            "-no_ign_eof",
+        ),
+        timeout=10,
+        input_bytes=request,
+    )
+    status: int | None = None
+    for line in output.splitlines():
+        match = _HTTP_STATUS.match(line)
+        if match is not None:
+            status = int(match.group(1))
+            break
+    if status not in accepted_statuses:
+        raise AdoptionError(f"legacy TLS readiness probe failed: {path}")
+
+
+def _verify_legacy_edge_readiness(
+    runner: Runner,
+    inventory: LegacyInventory,
+    runtime: Mapping[str, str],
+) -> None:
+    public_host, verify_option, host_header, connect_host = _legacy_tls_identity(runtime)
+    probes = (
+        (19443, "/health/ready", frozenset({200})),
+        (19443, "/", frozenset(range(200, 400))),
+        (19444, "/minio/health/ready", frozenset({200})),
+    )
+    deadline = time.monotonic() + REACTIVATION_EDGE_TIMEOUT_SECONDS
+    while True:
+        try:
+            ca_file = _legacy_proxy_root_ca(inventory)
+            for port, path, accepted in probes:
+                _openssl_http_probe(
+                    runner,
+                    ca_file=ca_file,
+                    public_host=public_host,
+                    verify_option=verify_option,
+                    host_header=host_header,
+                    connect_host=connect_host,
+                    port=port,
+                    path=path,
+                    accepted_statuses=accepted,
+                )
+        except AdoptionError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdoptionError("legacy TLS business readiness timed out") from exc
+            time.sleep(min(REACTIVATION_EDGE_POLL_SECONDS, remaining))
+            continue
+        return
+
+
+def _assert_reactivation_surface(
+    runner: Runner,
+    expected: LegacyInventory,
+    guard: ModuleType,
+) -> LegacyInventory:
+    current = _collect_partial_project_inventory(runner)
+    _validate_reactivation_subset(current, expected)
+    raw_names = runner.run(
+        (
+            runner.docker,
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            f"label=com.docker.compose.project={PROJECT}",
+        )
+    ).decode("utf-8", errors="strict")
+    observed = {line.strip() for line in raw_names.splitlines() if line.strip()}
+    expected_names = {item.name for item in expected.volumes}
+    if observed != expected_names:
+        raise AdoptionError("project volume set drifted after retirement")
+    _verify_named_volumes(runner, expected.volumes)
+    _verify_edge_ports_available(runner, current, expected, guard)
+    return current
+
+
+def _collect_exact_primary_service(runner: Runner, service: str) -> ContainerRecord:
+    raw_ids = runner.run(
+        (
+            runner.docker,
+            "ps",
+            "-aq",
+            "--no-trunc",
+            "--filter",
+            f"label=com.docker.compose.project={PROJECT}",
+            "--filter",
+            f"label=com.docker.compose.service={service}",
+        )
+    ).decode("ascii", errors="strict")
+    ids = [line.strip() for line in raw_ids.splitlines() if line.strip()]
+    if len(ids) != 1 or _CONTAINER_ID.fullmatch(ids[0]) is None:
+        raise AdoptionError(f"reactivated service identity is ambiguous: {service}")
+    inspected = runner.docker_json(("inspect", ids[0]))
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise AdoptionError(f"reactivated service inspection is ambiguous: {service}")
+    record = _container_record(inspected[0])
+    if record.service != service or record.oneoff:
+        raise AdoptionError(f"reactivated service label differs: {service}")
+    return record
+
+
+def _same_recreated_container(current: ContainerRecord, expected: ContainerRecord) -> bool:
+    return current.running is expected.running and (
+        replace(
+            current,
+            container_id=expected.container_id,
+            restart_count=expected.restart_count,
+        )
+        == expected
+    )
+
+
+def _reactivated_health_status(
+    runner: Runner,
+    *,
+    current: ContainerRecord,
+    expected: ContainerRecord,
+) -> str | None:
+    inspected = runner.docker_json(("inspect", current.container_id))
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise AdoptionError(f"reactivated health inspection is ambiguous: {current.service}")
+    observed = _container_record(inspected[0])
+    if not _same_recreated_container(observed, expected):
+        raise AdoptionError(f"reactivated service changed during health wait: {current.service}")
+    container = _object(inspected[0], "reactivated container")
+    config = _object(container.get("Config"), "reactivated container config")
+    raw_healthcheck = config.get("Healthcheck")
+    healthcheck_enabled = False
+    if raw_healthcheck is not None:
+        healthcheck = _object(raw_healthcheck, "reactivated healthcheck")
+        test = _list(healthcheck.get("Test"), "reactivated healthcheck test")
+        if (
+            not test
+            or any(not isinstance(value, str) or not value for value in test)
+            or test[0] not in {"NONE", "CMD", "CMD-SHELL"}
+            or (test[0] == "NONE" and len(test) != 1)
+        ):
+            raise AdoptionError("reactivated healthcheck test is malformed")
+        healthcheck_enabled = bool(test and test[0] != "NONE")
+    state = _object(container.get("State"), "reactivated container state")
+    raw_health = state.get("Health")
+    if not healthcheck_enabled:
+        if raw_health is not None:
+            raise AdoptionError("container health state exists without a defined healthcheck")
+        return None
+    health = _object(raw_health, "reactivated health state")
+    status = _string(health.get("Status"), "reactivated health status")
+    if status not in {"starting", "healthy", "unhealthy"}:
+        raise AdoptionError("reactivated health status is invalid")
+    return status
+
+
+def _wait_reactivated_service_ready(
+    runner: Runner,
+    *,
+    current: ContainerRecord,
+    expected: ContainerRecord,
+) -> None:
+    if not expected.running:
+        return
+    deadline = time.monotonic() + REACTIVATION_HEALTH_TIMEOUT_SECONDS
+    while True:
+        status = _reactivated_health_status(
+            runner,
+            current=current,
+            expected=expected,
+        )
+        if status in {None, "healthy"}:
+            return
+        if status == "unhealthy":
+            raise AdoptionError(f"reactivated service is unhealthy: {current.service}")
+        if time.monotonic() >= deadline:
+            raise AdoptionError(f"reactivated service health timed out: {current.service}")
+        time.sleep(REACTIVATION_HEALTH_POLL_SECONDS)
+
+
+def _run_exact_compose_service(
+    runner: Runner,
+    *,
+    expected: LegacyInventory,
+    service: str,
+    compose_paths: Sequence[Path],
+    runtime_path: Path,
+    env_paths: Sequence[Path],
+) -> None:
+    record = _service(expected, service)
+    base = _compose_for_service(expected, service, compose_paths, runtime_path, env_paths)
+    runner.run((*base, "config", "--quiet"), timeout=120)
+    operation: tuple[str, ...]
+    if record.running:
+        operation = ("up", "-d", "--no-build", "--pull", "never", "--no-deps", service)
+    else:
+        operation = (
+            "up",
+            "--no-start",
+            "--no-deps",
+            "--no-build",
+            "--pull",
+            "never",
+            service,
+        )
+    runner.run((*base, *operation), timeout=900)
+    current = _collect_exact_primary_service(runner, service)
+    if not _same_recreated_container(current, record):
+        raise AdoptionError(f"reactivated service contract differs: {service}")
+    _wait_reactivated_service_ready(runner, current=current, expected=record)
+
+
+def _reactivate(arguments: argparse.Namespace, runner: Runner) -> None:
+    binding_key = _read_binding_key(arguments.binding_key)
+    plan, plan_digest, runtime, compose_paths, env_paths = _validate_plan(
+        arguments.plan,
+        binding_key,
+        enforce_freshness=False,
+    )
+    expected = _planned_inventory(plan)
+    receipt = _verify_retirement_receipt(
+        runner,
+        receipt_path=arguments.retirement_receipt,
+        signature_path=arguments.retirement_signature,
+        public_key=arguments.evidence_public_key,
+        plan=plan,
+        plan_digest=plan_digest,
+        inventory=expected,
+        enforce_freshness=False,
+    )
+    _verify_target_abort_authorization(
+        runner,
+        receipt_path=arguments.target_abort_receipt,
+        signature_path=arguments.target_abort_signature,
+        public_key=arguments.evidence_public_key,
+        adoption_transaction=arguments.adoption_transaction,
+        plan_digest=plan_digest,
+        retirement_receipt_path=arguments.retirement_receipt,
+        retirement_receipt=receipt,
+    )
+    _verify_data_bindings(expected)
+    if _release_state_binding() != receipt["release_state_binding"]:
+        raise AdoptionError("install or materialized-release state drifted after retirement")
+    guard = _verify_host_isolation(
+        plan, arguments.host_isolation_baseline, arguments.host_isolation_hmac_key
+    )
+    _assert_reactivation_surface(runner, expected, guard)
+    execute = _confirm(arguments, plan_digest)
+    if execute and arguments.confirm_restore_boundary != REACTIVATION_BOUNDARY:
+        raise AdoptionError("reactivation requires the exact pre-migration-only boundary")
+    if not execute:
+        print(
+            json.dumps(
+                {
+                    "status": "dry-run",
+                    "operation": "reactivate",
+                    "project": PROJECT,
+                    "plan_sha256": plan_digest,
+                    "restore_boundary": REACTIVATION_BOUNDARY,
+                    "adoption_transaction": arguments.adoption_transaction,
+                    "host_isolation": "verified",
+                    "oneoff_containers_restored": False,
+                    "global_actions": [],
+                },
+                sort_keys=True,
+            )
+        )
+        return
+
+    runtime_path = Path(_object(plan["runtime_env"], "runtime environment")["path"])
+    postgres_expected = _service(expected, "postgres")
+    if not postgres_expected.running:
+        raise AdoptionError("signed legacy PostgreSQL was not running at retirement")
+    _run_exact_compose_service(
+        runner,
+        expected=expected,
+        service="postgres",
+        compose_paths=compose_paths,
+        runtime_path=runtime_path,
+        env_paths=env_paths,
+    )
+    postgres = _collect_exact_primary_service(runner, "postgres")
+    postgres_inventory = LegacyInventory((postgres,), (), ())
+    _verify_postgres_17_and_schema(
+        runner,
+        postgres_inventory,
+        runtime,
+        _string(receipt.get("source_schema_head"), "retirement schema head"),
+    )
+    for service in _ordered_primary_services(expected):
+        if service == "postgres":
+            continue
+        _run_exact_compose_service(
+            runner,
+            expected=expected,
+            service=service,
+            compose_paths=compose_paths,
+            runtime_path=runtime_path,
+            env_paths=env_paths,
+        )
+    current = collect_inventory(runner)
+    if any(item.oneoff for item in current.containers):
+        raise AdoptionError("reactivation unexpectedly restored a one-off container")
+    if restorable_topology_sha256(current) != receipt["restorable_topology_sha256"]:
+        raise AdoptionError("reactivated legacy topology differs from signed retirement state")
+    _verify_data_bindings(current)
+    for service in _ordered_primary_services(expected):
+        _wait_reactivated_service_ready(
+            runner,
+            current=_service(current, service),
+            expected=_service(expected, service),
+        )
+    _verify_named_volumes(runner, expected.volumes)
+    if _release_state_binding() != receipt["release_state_binding"]:
+        raise AdoptionError("release state changed during legacy reactivation")
+    final_guard = _verify_host_isolation(
+        plan, arguments.host_isolation_baseline, arguments.host_isolation_hmac_key
+    )
+    _verify_edge_ports_available(runner, current, expected, final_guard)
+    _verify_legacy_edge_readiness(runner, current, runtime)
+    print(
+        json.dumps(
+            {
+                "status": "reactivated-pre-migration-only",
+                "project": PROJECT,
+                "plan_sha256": plan_digest,
+                "restore_boundary": REACTIVATION_BOUNDARY,
+                "adoption_transaction": arguments.adoption_transaction,
+                "restored_services": list(_ordered_primary_services(current)),
+                "oneoff_containers_restored": False,
+                "retirement_receipt_preserved": str(arguments.retirement_receipt),
+                "runtime_healthchecks": "passed-or-not-defined",
+                "business_readiness": "ca-verified-edge-probes-passed",
+                "global_actions": [],
             },
             sort_keys=True,
         )
@@ -3471,7 +5316,7 @@ def _plan_command(arguments: argparse.Namespace, runner: Runner) -> None:
         inventory=inventory,
         runtime_env=runtime_path,
         runtime_binding=runtime_binding,
-        compose_file=arguments.compose_file,
+        compose_files=tuple(arguments.compose_file),
         legacy_env_files=env_paths,
         legacy_env_bindings=bindings,
         target_manifest=arguments.target_manifest,
@@ -3519,7 +5364,7 @@ def _parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan", help="capture a protected immutable adoption plan")
     plan.add_argument("--binding-key", type=Path, required=True)
     plan.add_argument("--runtime-env", type=Path, required=True)
-    plan.add_argument("--compose-file", type=Path, required=True)
+    plan.add_argument("--compose-file", type=Path, action="append", required=True)
     plan.add_argument("--legacy-env-file", type=Path, action="append", default=[])
     plan.add_argument("--target-manifest", type=Path, required=True)
     plan.add_argument("--git-sha", required=True)
@@ -3571,6 +5416,23 @@ def _parser() -> argparse.ArgumentParser:
     retire.add_argument("--evidence-signing-key", type=Path, required=True)
     retire.add_argument("--confirm-preserve-data", default="")
     _add_execution_confirmation(retire)
+
+    reactivate = subparsers.add_parser(
+        "reactivate",
+        help="restore only the signed legacy topology before any target migration",
+    )
+    reactivate.add_argument("--plan", type=Path, required=True)
+    reactivate.add_argument("--binding-key", type=Path, required=True)
+    reactivate.add_argument("--retirement-receipt", type=Path, required=True)
+    reactivate.add_argument("--retirement-signature", type=Path, required=True)
+    reactivate.add_argument("--target-abort-receipt", type=Path, required=True)
+    reactivate.add_argument("--target-abort-signature", type=Path, required=True)
+    reactivate.add_argument("--adoption-transaction", required=True)
+    reactivate.add_argument("--evidence-public-key", type=Path, required=True)
+    reactivate.add_argument("--host-isolation-baseline", type=Path, required=True)
+    reactivate.add_argument("--host-isolation-hmac-key", type=Path, required=True)
+    reactivate.add_argument("--confirm-restore-boundary", default="")
+    _add_execution_confirmation(reactivate)
     return parser
 
 
@@ -3584,6 +5446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prepare": _prepare,
             "finalize": _finalize,
             "retire": _retire,
+            "reactivate": _reactivate,
         }
         operations[arguments.operation](arguments, runner)
     except (AdoptionError, OSError, UnicodeError, tarfile.TarError) as exc:

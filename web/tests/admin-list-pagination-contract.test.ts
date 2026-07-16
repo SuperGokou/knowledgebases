@@ -21,8 +21,10 @@ describe("large admin-list reachability", () => {
     expect(usersPanel).toContain("function moveToUserOffset(offset: number)");
     expect(usersPanel).toContain('aria-labelledby="role-assignment-editor-title"');
     expect(usersPanel).toContain('aria-labelledby="password-reset-editor-title"');
+    expect(usersPanel).toContain('aria-labelledby="user-retirement-editor-title"');
     expect(usersPanel).toContain("roleEditorUser?.email");
     expect(usersPanel).toContain("passwordEditorUser?.email");
+    expect(usersPanel).toContain("retirementEditorUser?.display_name");
   });
 
   it("loads role candidates independently so a catalog failure cannot block member actions", () => {

@@ -24,6 +24,9 @@ const CONTEXT = {
 const CHAT_CONTEXT = {
   params: Promise.resolve({ path: ["api", "v1", "chat", "query"] }),
 };
+const AUDIT_EXPORT_CONTEXT = {
+  params: Promise.resolve({ path: ["api", "v1", "audit-logs", "export"] }),
+};
 
 function restoreEnvironment(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];
@@ -82,6 +85,65 @@ afterEach(() => {
 });
 
 describe("catch-all backend BFF", () => {
+  it("forwards a safe audit CSV content disposition through the same-origin boundary", async () => {
+    const disposition = 'attachment; filename="audit-logs-20260715T123000Z.csv"; filename*=UTF-8\'\'audit-logs-20260715T123000Z.csv';
+    const fetchMock = vi.fn().mockResolvedValue(new Response("id,action\r\n1,file.approved\r\n", {
+      status: 200,
+      headers: {
+        "Content-Disposition": disposition,
+        "Content-Type": "text/csv; charset=utf-8",
+        "Cache-Control": "no-store, private",
+        "X-Content-Type-Options": "nosniff",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const request = new NextRequest(
+      "https://knowledge.example/api/backend/api/v1/audit-logs/export?action=file.approved",
+      {
+        headers: {
+          Accept: "text/html, application/xhtml+xml",
+          Cookie: "kb_access=access-token",
+        },
+      },
+    );
+
+    const response = await GET(request, AUDIT_EXPORT_CONTEXT);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-disposition")).toBe(disposition);
+    expect(response.headers.get("content-type")).toContain("text/csv");
+    expect(response.headers.get("cache-control")).toBe("no-store, private");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await response.text()).toContain("file.approved");
+    const forwardedHeaders = new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit).headers);
+    expect(forwardedHeaders.get("accept")).toBe("text/csv");
+  });
+
+  it("keeps JSON content negotiation outside the exact audit export route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(
+      { items: [] },
+      { headers: { "Content-Disposition": "attachment; filename=unexpected.csv" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const request = new NextRequest(
+      "https://knowledge.example/api/backend/api/v1/files",
+      {
+        headers: {
+          Accept: "text/csv, text/html",
+          Cookie: "kb_access=access-token",
+        },
+      },
+    );
+
+    const response = await GET(request, CONTEXT);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("content-disposition")).toBeNull();
+    const forwardedHeaders = new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit).headers);
+    expect(forwardedHeaders.get("accept")).toBe("application/json");
+  });
+
   it("rejects an oversized backend response before buffering it", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response("", {
       status: 200,

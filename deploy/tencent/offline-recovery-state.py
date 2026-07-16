@@ -31,9 +31,33 @@ ACTIVE_PATH = STATE_ROOT / "active-release.json"
 PROJECT_NAME = "heyi-kb-offline"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 TXID = re.compile(r"[0-9a-f]{32}\Z")
+SCHEMA_HEAD = re.compile(r"[0-9]{8}_[0-9]{4}\Z")
 SAFE_RELATIVE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 PROFILES = {"strict-offline", "controlled-egress"}
 OPERATIONS = {"install", "deploy", "maintenance"}
+INSTALLED_V1_KEYS = frozenset(
+    {
+        "schema_version",
+        "contract_sha256",
+        "runtime_sha256",
+        "release_sha256",
+        "manifest_sha256",
+        "phase",
+    }
+)
+INSTALLED_V2_KEYS = frozenset(
+    {
+        *INSTALLED_V1_KEYS,
+        "migration_command_invoked",
+        "operation_mode",
+        "adoption_transaction_id",
+        "adoption_journal_sha256",
+        "adoption_plan_sha256",
+        "retirement_receipt_sha256",
+        "target_schema_head",
+        "legacy_source_schema_head",
+    }
+)
 
 # This helper is installed on Linux only, but the repository is type-checked on
 # Windows as well.  Resolve POSIX-only primitives without teaching the type
@@ -623,6 +647,161 @@ def clear_intent(contract_sha256: str, transaction_id: str) -> None:
     _fsync_directory(STATE_ROOT)
 
 
+def abort_install_intent(
+    contract_sha256: str,
+    transaction_id: str,
+    adoption_transaction_id: str,
+    journal_sha256: str,
+    archive_path: pathlib.Path,
+) -> dict[str, object]:
+    """Archive one exact pre-active install intent for an adoption rollback.
+
+    This is deliberately separate from :func:`clear_intent`.  The normal
+    clear operation requires a matching committed active receipt, while this
+    operation requires the opposite: no active receipt may exist and the
+    intent must still be the exact uncommitted install transaction.  The
+    caller has already restored the host watchdog to its pre-adoption state;
+    moving the intent is therefore the final durable state transition before
+    a signed PRE_MIGRATION_ONLY receipt may be published.
+    """
+
+    _require_root()
+    contract = _validate_hex64(contract_sha256, "contract_sha256")
+    transaction = _validate_transaction(transaction_id)
+    adoption_transaction = _validate_transaction(adoption_transaction_id)
+    journal_digest = _validate_hex64(journal_sha256, "journal_sha256")
+    if _path_present(ACTIVE_PATH):
+        _fail("cannot abort an install intent while an active release exists")
+
+    transaction_root = STATE_ROOT / "legacy-adoption" / "transactions" / adoption_transaction
+    allowed_archives = {
+        transaction_root
+        / ".target-pre-migration-abort.pending"
+        / "archived"
+        / "cutover-intent.json",
+        transaction_root / "target-pre-migration-abort" / "archived" / "cutover-intent.json",
+    }
+    if archive_path not in allowed_archives:
+        _fail("install intent archive path is outside the exact adoption transaction")
+    if archive_path.is_symlink() or archive_path.parent.is_symlink():
+        _fail("install intent archive path must not be symbolic")
+    _validate_directory(transaction_root, exact_mode=0o700)
+    _validate_directory(archive_path.parent, exact_mode=0o700)
+
+    intent_present = _path_present(INTENT_PATH)
+    archive_present = _path_present(archive_path)
+    if intent_present and archive_present:
+        _fail("live and archived install intents are both present")
+    if not intent_present and not archive_present:
+        _fail("exact install intent is missing")
+    selected_path = INTENT_PATH if intent_present else archive_path
+    intent = _validate_intent(_read_json_file(selected_path))
+    if intent["operation"] != "install":
+        _fail("only an uncommitted install intent may be archived")
+    if intent["contract_sha256"] != contract or intent["transaction_id"] != transaction:
+        _fail("install intent differs from the confirmed adoption transaction")
+
+    if intent_present:
+        os.replace(INTENT_PATH, archive_path)
+        _fsync_directory(archive_path.parent)
+        _fsync_directory(STATE_ROOT)
+    payload = _regular_root_file(archive_path, 0o400)
+    return {
+        "path": str(archive_path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "contract_sha256": contract,
+        "transaction_id": transaction,
+        "adoption_transaction_id": adoption_transaction,
+        "journal_sha256": journal_digest,
+    }
+
+
+def validate_installed_receipt(
+    path: pathlib.Path, expected_target_schema_head: str
+) -> dict[str, object]:
+    """Validate one historical-v1 or transaction-bound-v2 install receipt."""
+
+    _require_root()
+    if (
+        not isinstance(expected_target_schema_head, str)
+        or SCHEMA_HEAD.fullmatch(expected_target_schema_head) is None
+    ):
+        _fail("expected target schema head is invalid")
+    if (
+        path.parent != STATE_ROOT
+        or path.name != f"installed-{path.stem.removeprefix('installed-')}.json"
+    ):
+        _fail("installed receipt path is outside the fixed state directory")
+    filename_digest = path.stem.removeprefix("installed-")
+    _validate_hex64(filename_digest, "installed receipt filename")
+    payload = _regular_root_file(path, 0o400)
+    try:
+        raw_document = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StateError("installed receipt is not valid UTF-8 JSON") from exc
+    if not isinstance(raw_document, dict):
+        _fail("installed receipt must be a JSON object")
+    document = cast(dict[str, object], raw_document)
+    base_valid = (
+        document.get("contract_sha256") == filename_digest
+        and document.get("phase") == "completed"
+        and all(
+            isinstance(document.get(key), str)
+            and HEX64.fullmatch(cast(str, document[key])) is not None
+            for key in ("runtime_sha256", "release_sha256", "manifest_sha256")
+        )
+    )
+    if not base_valid:
+        _fail("installed receipt identity or digest fields differ")
+
+    if document.get("schema_version") == 1:
+        if set(document) != INSTALLED_V1_KEYS:
+            _fail("historical installed receipt has mixed or unknown fields")
+        return document
+    if document.get("schema_version") != 2 or set(document) != INSTALLED_V2_KEYS:
+        _fail("installed receipt schema is unsupported, mixed, or unknown")
+    if (
+        document.get("migration_command_invoked") is not True
+        or document.get("target_schema_head") != expected_target_schema_head
+    ):
+        _fail("installed receipt migration or target schema binding differs")
+    operation_mode = document.get("operation_mode")
+    if operation_mode == "standalone":
+        if any(
+            document.get(key) != "none"
+            for key in (
+                "adoption_transaction_id",
+                "adoption_journal_sha256",
+                "adoption_plan_sha256",
+                "retirement_receipt_sha256",
+                "legacy_source_schema_head",
+            )
+        ):
+            _fail("standalone installed receipt contains mixed adoption bindings")
+    elif operation_mode == "adoption":
+        transaction = document.get("adoption_transaction_id")
+        legacy_head = document.get("legacy_source_schema_head")
+        if (
+            not isinstance(transaction, str)
+            or TXID.fullmatch(transaction) is None
+            or not isinstance(legacy_head, str)
+            or SCHEMA_HEAD.fullmatch(legacy_head) is None
+            or any(
+                not isinstance(document.get(key), str)
+                or HEX64.fullmatch(cast(str, document[key])) is None
+                for key in (
+                    "adoption_journal_sha256",
+                    "adoption_plan_sha256",
+                    "retirement_receipt_sha256",
+                )
+            )
+        ):
+            _fail("adoption installed receipt bindings are invalid")
+    else:
+        _fail("installed receipt operation mode is unsupported")
+    return document
+
+
 def stage_contract(contract_sha256: str, destination_parent_text: str) -> pathlib.Path:
     _require_root()
     source = CONTRACT_ROOT / _validate_hex64(contract_sha256, "contract_sha256")
@@ -808,6 +987,15 @@ def _parser() -> argparse.ArgumentParser:
     clear = subparsers.add_parser("clear-intent")
     clear.add_argument("contract_sha256")
     clear.add_argument("transaction_id")
+    abort = subparsers.add_parser("abort-install-intent")
+    abort.add_argument("contract_sha256")
+    abort.add_argument("transaction_id")
+    abort.add_argument("adoption_transaction_id")
+    abort.add_argument("journal_sha256")
+    abort.add_argument("archive_path", type=pathlib.Path)
+    installed = subparsers.add_parser("validate-installed-receipt")
+    installed.add_argument("path", type=pathlib.Path)
+    installed.add_argument("expected_target_schema_head")
     subparsers.add_parser("select")
     subparsers.add_parser("simulate-faults")
     stage = subparsers.add_parser("stage-contract")
@@ -856,6 +1044,28 @@ def main() -> int:
         )
     elif arguments.command == "clear-intent":
         clear_intent(arguments.contract_sha256, arguments.transaction_id)
+    elif arguments.command == "abort-install-intent":
+        print(
+            json.dumps(
+                abort_install_intent(
+                    arguments.contract_sha256,
+                    arguments.transaction_id,
+                    arguments.adoption_transaction_id,
+                    arguments.journal_sha256,
+                    arguments.archive_path,
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif arguments.command == "validate-installed-receipt":
+        print(
+            json.dumps(
+                validate_installed_receipt(arguments.path, arguments.expected_target_schema_head),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     elif arguments.command == "select":
         print(json.dumps(select_state(), sort_keys=True, separators=(",", ":")))
     elif arguments.command == "stage-contract":

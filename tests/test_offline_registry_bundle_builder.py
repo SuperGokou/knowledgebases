@@ -128,6 +128,22 @@ def test_builder_enforces_linux_amd64_and_builds_all_three_release_images() -> N
     assert "image is not a single linux/amd64 artifact" in script
 
 
+def test_builder_generates_exact_image_sboms_before_signing_the_bundle() -> None:
+    script = builder_text()
+
+    assert "[string]$ImageSbomScanner" in script
+    assert "[string]$ImageSbomScannerSha256" in script
+    assert "scanner binary SHA-256 does not match the approved digest" in script
+    assert "generate_offline_image_sboms.py" in script
+    assert "--release-git-sha', $gitHead" in script
+    assert "--image-manifest', (Join-Path $bundleRoot 'release.env.images')" in script
+    assert "--output-dir', (Join-Path $bundleRoot 'sbom')" in script
+    assert "$sbomReport.image_count -ne 9" in script
+    assert script.index("generate_offline_image_sboms.py") < script.index(
+        "Write-AsciiFile $checksums $checksumEntries"
+    )
+
+
 def test_builder_fails_closed_if_a_compose_digest_changes() -> None:
     script = builder_text()
 
@@ -336,7 +352,7 @@ def test_bundle_checksum_inventory_is_complete_and_openssl_signed() -> None:
     script = builder_text()
 
     assert "@('bundle.control', 'release.env', 'release.env.images')" in script
-    assert "foreach ($directory in @('registry', 'release'))" in script
+    assert "foreach ($directory in @('registry', 'release', 'sbom'))" in script
     assert "Get-ChildItem -LiteralPath $base -File -Force -Recurse" in script
     assert "Write-AsciiFile $checksums $checksumEntries" in script
     assert "'dgst', '-sha256', '-sign'" in script

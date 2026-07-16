@@ -71,19 +71,49 @@ def final_browser_e2e_gate() -> AcceptanceGate:
 
 
 _REQUIRED_BROWSER_TITLES = (
+    "@enterprise preflight 真实前端、API 与故障控制面必须可达",
+    "@enterprise TLS validates trusted identity and short-lived certificate renewal architecture",
+    "@enterprise unified login routes accounts by effective role",
+    "@enterprise account lifecycle rejects duplicates and revokes active access",
     "@enterprise password reset enforces scope and revokes old credentials and sessions",
     "@enterprise role administration edits and deletes safely under references and concurrency",
+    "@enterprise knowledge grants are visible then fail closed immediately after revocation",
+    "@enterprise all nine document formats complete scan, OKF, approval, retrieval and cited chat",
+    "@enterprise chat renders citations, no-answer, audited rejection and sourced table",
+    "@enterprise configured model switches and provider failure degrades safely",
+    "@enterprise API key enforces knowledge scope, rate limit and revocation",
+    "@enterprise audit query, pagination, CSV export and permission revocation fail closed",
+    "@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly",
+)
+
+_REQUIRED_BROWSER_CHECKS = (
+    "login_role_routing",
+    "account_lifecycle",
+    "knowledge_acl",
+    "file_upload_scan_okf_approval_download",
+    "chat_citations_audit_table",
+    "model_switch",
+    "model_deepseek_success",
+    "model_qwen_success",
+    "model_minimax_success",
+    "api_key_lifecycle",
+    "audit_log_query_export",
+    "error_loading_states",
+    "tls_ca_trust",
+    "tls_san_identity",
+    "tls_validity_and_renewal",
+    "tls_strict_client",
 )
 
 
 def _browser_collection_output() -> str:
-    cases = (*_REQUIRED_BROWSER_TITLES, *(f"@enterprise scenario {index}" for index in range(9)))
     lines = ["Listing tests:"]
     for project in ("enterprise-desktop", "enterprise-mobile"):
         lines.extend(
-            f"  [{project}] › enterprise-business.spec.ts:1:1 › {title}" for title in cases
+            f"  [{project}] › enterprise-business.spec.ts:1:1 › {title}"
+            for title in _REQUIRED_BROWSER_TITLES
         )
-    lines.append("Total: 22 tests in 1 file")
+    lines.append("Total: 26 tests in 3 files")
     return "\n".join(lines)
 
 
@@ -286,7 +316,7 @@ def test_browser_collection_requires_exact_count_projects_and_critical_titles() 
         contract,
     )
     filtered, _ = verify_browser_e2e_collection(
-        _browser_collection_output().replace("Total: 22 tests", "Total: 21 tests"),
+        _browser_collection_output().replace("Total: 26 tests", "Total: 25 tests"),
         contract,
     )
 
@@ -347,7 +377,7 @@ def test_browser_e2e_runner_and_outer_gate_use_configured_timeout(
         acceptance_module,
         "_browser_collection_contract",
         lambda _repository: BrowserCollectionContract(
-            22,
+            26,
             ("enterprise-desktop", "enterprise-mobile"),
             _REQUIRED_BROWSER_TITLES,
         ),
@@ -373,7 +403,7 @@ def test_browser_e2e_runner_and_outer_gate_use_configured_timeout(
         return subprocess.CompletedProcess(
             args=command,
             returncode=0,
-            stdout="22 passed",
+            stdout="26 passed",
             stderr="",
         )
 
@@ -478,16 +508,7 @@ def test_signed_browser_evidence_passes_once_and_replay_blocks(tmp_path: Path) -
     run_id = "acceptance-browser-final-001"
     checks = {
         check: {"status": "passed", "artifact_ids": ["browser-result"]}
-        for check in (
-            "login_role_routing",
-            "account_lifecycle",
-            "knowledge_acl",
-            "file_upload_scan_okf_approval_download",
-            "chat_citations_audit_table",
-            "model_switch",
-            "api_key_lifecycle",
-            "error_loading_states",
-        )
+        for check in _REQUIRED_BROWSER_CHECKS
     }
     document: dict[str, object] = {
         "schema_version": 2,
@@ -1059,11 +1080,22 @@ def test_security_scan_evidence_requires_complete_matching_report(tmp_path: Path
 def _signed_formal_evidence(
     tmp_path: Path,
     kind: str,
-) -> tuple[Path, Path, GateIdentity, ExternalTrustContext, dict[str, object]]:
+) -> tuple[
+    Path,
+    Path,
+    GateIdentity,
+    ExternalTrustContext,
+    dict[str, object],
+    Ed25519PrivateKey,
+    str,
+    str,
+    str,
+]:
     repository = tmp_path / f"{kind}-repository"
     _init_git_repository(repository)
     worktree = collect_worktree_evidence(repository)
     identity = GateIdentity(worktree.git_head, worktree.content_fingerprint, "c" * 32)
+    run_id = f"acceptance-{identity.run_nonce}"
     evidence_dir = tmp_path / f"{kind}-signed-evidence"
     evidence_dir.mkdir()
     if kind == "malware":
@@ -1106,8 +1138,7 @@ def _signed_formal_evidence(
         "target": {
             "git_head": identity.git_head,
             "content_fingerprint": identity.content_fingerprint,
-            "run_nonce": identity.run_nonce,
-            **({"os": "linux"} if kind == "malware" else {}),
+            "run_id": run_id,
         },
         "collected_at": now.isoformat(),
         "artifacts": artifacts,
@@ -1156,13 +1187,28 @@ def _signed_formal_evidence(
                 "evidence_id": evidence_id,
                 "nonce": challenge_nonce,
                 "status": "issued",
+                "target": {
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                    "run_id": run_id,
+                },
                 "issued_at": (now - timedelta(minutes=1)).isoformat(),
                 "expires_at": (now + timedelta(minutes=10)).isoformat(),
             }
         },
         consumed_challenges=set(),
     )
-    return repository, evidence, identity, trust_context, document
+    return (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        document,
+        private_key,
+        key_id,
+        challenge_id,
+        challenge_nonce,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1180,30 +1226,18 @@ def test_formal_evidence_requires_full_signature_identity_and_one_time_challenge
     kind: str,
     success_summary: str,
 ) -> None:
-    repository, evidence, identity, trust_context, document = _signed_formal_evidence(
-        tmp_path, kind
-    )
-    original = evidence.read_text(encoding="utf-8")
-
-    target = document["target"]
-    assert isinstance(target, dict)
-    target["run_nonce"] = "d" * 32
-    evidence.write_text(json.dumps(document), encoding="utf-8")
-    tamper_context = ExternalTrustContext(
-        trust_context.public_keys,
-        trust_context.challenges,
-        set(),
-    )
-    assert not verify_formal_evidence(
-        kind,  # type: ignore[arg-type]
-        evidence,
+    (
         repository,
-        identity=identity,
-        trust_context=tamper_context,
-        require_protected_evidence=False,
-    )[0]
+        evidence,
+        identity,
+        trust_context,
+        _document,
+        _private_key,
+        _key_id,
+        _challenge_id,
+        _challenge_nonce,
+    ) = _signed_formal_evidence(tmp_path, kind)
 
-    evidence.write_text(original, encoding="utf-8")
     accepted, summary = verify_formal_evidence(
         kind,  # type: ignore[arg-type]
         evidence,
@@ -1224,6 +1258,117 @@ def test_formal_evidence_requires_full_signature_identity_and_one_time_challenge
         require_protected_evidence=False,
     )
     assert replayed is False
+
+
+@pytest.mark.parametrize("kind", ("malware", "security-scan"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "extra_run_nonce",
+        "extra_os",
+        "missing_run_id",
+        "mismatched_run_id",
+        "mismatched_challenge_target",
+    ),
+)
+def test_formal_evidence_rejects_noncanonical_or_unbound_run_target(
+    tmp_path: Path,
+    kind: str,
+    mutation: str,
+) -> None:
+    (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        document,
+        private_key,
+        key_id,
+        challenge_id,
+        challenge_nonce,
+    ) = _signed_formal_evidence(tmp_path, kind)
+    target = document["target"]
+    assert isinstance(target, dict)
+    if mutation == "extra_run_nonce":
+        target["run_nonce"] = identity.run_nonce
+    elif mutation == "extra_os":
+        target["os"] = "linux"
+    elif mutation == "missing_run_id":
+        target.pop("run_id")
+    elif mutation == "mismatched_run_id":
+        target["run_id"] = "acceptance-" + "d" * 32
+
+    challenge = trust_context.challenges[challenge_id]
+    challenge["target"] = dict(target)
+    if mutation == "mismatched_challenge_target":
+        challenge_target = challenge["target"]
+        assert isinstance(challenge_target, dict)
+        challenge_target["run_id"] = "acceptance-" + "d" * 32
+
+    document["attestation"] = {
+        "type": "ed25519-challenge-v1",
+        "key_id": key_id,
+        "challenge_id": challenge_id,
+        "challenge_nonce": challenge_nonce,
+        "signature": base64.b64encode(
+            private_key.sign(
+                _formal_signature_payload(
+                    document,
+                    key_id=key_id,
+                    challenge_id=challenge_id,
+                    challenge_nonce=challenge_nonce,
+                )
+            )
+        ).decode("ascii"),
+    }
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+
+    accepted, _summary = verify_formal_evidence(
+        kind,  # type: ignore[arg-type]
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+        require_protected_evidence=False,
+    )
+
+    assert accepted is False
+
+
+def test_formal_malware_evidence_keeps_protected_linux_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        _document,
+        _private_key,
+        _key_id,
+        _challenge_id,
+        _challenge_nonce,
+    ) = _signed_formal_evidence(tmp_path, "malware")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(acceptance_module, "_protected_regular_file", lambda *_a, **_k: True)
+    assert not verify_formal_evidence(
+        "malware",
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+    )[0]
+
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(acceptance_module, "_protected_regular_file", lambda *_a, **_k: False)
+    assert not verify_formal_evidence(
+        "malware",
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+    )[0]
 
 
 def test_formal_evidence_rejects_symlinked_artifact(tmp_path: Path) -> None:

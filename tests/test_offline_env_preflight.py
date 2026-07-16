@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -486,6 +488,66 @@ def test_maintenance_transition_records_and_restores_only_the_exact_original_pro
     assert "snapshot_script_dir=$contract_dir/release/deploy/tencent" not in script
 
 
+def test_business_writer_shutdown_budget_is_bounded_and_never_force_kills() -> None:
+    scripts = {
+        name: (DEPLOY / name).read_text(encoding="utf-8")
+        for name in (
+            "deploy-offline.sh",
+            "enter-maintenance-offline.sh",
+            "install-offline.sh",
+        )
+    }
+    required_services = "api maintenance web llm-egress minio-multipart-gc"
+
+    for script in scripts.values():
+        timeout_line = next(
+            line
+            for line in script.splitlines()
+            if line.startswith("business_writer_stop_timeout_seconds=")
+        )
+        timeout_seconds = int(timeout_line.partition("=")[2])
+        assert 140 <= timeout_seconds <= 300
+
+    for name, function_name in (
+        ("deploy-offline.sh", "quiesce_owned_business_writers"),
+        ("enter-maintenance-offline.sh", "quiesce_business_writers"),
+    ):
+        block = scripts[name].split(f"{function_name}() {{", 1)[1].split("\n}", 1)[0]
+        normalized_block = " ".join(block.replace("\\\n", " ").split())
+        assert (
+            f'stop --timeout "$business_writer_stop_timeout_seconds" {required_services}'
+        ) in normalized_block
+        for forbidden in (
+            "docker kill",
+            "docker rm -f",
+            "stop --timeout 30",
+            "stop --timeout 60",
+            "stop --timeout 130",
+        ):
+            assert forbidden not in block
+
+    install_stop = (
+        scripts["install-offline.sh"]
+        .split("stop_exact_install_services() {", 1)[1]
+        .split("\n}", 1)[0]
+    )
+    assert "for service_name in proxy web api maintenance minio-multipart-gc llm-egress" in (
+        install_stop
+    )
+    assert 'docker stop --time "$business_writer_stop_timeout_seconds"' in install_stop
+    assert "docker kill" not in install_stop
+    assert "docker rm -f" not in install_stop
+
+    for name in ("deploy-offline.sh", "install-offline.sh"):
+        removal = scripts[name].split("remove_exact_llm_egress() {", 1)[1].split("\n}", 1)[0]
+        stopped_check = "{{.State.Running}}"
+        graceful_remove = 'docker rm "$service_ids"'
+        assert stopped_check in removal
+        assert graceful_remove in removal
+        assert removal.index(stopped_check) < removal.index(graceful_remove)
+        assert "docker rm -f" not in removal
+
+
 def test_one_flock_covers_snapshot_preflight_and_maintenance_switch() -> None:
     common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
     enter = (DEPLOY / "enter-maintenance-offline.sh").read_text(encoding="utf-8")
@@ -519,12 +581,22 @@ def test_registry_import_uses_signed_loopback_bundle_not_classic_save_load() -> 
     assert "docker save" not in script
     assert "docker load" not in script
     assert 'docker rm -f "$registry_container_id"' in script
-    assert 'for directory in ("registry", "release")' in script
+    assert 'for directory in ("registry", "release", "sbom")' in script
+    assert "image SBOM evidence does not match the signed nine-image manifest" in script
+    assert 'len(images) != 9' in script
+    assert '"https://knowledgebases.local/schemas/image-sbom-index-v1.schema.json"' in script
     assert "signed release asset inventory differs" in script
     assert "RELEASE_SEQUENCE" in script
     assert "signed release sequence is replayed or downgraded" in script
     assert "highest-release.json" in script
     assert "release_assets_sha256" in script
+    assert '20260715_0021' in script
+    assert '20260714_0020' not in script
+    assert 'target_schema_head = sys.argv[2]' in script
+    assert (
+        "tuple(map(int, schema_match.groups())) "
+        "<= tuple(map(int, target_match.groups()))"
+    ) in script
     docker_capacity_gate = script.index("docker_root=$(docker info")
     first_registry_pull = script.index('docker pull --platform linux/amd64 "$image"')
     assert docker_capacity_gate < first_registry_pull
@@ -533,6 +605,47 @@ def test_registry_import_uses_signed_loopback_bundle_not_classic_save_load() -> 
     assert "unpacked_image_kib + 41943040" in script
     assert "signed unpacked-image capacity plus the 40 GiB rollback reserve" in script
     assert "registry_unpacked_inodes + rollback_inode_reserve" in script
+
+
+def test_registry_import_accepts_a_valid_previous_schema_head_but_rejects_downgrade(
+    tmp_path: Path,
+) -> None:
+    script = (DEPLOY / "import-offline-registry-bundle.sh").read_text(encoding="utf-8")
+    program = script.split("highest_release_sequence=$(python3 -I -c '\n", 1)[1].split(
+        "\n' \"$highest_release_file\" \"$release_schema_head\")",
+        1,
+    )[0]
+    state = {
+        "schema_version": 1,
+        "release_sequence": 17,
+        "release_id": "previous-release",
+        "release_git_sha": "a" * 40,
+        "release_schema_head": "20260714_0020",
+        "manifest_sha256": "b" * 64,
+        "release_assets_sha256": "c" * 64,
+    }
+    state_path = tmp_path / "highest-release.json"
+
+    def validate(
+        existing_head: str,
+        target_head: str = "20260715_0021",
+    ) -> subprocess.CompletedProcess[str]:
+        state["release_schema_head"] = existing_head
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, "-I", "-c", program, str(state_path), target_head],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    previous = validate("20260714_0020")
+    assert previous.returncode == 0
+    assert previous.stdout.strip() == "17"
+    assert validate("20260715_0021").returncode == 0
+    assert validate("20260716_0022").returncode != 0
+    assert validate("not-a-schema-head").returncode != 0
 
 
 def test_every_hashed_release_asset_exists_and_is_copied_into_the_contract() -> None:
@@ -575,9 +688,15 @@ def test_deploy_wrapper_keeps_one_contract_and_flock_through_verified_cutover() 
     assert '"$runtime_env_file" "$release_env_file"' not in script
     assert script.count('--contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"') >= 2
     assert script.count("offline_compose deploy") >= 5
-    writer_stop = "stop --timeout 60 api maintenance web llm-egress minio-multipart-gc"
-    assert writer_stop in script
-    assert script.index(writer_stop) < migration_position
+    writer_stop = (
+        'stop --timeout "$business_writer_stop_timeout_seconds" '
+        "api maintenance web llm-egress minio-multipart-gc"
+    )
+    normalized_script = " ".join(script.replace("\\\n", " ").split())
+    assert writer_stop in normalized_script
+    assert normalized_script.index(writer_stop) < normalized_script.index(
+        "run --pull never --rm migrate"
+    )
     assert "remained active before migration" in script
     restore_block = script.split("restore_exact_maintenance() {", 1)[1].split("\n}", 1)[0]
     assert restore_block.index("quiesce_owned_business_writers") < restore_block.index(
@@ -625,19 +744,28 @@ def test_deploy_wrapper_keeps_one_contract_and_flock_through_verified_cutover() 
 
 def test_install_wrapper_keeps_ports_closed_until_strict_business_cutover() -> None:
     script = (DEPLOY / "install-offline.sh").read_text(encoding="utf-8")
+    execution_marker = (
+        'verified_contract_sha256=$(offline_verify_contract install "$contract_dir")'
+    )
+    # The same verifier assignment also appears in the materialized-contract
+    # setup path.  The last occurrence is the actual main execution boundary,
+    # after all helper function definitions.
+    execution = script.rsplit(execution_marker, 1)[1]
 
     lock_position = script.index("offline_acquire_lock install")
     snapshot_position = script.index("prepare-offline-contract.sh")
-    preflight_position = script.index('preflight-offline.sh"')
-    migration_position = script.index("run --pull never --rm migrate")
-    bootstrap_position = script.index("write_install_state bootstrapped")
-    proxy_position = script.index("--wait --wait-timeout 120 proxy")
-    readiness_position = script.index("--business-ready-compose-config-stdin")
-    final_verify_position = script.index(
+    execution_position = script.rindex(execution_marker)
+    preflight_position = execution.index('preflight-offline.sh"')
+    migration_position = execution.index("run --pull never --rm migrate")
+    bootstrap_position = execution.index("write_install_state bootstrapped")
+    proxy_position = execution.index("--wait --wait-timeout 120 proxy")
+    readiness_position = execution.index("--business-ready-compose-config-stdin")
+    final_verify_position = execution.index(
         'final_contract_sha256=$(offline_verify_contract install "$contract_dir")'
     )
 
-    assert lock_position < snapshot_position < preflight_position < migration_position
+    assert lock_position < snapshot_position < execution_position
+    assert preflight_position < migration_position
     assert migration_position < bootstrap_position < proxy_position < readiness_position
     assert readiness_position < final_verify_position
     assert "enter-maintenance-offline.sh" not in script
@@ -646,15 +774,23 @@ def test_install_wrapper_keeps_ports_closed_until_strict_business_cutover() -> N
     assert "installed-$contract_sha256.json" in script
     assert 'preflight-offline.sh" --resume-install' in script
     assert "installation state does not match this canonical contract" in script
-    assert "a completed installation receipt already exists" in script
+    assert "a different or ambiguous completed installation receipt already exists" in script
     assert 'set -- "$state_directory"/installed-*.json' in script
     assert '[ "$install_state_owned" = true ]' in script
     assert "remove_stopped_resume_oneoffs" in script
-    assert "api-preflight clamav-db-preflight migrate bootstrap" in script
+    for oneoff_service in (
+        "api-preflight",
+        "clamav-db-preflight",
+        "llm-egress-preflight",
+        "migrate",
+        "bootstrap",
+    ):
+        assert oneoff_service in script
     assert "com.docker.compose.oneoff" in script
     assert "running or unverified one-off operations block safe installation resume" in script
     assert "selected_egress_profile" in script
     assert "llm-egress api maintenance web" in script
+    assert 'docker stop --time "$business_writer_stop_timeout_seconds"' in script
     assert "docker compose" not in script
     assert "docker system prune" not in script
     assert "docker compose down" not in script

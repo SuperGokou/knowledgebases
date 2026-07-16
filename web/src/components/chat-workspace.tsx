@@ -10,6 +10,12 @@ import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import { parseChatReply } from "@/lib/chat-contract";
 import { createChatIdempotencyController } from "@/lib/chat-idempotency";
 import { answerWithoutEmbeddedSources } from "@/lib/chat-sources";
+import {
+  INITIAL_CHAT_SERVICE_STATUS,
+  beginChatServiceCheck,
+  settleChatServiceCheck,
+  type ChatServiceResolution,
+} from "@/lib/chat-service-status";
 import { CHAT_BROWSER_TIMEOUT_MS } from "@/lib/chat-timeout-budget";
 import { scrollIntoViewIfSupported } from "@/lib/dom";
 import {
@@ -49,8 +55,7 @@ export function ChatWorkspace() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
-  const [serviceHint, setServiceHint] = useState("正在连接知识检索");
-  const [serviceState, setServiceState] = useState<"connected" | "warning">("warning");
+  const [serviceStatus, setServiceStatus] = useState(INITIAL_CHAT_SERVICE_STATUS);
   const [retryFailureId, setRetryFailureId] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeRequestRef = useRef<RequestDeadline | null>(null);
@@ -58,6 +63,22 @@ export function ChatWorkspace() {
   const retryOperationRef = useRef<ChatOperation | null>(null);
   const knowledgeRequestId = useRef(0);
   const knowledgeBaseIdRef = useRef("");
+  const serviceRevisionRef = useRef(INITIAL_CHAT_SERVICE_STATUS.revision);
+
+  const beginServiceRequest = useCallback((hint: string): number => {
+    const started = beginChatServiceCheck(serviceRevisionRef.current, hint);
+    serviceRevisionRef.current = started.revision;
+    setServiceStatus(started.status);
+    return started.revision;
+  }, []);
+
+  const settleServiceRequest = useCallback((
+    revision: number,
+    resolution: ChatServiceResolution,
+  ) => {
+    if (revision !== serviceRevisionRef.current) return;
+    setServiceStatus((current) => settleChatServiceCheck(current, revision, resolution));
+  }, []);
 
   const loadKnowledgeBases = useCallback(async ({
     search = activeKnowledgeQuery,
@@ -65,6 +86,7 @@ export function ChatWorkspace() {
     append = false,
   }: { search?: string; offset?: number; append?: boolean } = {}) => {
     const requestId = ++knowledgeRequestId.current;
+    const serviceRevision = beginServiceRequest("正在连接知识检索");
     setKnowledgeCatalogLoading(true);
     setKnowledgeCatalogError("");
     try {
@@ -91,30 +113,31 @@ export function ChatWorkspace() {
       }
 
       const hasSelection = Boolean(knowledgeBaseIdRef.current || refreshedSelection);
-      setServiceHint(hasSelection ? "知识检索已连接" : "暂无可访问知识库");
-      setServiceState(hasSelection ? "connected" : "warning");
+      settleServiceRequest(serviceRevision, {
+        state: hasSelection ? "connected" : "warning",
+        hint: hasSelection ? "知识检索已连接" : "暂无可访问知识库",
+      });
     } catch (reason) {
       if (requestId !== knowledgeRequestId.current) return;
       setKnowledgeBases((current) => current ?? []);
       setKnowledgeCatalogError(readableError(reason));
-      if (!knowledgeBaseIdRef.current) {
-        setServiceHint(
-          reason instanceof ApiClientError && [404, 501].includes(reason.status)
-            ? "问答服务尚未接入"
-            : "连接异常",
-        );
-        setServiceState("warning");
-      }
+      settleServiceRequest(serviceRevision, {
+        state: "warning",
+        hint: reason instanceof ApiClientError && [404, 501].includes(reason.status)
+          ? "问答服务尚未接入"
+          : "连接异常",
+      });
     } finally {
       if (requestId === knowledgeRequestId.current) setKnowledgeCatalogLoading(false);
     }
-  }, [activeKnowledgeQuery]);
+  }, [activeKnowledgeQuery, beginServiceRequest, settleServiceRequest]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void loadKnowledgeBases(), 0);
     return () => {
       window.clearTimeout(timeout);
       knowledgeRequestId.current += 1;
+      serviceRevisionRef.current += 1;
     };
   }, [loadKnowledgeBases]);
 
@@ -137,6 +160,11 @@ export function ChatWorkspace() {
     setRetryFailureId(null);
     setPending(false);
     setMessages([]);
+    if (activeRequest) {
+      beginServiceRequest("请求已取消");
+    } else if (!knowledgeBaseIdRef.current) {
+      beginServiceRequest("暂无可访问知识库");
+    }
   }
 
   function updateInput(nextInput: string) {
@@ -155,6 +183,7 @@ export function ChatWorkspace() {
   ) {
     const deadline = createRequestDeadline(CHAT_BROWSER_TIMEOUT_MS);
     activeRequestRef.current = deadline;
+    const serviceRevision = beginServiceRequest("正在检索知识库");
     retryOperationRef.current = operation;
     if (appendUserMessage) {
       setMessages((current) => [...current, operation.userMessage]);
@@ -192,8 +221,10 @@ export function ChatWorkspace() {
           answerReview: reply.answer_review,
         },
       ]);
-      setServiceHint("知识检索已连接");
-      setServiceState("connected");
+      settleServiceRequest(serviceRevision, {
+        state: "connected",
+        hint: "知识检索已连接",
+      });
     } catch (reason) {
       if (
         activeRequestRef.current !== deadline
@@ -217,8 +248,10 @@ export function ChatWorkspace() {
           failed: true,
         },
       ]);
-      setServiceHint(timedOut ? "请求超时" : unavailable ? "问答服务尚未接入" : "连接异常");
-      setServiceState("warning");
+      settleServiceRequest(serviceRevision, {
+        state: "warning",
+        hint: timedOut ? "请求超时" : unavailable ? "问答服务尚未接入" : "连接异常",
+      });
     } finally {
       deadline.dispose();
       if (activeRequestRef.current === deadline) {
@@ -344,7 +377,7 @@ export function ChatWorkspace() {
                 知识库列表加载失败；当前对话仍可继续。{knowledgeCatalogError}
               </span>
             ) : null}
-            <span className="chat-status" data-state={serviceState} aria-live="polite"><span />{serviceHint}</span>
+            <span className="chat-status" data-state={serviceStatus.state} aria-live="polite"><span />{serviceStatus.hint}</span>
             <button className="button secondary small" type="button" onClick={startNewConversation}>
               <Icon name="plus" /> 新对话
             </button>

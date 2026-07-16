@@ -4,6 +4,8 @@ param(
     [switch]$DryRun,
     [string]$OutputDirectory,
     [string]$SigningPrivateKey,
+    [string]$ImageSbomScanner,
+    [string]$ImageSbomScannerSha256,
     [long]$ReleaseSequence,
     [string]$ReleaseId,
     [string]$RegistryBootstrapSource = "docker.io/library/registry:2.8.3@sha256:46faa9a1ae6813194b53921a370f2f4f8c5e1aae228a89bceafef5847a6a3278"
@@ -20,6 +22,8 @@ Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-offline-registry-bundle.ps1 `
     -OutputDirectory C:\release\heyi-kb-2026.07.14 `
     -SigningPrivateKey D:\release-keys\heyi-release-rsa.pem `
+    -ImageSbomScanner D:\release-tools\syft.exe `
+    -ImageSbomScannerSha256 <approved-lowercase-sha256> `
     -ReleaseSequence 202607140001 `
     -ReleaseId 2026.07.14
 
@@ -33,6 +37,7 @@ Security contract:
   * Source and release assets are read only from a frozen `git archive HEAD`.
   * The output directory and RSA signing key must be absolute and outside Git.
   * Only linux/amd64 images are accepted. A digest-changing mirror operation fails.
+  * A hash-pinned external scanner generates one CycloneDX 1.6 SBOM per final image.
   * The private key is never copied to, or named in, any output artifact or log.
 '@
 
@@ -662,6 +667,7 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
 }
 
 if (-not $OutputDirectory -or -not $SigningPrivateKey -or
+    -not $ImageSbomScanner -or -not $ImageSbomScannerSha256 -or
     $ReleaseSequence -le 0 -or -not $ReleaseId) {
     Write-Error $Usage
     exit 64
@@ -676,19 +682,24 @@ if ($RegistryBootstrapSource -notmatch '^docker\.io/library/registry:2\.8\.3@sha
     Fail 'bootstrap Registry source must be the pinned registry:2.8.3 linux/amd64 manifest'
 }
 if (-not [IO.Path]::IsPathRooted($OutputDirectory) -or
-    -not [IO.Path]::IsPathRooted($SigningPrivateKey)) {
-    Fail 'output directory and signing key must use absolute paths'
+    -not [IO.Path]::IsPathRooted($SigningPrivateKey) -or
+    -not [IO.Path]::IsPathRooted($ImageSbomScanner)) {
+    Fail 'output directory, signing key and image SBOM scanner must use absolute paths'
 }
 
 $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $repository = [IO.Path]::GetFullPath($repository)
 $output = [IO.Path]::GetFullPath($OutputDirectory).TrimEnd('\', '/')
 $key = [IO.Path]::GetFullPath($SigningPrivateKey)
+$imageSbomScannerPath = [IO.Path]::GetFullPath($ImageSbomScanner)
 if (Test-IsWithin $output $repository) {
     Fail 'output directory must be outside the Git repository'
 }
 if (Test-IsWithin $key $repository) {
     Fail 'signing key must be outside the Git repository'
+}
+if (Test-IsWithin $imageSbomScannerPath $repository) {
+    Fail 'image SBOM scanner must be outside the Git repository'
 }
 if (-not (Test-Path -LiteralPath $key -PathType Leaf)) {
     Fail 'signing key is unavailable'
@@ -696,6 +707,17 @@ if (-not (Test-Path -LiteralPath $key -PathType Leaf)) {
 $keyItem = Get-Item -LiteralPath $key -Force
 if (($keyItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     Fail 'signing key must not be a symbolic link or reparse point'
+}
+if (-not (Test-Path -LiteralPath $imageSbomScannerPath -PathType Leaf)) {
+    Fail 'image SBOM scanner is unavailable'
+}
+$imageSbomScannerItem = Get-Item -LiteralPath $imageSbomScannerPath -Force
+if (($imageSbomScannerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    Fail 'image SBOM scanner must not be a symbolic link or reparse point'
+}
+if ($ImageSbomScannerSha256 -notmatch '^[0-9a-f]{64}$' -or
+    (Get-Sha256 $imageSbomScannerPath) -ne $ImageSbomScannerSha256) {
+    Fail 'scanner binary SHA-256 does not match the approved digest'
 }
 if (Test-Path -LiteralPath $output) {
     Fail 'output directory already exists; refusing a non-atomic overwrite'
@@ -1011,6 +1033,31 @@ try {
         Fail 'release image manifest differs from docker compose config --images'
     }
 
+    $sbomGenerator = Join-Path $sourceRoot 'scripts/generate_offline_image_sboms.py'
+    $sbomOutput = @(Invoke-Captured $python @(
+        '-I', $sbomGenerator,
+        '--artifact-root', $bundleRoot,
+        '--image-manifest', (Join-Path $bundleRoot 'release.env.images'),
+        '--output-dir', (Join-Path $bundleRoot 'sbom'),
+        '--scanner', $imageSbomScannerPath,
+        '--scanner-sha256', $ImageSbomScannerSha256,
+        '--release-id', $ReleaseId,
+        '--release-git-sha', $gitHead
+    ) 'cannot generate the final image SBOM set')
+    if ($sbomOutput.Count -ne 1) {
+        Fail 'image SBOM generator returned a malformed report'
+    }
+    try {
+        $sbomReport = $sbomOutput[0] | ConvertFrom-Json
+    }
+    catch {
+        Fail 'image SBOM generator returned invalid JSON'
+    }
+    if ($sbomReport.status -ne 'PASS' -or $sbomReport.image_count -ne 9 -or
+        $sbomReport.index_path -ne 'sbom/image-sbom-index.json') {
+        Fail 'image SBOM generator did not bind the exact nine-image release set'
+    }
+
     $unpackedCapacity = Get-DeduplicatedUnpackedCapacity `
         -Docker $docker `
         -Python $python `
@@ -1036,7 +1083,7 @@ try {
         $path = Join-Path $bundleRoot $relative
         [void]$checksumEntries.Add("$(Get-Sha256 $path)  $relative")
     }
-    foreach ($directory in @('registry', 'release')) {
+    foreach ($directory in @('registry', 'release', 'sbom')) {
         $base = Join-Path $bundleRoot $directory
         foreach ($file in Get-ChildItem -LiteralPath $base -File -Force -Recurse |
             Sort-Object { $_.FullName.Substring($bundleRoot.Length + 1).Replace('\', '/') }) {

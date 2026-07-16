@@ -16,6 +16,7 @@ from app.db.models import (
     RolePermission,
     User,
     UserRole,
+    UserStatus,
 )
 from app.db.session import SessionFactory
 from app.services.audit import AuditResult, add_audit_event
@@ -24,6 +25,7 @@ from app.services.rbac_mutation import (
     lock_role_union,
     locked_users_statement,
 )
+from app.services.user_activity import ActivityLockMode, acquire_user_activity_locks
 
 PERMISSION_CATALOG: dict[str, tuple[str, str]] = {
     "file:read": ("查看本人文件", "查看本人拥有的文件列表、详情并获取下载链接"),
@@ -101,6 +103,28 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
     # CAS-protected role assignment.
     await acquire_rbac_mutation_lock(session)
 
+    email = settings.bootstrap_admin_email.strip().lower()
+    user = await session.scalar(select(User).where(User.email == email))
+    user_was_created = user is None
+    if user is not None:
+        await acquire_user_activity_locks(
+            session,
+            {user.id: ActivityLockMode.EXCLUSIVE},
+        )
+        user = await session.scalar(locked_users_statement({user.id}))
+        if user is None:
+            raise RuntimeError("Bootstrap administrator disappeared while acquiring its row lock")
+        if not user.is_superuser:
+            raise RuntimeError(
+                "Refusing to grant superuser to an existing bootstrap email; "
+                "use an explicit recovery flow"
+            )
+        if user.retired_at is not None or user.status is not UserStatus.ACTIVE:
+            raise RuntimeError(
+                "Refusing to recover an inactive or retired bootstrap administrator; "
+                "use an explicit recovery flow or a different bootstrap email"
+            )
+
     catalog_repaired = False
     permissions: dict[str, Permission] = {}
     for code, (name, description) in PERMISSION_CATALOG.items():
@@ -144,9 +168,6 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
         definitions[key] = definition
     await session.flush()
 
-    email = settings.bootstrap_admin_email.strip().lower()
-    user = await session.scalar(select(User).where(User.email == email))
-    user_was_created = user is None
     if user is None:
         if settings.bootstrap_admin_password is None:
             raise RuntimeError("KB_BOOTSTRAP_ADMIN_PASSWORD is required for the first bootstrap")
@@ -162,6 +183,10 @@ async def seed_database(session: AsyncSession, settings: Settings) -> User:
         )
         session.add(user)
         await session.flush()
+        await acquire_user_activity_locks(
+            session,
+            {user.id: ActivityLockMode.EXCLUSIVE},
+        )
     locked_user = await session.scalar(locked_users_statement({user.id}))
     if locked_user is None:
         raise RuntimeError("Bootstrap administrator disappeared while acquiring its row lock")

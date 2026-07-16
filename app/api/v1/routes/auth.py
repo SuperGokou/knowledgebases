@@ -29,6 +29,7 @@ from app.schemas.auth import AuthMe, RefreshRequest, TokenPair
 from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.rate_limit import RateLimiter
+from app.services.user_activity import ActivityLockMode, acquire_user_activity_locks
 
 router = APIRouter()
 
@@ -155,9 +156,22 @@ async def login(
         limit=settings.login_attempts_per_account_per_minute,
     )
     user = await session.scalar(select(User).where(User.email == email))
+    if user is not None:
+        await acquire_user_activity_locks(
+            session,
+            {user.id: ActivityLockMode.SHARED},
+        )
+        user = await session.scalar(
+            select(User).where(User.id == user.id).execution_options(populate_existing=True)
+        )
     encoded_hash = user.password_hash if user is not None else passwords.dummy_hash
     password_is_valid = await verify_password(passwords, form.password, encoded_hash)
-    if user is None or user.status is not UserStatus.ACTIVE or not password_is_valid:
+    if (
+        user is None
+        or user.status is not UserStatus.ACTIVE
+        or user.retired_at is not None
+        or not password_is_valid
+    ):
         add_audit_event(
             session,
             action="auth.login.denied",
@@ -218,6 +232,11 @@ async def refresh_tokens(
             code="invalid_refresh_token",
             message="Refresh token is invalid or expired",
         ) from error
+
+    await acquire_user_activity_locks(
+        session,
+        {claims.user_id: ActivityLockMode.SHARED},
+    )
 
     # All refresh paths use one global lock order: user, token, then family.
     # The user lock serializes token_version changes across independent token
@@ -293,6 +312,7 @@ async def refresh_tokens(
     invalid = (
         as_utc(record.expires_at) <= now
         or user.status is not UserStatus.ACTIVE
+        or user.retired_at is not None
         or user.token_version != claims.token_version
     )
     if invalid:
@@ -351,7 +371,14 @@ async def refresh_session_status(
             message="Refresh token is invalid or has been revoked",
         ) from error
 
-    user = await session.get(User, claims.user_id)
+    await acquire_user_activity_locks(
+        session,
+        {claims.user_id: ActivityLockMode.SHARED},
+    )
+
+    user = await session.scalar(
+        select(User).where(User.id == claims.user_id).execution_options(populate_existing=True)
+    )
     record = await session.scalar(
         select(RefreshToken).where(
             RefreshToken.id == claims.token_id,
@@ -362,6 +389,7 @@ async def refresh_session_status(
     valid = (
         user is not None
         and user.status is UserStatus.ACTIVE
+        and user.retired_at is None
         and user.token_version == claims.token_version
         and record is not None
         and record.revoked_at is None
@@ -396,6 +424,11 @@ async def logout(
         claims = tokens.decode(payload.refresh_token, expected_type="refresh")
     except TokenError:
         return
+
+    await acquire_user_activity_locks(
+        session,
+        {claims.user_id: ActivityLockMode.SHARED},
+    )
 
     # Match refresh rotation's global lock order (user, token, then family).
     # Revoking the whole family closes the interleaving where rotation commits

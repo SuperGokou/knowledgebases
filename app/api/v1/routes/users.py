@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from redis.asyncio import Redis
-from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy import delete, func, or_, select, update
 
 from app.api.dependencies import (
     DatabaseSession,
@@ -21,6 +22,8 @@ from app.core.config import Settings, get_settings
 from app.core.password_async import hash_password, verify_password
 from app.core.security import PasswordService
 from app.db.models import (
+    ApiKey,
+    KnowledgeBase,
     KnowledgeBaseAccessLevel,
     KnowledgeBaseRoleGrant,
     LimitDefinition,
@@ -38,18 +41,26 @@ from app.schemas.users import (
     UserCreate,
     UserPasswordReset,
     UserRead,
+    UserRetirement,
     UserUpdate,
 )
 from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
 from app.services.list_search import literal_contains_pattern
+from app.services.llm_egress_policy import acquire_llm_egress_locks
 from app.services.rate_limit import RateLimiter
 from app.services.rbac_mutation import (
+    acquire_authorization_advisory_lock,
     acquire_rbac_mutation_lock,
     lock_role_union,
     locked_users_statement,
     refresh_locked_actor_access,
+)
+from app.services.user_activity import (
+    ActivityLockMode,
+    acquire_user_activity_locks,
+    rbac_mutation_endpoint,
 )
 
 router = APIRouter()
@@ -95,8 +106,117 @@ async def _user_read(session: DatabaseSession, user: User) -> UserRead:
 
 
 async def _lock_superuser_guard(session: DatabaseSession) -> None:
-    if session.get_bind().dialect.name == "postgresql":
-        await session.execute(text("SELECT pg_advisory_xact_lock(1262836038)"))
+    await acquire_authorization_advisory_lock(session, 1_262_836_038)
+
+
+async def _lock_authorized_user_target(
+    session: DatabaseSession,
+    access: AccessContext,
+    target_user_id: UUID,
+    required_permissions: set[str],
+    *,
+    additional_role_ids: set[UUID] | None = None,
+    authorize_target: Callable[
+        [DatabaseSession, AccessContext, User, User],
+        Awaitable[dict[UUID, ActivityLockMode]],
+    ],
+) -> tuple[AccessContext, User, User, dict[UUID, Role]]:
+    """Authorize an object before entering its exclusive lifecycle domain."""
+
+    await acquire_rbac_mutation_lock(session)
+    actor = await session.scalar(
+        select(User)
+        .where(User.id == access.user.id)
+        .execution_options(populate_existing=True)
+    )
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    await lock_role_union(session, user_ids={actor.id})
+    access = await refresh_locked_actor_access(session, actor, required_permissions)
+
+    # Object authorization deliberately precedes the target activity lock. A
+    # manager who may operate only below their own tier must not be able to hold
+    # an exclusive lifecycle lock on a protected administrator.
+    candidate = await session.scalar(
+        select(User)
+        .where(User.id == target_user_id)
+        .execution_options(populate_existing=True)
+    )
+    if candidate is None:
+        raise ApiError(status_code=404, code="user_not_found", message="User not found")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={target_user_id},
+        additional_role_ids=additional_role_ids or set(),
+    )
+    additional_activity_locks = await authorize_target(
+        session,
+        access,
+        actor,
+        candidate,
+    )
+
+    activity_locks = {
+        actor.id: ActivityLockMode.SHARED,
+        target_user_id: ActivityLockMode.EXCLUSIVE,
+    }
+    for user_id, mode in additional_activity_locks.items():
+        if activity_locks.get(user_id) is not ActivityLockMode.EXCLUSIVE:
+            activity_locks[user_id] = mode
+    await acquire_user_activity_locks(
+        session,
+        activity_locks,
+    )
+    locked_user_ids = {actor.id, target_user_id, *additional_activity_locks}
+    users = list(
+        (
+            await session.scalars(
+                locked_users_statement(locked_user_ids)
+            )
+        ).all()
+    )
+    users_by_id = {item.id: item for item in users}
+    actor = users_by_id.get(actor.id)
+    user = users_by_id.get(target_user_id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    if user is None:
+        raise ApiError(status_code=404, code="user_not_found", message="User not found")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={actor.id, target_user_id},
+        additional_role_ids=additional_role_ids or set(),
+    )
+    access = await refresh_locked_actor_access(session, actor, required_permissions)
+    confirmed_activity_locks = await authorize_target(session, access, actor, user)
+    if confirmed_activity_locks != additional_activity_locks:
+        raise RuntimeError("target authorization changed inside the RBAC critical section")
+    return access, actor, user, locked_roles
+
+
+async def _commit_user_denial(
+    session: DatabaseSession,
+    request: Request,
+    access: AccessContext,
+    *,
+    action: str,
+    target_user_id: UUID,
+    reason_code: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Persist a security-significant denial before releasing policy locks."""
+
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action=action,
+        result=AuditResult.DENIED,
+        resource_type="user",
+        resource_id=str(target_user_id),
+        request_id=getattr(request.state, "request_id", None),
+        details={"reason_code": reason_code, **(details or {})},
+    )
+    await session.commit()
 
 
 async def _ensure_target_is_below_actor(
@@ -124,6 +244,37 @@ async def _ensure_target_is_below_actor(
             code="target_user_protected",
             message="You can only manage users whose active roles are below your own priority",
         )
+
+
+async def _authorize_managed_user_target(
+    session: DatabaseSession,
+    access: AccessContext,
+    actor: User,
+    target: User,
+) -> dict[UUID, ActivityLockMode]:
+    await _ensure_target_is_below_actor(session, access, target.id)
+    if target.is_superuser and not actor.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="superuser_protected",
+            message="Only a superuser can modify another superuser",
+        )
+    return {}
+
+
+async def _authorize_password_target(
+    _session: DatabaseSession,
+    _access: AccessContext,
+    actor: User,
+    target: User,
+) -> dict[UUID, ActivityLockMode]:
+    if target.id != actor.id and not actor.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="superuser_required",
+            message="Only a superuser can reset another user's password",
+        )
+    return {}
 
 
 async def _ensure_roles_assignable(
@@ -218,6 +369,7 @@ async def list_users(
 
 
 @router.post("", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+@rbac_mutation_endpoint
 async def create_user(
     payload: UserCreate,
     request: Request,
@@ -231,7 +383,24 @@ async def create_user(
         required_permissions.add("role:assign")
     password_hash = await hash_password(passwords, payload.password)
     await acquire_rbac_mutation_lock(session)
-    actor = await session.scalar(locked_users_statement({access.user.id}))
+    actor = await session.scalar(
+        select(User)
+        .where(User.id == access.user.id)
+        .execution_options(populate_existing=True)
+    )
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    locked_roles = await lock_role_union(
+        session,
+        user_ids={actor.id},
+        additional_role_ids=role_ids,
+    )
+    access = await refresh_locked_actor_access(session, actor, required_permissions)
+    await acquire_user_activity_locks(
+        session,
+        {actor.id: ActivityLockMode.SHARED},
+    )
+    actor = await session.scalar(locked_users_statement({actor.id}))
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
     locked_roles = await lock_role_union(
@@ -284,6 +453,7 @@ async def create_user(
 
 
 @router.patch("/{user_id}", response_model=UserRead)
+@rbac_mutation_endpoint
 async def update_user(
     user_id: UUID,
     payload: UserUpdate,
@@ -291,27 +461,24 @@ async def update_user(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
 ) -> UserRead:
-    await acquire_rbac_mutation_lock(session)
-    locked_users = list(
-        (await session.scalars(locked_users_statement({access.user.id, user_id}))).all()
+    access, _, user, _ = await _lock_authorized_user_target(
+        session,
+        access,
+        user_id,
+        {"user:manage"},
+        authorize_target=_authorize_managed_user_target,
     )
-    users_by_id = {item.id: item for item in locked_users}
-    await lock_role_union(session, user_ids=users_by_id)
-    actor = users_by_id.get(access.user.id)
-    if actor is None:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    access = await refresh_locked_actor_access(session, actor, {"user:manage"})
-    user = users_by_id.get(user_id)
-    if user is None:
-        raise ApiError(status_code=404, code="user_not_found", message="User not found")
-    await _ensure_target_is_below_actor(session, access, user.id)
-    if user.is_superuser and not access.user.is_superuser:
-        raise ApiError(
-            status_code=403,
-            code="superuser_protected",
-            message="Only a superuser can modify another superuser",
-        )
     changes = payload.model_dump(exclude_unset=True)
+    if (
+        user.retired_at is not None
+        and changes.get("status") is not None
+        and changes["status"] is not UserStatus.DISABLED
+    ):
+        raise ApiError(
+            status_code=409,
+            code="user_retired",
+            message="A retired account cannot be reactivated",
+        )
     if (
         user.is_superuser
         and changes.get("status") is not None
@@ -324,10 +491,19 @@ async def update_user(
             .where(
                 User.is_superuser.is_(True),
                 User.status == UserStatus.ACTIVE,
+                User.retired_at.is_(None),
                 User.id != user.id,
             )
         )
         if not remaining:
+            await _commit_user_denial(
+                session,
+                request,
+                access,
+                action="user.status_change.denied",
+                target_user_id=user.id,
+                reason_code="last_superuser_protected",
+            )
             raise ApiError(
                 status_code=409,
                 code="last_superuser_protected",
@@ -364,6 +540,269 @@ async def update_user(
     await session.commit()
     await session.refresh(user)
     return await _user_read(session, user)
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@rbac_mutation_endpoint
+async def retire_user(
+    user_id: UUID,
+    payload: UserRetirement,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
+) -> None:
+    """Retire an account without deleting its business history or audit identity."""
+
+    async def authorize_retirement_target(
+        locked_session: DatabaseSession,
+        current_access: AccessContext,
+        actor: User,
+        target: User,
+    ) -> dict[UUID, ActivityLockMode]:
+        if target.id == actor.id:
+            await _commit_user_denial(
+                locked_session,
+                request,
+                current_access,
+                action="user.retirement.denied",
+                target_user_id=target.id,
+                reason_code="self_retirement_forbidden",
+            )
+            raise ApiError(
+                status_code=409,
+                code="self_retirement_forbidden",
+                message="The signed-in account cannot retire itself",
+            )
+        await _authorize_managed_user_target(
+            locked_session,
+            current_access,
+            actor,
+            target,
+        )
+        if str(payload.confirmation_email) != target.email:
+            await _commit_user_denial(
+                locked_session,
+                request,
+                current_access,
+                action="user.retirement.denied",
+                target_user_id=target.id,
+                reason_code="retirement_confirmation_mismatch",
+            )
+            raise ApiError(
+                status_code=409,
+                code="retirement_confirmation_mismatch",
+                message="The confirmation email does not match the target account",
+            )
+        if target.retired_at is not None:
+            return {}
+        replacement_owner_id = payload.replacement_owner_id
+        if replacement_owner_id is None:
+            return {}
+        if replacement_owner_id == target.id:
+            raise ApiError(
+                status_code=409,
+                code="replacement_owner_invalid",
+                message="The replacement owner must be different from the retiring account",
+            )
+        if not current_access.allows("knowledge:grant"):
+            raise ApiError(
+                status_code=403,
+                code="permission_denied",
+                message="Permission required: knowledge:grant",
+            )
+        replacement = await locked_session.scalar(
+            select(User)
+            .where(User.id == replacement_owner_id)
+            .execution_options(populate_existing=True)
+        )
+        if replacement is None:
+            raise ApiError(
+                status_code=404,
+                code="replacement_owner_not_found",
+                message="Replacement owner not found",
+            )
+        if (
+            replacement.status is not UserStatus.ACTIVE
+            or replacement.retired_at is not None
+        ):
+            raise ApiError(
+                status_code=409,
+                code="replacement_owner_invalid",
+                message="The replacement owner must be active and not retired",
+            )
+        return {replacement.id: ActivityLockMode.SHARED}
+
+    access, actor, user, _ = await _lock_authorized_user_target(
+        session,
+        access,
+        user_id,
+        {"user:manage"},
+        authorize_target=authorize_retirement_target,
+    )
+    if user.retired_at is not None:
+        await session.rollback()
+        return
+    if user.is_superuser:
+        await _lock_superuser_guard(session)
+        remaining = await session.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(
+                User.is_superuser.is_(True),
+                User.status == UserStatus.ACTIVE,
+                User.retired_at.is_(None),
+                User.id != user.id,
+            )
+        )
+        if not remaining:
+            await _commit_user_denial(
+                session,
+                request,
+                access,
+                action="user.retirement.denied",
+                target_user_id=user.id,
+                reason_code="last_superuser_protected",
+            )
+            raise ApiError(
+                status_code=409,
+                code="last_superuser_protected",
+                message="The final active superuser cannot be retired",
+            )
+
+    owned_knowledge_bases = list(
+        (
+            await session.scalars(
+                select(KnowledgeBase)
+                .where(KnowledgeBase.owner_id == user.id)
+                .order_by(KnowledgeBase.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    if owned_knowledge_bases and payload.replacement_owner_id is None:
+        references = {"owned_knowledge_bases": len(owned_knowledge_bases)}
+        await _commit_user_denial(
+            session,
+            request,
+            access,
+            action="user.retirement.denied",
+            target_user_id=user.id,
+            reason_code="user_ownership_conflict",
+            details={"references": references},
+        )
+        raise ApiError(
+            status_code=409,
+            code="user_ownership_conflict",
+            message="Transfer owned knowledge bases before retiring this account",
+            details={"references": references},
+        )
+
+    if owned_knowledge_bases and not access.user.is_superuser:
+        if not access.allows("knowledge:grant"):
+            raise ApiError(
+                status_code=403,
+                code="permission_denied",
+                message="Permission required: knowledge:grant",
+            )
+        for knowledge_base in owned_knowledge_bases:
+            await require_knowledge_base_access(
+                session,
+                access,
+                knowledge_base.id,
+                minimum=KnowledgeBaseAccessLevel.MANAGER,
+            )
+
+    # Every egress guard runs before the first owner mutation. The guard may
+    # commit a denial audit, so moving even one owner earlier would violate the
+    # all-or-nothing handoff contract.
+    await acquire_llm_egress_locks(
+        session,
+        [
+            ("user", user.id),
+            *(("knowledge_base", item.id) for item in owned_knowledge_bases),
+        ],
+    )
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="user_retirement",
+        resource_type="user",
+        resource_id=str(user.id),
+        user_id=user.id,
+    )
+    for knowledge_base in owned_knowledge_bases:
+        await deny_if_active_external_llm_egress(
+            session,
+            request,
+            access,
+            revocation_scope="knowledge_base_owner_transfer",
+            resource_type="knowledge_base",
+            resource_id=str(knowledge_base.id),
+            knowledge_base_id=knowledge_base.id,
+        )
+
+    replacement_owner_id = payload.replacement_owner_id
+    if owned_knowledge_bases:
+        if replacement_owner_id is None:
+            raise RuntimeError("knowledge-base ownership transfer was not authorized")
+        for knowledge_base in owned_knowledge_bases:
+            knowledge_base.owner_id = replacement_owner_id
+
+    now = datetime.now(UTC)
+    user.status = UserStatus.DISABLED
+    user.retired_at = now
+    user.retired_by_id = actor.id
+    user.retirement_reason = payload.reason
+    user.token_version += 1
+
+    revoked_refresh = await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    revoked_api_keys = await session.execute(
+        update(ApiKey)
+        .where(ApiKey.user_id == user.id, ApiKey.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    removed_roles = await session.execute(delete(UserRole).where(UserRole.user_id == user.id))
+    removed_role_count = max(int(getattr(removed_roles, "rowcount", 0) or 0), 0)
+    if removed_role_count:
+        user.role_assignment_version += 1
+
+    audit_details: dict[str, Any] = {
+        "reason": payload.reason,
+        "revoked_api_keys": max(int(getattr(revoked_api_keys, "rowcount", 0) or 0), 0),
+        "revoked_refresh_tokens": max(
+            int(getattr(revoked_refresh, "rowcount", 0) or 0),
+            0,
+        ),
+        "removed_role_assignments": removed_role_count,
+    }
+    if owned_knowledge_bases and replacement_owner_id is not None:
+        bounded_ids = [str(item.id) for item in owned_knowledge_bases[:100]]
+        audit_details.update(
+            {
+                "transferred_knowledge_bases": len(owned_knowledge_bases),
+                "knowledge_base_owner_from": str(user.id),
+                "knowledge_base_owner_to": str(replacement_owner_id),
+                "transferred_knowledge_base_ids": bounded_ids,
+                "transferred_knowledge_base_ids_truncated": len(owned_knowledge_bases) > 100,
+            }
+        )
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="user.retired",
+        result=AuditResult.SUCCESS,
+        resource_type="user",
+        resource_id=str(user.id),
+        request_id=getattr(request.state, "request_id", None),
+        details=audit_details,
+    )
+    await session.commit()
 
 
 async def _replace_user_password(
@@ -418,19 +857,19 @@ async def _replace_user_password(
     # The resulting one-way hash is safe to hold briefly and keeps the global
     # policy lock from being occupied by CPU-bound password derivation.
     password_hash = await hash_password(passwords, payload.new_password.get_secret_value())
-    await acquire_rbac_mutation_lock(session)
-    locked_users = list(
-        (await session.scalars(locked_users_statement({access.user.id, user_id}))).all()
+    access, actor, user, _ = await _lock_authorized_user_target(
+        session,
+        access,
+        user_id,
+        required_permissions,
+        authorize_target=_authorize_password_target,
     )
-    users_by_id = {item.id: item for item in locked_users}
-    await lock_role_union(session, user_ids=users_by_id)
-    actor = users_by_id.get(access.user.id)
-    if actor is None:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    access = await refresh_locked_actor_access(session, actor, required_permissions)
-    user = users_by_id.get(user_id)
-    if user is None:
-        raise ApiError(status_code=404, code="user_not_found", message="User not found")
+    if user.retired_at is not None:
+        raise ApiError(
+            status_code=409,
+            code="user_retired",
+            message="A retired account cannot receive a new password",
+        )
 
     is_self_change = user.id == actor.id
     if is_self_change:
@@ -519,6 +958,7 @@ async def _enforce_self_password_change_rate_limit(
 
 
 @router.put("/me/password", status_code=status.HTTP_204_NO_CONTENT)
+@rbac_mutation_endpoint
 async def change_own_password(
     payload: UserPasswordReset,
     request: Request,
@@ -545,6 +985,7 @@ async def change_own_password(
 
 
 @router.put("/{user_id}/password", status_code=status.HTTP_204_NO_CONTENT)
+@rbac_mutation_endpoint
 async def reset_user_password(
     user_id: UUID,
     payload: UserPasswordReset,
@@ -573,6 +1014,7 @@ async def reset_user_password(
 
 
 @router.put("/{user_id}/roles", response_model=UserRead)
+@rbac_mutation_endpoint
 async def replace_user_roles(
     user_id: UUID,
     payload: RoleAssignmentUpdate,
@@ -581,31 +1023,21 @@ async def replace_user_roles(
     access: Annotated[AccessContext, Depends(require_permission("role:assign"))],
 ) -> UserRead:
     role_ids = set(payload.role_ids)
-    await acquire_rbac_mutation_lock(session)
-    locked_users = list(
-        (await session.scalars(locked_users_statement({access.user.id, user_id}))).all()
-    )
-    users_by_id = {item.id: item for item in locked_users}
-    locked_roles = await lock_role_union(
+    access, _, user, locked_roles = await _lock_authorized_user_target(
         session,
-        user_ids=users_by_id,
+        access,
+        user_id,
+        {"role:assign"},
         additional_role_ids=role_ids,
+        authorize_target=_authorize_managed_user_target,
     )
-    actor = users_by_id.get(access.user.id)
-    if actor is None:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    access = await refresh_locked_actor_access(session, actor, {"role:assign"})
-    user = users_by_id.get(user_id)
-    if user is None:
-        raise ApiError(status_code=404, code="user_not_found", message="User not found")
-    await _ensure_target_is_below_actor(session, access, user.id)
+    if user.retired_at is not None and role_ids:
+        raise ApiError(
+            status_code=409,
+            code="user_retired",
+            message="A retired account cannot receive role assignments",
+        )
     if user.is_superuser:
-        if not access.user.is_superuser:
-            raise ApiError(
-                status_code=403,
-                code="superuser_protected",
-                message="Only a superuser can replace another superuser's roles",
-            )
         await _lock_superuser_guard(session)
         remaining = await session.scalar(
             select(func.count())
@@ -613,10 +1045,19 @@ async def replace_user_roles(
             .where(
                 User.is_superuser.is_(True),
                 User.status == UserStatus.ACTIVE,
+                User.retired_at.is_(None),
                 User.id != user.id,
             )
         )
         if not remaining:
+            await _commit_user_denial(
+                session,
+                request,
+                access,
+                action="user.roles_replace.denied",
+                target_user_id=user.id,
+                reason_code="last_superuser_protected",
+            )
             raise ApiError(
                 status_code=409,
                 code="last_superuser_protected",

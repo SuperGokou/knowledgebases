@@ -12,6 +12,7 @@ port_listener_evidence=
 disk_usage_evidence=
 docker_storage_evidence=
 preflight_mode=install
+preflight_adoption_transaction=none
 if [ "${1:-}" = "--upgrade" ]; then
   preflight_mode=upgrade
   shift
@@ -19,7 +20,13 @@ elif [ "${1:-}" = "--resume-install" ]; then
   preflight_mode=install-resume
   shift
 fi
-if [ "$#" -eq 4 ] && [ "$1" = "--contract-dir" ] && \
+if [ "$#" -eq 6 ] && [ "$1" = "--contract-dir" ] && \
+  [ "$3" = "--contract-sha256" ] && \
+  [ "$5" = "--adoption-transaction" ]; then
+  contract_dir=$2
+  expected_contract_sha256=$4
+  preflight_adoption_transaction=$6
+elif [ "$#" -eq 4 ] && [ "$1" = "--contract-dir" ] && \
   [ "$3" = "--contract-sha256" ]; then
   contract_dir=$2
   expected_contract_sha256=$4
@@ -33,7 +40,7 @@ elif [ "$#" -eq 2 ]; then
   cleanup_contract=$contract_dir
 else
   echo "usage: $0 RUNTIME_ENV RELEASE_ENV" >&2
-  echo "   or: $0 [--upgrade|--resume-install] --contract-dir DIR --contract-sha256 SHA256" >&2
+  echo "   or: $0 [--upgrade|--resume-install] --contract-dir DIR --contract-sha256 SHA256 [--adoption-transaction TX]" >&2
   exit 64
 fi
 
@@ -64,6 +71,15 @@ contract_sha256=$(offline_verify_contract preflight "$contract_dir")
 if [ "$contract_sha256" != "$expected_contract_sha256" ]; then
   offline_fail preflight "contract SHA-256 does not match the accepted snapshot" 65
 fi
+case "$preflight_adoption_transaction" in
+  none) ;;
+  *)
+    if ! printf '%s\n' "$preflight_adoption_transaction" | \
+      grep -Eq '^[0-9a-f]{32}$'; then
+      offline_fail preflight "adoption transaction identifier is invalid" 65
+    fi
+    ;;
+esac
 snapshot_script_dir=$contract_dir/release/deploy/tencent
 # From this point onward every helper and Compose primitive is loaded from the
 # verified snapshot, so replacing the release directory cannot change the
@@ -581,9 +597,20 @@ if docker volume inspect "$project_marker_volume" >/dev/null 2>&1; then
     '{{ index .Labels "io.heyi.knowledgebases.owner" }}' "$project_marker_volume")
   marker_project=$(docker volume inspect --format \
     '{{ index .Labels "io.heyi.knowledgebases.compose-project" }}' "$project_marker_volume")
+  marker_contract=$(docker volume inspect --format \
+    '{{ index .Labels "io.heyi.knowledgebases.contract-sha256" }}' "$project_marker_volume")
+  marker_adoption=$(docker volume inspect --format \
+    '{{ index .Labels "io.heyi.knowledgebases.adoption-transaction" }}' \
+    "$project_marker_volume")
   if [ "$marker_owner" != "$project_owner_label" ] || \
     [ "$marker_project" != "$COMPOSE_PROJECT_NAME" ]; then
     echo "preflight: compose project ownership marker is invalid" >&2
+    exit 65
+  fi
+  if [ "$preflight_mode" != upgrade ] && \
+    { [ "$marker_contract" != "$contract_sha256" ] || \
+      [ "$marker_adoption" != "$preflight_adoption_transaction" ]; }; then
+    echo "preflight: compose project marker transaction binding differs" >&2
     exit 65
   fi
 elif [ "$preflight_mode" = upgrade ]; then
@@ -596,13 +623,22 @@ else
   docker volume create \
     --label "io.heyi.knowledgebases.owner=$project_owner_label" \
     --label "io.heyi.knowledgebases.compose-project=$COMPOSE_PROJECT_NAME" \
+    --label "io.heyi.knowledgebases.contract-sha256=$contract_sha256" \
+    --label "io.heyi.knowledgebases.adoption-transaction=$preflight_adoption_transaction" \
     "$project_marker_volume" >/dev/null
   marker_owner=$(docker volume inspect --format \
     '{{ index .Labels "io.heyi.knowledgebases.owner" }}' "$project_marker_volume")
   marker_project=$(docker volume inspect --format \
     '{{ index .Labels "io.heyi.knowledgebases.compose-project" }}' "$project_marker_volume")
+  marker_contract=$(docker volume inspect --format \
+    '{{ index .Labels "io.heyi.knowledgebases.contract-sha256" }}' "$project_marker_volume")
+  marker_adoption=$(docker volume inspect --format \
+    '{{ index .Labels "io.heyi.knowledgebases.adoption-transaction" }}' \
+    "$project_marker_volume")
   if [ "$marker_owner" != "$project_owner_label" ] || \
-    [ "$marker_project" != "$COMPOSE_PROJECT_NAME" ]; then
+    [ "$marker_project" != "$COMPOSE_PROJECT_NAME" ] || \
+    [ "$marker_contract" != "$contract_sha256" ] || \
+    [ "$marker_adoption" != "$preflight_adoption_transaction" ]; then
     echo "preflight: compose project ownership marker creation was not verifiable" >&2
     exit 73
   fi
@@ -846,28 +882,9 @@ if [ "$preflight_mode" = upgrade ]; then
     [ "$(stat -c %h -- "$completed_install_receipt")" -ne 1 ] || \
     [ "$(realpath -e -- "$completed_install_receipt")" != \
       "$completed_install_receipt" ] || \
-    ! python3 -I -c '
-import json, pathlib, re, sys
-path = pathlib.Path(sys.argv[1])
-document = json.loads(path.read_text(encoding="utf-8"))
-required = {
-    "schema_version", "contract_sha256", "runtime_sha256",
-    "release_sha256", "manifest_sha256", "phase",
-}
-filename_digest = path.stem.removeprefix("installed-")
-valid = (
-    set(document) == required
-    and document["schema_version"] == 1
-    and document["phase"] == "completed"
-    and document["contract_sha256"] == filename_digest
-    and re.fullmatch(r"[0-9a-f]{64}", filename_digest) is not None
-    and all(
-        re.fullmatch(r"[0-9a-f]{64}", document[key]) is not None
-        for key in ("runtime_sha256", "release_sha256", "manifest_sha256")
-    )
-)
-raise SystemExit(0 if valid else 1)
-' "$completed_install_receipt"; then
+    ! python3 -I "$snapshot_script_dir/offline-recovery-state.py" \
+      validate-installed-receipt "$completed_install_receipt" \
+      20260715_0021 >/dev/null; then
     offline_fail preflight "completed-install receipt is unsafe or malformed" 65
   fi
   if [ -z "${KB_UPGRADE_BACKUP_EVIDENCE_PATH:-}" ] || \
@@ -927,7 +944,7 @@ valid = (
     and re.fullmatch(r"[A-Za-z0-9._-]+", document["release_id"])
     and isinstance(document["release_git_sha"], str)
     and re.fullmatch(r"[0-9a-f]{40}", document["release_git_sha"])
-    and document["release_schema_head"] == "20260714_0020"
+    and document["release_schema_head"] == "20260715_0021"
     and all(
         isinstance(document[key], str) and digest.fullmatch(document[key])
         for key in (
@@ -980,6 +997,14 @@ if [ "$selected_egress_profile" = controlled-egress ]; then
     *) offline_fail preflight "controlled egress image is not an exact loopback digest" 65 ;;
   esac
   if ! docker run --rm --pull never --network none --read-only \
+    --label "com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+    --label "com.docker.compose.service=llm-egress-preflight" \
+    --label "com.docker.compose.oneoff=True" \
+    --label "com.docker.compose.project.config_files=$compose_file" \
+    --label "io.heyi.knowledgebases.owner=$project_owner_label" \
+    --label "io.heyi.knowledgebases.stack=offline" \
+    --label "io.heyi.knowledgebases.contract-sha256=$contract_sha256" \
+    --label "io.heyi.knowledgebases.adoption-transaction=$preflight_adoption_transaction" \
     --user 10001:10001 --cap-drop ALL --cap-add NET_BIND_SERVICE \
     --security-opt no-new-privileges:true \
     --tmpfs /tmp:size=16m,uid=10001,gid=10001,mode=0700 \
@@ -990,7 +1015,16 @@ if [ "$selected_egress_profile" = controlled-egress ]; then
     offline_fail preflight "controlled egress Caddy contract is invalid" 65
   fi
   egress_applets=$(docker run --rm --pull never --network none --read-only \
+    --label "com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+    --label "com.docker.compose.service=llm-egress-preflight" \
+    --label "com.docker.compose.oneoff=True" \
+    --label "com.docker.compose.project.config_files=$compose_file" \
+    --label "io.heyi.knowledgebases.owner=$project_owner_label" \
+    --label "io.heyi.knowledgebases.stack=offline" \
+    --label "io.heyi.knowledgebases.contract-sha256=$contract_sha256" \
+    --label "io.heyi.knowledgebases.adoption-transaction=$preflight_adoption_transaction" \
     --cap-drop ALL --security-opt no-new-privileges:true \
+    --volume "$snapshot_script_dir/Caddyfile.llm-egress:/etc/caddy/Caddyfile:ro" \
     --entrypoint /bin/busybox "$egress_image" --list) || \
     offline_fail preflight "controlled egress BusyBox inventory is unavailable" 65
   for required_applet in sh wget sha256sum; do
@@ -1004,16 +1038,28 @@ fi
 
 offline_compose preflight "$contract_dir" \
   --profile ops \
-  run --pull never --rm --no-deps api-preflight \
+  run --pull never --rm --no-deps \
+  --label "io.heyi.knowledgebases.contract-sha256=$contract_sha256" \
+  --label "io.heyi.knowledgebases.adoption-transaction=$preflight_adoption_transaction" \
+  --label "com.docker.compose.project.config_files=$compose_file" \
+  api-preflight \
   python -c 'import shutil; probe = "/var/lib/kb-capacity"; usage = shutil.disk_usage(probe); assert usage.total > 0 and usage.free >= 0'
 
 offline_compose preflight "$contract_dir" \
   --profile ops \
-  run --pull never --rm --no-deps api-preflight \
+  run --pull never --rm --no-deps \
+  --label "io.heyi.knowledgebases.contract-sha256=$contract_sha256" \
+  --label "io.heyi.knowledgebases.adoption-transaction=$preflight_adoption_transaction" \
+  --label "com.docker.compose.project.config_files=$compose_file" \
+  api-preflight \
   python -m app.document_parser_preflight --require-all
 
 offline_compose preflight "$contract_dir" \
   --profile ops \
-  run --pull never --rm --no-deps clamav-db-preflight
+  run --pull never --rm --no-deps \
+  --label "io.heyi.knowledgebases.contract-sha256=$contract_sha256" \
+  --label "io.heyi.knowledgebases.adoption-transaction=$preflight_adoption_transaction" \
+  --label "com.docker.compose.project.config_files=$compose_file" \
+  clamav-db-preflight
 
 echo "preflight: offline deployment requirements satisfied; contract_sha256=$contract_sha256"

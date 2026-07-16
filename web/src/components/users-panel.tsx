@@ -40,6 +40,14 @@ import {
   validateStrongPassword,
   type UserPasswordResetEditor,
 } from "@/lib/user-password-reset";
+import {
+  canRetireUser,
+  eligibleReplacementOwners,
+  mergeReplacementOwnerSearchResults,
+  readableUserRetirementError,
+  retireUserWithRefresh,
+  type UserRetirementEditor,
+} from "@/lib/user-retirement";
 
 const statusLabel: Record<UserStatus, string> = { active: "正常", disabled: "已停用", locked: "已锁定" };
 const statusTone: Record<UserStatus, "success" | "neutral" | "danger"> = { active: "success", disabled: "neutral", locked: "danger" };
@@ -68,6 +76,11 @@ export function UsersPanel() {
   const [hasNextUsers, setHasNextUsers] = useState(false);
   const [roleEditor, setRoleEditor] = useState<RoleAssignmentEditor | null>(null);
   const [passwordEditor, setPasswordEditor] = useState<UserPasswordResetEditor | null>(null);
+  const [retirementEditor, setRetirementEditor] = useState<UserRetirementEditor | null>(null);
+  const [replacementOwnerQuery, setReplacementOwnerQuery] = useState("");
+  const [replacementOwnerCandidates, setReplacementOwnerCandidates] = useState<User[]>([]);
+  const [replacementOwnerLoading, setReplacementOwnerLoading] = useState(false);
+  const [replacementOwnerError, setReplacementOwnerError] = useState("");
   const loadController = useMemo(() => createLatestRequestController(), []);
   const roleLoadController = useMemo(() => createLatestRequestController(), []);
 
@@ -185,10 +198,41 @@ export function UsersPanel() {
   );
   const roleEditorUser = roleEditor ? users?.find((user) => user.id === roleEditor.userId) : null;
   const passwordEditorUser = passwordEditor ? users?.find((user) => user.id === passwordEditor.userId) : null;
+  const retirementEditorUser = retirementEditor
+    ? users?.find((user) => user.id === retirementEditor.userId)
+    : null;
 
   function closeMemberEditors() {
     setRoleEditor(null);
     setPasswordEditor(null);
+    setRetirementEditor(null);
+    setReplacementOwnerQuery("");
+    setReplacementOwnerCandidates([]);
+    setReplacementOwnerError("");
+  }
+
+  async function searchReplacementOwners() {
+    if (!retirementEditor || replacementOwnerLoading) return;
+    setReplacementOwnerLoading(true);
+    setReplacementOwnerError("");
+    try {
+      const candidates = await apiRequest<User[]>(buildOffsetListPath("/api/v1/users", {
+        offset: 0,
+        search: replacementOwnerQuery,
+      }));
+      setReplacementOwnerCandidates((currentCandidates) => (
+        mergeReplacementOwnerSearchResults(
+          currentCandidates,
+          candidates,
+          retirementEditor.userId,
+          retirementEditor.replacementOwnerId,
+        )
+      ));
+    } catch (reason) {
+      setReplacementOwnerError(readableError(reason));
+    } finally {
+      setReplacementOwnerLoading(false);
+    }
   }
 
   function moveToUserOffset(offset: number) {
@@ -325,6 +369,35 @@ export function UsersPanel() {
     }
   }
 
+  async function confirmRetirement() {
+    if (!retirementEditor || pending) return;
+    setPending(true);
+    setError("");
+    setNotice("");
+    try {
+      const editorSnapshot = retirementEditor;
+      const outcome = await retireUserWithRefresh(editorSnapshot, {
+        onCommitted: () => {
+          setUsers((current) => current?.map((user) => user.id === editorSnapshot.userId
+            ? { ...user, status: "disabled", retired_at: new Date().toISOString(), role_ids: [] }
+            : user) ?? current);
+          setRetirementEditor(null);
+          setReplacementOwnerQuery("");
+          setReplacementOwnerCandidates([]);
+          setNotice("成员账号已安全退休：登录凭证和 API 密钥已撤销，角色已移除。知识库实际接管结果请在知识库与审计记录中核验；审计与业务历史继续保留。");
+        },
+        reload: () => load({ propagateError: true }),
+      });
+      if (outcome.status === "refresh_failed") {
+        setError(`账号已退休，但列表刷新失败，请手动刷新。${readableError(outcome.error)}`);
+      }
+    } catch (reason) {
+      setError(readableUserRetirementError(reason));
+    } finally {
+      setPending(false);
+    }
+  }
+
   if (!accessLoading && !can("user:manage")) {
     return <EmptyState icon="lock" title="没有账号管理权限" description="当前角色不包含 user:manage。管理入口已从导航隐藏，FastAPI 仍会执行最终权限校验。" />;
   }
@@ -389,17 +462,22 @@ export function UsersPanel() {
             <table>
               <thead><tr><th>成员</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
               <tbody>
-                {users.map((user) => (
-                  <tr key={user.id}>
+                {users.map((user) => {
+                  const retired = Boolean(user.retired_at);
+                  const protectedTarget = user.is_superuser && !me?.is_superuser;
+                  const retirementAllowed = canRetireUser(user, me);
+                  return (
+                  <tr key={user.id} aria-label={retired ? `${user.email} 已退休` : user.email}>
                     <td><div className="primary-cell"><span className="file-icon"><Icon name="users" /></span><span><strong>{user.display_name || user.email}</strong><small>{user.email}{user.is_superuser ? " · 超级管理员" : ""}</small></span></div></td>
                     <td>{user.role_ids.length ? user.role_ids.map((id) => roleById.get(id) || id.slice(0, 8)).join("、") : "未分配"}</td>
-                    <td><StatusBadge tone={statusTone[user.status]}>{statusLabel[user.status]}</StatusBadge></td>
+                    <td><StatusBadge tone={retired ? "neutral" : statusTone[user.status]}>{retired ? "已退休" : statusLabel[user.status]}</StatusBadge></td>
                     <td>{new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(new Date(user.created_at))}</td>
                     <td><div className="button-row">
-                      <button className="button ghost small" type="button" aria-label={`${user.status === "active" ? "停用" : "启用"} ${user.email}`} disabled={pending} onClick={() => void setStatus(user, user.status === "active" ? "disabled" : "active")}>{user.status === "active" ? "停用" : "启用"}</button>
+                      <button className="button ghost small" type="button" aria-label={`${user.status === "active" ? "停用" : "启用"} ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => void setStatus(user, user.status === "active" ? "disabled" : "active")}>{user.status === "active" ? "停用" : "启用"}</button>
                       {canResetUserPassword(user.id, me?.id, Boolean(me?.is_superuser)) ? (
-                        <button className="button ghost small" type="button" aria-label={`修改密码 ${user.email}`} disabled={pending} onClick={() => {
+                        <button className="button ghost small" type="button" aria-label={`修改密码 ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => {
                           setRoleEditor(null);
+                          setRetirementEditor(null);
                           setPasswordEditor({
                             userId: user.id,
                             isSelf: user.id === me?.id,
@@ -409,10 +487,34 @@ export function UsersPanel() {
                           });
                         }}>修改密码</button>
                       ) : null}
-                      {can("role:assign") && can("role:read") ? <button className="button secondary small" type="button" aria-label={`分配角色 ${user.email}`} disabled={pending} onClick={() => { setPasswordEditor(null); setRoleEditor(openRoleAssignmentEditor(user)); }}>分配角色</button> : null}
+                      {can("role:assign") && can("role:read") ? <button className="button secondary small" type="button" aria-label={`分配角色 ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => { setPasswordEditor(null); setRetirementEditor(null); setRoleEditor(openRoleAssignmentEditor(user)); }}>分配角色</button> : null}
+                      <button
+                        className="button danger small"
+                        type="button"
+                        aria-label={`删除账号 ${user.email}`}
+                        disabled={pending || !retirementAllowed}
+                        title={retired ? "该账号已安全退休" : retirementAllowed ? "安全退休账号并保留审计历史" : "当前账号受保护，不能删除"}
+                        onClick={() => {
+                          setRoleEditor(null);
+                          setPasswordEditor(null);
+                          setReplacementOwnerQuery("");
+                          setReplacementOwnerCandidates(
+                            eligibleReplacementOwners(users, user.id),
+                          );
+                          setReplacementOwnerError("");
+                          setRetirementEditor({
+                            userId: user.id,
+                            email: user.email,
+                            confirmationEmail: "",
+                            reason: "",
+                            replacementOwnerId: "",
+                          });
+                        }}
+                      >{retired ? "已退休" : "删除账号"}</button>
                     </div></td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
             <nav className="pagination-bar" aria-label="成员列表分页">
@@ -465,6 +567,46 @@ export function UsersPanel() {
               <label className="full">确认新密码<input type="password" minLength={12} maxLength={256} autoComplete="new-password" value={passwordEditor.confirmation} disabled={pending} onChange={(event) => setPasswordEditor((current) => current ? { ...current, confirmation: event.target.value } : current)} required /></label>
             </div>
             <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setPasswordEditor(null)}>取消</button><button className="button primary" type="submit" disabled={pending}>{pending ? "正在修改…" : "确认修改并撤销旧会话"}</button></div>
+          </form>
+        ) : null}
+        {retirementEditor ? (
+          <form
+            className="inline-editor"
+            role="dialog"
+            aria-labelledby="user-retirement-editor-title"
+            aria-describedby="user-retirement-editor-description"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && !pending) setRetirementEditor(null);
+            }}
+            onSubmit={(event) => { event.preventDefault(); void confirmRetirement(); }}
+          >
+            <div>
+              <strong id="user-retirement-editor-title">删除成员账号：{retirementEditorUser?.display_name || retirementEditor.email}</strong>
+              <p id="user-retirement-editor-description">这是不可逆的账号退休操作。系统会立即禁止登录、撤销会话与 API 密钥并移除角色，但会保留审计记录和业务历史。若该成员拥有知识库，请选择一名活跃成员在同一事务中接管全部知识库。</p>
+            </div>
+            <div className="notice error-notice" role="alert">
+              <Icon name="warning" />
+              <div><strong>请确认目标账号</strong><p>在下方完整输入 <b>{retirementEditor.email}</b> 才能继续。</p></div>
+            </div>
+            <div className="form-grid">
+              <label className="full">确认成员邮箱<input type="email" autoComplete="off" autoFocus value={retirementEditor.confirmationEmail} disabled={pending} onChange={(event) => setRetirementEditor((current) => current ? { ...current, confirmationEmail: event.target.value } : current)} required /></label>
+              <label className="full">知识库接管人（目标账号拥有知识库时必选）
+                <div className="toolbar">
+                  <input aria-label="搜索知识库接管成员" maxLength={200} placeholder="输入邮箱或姓名后搜索" value={replacementOwnerQuery} disabled={pending || replacementOwnerLoading} onChange={(event) => setReplacementOwnerQuery(event.target.value)} />
+                  <button className="button secondary small" type="button" disabled={pending || replacementOwnerLoading} onClick={() => void searchReplacementOwners()}>{replacementOwnerLoading ? "搜索中…" : "搜索成员"}</button>
+                </div>
+                <select aria-label="选择知识库接管成员" value={retirementEditor.replacementOwnerId} disabled={pending || replacementOwnerLoading} onChange={(event) => setRetirementEditor((current) => current ? { ...current, replacementOwnerId: event.target.value } : current)}>
+                  <option value="">该账号不拥有知识库 / 暂不选择</option>
+                  {replacementOwnerCandidates.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.display_name || candidate.email} · {candidate.email}</option>)}
+                </select>
+              </label>
+              {replacementOwnerError ? <p className="inline-error">接管成员搜索失败：{replacementOwnerError}</p> : null}
+              <label className="full">退休原因（可选，最多 1000 字）<textarea maxLength={1_000} value={retirementEditor.reason} disabled={pending} onChange={(event) => setRetirementEditor((current) => current ? { ...current, reason: event.target.value } : current)} /></label>
+            </div>
+            <div className="form-actions">
+              <button className="button ghost" type="button" disabled={pending} onClick={() => setRetirementEditor(null)}>取消</button>
+              <button className="button danger" type="submit" disabled={pending || retirementEditor.confirmationEmail.trim() !== retirementEditor.email}>{pending ? "正在安全退休…" : "确认删除账号"}</button>
+            </div>
           </form>
         ) : null}
         <details className="drawer-form">

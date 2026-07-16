@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -9,7 +10,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AuditLog, AuditResult
 
-__all__ = ["AuditResult", "add_audit_event", "list_audit_events"]
+__all__ = ["AuditEventView", "AuditResult", "add_audit_event", "list_audit_events"]
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEventView:
+    """The only audit fields allowed to leave the database query boundary."""
+
+    id: int
+    actor_id: UUID | None
+    action: str
+    result: AuditResult
+    resource_type: str
+    resource_id: str | None
+    request_id: str | None
+    created_at: datetime
 
 
 async def list_audit_events(
@@ -24,8 +39,17 @@ async def list_audit_events(
     created_to: datetime | None = None,
     cursor: int | None = None,
     limit: int = 50,
-) -> tuple[list[AuditLog], int | None]:
-    statement = select(AuditLog)
+) -> tuple[list[AuditEventView], int | None]:
+    statement = select(
+        AuditLog.id,
+        AuditLog.actor_id,
+        AuditLog.action,
+        AuditLog.result,
+        AuditLog.resource_type,
+        AuditLog.resource_id,
+        AuditLog.request_id,
+        AuditLog.created_at,
+    )
     if actor_id is not None:
         statement = statement.where(AuditLog.actor_id == actor_id)
     if action is not None:
@@ -43,9 +67,20 @@ async def list_audit_events(
     if cursor is not None:
         statement = statement.where(AuditLog.id < cursor)
 
-    events = list(
-        (await session.scalars(statement.order_by(AuditLog.id.desc()).limit(limit + 1))).all()
-    )
+    rows = (await session.execute(statement.order_by(AuditLog.id.desc()).limit(limit + 1))).all()
+    events = [
+        AuditEventView(
+            id=row.id,
+            actor_id=row.actor_id,
+            action=row.action,
+            result=row.result,
+            resource_type=row.resource_type,
+            resource_id=row.resource_id,
+            request_id=row.request_id,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
     has_more = len(events) > limit
     page = events[:limit]
     next_cursor = page[-1].id if has_more and page else None

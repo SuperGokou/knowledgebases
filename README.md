@@ -9,13 +9,15 @@
   <a href="https://github.com/SuperGokou/knowledgebases/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/SuperGokou/knowledgebases/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="docs/ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md"><img alt="Readiness: Technical Pilot" src="https://img.shields.io/badge/Readiness-Technical%20Pilot-F59E0B?style=flat-square"></a>
   <a href="docs/DEPENDENCY_LICENSE_AUDIT.zh-CN.md"><img alt="Commercial Release: NO-GO" src="https://img.shields.io/badge/Commercial%20Release-NO--GO-C62828?style=flat-square"></a>
+  <a href="pyproject.toml"><img alt="Version 0.1.0" src="https://img.shields.io/badge/Version-0.1.0-475569?style=flat-square"></a>
+  <a href="app/db/schema_version.py"><img alt="Schema 20260715_0021" src="https://img.shields.io/badge/Schema-20260715__0021-7C3AED?style=flat-square"></a>
   <a href="https://www.python.org/"><img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white"></a>
   <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI 0.116+" src="https://img.shields.io/badge/FastAPI-0.116%2B-009688?style=flat-square&amp;logo=fastapi&amp;logoColor=white"></a>
   <a href="https://nextjs.org/"><img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-000000?style=flat-square&amp;logo=nextdotjs&amp;logoColor=white"></a>
   <a href="https://www.postgresql.org/"><img alt="PostgreSQL 17" src="https://img.shields.io/badge/PostgreSQL-17-4169E1?style=flat-square&amp;logo=postgresql&amp;logoColor=white"></a>
   <a href="https://redis.io/"><img alt="Redis 8" src="https://img.shields.io/badge/Redis-8-DC382D?style=flat-square&amp;logo=redis&amp;logoColor=white"></a>
   <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html"><img alt="S3 Compatible" src="https://img.shields.io/badge/Storage-S3%20Compatible-569A31?style=flat-square&amp;logo=amazons3&amp;logoColor=white"></a>
-  <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF Phase 1" src="https://img.shields.io/badge/OKF-v0.1%20Phase%201-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
+  <a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"><img alt="OKF v0.1 Draft · Phase 1" src="https://img.shields.io/badge/OKF-v0.1%20Draft%20%C2%B7%20Phase%201-4285F4?style=flat-square&amp;logo=googlecloud&amp;logoColor=white"></a>
   <a href="docs/API_AND_MODEL_MANAGEMENT.zh-CN.md"><img alt="AI: DeepSeek, Qwen, MiniMax" src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Qwen%20%7C%20MiniMax-536AF5?style=flat-square"></a>
   <a href="https://www.docker.com/"><img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&amp;logo=docker&amp;logoColor=white"></a>
   <a href="https://vercel.com/docs/regions"><img alt="Vercel US East Region" src="https://img.shields.io/badge/Region-US%20East%20iad1-2563EB?style=flat-square&amp;logo=vercel&amp;logoColor=white"></a>
@@ -75,7 +77,7 @@
 - 腾讯 COS、AWS S3 或 MinIO 保存私有文件对象；
 - 客户端通过短期预签名 URL 直接上传和下载。
 
-因此，API 按控制面请求数扩容，文件吞吐由对象存储承担，适合从单机开发演进到 10 TB 以上的文件容量。
+因此，API 按控制面请求数扩容，文件吞吐由对象存储承担，并为从单机基线演进到独立对象存储集群提供架构路径。当前 300 GB 单节点不构成 10 TB 容量、高可用或恢复认证；相关结论仍须以目标拓扑的签名实测证据为准。
 
 支持的文件扩展名：
 
@@ -113,12 +115,12 @@ flowchart LR
 
     subgraph Control["FastAPI 控制面（Vercel Function / Container）"]
         Middleware["Middleware<br/>Trusted Host · CORS · Request ID · Body Limit"]
-        API["API Routers<br/>Auth · Users · Roles · Knowledge · Files · Chat"]
-        Services["Domain & Services<br/>RBAC · KB ACL · Quota · Search · Audit"]
+        API["API Routers<br/>Auth · Users · Roles · Knowledge · Files · Chat · Audit"]
+        Services["Domain & Services<br/>RBAC · KB ACL · Quota · Account Retirement<br/>Search · Citation Review · Audit Query / Export"]
         Middleware --> API --> Services
     end
 
-    PostgreSQL[("PostgreSQL / Supabase<br/>Users · RBAC · KB ACL · Entries · Audit")]
+    PostgreSQL[("PostgreSQL / Supabase<br/>Users · Retirement · RBAC · KB ACL · Entries · Audit")]
     Redis[("Upstash / Redis<br/>Atomic Rate Limits")]
     Storage[("COS / S3 / MinIO<br/>Private Objects")]
     LLM["DeepSeek / Qwen / MiniMax<br/>RAG · JSON Output · server-side keys"]
@@ -191,16 +193,17 @@ sequenceDiagram
 | 身份认证 | OAuth2 密码登录、Argon2 哈希、短期 JWT、一次性 Refresh Token 轮换、`token_version` 撤销 |
 | 统一登录工作台 | 单一登录入口、RSC 输出前 `/auth/me` 会话与权限守卫、管理员/编辑者/问答用户自动落地、HttpOnly Cookie BFF 与刷新 single-flight |
 | 动态 RBAC | 自定义角色、权限目录、角色优先级、角色分配、通配权限与最后一个超级管理员保护 |
+| 账号生命周期 | 修改密码、管理员重置、启停与不可逆账号退休；邮箱二次确认、自退休/最后活跃超级管理员保护、知识库所有权原子交接、凭据撤销和审计历史保留 |
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
 | 文档解析与 OKF | TXT/CSV/OOXML 内建解析；PDF/旧版 Office 断网沙箱；来源定位、持久任务、严格 schema、租约、草稿/发布门禁 |
-| 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；审计只记录文档 ID、模型、策略版本与 token 用量，不记录正文 |
+| 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；外发审计与用量事实只记录文档/主体标识、模型、策略版本、结果与 token，不记录提示词、模型输出或知识正文 |
 | 强制来源与回答审核 | 授权检索与可选 RAG；正文来源脚注、结构化 `citations`、`source_status` 与 `answer_review`；生成与审核使用独立客户端，引用或语义审核失败时丢弃模型文本并确定性降级 |
 | 分级限额 | 每分钟请求数、单文件大小、每日上传字节、生命周期累计存储写入量、每日下载凭证 |
 | 大文件上传 | 单 PUT、S3 Multipart、最多 10,000 分片、分批签名、并发上传和客户端断点续传 |
 | 并发安全 | PostgreSQL `used + reserved` 配额模型、行锁、唯一约束与幂等键 |
 | 对象安全 | 私有 Bucket、短期预签名 URL、精确 `Content-Length`、单 PUT SHA-256 强校验、staging/final key 隔离 |
 | 恢复与维护 | 上传状态机、`FINALIZING` 对账、过期会话与 reservation 清理、Vercel Cron |
-| 审计 | 用户、角色、上传、审批和下载凭证等安全事件持久化 |
+| 审计 | `/admin/audit` 权限化控制台、动作/主体/资源/结果/时间过滤、游标分页、8 字段脱敏投影与最多 5,000 行的安全 CSV 导出；离线运行时数据库角色仅可查询和追加审计 |
 | 部署 | Docker Compose 本地栈、Alembic、幂等 Bootstrap、Vercel Functions、S3-compatible 对象存储、其他云 Linux 离线单机 |
 
 ### 权限与限额语义
@@ -350,7 +353,7 @@ Authorization: Bearer <access-token>
 |---|---|
 | 登录、刷新与退出 | `POST /api/v1/auth/token` · `POST /api/v1/auth/refresh` · `POST /api/v1/auth/logout` |
 | 当前会话 | `GET /api/v1/auth/me` |
-| 用户管理 | `GET/POST /api/v1/users` · `PATCH /api/v1/users/{id}` · `PUT /api/v1/users/{id}/roles` |
+| 用户管理 | `GET/POST /api/v1/users` · `PATCH /api/v1/users/{id}` · `PUT /api/v1/users/{id}/roles` · `DELETE /api/v1/users/{id}`（不可逆退休） |
 | 密码生命周期 | `PUT /api/v1/users/me/password` · `PUT /api/v1/users/{id}/password` |
 | 动态角色 | `GET/POST /api/v1/roles` · `PATCH /api/v1/roles/{id}` · `DELETE /api/v1/roles/{id}?expected_version=N` |
 | 角色策略 | `PUT /api/v1/roles/{id}/policy`（原子更新）· 兼容 `/permissions` 与 `/limits` 分接口 |
@@ -369,6 +372,7 @@ Authorization: Bearer <access-token>
 | API Key 管理 | `GET/POST /api/v1/api-keys` · `POST /api/v1/api-keys/{id}/rotate` · `DELETE /api/v1/api-keys/{id}` |
 | 模型供应商 | `GET /api/v1/llm/providers` · `PATCH /api/v1/llm/providers/{provider}` |
 | 外部知识 API | `POST /api/v1/public/chat/query` · `POST /api/v1/public/knowledge-bases/{id}/search` |
+| 审计查询与导出 | `GET /api/v1/audit-logs` · `GET /api/v1/audit-logs/export` |
 
 用户角色替换采用严格 CAS，客户端必须提交最近一次 `UserRead.role_assignment_version`，避免并发管理员用旧快照恢复已撤销权限：
 
@@ -388,6 +392,8 @@ Content-Type: application/json
 角色自身的名称、描述、优先级、权限与限额也使用统一的严格 CAS。客户端先从 `RoleRead.policy_version` 保存编辑快照，再在 `PATCH /roles/{id}`、`PUT /roles/{id}/permissions`、`PUT /roles/{id}/limits` 或 `PUT /roles/{id}/policy` 中提交同值的 `expected_version`。实际变更令版本单调递增；完全相同的提交不写审计、不触发撤权检查且不递增版本。旧快照返回 `409 stale_role_policy`，管理端会立即关闭旧草稿并刷新，禁止自动重放整组权限或限额。删除角色也必须提交 `expected_version`；系统角色及高优先级越权操作被拒绝，存在用户分配或知识库授权引用时返回 `409 role_in_use` 和脱敏引用计数，成功删除写入 `role.deleted` 审计事件。
 
 用户自助改密必须提交当前密码，并经过限流；管理员重置他人密码仅允许仍有效的超级管理员执行。两条路径都使用统一强密码策略，并原子提升 `token_version`、撤销现有 refresh token，旧访问令牌与旧密码随即失效。
+
+`DELETE /api/v1/users/{user_id}` 执行的是不可逆、非物理删除的账号退休。请求体必须提交与目标账号完全一致的 `confirmation_email`，可附带最长 1,000 字符的 `reason`；目标账号仍拥有知识库时，还必须提交处于正常状态的 `replacement_owner_id`，由同一事务完成全部所有权交接。系统禁止退休当前登录账号和最后一个活跃超级管理员，并在目标账号或其知识库仍有活动外部模型请求时失败关闭。成功后账号进入已退休状态，refresh token 与 API Key 被撤销、角色被移除、`token_version` 提升，既有业务与审计历史继续保留；已退休账号不能重新启用、修改密码、分配角色或再次登录。
 
 知识库角色授权替换使用同样的严格 CAS：先从知识库响应读取 `role_grant_version`，再将它作为 `expected_version` 提交。成功变更后版本单调递增；旧版本返回 `409 stale_knowledge_grants`，客户端必须重新读取知识库和授权集合，禁止自动重放旧的整组授权。
 
@@ -435,7 +441,9 @@ uv sync --extra dev
 cd web
 npm test
 npm run lint
+npm run typecheck
 npm run build
+npm run test:e2e  # 本地 smoke；正式企业档案见 web/e2e/README.md
 ```
 
 项目配置了：
@@ -447,7 +455,7 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-当前候选版本已收集 **1,082 项后端测试（60 项 PostgreSQL 集成、1,022 项非 PostgreSQL）**；该数字只表示收集范围，最终通过/跳过/覆盖率必须由绑定本候选 Git 身份、内容指纹和目标环境的签名终验证据给出，在证据生成前不得写成“全部通过”。前端当前基线为 **Vitest 42 个文件、290 项测试**；Playwright 企业档案为 **22 个实例（11 个场景 × 桌面/移动）**。Ruff、mypy、ESLint、TypeScript、production build、真实浏览器与目标机运行结论同样以最终 Gate 产物为准。
+测试数量由最终冻结候选版本动态收集，不在代码仍变动时写死。pytest、PostgreSQL 集成测试、Vitest 与 Playwright 的“已收集”仅表示发现范围，不等于通过、覆盖率或目标机能力证明；Ruff、mypy、ESLint、TypeScript、production build、真实浏览器和目标 Linux 运行结论都必须来自绑定同一 Git 身份、内容指纹与目标环境的签名 Gate 产物。默认 `npm run test:e2e` 只是本地 smoke，企业档案、证据检查 ID 与正式执行方式以[浏览器企业验收套件](web/e2e/README.md)和[企业终验标准](docs/ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md)为准。
 
 > [!CAUTION]
 > 功能测试通过不等于容量认证通过。目标机性能门禁还需要项目方批准的验收阈值和同机压测产物；仓库当前不把单机 8C16G300G、1,000 人并发或每日 50 亿 token 写成已验证能力。
@@ -549,6 +557,12 @@ flowchart LR
 
 完整的准备、预检、迁移、启动、验收与回滚流程见 [其他云 Linux 8C16G 离线部署手册](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。
 
+### TLS 与静态加密边界
+
+离线入口由 Caddy 在 `19443/19444` 提供 HTTPS，可采用 Caddy 内部 CA 或经审批的企业 PKI。客户端必须先核对并安装受控分发的公开根证书，严格验证证书链、实际访问 IP/DNS 的 SAN、协议与有效期；禁止 `curl -k`、`--insecure`、`verify=False`、`NODE_TLS_REJECT_UNAUTHORIZED=0`、`ignoreHTTPSErrors` 或点击浏览器警告继续访问。Caddy 会自动续期短生命周期叶证书，但这不替代证据：正式验收仍要求工作台/API 与对象入口的证书链可信、SAN 精确匹配、仅协商 TLS 1.2/1.3，叶证书当前有效且剩余时间不少于 1 小时，并由持久 CA 存储、自动证书管理配置和可核验的成功续期事件共同证明连续性。代码和企业 E2E 已定义上述检查，目标服务器仍须生成绑定当前发布的可复核证据。
+
+聊天幂等重放字段使用 AES-256-GCM，不代表 PostgreSQL、MinIO、WAL、快照、备份或整盘已经静态加密。宿主卷加密、密钥托管、备份恢复和销毁证明属于目标环境前置条件；缺少任一证据时，敏感数据正式交付保持 `NO-GO`。操作步骤与证据边界见[内网 TLS 与 Caddy 内部 CA 运维](docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)、[主机与存储验收](docs/HOST_STORAGE_ACCEPTANCE.zh-CN.md)和[聊天幂等回放加密运维](docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)。
+
 ## 安全边界
 
 已经实现：
@@ -557,13 +571,14 @@ flowchart LR
 - Argon2 密码哈希、短期 access token、一次性 Refresh Token 轮换；
 - 登录 IP/账号双维度限流和用户级动态限流；
 - 动态权限实时解析、角色优先级与权限提升防护；
+- 不可逆账号退休、最后活跃超级管理员保护、知识库所有权原子交接与全部凭据撤销；
 - 请求体上限、Trusted Host、CORS、请求 ID 和安全错误响应；
 - 私有对象、短期签名、精确大小校验、不可复用最终写 key；
 - 单 PUT SHA-256 绑定签名并恒定时间校验，摘要不匹配时删除对象并释放配额；
 - OKF 草稿/发布门禁、知识库级外部模型 opt-in 与转换租约所有权；
 - 九类文档解析能力矩阵、OOXML 主动内容/Zip Bomb 拒绝，以及 PDF/旧版 Office 断网沙箱与资源上限；
 - 离线部署四个 `internal` 网络与一个可选模型 uplink、固定 Trusted Host/健康检查 Host、固定镜像 digest，以及 ClamAV 只读病毒库和最小进程权限；
-- PostgreSQL 原子配额预留与持久审计。
+- PostgreSQL 原子配额预留、权限化审计查询/有界脱敏导出，以及离线运行时角色对审计表仅 `SELECT/INSERT` 的追加边界。
 
 正式对外前仍必须补齐：
 
@@ -584,6 +599,8 @@ flowchart LR
 - [x] Docker Compose 本地栈
 - [x] Vercel Functions、Cron 与腾讯 COS
 - [x] 登录、聊天、知识库、账号、角色、权限与限额管理前端
+- [x] 不可逆账号退休、知识库所有权原子交接与凭据撤销
+- [x] 权限化审计控制台、游标查询与有界脱敏 CSV 导出
 - [x] 知识库 Reader/Editor/Manager 动态 ACL 与撤权回归
 - [x] OKF v0.1 兼容字段与原始来源/派生知识分层
 - [x] 九类文档失败关闭解析、来源定位、持久任务、租约、重试、草稿审批发布
@@ -607,6 +624,14 @@ flowchart LR
 - [离线运行时与断网冷启动验收](docs/OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md)：本地制品冷加载、断网闭环、socket 证据与失败关闭判定。
 - [文档解析能力与安全边界](docs/DOCUMENT_PARSER_SECURITY.zh-CN.md)：九类格式矩阵、来源定位、隔离工具和失败关闭语义。
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
+- [内网 TLS 与 Caddy 内部 CA 运维](docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)：根证书分发、严格 SAN 校验、短生命周期证书续期与换根边界。
+- [主机与存储验收](docs/HOST_STORAGE_ACCEPTANCE.zh-CN.md)：8C16G/300GB、SSD、fio、磁盘水位与目标机证据。
+- [性能与容量模型](docs/PERFORMANCE_CAPACITY_MODEL.zh-CN.md)：1,000 用户、每日 50 亿 token 与未来 10 TB 的建模和未验证边界。
+- [功能验收标准](docs/FUNCTIONAL_ACCEPTANCE_STANDARD.zh-CN.md)与[证据信任模型](docs/FUNCTIONAL_ACCEPTANCE_TRUST.zh-CN.md)：业务闭环、签名 challenge 与重放防护。
+- [终验证据格式](docs/ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md)：目标主机、浏览器、离线运行、容量与灾备的机器可读证据。
+- [聊天幂等回放加密运维](docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)：AES-256-GCM 密钥环、轮换与整库加密边界。
+- [发布供应链证据](docs/RELEASE_SUPPLY_CHAIN_EVIDENCE.zh-CN.md)：九镜像 SBOM、摘要清单、签名边界与法律批准的失败关闭规则。
+- [依赖许可证审计](docs/DEPENDENCY_LICENSE_AUDIT.zh-CN.md)、[资产来源与授权](docs/ASSET_PROVENANCE.zh-CN.md)与[第三方声明草案](docs/THIRD-PARTY-NOTICES.md)：商业发行的法律阻断项与待签署材料。
 - [知识编译、OKF 与聊天架构](docs/KNOWLEDGE_PIPELINE.zh-CN.md)：原始来源、派生知识、OKF v0.1、LLM-Wiki 与聊天 ACL。
 - [OKF 第一阶段与 DeepSeek](docs/OKF_DEEPSEEK_PHASE1.zh-CN.md)：外部处理策略、持久任务、租约、重试、草稿发布与运维配置。
 - [商业版代码审计与交付报告（历史快照）](docs/COMMERCIAL_READINESS_REVIEW.zh-CN.md)：2026-07-11 时点证据，不代表当前候选版本状态。

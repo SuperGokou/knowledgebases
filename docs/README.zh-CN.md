@@ -11,7 +11,7 @@
 </div>
 
 > [!IMPORTANT]
-> 本目录是当前文档的发现入口，不是通过证明。功能、容量、灾备或安全结论只有在证据绑定当前 Git 身份、内容指纹、目标环境且通过对应签名门禁后才成立。当前候选版本收集到 1,082 项后端测试、290 项 Vitest 和 22 个 Playwright 实例；最终通过状态仍以本候选版本的新签名验收产物为准。
+> 本目录是当前文档的发现入口，不是通过证明。功能、容量、灾备或安全结论只有在证据绑定当前 Git 身份、内容指纹、目标环境且通过对应签名门禁后才成立。测试数量必须由最终冻结候选版本动态收集；“已收集”不等于通过，最终状态仍以同一候选版本的新签名验收产物为准。当前应用要求的 Alembic Schema head 为 `20260715_0021`。
 
 > [!CAUTION]
 > 当前商业发行、敏感数据正式交付、每日 50 亿 token 容量和 10 TB 存储认证均为 `NO-GO` 或 `UNVERIFIED`：项目许可证、第三方依赖/资产授权、整盘/WAL/快照/备份静态加密、目标机容量及恢复证据尚未全部签署。历史自测或旧部署报告不能覆盖这些阻断项。
@@ -33,7 +33,7 @@
 | [架构设计](./ARCHITECTURE.zh-CN.md) | 元数据/对象分离、RBAC、限额、扫描、OKF、检索、RAG、状态机与 10 TB 目标拓扑 |
 | [知识编译、OKF 与聊天架构](./KNOWLEDGE_PIPELINE.zh-CN.md) | 原始来源、派生知识、引用协议、LLM-Wiki 演进边界 |
 | [OKF 第一阶段与模型增强](./OKF_DEEPSEEK_PHASE1.zh-CN.md) | 持久任务、租约、草稿、发布门禁与外部处理策略 |
-| [API 与模型管理](./API_AND_MODEL_MANAGEMENT.zh-CN.md) | API Key、账号密码、角色 CAS、安全删除、模型切换、受控出口与调用示例 |
+| [API 与模型管理](./API_AND_MODEL_MANAGEMENT.zh-CN.md) | API Key、账号密码、不可逆账号退休、角色 CAS/安全删除、审计查询导出、模型切换、受控出口与调用示例 |
 | [LLM token 与费用治理](./LLM_TOKEN_COST_GOVERNANCE.zh-CN.md) | 供应商价格、token/费用预算、原子预留、结算与停止边界 |
 | [RAG 检索评估](./RAG_RETRIEVAL_EVALUATION.zh-CN.md) | 来源、召回与确定性评估方法；不得替代目标数据集实测 |
 
@@ -44,7 +44,7 @@
 | [Linux 8C16G/300GB 离线企业部署](./TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md) | 供应商中立的离线安装、固定镜像、4 个 internal 网络、可选受控模型出口、升级与失败关闭回滚 |
 | [共享服务器部署基线](./TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md) | 同机多应用的端口、网络、资源和变更隔离；文件名为历史兼容路径 |
 | [运维手册](./OPERATIONS.zh-CN.md) | 启停、账号/角色操作、扫描审批、备份恢复、容量和故障排查 |
-| [内部 CA 与 TLS 运维](./TLS_INTERNAL_CA_OPERATIONS.zh-CN.md) | 私有 CA 安装、证书轮换、客户端信任与禁止降级要求 |
+| [内部 CA 与 TLS 运维](./TLS_INTERNAL_CA_OPERATIONS.zh-CN.md) | 私有 CA 安装、短生命周期叶证书续期、严格 SAN/有效期验收、证书轮换、客户端信任与禁止降级要求 |
 | [离线 Registry Bundle 构建](./OFFLINE_REGISTRY_BUNDLE_BUILD.zh-CN.md) | 回环 Registry、精确摘要、SBOM、签名与离线镜像运输 |
 | [断网冷启动验收](./OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md) | 无 GitHub、Vercel、COS、公共 Registry/npm/PyPI 依赖的真实冷启动证据 |
 | [主机隔离守卫](./HOST_ISOLATION_GUARD.zh-CN.md) | 防止部署影响同机其他应用和越界修改宿主资源 |
@@ -61,6 +61,7 @@
 | [威胁模型](./THREAT_MODEL.zh-CN.md) | 身份、文件、对象、模型出口、供应链与运维攻击面 |
 | [文档解析安全边界](./DOCUMENT_PARSER_SECURITY.zh-CN.md) | 九格式能力矩阵、Zip Bomb/主动内容、沙箱与失败关闭 |
 | [聊天回放加密运维](./CHAT_REPLAY_ENCRYPTION.zh-CN.md) | AES-256-GCM 密钥环、轮换、AAD 与不可逆迁移 `20260714_0020` |
+| [发布供应链证据](./RELEASE_SUPPLY_CHAIN_EVIDENCE.zh-CN.md) | 九镜像 SBOM、摘要清单、签名验证、权利声明与发布 NO-GO 边界 |
 | [依赖许可证审计](./DEPENDENCY_LICENSE_AUDIT.zh-CN.md) | 依赖许可风险及法律签署阻断项 |
 | [资产来源与授权](./ASSET_PROVENANCE.zh-CN.md) | Logo、Icon 和其他资产的来源、审批与缺口 |
 | [第三方声明草案](./THIRD-PARTY-NOTICES.md) | 工程清单草案；未经法务批准不得作为商业授权结论 |
@@ -78,7 +79,7 @@
 | [终验证据格式](./ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md) | 目标主机、离线运行、浏览器、容量和灾备的机器可读证据要求 |
 | [性能与容量模型](./PERFORMANCE_CAPACITY_MODEL.zh-CN.md) | 1,000 用户、50 亿 token/日、8C16G/300GB 与未来 10 TB 的建模及 NO-GO 门禁 |
 | [文档验收样本](./DOCUMENT_ACCEPTANCE_FIXTURES.zh-CN.md) | 九格式合成黄金样本、摘要和隔离要求 |
-| [浏览器企业验收套件](../web/e2e/README.md) | 22 个实例、8 个证据聚合组、双端场景与签名产物 |
+| [浏览器企业验收套件](../web/e2e/README.md) | 桌面/移动企业档案、严格 TLS 与业务闭环、证据检查 ID 和签名产物；实际 collection 以冻结候选版本为准 |
 
 机器可读策略和 Schema 位于：
 

@@ -23,6 +23,11 @@ from app.services.rbac_mutation import (
     locked_users_statement,
     refresh_locked_actor_access,
 )
+from app.services.user_activity import (
+    ActivityLockMode,
+    acquire_user_activity_locks,
+    rbac_mutation_endpoint,
+)
 
 router = APIRouter()
 
@@ -33,18 +38,50 @@ async def _lock_api_key_mutation(
     api_key_id: UUID,
 ) -> tuple[ApiKey, AccessContext, User]:
     candidate = await session.scalar(select(ApiKey).where(ApiKey.id == api_key_id))
-    if candidate is None or (not access.user.is_superuser and candidate.user_id != access.user.id):
+    if candidate is None or (
+        not access.user.is_superuser and candidate.user_id != access.user.id
+    ):
         raise ApiError(status_code=404, code="api_key_not_found", message="API key not found")
 
-    # Match chat replay's lock order: RBAC domain -> users/roles -> API key ->
-    # egress advisory locks. This removes the former User<->ApiKey inversion.
     await acquire_rbac_mutation_lock(session)
+    actor = await session.scalar(
+        select(User)
+        .where(User.id == access.user.id)
+        .execution_options(populate_existing=True)
+    )
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    await lock_role_union(session, user_ids={actor.id})
+    current = await refresh_locked_actor_access(session, actor, {"api-key:manage"})
+
+    # Re-read and object-authorize under RBAC-X before taking another user's
+    # activity lock. A scoped key manager must not lock arbitrary principals.
+    candidate = await session.scalar(
+        select(ApiKey)
+        .where(ApiKey.id == api_key_id)
+        .execution_options(populate_existing=True)
+    )
+    if candidate is None or (
+        not current.user.is_superuser and candidate.user_id != current.user.id
+    ):
+        raise ApiError(status_code=404, code="api_key_not_found", message="API key not found")
+    await acquire_user_activity_locks(
+        session,
+        {
+            actor.id: ActivityLockMode.SHARED,
+            candidate.user_id: ActivityLockMode.SHARED,
+        },
+    )
     users = list(
-        (await session.scalars(locked_users_statement({access.user.id, candidate.user_id}))).all()
+        (
+            await session.scalars(
+                locked_users_statement({actor.id, candidate.user_id})
+            )
+        ).all()
     )
     users_by_id = {user.id: user for user in users}
     await lock_role_union(session, user_ids=users_by_id)
-    actor = users_by_id.get(access.user.id)
+    actor = users_by_id.get(actor.id)
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
     current = await refresh_locked_actor_access(session, actor, {"api-key:manage"})
@@ -60,6 +97,68 @@ async def _lock_api_key_mutation(
     if target is None:
         raise ApiError(status_code=404, code="user_not_found", message="User not found")
     return api_key, current, target
+
+
+async def _lock_api_key_creation(
+    session: AsyncSession,
+    access: AccessContext,
+    target_user_id: UUID,
+) -> tuple[AccessContext, User]:
+    """Reauthorize key issuance before locking an authorized target account."""
+
+    await acquire_rbac_mutation_lock(session)
+    actor = await session.scalar(
+        select(User)
+        .where(User.id == access.user.id)
+        .execution_options(populate_existing=True)
+    )
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    await lock_role_union(session, user_ids={actor.id})
+    current = await refresh_locked_actor_access(session, actor, {"api-key:manage"})
+    candidate = await session.scalar(
+        select(User)
+        .where(User.id == target_user_id)
+        .execution_options(populate_existing=True)
+    )
+    if candidate is None:
+        raise ApiError(status_code=404, code="user_not_found", message="Active user not found")
+    if candidate.id != actor.id and not current.user.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="api_key_escalation_denied",
+            message="Only a superuser can issue an API key for another user",
+        )
+    await acquire_user_activity_locks(
+        session,
+        {
+            actor.id: ActivityLockMode.SHARED,
+            candidate.id: ActivityLockMode.SHARED,
+        },
+    )
+    users = list(
+        (
+            await session.scalars(
+                locked_users_statement({actor.id, candidate.id})
+            )
+        ).all()
+    )
+    users_by_id = {user.id: user for user in users}
+    actor = users_by_id.get(actor.id)
+    target = users_by_id.get(target_user_id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    if target is None or target.status is not UserStatus.ACTIVE or target.retired_at is not None:
+        raise ApiError(status_code=404, code="user_not_found", message="Active user not found")
+    await lock_role_union(session, user_ids=users_by_id)
+    current = await refresh_locked_actor_access(session, actor, {"api-key:manage"})
+    if target.id != actor.id and not current.user.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="api_key_escalation_denied",
+            message="Only a superuser can issue an API key for another user",
+        )
+    return current, target
 
 
 @router.get("", response_model=list[ApiKeyRead])
@@ -85,6 +184,7 @@ async def list_api_keys(
 
 
 @router.post("", response_model=ApiKeyCreated, status_code=status.HTTP_201_CREATED)
+@rbac_mutation_endpoint
 async def create_api_key(
     payload: ApiKeyCreate,
     request: Request,
@@ -93,15 +193,7 @@ async def create_api_key(
     access: Annotated[AccessContext, Depends(require_permission("api-key:manage"))],
 ) -> ApiKeyCreated:
     target_user_id = payload.user_id or access.user.id
-    if target_user_id != access.user.id and not access.user.is_superuser:
-        raise ApiError(
-            status_code=403,
-            code="api_key_escalation_denied",
-            message="Only a superuser can issue an API key for another user",
-        )
-    target = await session.get(User, target_user_id)
-    if target is None or target.status is not UserStatus.ACTIVE:
-        raise ApiError(status_code=404, code="user_not_found", message="Active user not found")
+    access, target = await _lock_api_key_creation(session, access, target_user_id)
 
     requested_permissions = set(payload.permission_codes)
     unsupported = requested_permissions - PUBLIC_API_PERMISSIONS
@@ -184,6 +276,7 @@ async def create_api_key(
     response_model=ApiKeyCreated,
     status_code=status.HTTP_201_CREATED,
 )
+@rbac_mutation_endpoint
 async def rotate_api_key(
     api_key_id: UUID,
     request: Request,
@@ -201,7 +294,7 @@ async def rotate_api_key(
             code="api_key_not_rotatable",
             message="Only an active API key can be rotated",
         )
-    if target.status is not UserStatus.ACTIVE:
+    if target.status is not UserStatus.ACTIVE or target.retired_at is not None:
         raise ApiError(status_code=404, code="user_not_found", message="Active user not found")
     await deny_if_active_external_llm_egress(
         session,
@@ -263,6 +356,7 @@ async def rotate_api_key(
 
 
 @router.delete("/{api_key_id}", status_code=status.HTTP_204_NO_CONTENT)
+@rbac_mutation_endpoint
 async def revoke_api_key(
     api_key_id: UUID,
     request: Request,
