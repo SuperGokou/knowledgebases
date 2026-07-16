@@ -48,6 +48,8 @@ powershell -NoProfile -ExecutionPolicy Bypass `
   -DryRun `
   -OutputDirectory C:\release\heyi-kb-2026.07.14 `
   -SigningPrivateKey D:\release-keys\heyi-release-rsa.pem `
+  -ImageSbomScanner D:\release-tools\syft.exe `
+  -ImageSbomScannerSha256 <approved-lowercase-sha256> `
   -ReleaseSequence 202607140001 `
   -ReleaseId 2026.07.14
 ```
@@ -61,6 +63,8 @@ powershell -NoProfile -ExecutionPolicy Bypass `
   -File .\scripts\build-offline-registry-bundle.ps1 `
   -OutputDirectory C:\release\heyi-kb-2026.07.14 `
   -SigningPrivateKey D:\release-keys\heyi-release-rsa.pem `
+  -ImageSbomScanner D:\release-tools\syft.exe `
+  -ImageSbomScannerSha256 <approved-lowercase-sha256> `
   -ReleaseSequence 202607140001 `
   -ReleaseId 2026.07.14
 ```

@@ -429,3 +429,19 @@ def test_bundle_build_documentation_covers_verification_and_import_order() -> No
     assert documentation.index("docker load") < documentation.index(
         "import-offline-registry-bundle.sh"
     )
+
+
+def test_bundle_build_documentation_binds_the_approved_sbom_scanner_in_both_modes() -> None:
+    documentation = DOCUMENTATION.read_text(encoding="utf-8")
+    invocations = [
+        block
+        for block in re.findall(r"```powershell\r?\n(?P<body>.*?)\r?\n```", documentation, re.S)
+        if "build-offline-registry-bundle.ps1" in block
+    ]
+
+    assert len(invocations) == 2
+    assert any("-DryRun" in invocation for invocation in invocations)
+    assert any("-DryRun" not in invocation for invocation in invocations)
+    for invocation in invocations:
+        assert "-ImageSbomScanner D:\\release-tools\\syft.exe" in invocation
+        assert "-ImageSbomScannerSha256 <approved-lowercase-sha256>" in invocation
