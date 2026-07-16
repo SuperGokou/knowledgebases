@@ -406,10 +406,18 @@ def test_browser_e2e_runner_and_outer_gate_use_configured_timeout(
     challenge_store = tmp_path / "challenges"
     captured: dict[str, object] = {}
     calls: list[list[str]] = []
+    child_environments: list[dict[str, str]] = []
     identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    audit_controls = {
+        "KB_E2E_AUDIT_PAGE_ACTION": "e2e.acceptance.audit.page.trusted-run",
+        "KB_E2E_AUDIT_OVERSIZED_ACTION": "e2e.acceptance.audit.oversized.trusted-run",
+        "KB_E2E_AUDIT_REDACTION_SENTINEL": "E2E_REDACT_TRUSTED_RUN",
+    }
 
     monkeypatch.setenv("KB_E2E_TEST_TIMEOUT_MS", "1800000")
     monkeypatch.setenv("KB_E2E_SUITE_TIMEOUT_MS", "3600000")
+    for name, value in audit_controls.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(
         acceptance_module,
@@ -436,6 +444,9 @@ def test_browser_e2e_runner_and_outer_gate_use_configured_timeout(
         calls.append(command)
         captured["timeout"] = kwargs["timeout"]
         captured["environment"] = kwargs["env"]
+        child_environment = kwargs["env"]
+        assert isinstance(child_environment, dict)
+        child_environments.append(child_environment)
         if command[-2:] == ["--", "--list"]:
             return subprocess.CompletedProcess(
                 args=command,
@@ -477,6 +488,12 @@ def test_browser_e2e_runner_and_outer_gate_use_configured_timeout(
     assert isinstance(environment, dict)
     assert environment["KB_E2E_PROFILE"] == "enterprise"
     assert environment["KB_E2E_RUN_ID"] == f"acceptance-{identity.run_nonce}"
+    assert all(
+        {name: child_environment[name] for name in audit_controls} == audit_controls
+        for child_environment in child_environments
+    )
+    outer_gate_environment = dict(e2e_gate.environment)
+    assert {name: outer_gate_environment[name] for name in audit_controls} == audit_controls
     assert e2e_gate.timeout_seconds == 3_660
     assert e2e_gate.blocked_reason is None
 

@@ -268,6 +268,33 @@ def test_pytest_environment_and_commands_cannot_inherit_selection_controls() -> 
     assert "--junitxml=result.xml" in execution
 
 
+def test_audit_e2e_controls_are_stripped_from_source_and_restored_only_by_runner() -> None:
+    audit_controls = {
+        "KB_E2E_AUDIT_PAGE_ACTION": "e2e.acceptance.audit.page.trusted-run",
+        "KB_E2E_AUDIT_OVERSIZED_ACTION": "e2e.acceptance.audit.oversized.trusted-run",
+        "KB_E2E_AUDIT_REDACTION_SENTINEL": "E2E_REDACT_TRUSTED_RUN",
+    }
+    inherited = sanitized_test_environment(
+        {
+            **{name: f"attacker-{name}" for name in audit_controls},
+            "KEEP_ME": "yes",
+        }
+    )
+
+    assert all(name not in inherited for name in audit_controls)
+    assert inherited["KEEP_ME"] == "yes"
+    assert inherited["PYTHONDONTWRITEBYTECODE"] == "1"
+
+    restored = sanitized_test_environment(
+        {name: f"attacker-{name}" for name in audit_controls},
+        overrides=audit_controls,
+    )
+
+    assert {name: restored[name] for name in audit_controls} == audit_controls
+    with pytest.raises(AcceptanceGateError, match="cannot be restored"):
+        sanitized_test_environment(overrides={"KB_E2E_AUDIT_UNTRUSTED_CONTROL": "attacker-value"})
+
+
 def test_collection_and_junit_require_the_exact_same_nodes(tmp_path: Path) -> None:
     collection = parse_pytest_collection(
         "\n".join(
