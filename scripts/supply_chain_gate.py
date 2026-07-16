@@ -1595,7 +1595,7 @@ def _trusted_directory_descriptor(path: Path) -> int:
             or (
                 os.name == "posix"
                 and (
-                    pinned.st_uid != os.geteuid()  # type: ignore[attr-defined]
+                    pinned.st_uid != os.geteuid()  # type: ignore[attr-defined, unused-ignore]
                     or pinned.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 )
             )

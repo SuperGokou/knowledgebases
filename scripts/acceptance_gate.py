@@ -256,7 +256,7 @@ def _trusted_directory_descriptor(path: Path) -> int:
             or (
                 os.name == "posix"
                 and (
-                    pinned.st_uid != os.geteuid()  # type: ignore[attr-defined]
+                    pinned.st_uid != os.geteuid()  # type: ignore[attr-defined, unused-ignore]
                     or pinned.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 )
             )
@@ -400,7 +400,7 @@ def reserve_machine_report(path: Path) -> None:
         parent = path.parent.lstat()
         if (
             not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != os.geteuid()  # type: ignore[attr-defined]
+            or parent.st_uid != os.geteuid()  # type: ignore[attr-defined, unused-ignore]
             or (parent.st_mode & 0o777) != 0o700
         ):
             raise AcceptanceGateError("machine report parent must be private")
@@ -413,7 +413,10 @@ def reserve_machine_report(path: Path) -> None:
         raise AcceptanceGateError("machine report cannot be reserved exclusively") from exc
     try:
         if os.name == "posix":
-            os.fchmod(descriptor, 0o600)  # type: ignore[attr-defined]
+            os.fchmod(  # type: ignore[attr-defined, unused-ignore]
+                descriptor,
+                0o600,
+            )
     finally:
         os.close(descriptor)
 

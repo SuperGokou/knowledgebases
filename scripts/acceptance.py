@@ -247,7 +247,10 @@ def acquire_offline_acceptance_lock() -> int:
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(_OFFLINE_LOCK_PATH, flags, 0o600)
         try:
-            os.fchmod(descriptor, 0o600)  # type: ignore[attr-defined]
+            os.fchmod(  # type: ignore[attr-defined, unused-ignore]
+                descriptor,
+                0o600,
+            )
             metadata = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(metadata.st_mode)
@@ -256,9 +259,10 @@ def acquire_offline_acceptance_lock() -> int:
                 or metadata.st_nlink != 1
             ):
                 raise AcceptanceGateError("offline deployment lock is not root-protected 0600")
-            fcntl.flock(  # type: ignore[attr-defined]
+            fcntl.flock(  # type: ignore[attr-defined, unused-ignore]
                 descriptor,
-                fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                fcntl.LOCK_EX  # type: ignore[attr-defined, unused-ignore]
+                | fcntl.LOCK_NB,  # type: ignore[attr-defined, unused-ignore]
             )
             if descriptor != _OFFLINE_LOCK_FD:
                 os.dup2(descriptor, _OFFLINE_LOCK_FD, inheritable=True)
@@ -285,7 +289,10 @@ def release_offline_acceptance_lock(descriptor: int) -> None:
     try:
         import fcntl
 
-        fcntl.flock(descriptor, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        fcntl.flock(  # type: ignore[attr-defined, unused-ignore]
+            descriptor,
+            fcntl.LOCK_UN,  # type: ignore[attr-defined, unused-ignore]
+        )
         os.close(descriptor)
     finally:
         _active_offline_lock_fd = None
