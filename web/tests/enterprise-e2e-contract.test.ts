@@ -36,6 +36,8 @@ import {
 } from "../e2e/support/enterprise-config";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const signingKeyPath = path.resolve("trust", "browser-e2e.pem");
+const challengePath = path.resolve("trust", "browser-challenge.json");
 const enterpriseFixtures = readFileSync(
   path.join(process.cwd(), "e2e/support/enterprise-fixtures.ts"),
   "utf8",
@@ -260,8 +262,8 @@ describe("enterprise Playwright profile", () => {
       {
         KB_E2E_PROFILE: "enterprise",
         KB_E2E_BASE_URL: "https://kb.invalid",
-        KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
-        KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+        KB_E2E_SIGNING_KEY_PATH: signingKeyPath,
+        KB_E2E_CHALLENGE_PATH: challengePath,
       },
       path.resolve("C:/repo/web"),
     );
@@ -272,8 +274,8 @@ describe("enterprise Playwright profile", () => {
       "enterprise-desktop",
       "enterprise-mobile",
     ]);
-    expect(enterprise.signingKeyPath).toBe("C:/trust/browser-e2e.pem");
-    expect(enterprise.challengePath).toBe("C:/trust/browser-challenge.json");
+    expect(enterprise.signingKeyPath).toBe(signingKeyPath);
+    expect(enterprise.challengePath).toBe(challengePath);
     expect(
       enterprise.evidenceOutput
         .replaceAll("\\", "/")
@@ -339,8 +341,8 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_FAULT_CONTROL_TOKEN: "not-a-real-token",
       KB_E2E_SEEDED_KNOWLEDGE_BASE_ID: "seeded",
       KB_E2E_UNSCOPED_KNOWLEDGE_BASE_ID: "unscoped",
-      KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
-      KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+      KB_E2E_SIGNING_KEY_PATH: signingKeyPath,
+      KB_E2E_CHALLENGE_PATH: challengePath,
       KB_E2E_RUN_ID: "acceptance-run-20260714",
       KB_E2E_AUDIT_PAGE_ACTION: "e2e.audit.page.fixture",
       KB_E2E_AUDIT_OVERSIZED_ACTION: "e2e.audit.oversized.fixture",
@@ -369,8 +371,8 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_SEEDED_KNOWLEDGE_BASE_ID: "seeded",
       KB_E2E_UNSCOPED_KNOWLEDGE_BASE_ID: "unscoped",
       KB_E2E_MULTIPART_BYTES: "104857600",
-      KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
-      KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+      KB_E2E_SIGNING_KEY_PATH: signingKeyPath,
+      KB_E2E_CHALLENGE_PATH: challengePath,
       KB_E2E_RUN_ID: "acceptance-run-20260714",
       KB_E2E_AUDIT_PAGE_ACTION: "e2e.audit.page.fixture",
       KB_E2E_AUDIT_OVERSIZED_ACTION: "e2e.audit.oversized.fixture",
