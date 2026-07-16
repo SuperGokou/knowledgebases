@@ -1,0 +1,268 @@
+# 性能与容量模型
+
+> 审计状态：企业终验容量基线
+>
+> 目标场景：1,000 用户、50 亿 token/日、Linux 8 vCPU / 16 GB RAM / 300 GB SSD 企业内网部署；10 TB 为未来独立存储集群扩展目标
+>
+> 结论：8C16G/300GB 是当前交付的正式单机硬件基线，可承载控制面和受水位保护的本地数据面；它不能承担 50 亿 token/日本地推理，也不等同于未来 10 TB 存储集群。
+
+## 1. 证据分级
+
+本文对每项结论使用以下证据标签，三者不得混用：
+
+| 标签 | 含义 | 当前状态 |
+|---|---|---|
+| `MEASURED` / 实测 | 在目标硬件、目标数据集和规定持续时间内得到的原始测试结果 | 尚无满足本文件目标口径的实测报告 |
+| `MODELLED` / 建模 | 由明确公式和公开假设计算，可用于制定测试目标，不能代替实测 | 已完成 token、请求、CPU 与存储模型 |
+| `UNVERIFIED` / 缺证 | 代码或配置存在，但尚无生产规模测试、供应商合同或恢复演练证明 | 性能、供应商配额、成本、长稳、故障恢复均待证明 |
+
+仓库已有本地单元测试、静态检查和 Compose 配置测试不等于生产负载证明。已有自检报告也明确记录：尚无 150 GB / 10 万条目 30 分钟负载证据，且无独立备份实现和恢复报告。
+
+## 2. 容量目标与假设
+
+### 2.1 固定目标
+
+- 注册或具备访问权限的企业用户：1,000；
+- 每日 LLM token 总消耗：5,000,000,000；
+- 当前交付主机：Linux amd64/x86_64、8 vCPU、16 GB RAM、300 GB SSD；
+- 主机预检阈值：至少 8 个可见逻辑 CPU、15 GiB 可见内存、目标文件系统 300 GB 十进制总量、部署前 240 GB 可用空间；
+- 当前单机对象强制停止线：180 GB（十进制），应用在签发预签名上传 URL 前执行 70% 预警、80% 停止 Multipart 批量上传、90% 拒绝所有新上传；
+- 单文件平台安全硬上限、应用扫描流上限与 clamd `StreamMaxLength`/`MaxScanSize`/`MaxFileSize` 统一为 2 GiB；角色额度的“无限制”不得绕过该安全硬上限；
+- 未来对象数据扩展目标：10 TB 独立企业内网存储集群，不计入当前主机 P0；
+- 隔离部署：数据库、Redis、对象存储和业务数据均在企业边界内，默认禁止公网出站；
+- 每个成功的 RAG 回答包含一次答案生成和一次语义审核，即两次串行 LLM 调用。
+
+### 2.2 建模假设
+
+`MODELLED`：token 口径按一次对话中两次 LLM 调用的输入与输出合计计算。若业务所称“50 亿 token”仅指输出 token，则实际输入、审核及重试流量会更高，必须重新建模。
+
+`MODELLED`：业务流量以 8 小时集中发生，并使用 5 倍短时峰值作为初始容量设计值。正式验收应以真实业务到达分布替换这些假设。
+
+`UNVERIFIED`：尚无 DeepSeek、Qwen、MiniMax 或内部推理集群对所需 token/s、并发、TPM、RPM、上下文长度及地域容量的合同或配额证明。
+
+## 3. Token 与请求吞吐模型
+
+### 3.1 基础数学
+
+`MODELLED`：
+
+```text
+24 小时平均 token/s = 5,000,000,000 / 86,400 = 57,870.37
+8 小时业务窗 token/s = 5,000,000,000 / 28,800 = 173,611.11
+5 倍峰值 token/s = 173,611.11 × 5 = 868,055.56
+每用户每日 token = 5,000,000,000 / 1,000 = 5,000,000
+```
+
+### 3.2 三档对话模型
+
+以下 token/对话包含主答案与审核调用的输入、输出合计。代码路径对每次 RAG 对话执行两次上游请求，因此“上游调用 RPS”约为 chat RPS 的两倍。
+
+| 端到端 token/对话 | 对话数/日 | 24h 平均 chat RPS | 8h 平均 chat RPS | 5 倍峰值 chat RPS | 5 倍峰值上游调用 RPS |
+|---:|---:|---:|---:|---:|---:|
+| 4,000 | 1,250,000 | 14.47 | 43.40 | 217.01 | 434.03 |
+| 8,000 | 625,000 | 7.23 | 21.70 | 108.51 | 217.01 |
+| 16,000 | 312,500 | 3.62 | 10.85 | 54.25 | 108.51 |
+
+这张表只证明目标规模对应的流量量级，不证明任何模型供应商或当前代码能够承载该流量。
+
+### 3.3 当前调用路径的容量风险
+
+`UNVERIFIED`（容量）/ 已实现（代码）：一次对话先生成答案，再由独立审核客户端进行语义审核；两次调用仍串行执行。超时链固定为 FastAPI 95 秒、BFF 105 秒、浏览器 115 秒。FastAPI 使用位于 Starlette `ServerErrorMiddleware`、请求体限制、认证、限流、RBAC、知识库授权和业务端点**之外**的最外层 `ChatIngressDeadlineMiddleware`，在第一次读取请求体之前建立同一组单调绝对截止时间：85 秒为 operation fence，94 秒为 cleanup fence，95 秒为 response fence。前 85 秒覆盖收体与全部路由处理；第 85–94 秒只允许一次取消后的 LLM 连接释放、计费与幂等终态封闭；第 94–95 秒只允许发送已经完整缓冲、验证通过的唯一响应。前置数据库连接池等待、语句执行和异常处理都会消耗同一套预算，不会重新获得 85 秒。断连状态在业务任务的有界等待间隙顺序探测；客户端取消只向活动任务发送一次。LLM 清理还必须在 94 秒终态截止前预留 2 秒给独立数据库 terminalizer。
+
+`MODELLED`（容量）/ 已实现（代码）：隔离 Compose 固定 `KB_CHAT_MAX_ACTIVE_REQUESTS=8`。准入发生在读取请求体和取得数据库连接之前，不设等待队列；第 9 个并发聊天立即返回 `503 chat_capacity_exceeded` 与 `Retry-After: 1`。每个已准入请求的最终响应最多使用 4 MiB 进程内缓冲，并另受 64 条 ASGI message、64 个响应头和 64 KiB 响应头总量限制；因此仅响应正文缓冲的理论硬上界是 `8 × 4 MiB = 32 MiB`，尚未计入请求体、检索结果、模型客户端、Python 对象和连接池。该值是配置模型，不是并发性能证明。
+
+任何路由、LLM、业务任务、终态写入或真实响应发送超过绝对栅栏时，系统都会进入强引用监管并设置 sticky poison；隔离部署还会持久化 `/srv/heyi-knowledgebases-offline/data/chat-safety/poison.json`。readiness 与新聊天立即失败关闭，backlog 清零、API 重启、Docker 重启或主机重启都不会自动恢复。恢复器在任何 API 自动启动前检查唯一受控容器，任意非零退出码都会物化持久 hold；退出码 `78` 标识哨兵持久化失败，其他非零码标识 worker 异常退出。只有在全部相关写入者停止、幂等账本/供应商用量/审计证据完成对账后，才可使用选定不可变发布中的摘要绑定清除脚本恢复。
+
+清除事务在删除哨兵前先持久化 `chat-safety-clear-pending.json`。只要 pending 存在，即使哨兵已经删除，恢复器仍保持维护页；操作员只能用相同状态、摘要、contract、transaction 和相同证据续提，直至 `cleared` 审计落盘并以删除 pending 作为提交点。该设计消除了明显的下游早退窗口、late 200、断连监控死锁和“哨兵已删但审计未提交”的自动恢复窗口，但不能证明供应商在目标负载下能在预算内稳定完成两次调用。
+
+`UNVERIFIED`（容量）/ 已实现（代码）：Provider 传输使用每进程、按事件循环共享的有界 HTTP 连接池；凭据代际更新会退休旧客户端，应用生命周期结束时 drain/close，不再为每次回答创建并立即关闭连接池。单元回归不能替代真实长稳连接、DNS、TLS 与供应商限额测试。
+
+`MEASURED（代码级回归）`：外部模型调用现已具备调用前 PostgreSQL 原子预留、日/月 token 与微美元硬预算、供应商实际 usage 结算、幂等防双花和内容无关账本；RAG 的答案生成与语义审核以及 OKF 转换均进入同一治理入口。真实 PostgreSQL 并发测试已证明同一幂等键只有一个胜者，且并发请求不能突破同一预算计数器。
+
+`UNVERIFIED`（容量）/ 已实现（代码）：模型调用已具备 provider-wide bulkhead、有界 active/queue 和取消安全准入；队列满时失败关闭，不允许无界占用连接与内存。供应商级熔断器和独立 token bucket 尚未实现，账本在 50 亿 token/日对应的记录增长、热点计数器锁等待、归档保留期和 300GB 磁盘水位下也尚未完成压力实测。控制面功能回归不能替代目标吞吐与长稳验证。
+
+## 4. 离线边界与推理可行性
+
+`MEASURED`：无目标硬件推理实测。
+
+`MODELLED`：默认 `KB_LLM_EGRESS_MODE=strict_offline`，不创建模型网关或公网 uplink；仓库当前没有 Ollama、vLLM、llama.cpp 或其他本地 Provider，因此严格离线模式的外部 LLM 消耗能力是 **0 token/日**，问答使用确定性检索降级。经审批的 `controlled_gateway` 只允许 API/Maintenance 通过固定 `http://llm-egress:8080` 访问规范化供应商白名单；`direct` 在 `deployment_profile=isolated` 中被禁止。受控网关不是本地推理，也不证明供应商容量、成本或跨境合规。
+
+8C16G 无 GPU 主机不能合理承诺持续 57,870 token/s，更不能承诺 868,056 token/s 峰值。完整目标必须选择一种可验收拓扑：
+
+1. **离线知识控制平面 + 企业内网 GPU 推理集群**：推理集群单独完成容量、隔离、模型版权与供应链验收；
+2. **完全检索型严格离线部署**：保留来源回答与人工审核，明确不承诺 50 亿 LLM token/日；
+3. **隔离控制面 + 受控外部模型网关**：只允许获批供应商、固定 HTTPS 目的地与 POST 路径，必须重新完成数据驻留、脱敏、跨境、供应商合同和网络出站评审，不能复用“完全离线”结论。
+
+当前 `controlled_gateway` 属于第 3 类的最小出口实现：它只缩小网络出口面，不改变 50 亿 token/日必须取得供应商配额、费用上限、数据审批和目标负载证据的要求。`direct` 模式不属于隔离部署的获准拓扑。
+
+## 5. 8C16G 主机资源模型
+
+### 5.1 稳态容器预算
+
+`MODELLED`：排除一次性 migrate、bootstrap、minio-init 和 ClamAV 病毒库预检，按 Compose 稳态硬限制汇总：
+
+| 服务 | CPU 上限 | 内存上限 |
+|---|---:|---:|
+| PostgreSQL | 1.00 | 2,048 MiB |
+| Redis | 0.25 | 768 MiB |
+| MinIO | 0.75 | 1,280 MiB |
+| Multipart GC | 0.05 | 128 MiB |
+| ClamAV | 0.50 | 1,792 MiB |
+| FastAPI | 1.25 | 1,536 MiB |
+| Maintenance | 0.25 | 512 MiB |
+| Next.js | 0.60 | 768 MiB |
+| Caddy | 0.15 | 128 MiB |
+| **合计** | **4.80** | **8,960 MiB（8.75 GiB）** |
+
+`controlled_gateway` 模式额外启用 `llm-egress`：0.15 CPU / 128 MiB，稳态静态上限变为 **4.95 CPU / 9,088 MiB（8.875 GiB）**。该附加预算不包含供应商推理资源。
+
+整改后的稳态容器 CPU 上限合计为 4.80 核，为 8 核主机保留 3.20 核；内存理论余量为 7,424 MiB（7.25 GiB）。该静态预算满足仓库 `OPS-P1-001` 的 CPU 门禁，并为操作系统、Docker 与同机其他应用留下明确硬上限空间；但保留空间还必须覆盖其他应用的实测峰值、备份与升级临时负载，不能仅凭静态配置判定共存通过，也不能容纳本地大模型推理。
+
+`UNVERIFIED`：硬限制之和不代表实际使用量。部署前后必须保留其他 Compose 项目的容器、端口、网络、卷与健康指纹，并通过 30 分钟稳态和 8–24 小时长稳测试证明 CPU 均值、内存、上下文切换、IO wait、磁盘延迟、OOM 行为和同机应用无回归。若宿主机与其他应用无法落入 3.20 vCPU / 7.25 GiB 保留预算，部署必须阻断。
+
+离线 API 镜像当前以 Dockerfile 的单条 Uvicorn 命令启动，未设置 `--workers`，因此每个 API 容器只有一个 worker。`KB_CHAT_MAX_ACTIVE_REQUESTS=8`、活动任务监管、响应缓冲和进程级 poison 都按这个单 worker 边界设计；在把 poison、准入计数和未决任务监管迁移为 PostgreSQL/Redis 共享状态并完成多进程故障注入前，禁止增加 Uvicorn worker 数或横向扩容 API 副本。单 worker 是当前安全限制，不是吞吐优化结论。
+
+### 5.2 PostgreSQL
+
+- `MODELLED`：应用通用默认值仍是 pool 8、overflow 4；离线 Compose 明确覆盖为每进程 pool 6、overflow 2，因此一个 API 加一个 maintenance 的理论应用峰值为 16。若横向增加进程，必须按 PostgreSQL `max_connections` 重新计算总连接预算。
+- `MEASURED`（配置测试）：应用与离线 PostgreSQL 已配置 `statement_timeout=15s`、`lock_timeout=5s`、`idle_in_transaction_session_timeout=30s` 和连接池等待超时 10 秒；配置/Compose 测试通过。真实锁争用与慢查询仍为 `UNVERIFIED`。
+- `MODELLED`：离线 PostgreSQL 容器上限为 2 GB，配置 `shared_buffers=512MB`、`effective_cache_size=1536MB`、`maintenance_work_mem=128MB`、`work_mem=4MB` 与 `max_connections=80`。并发排序/哈希、维护任务和连接开销仍可能逼近容器上限，需用真实查询计划与 RSS 曲线验证。
+- `UNVERIFIED`：中文检索会扩展多组 `%term%` `ILIKE` 条件；虽然存在 pg_trgm GIN 索引，但短中文词、无结果查询和大文档内容的真实执行计划尚未证明。
+
+### 5.3 Redis
+
+- 固定窗口限流使用原子 Lua，Redis 不可用时受保护接口 fail closed；
+- `noeviction` 防止静默丢失限流键，但内存耗尽会转换成 API 503；
+- `UNVERIFIED`：没有 Redis 内存水位、AOF fsync 延迟、rejected writes、连接数和恢复告警实测；
+- 单节点 AOF 不能替代业务恢复和高可用。
+
+### 5.4 MinIO 与文件数据面
+
+- 客户端通过预签名 URL 直接传输对象，API 不代理 10 TB 字节，这是正确的数据面边界；
+- 当前是单节点、单目录、未版本化 bucket，没有磁盘或节点冗余；
+- S3 客户端连接池默认 20，异步包装通过线程池执行但没有显式 semaphore，积压时缺少可观测 backpressure；
+- readiness 未验证 MinIO，可出现 API ready 但上传和下载不可用。
+
+### 5.5 OKF 任务吞吐
+
+外部 LLM 转换路径默认单 maintenance 进程每轮最多处理 5 个任务，时间预算 50 秒，随后睡眠 60 秒。即使忽略模型延迟，理论上限也只有约 7,200 项/日；当单次模型接近 45 秒时通常每轮只能处理一个，约 823 项/日。两者都是模型值，实际吞吐待测。
+
+`MEASURED`（代码级回归）：隔离环境关闭外部 LLM 后，TXT/CSV/OOXML 已通过确定性本地编译进入可审核、可检索状态；PDF 与旧版 Office 具备失败关闭的沙箱解析路径，并在工具缺失时进入明确的 `unsupported/parser_required` 终态。该结果只证明代码与黄金测试，不等于已在目标 Linux 镜像完成外部解析器运行验收，也没有证明 10 TB 队列吞吐。
+
+## 6. 300GB 当前边界与 10TB 未来扩展
+
+`MODELLED`：
+
+```text
+300 GB / 10,000 GB = 3.0%
+180 GB 建议对象停止线 / 10,000 GB = 1.8%
+10,000 / 300 = 33.3 倍原始容量差距
+10,000 / 180 = 55.6 倍安全对象容量差距
+```
+
+300GB 是当前单机部署的正式物理基线。上线前目标文件系统必须仍有至少 240GB 可用空间；对象数据建议在 180GB 停止增长，以便给代码、镜像、日志、PostgreSQL、WAL、临时 Multipart、备份暂存和升级回滚保留空间。磁盘策略必须验证：70% 预警、80% 停止批量上传、90% 拒绝新上传。
+
+10TB 是未来独立存储集群扩展目标，不作为当前单机的 P0 阻断项。未来集群容量仍应采用以下公式：
+
+```text
+主存储原始容量 =
+  (现有数据 + 保留版本 + 增长期数据 + Multipart/维护空间)
+  / 存储编码可用率
+  / 目标最高使用率
+```
+
+未来若只考虑 10TB 当前数据且最高使用率为 70%，至少需要 14.29TB 可用主存储；纠删码、对象版本、增长和独立备份还会进一步提高原始容量。备份必须位于不同故障域，单盘副本不算备份。该计算是扩展规划，不得反向声称当前 300GB 单机已具备 10TB 能力。
+
+## 7. SLO 与通过门禁
+
+以下门禁必须全部以原始测试结果证明：
+
+| 门禁 | 通过阈值 |
+|---|---|
+| 控制 API | P95 ≤500 ms，P99 ≤1.5 s，不含对象字节传输 |
+| 确定性检索 | P95 ≤2 s，P99 ≤5 s |
+| 稳态错误率 | 30 分钟 5xx ≤0.1% |
+| 资源稳定 | 无 OOM/重启；CPU 均值 ≤75%；内存 ≤85%；Redis eviction=0 |
+| PostgreSQL | 活跃连接 <80；死锁=0；未批准长事务=0 |
+| 队列 | 深度、最老任务年龄、重试、死信、恢复时间均有阈值和告警 |
+| 数据面 | 8 个并发 Multipart 无对象损坏、无泄漏会话、无 quota 双花 |
+| 长稳 | 至少 8 小时，正式容量认证建议 24 小时 |
+
+## 8. 必须执行的真实性能测试
+
+### 8.1 数据集
+
+- 1,000 个用户、100 个角色；
+- 至少 100,000 个 published knowledge entries；
+- 至少 150 GB 对象，其中包含单 PUT、Multipart、中文/英文/混合内容、无命中和热/冷查询；
+- 文件大小按真实业务 P50/P95/P99 分布构造，不得只用同尺寸小文件；
+- 所有数据必须是零敏感的合成数据。
+
+### 8.2 流量场景
+
+1. 20 个并发检索用户持续 30 分钟；
+2. 8 个并发 Multipart，同时运行控制面和检索流量；
+3. 1000 账号登录、refresh、RBAC 和知识库 ACL 混合流量；
+4. 4k/8k/16k 三档聊天流量，分别验证平均与 5 倍峰值；
+5. 8–24 小时长稳，监控内存增长、连接泄漏、锁等待、AOF、WAL、IOPS 和队列年龄；
+6. 当前 300GB 单机容量达到 70%、80%、90% 时分别验证告警、停止批量上传和拒绝新上传策略，并验证对象数据在 180GB 停止线前停止增长。
+
+### 8.3 LLM 验证边界
+
+- 可用企业内网确定性 LLM 模拟器验证 API、队列、超时、429、5xx 和 backpressure；
+- 模拟器结果只证明控制平面，不证明模型质量、真实 token/s 或供应商配额；
+- 真实推理能力必须在批准的内部 GPU 集群或非隔离预生产环境中测试，并附模型版本、量化方式、GPU、并发、上下文、首 token 延迟、输出 token/s、失败率和成本；
+- 50 亿 token/日必须有容量合同、预算上限、用量账本和停止开关，不能仅按单次样本线性外推。
+
+### 8.4 故障注入
+
+- PostgreSQL 重启、连接池耗尽、慢 SQL、锁等待和磁盘延迟；
+- Redis 停止、AOF 损坏、内存达到 maxmemory；
+- MinIO 503、超时、对象缺失、Multipart 中断和磁盘满；
+- LLM 429、超时、无效 JSON、审核失败和连续 5xx；
+- API/Web/maintenance 被终止并恢复；
+- 公网断开后验证不存在外部 DB、Redis、S3 或 LLM 调用。
+
+## 9. DR 与升级门禁
+
+正式通过前必须提供：
+
+1. PostgreSQL 定期 base backup 与连续 WAL 归档，恢复点丢失不超过 15 分钟；
+2. MinIO 对象版本或复制，以及独立介质上的加密备份；
+3. 在全新一次性主机恢复到可登录、检索、下载，RTO 不超过 4 小时；
+4. 恢复后随机抽检至少 1,000 个对象，大小和 SHA-256 一致率 100%；
+5. Caddy CA、Compose 清单与密钥的受控恢复，密钥值不进入报告；
+6. 备份证据 schema v3 必须签名绑定 `operation_scope`；`legacy_adoption` 证明旧栈恢复与目标授权，`active_upgrade` 才同时要求 `control_state_archive` 与 `control_state_manifest`。active manifest 必须声明 `initial_mode=chat_safety_maintenance_hold`、先于运行时物化 hold、缺失状态失败关闭、对账前禁止业务启动；完整签名采集器与 source/target 交叉绑定交付前，生产入口保持 `active_upgrade` fail-closed；
+7. control-state manifest 恰好记录十一项：mandatory present 的 `active-release.json`、`installed-<source-contract-sha256>.json`、`highest-release.json`、精确 Registry 回执、contract `files.sha256`、恢复 state helper、恢复 dispatcher，以及明确 present/absent 的 `poison.json`、`chat-safety-clear-pending.json`、`cutover-intent.json`、`install-in-progress.json`；缺记录不等于 absent；
+8. 全新主机先只启动数据服务与维护页，源/恢复 manifest 摘要和十一项记录逐项一致；每项 present 记录的源端/恢复端 SHA-256 必须相同，hold 清除与业务边缘/API 启动严格晚于人工对账；
+9. 升级前迁移克隆演练，镜像使用不可变摘要，15 分钟内可回滚；
+10. PostgreSQL、MinIO、API 明确 `stop_grace_period`，强杀次数为 0；
+11. 每季度至少一次恢复演练，失败必须形成整改项和复测证据。
+
+## 10. 交付证据清单
+
+每次性能验收至少保存：
+
+- Git commit、镜像摘要、Compose 渲染摘要和目标主机规格；
+- 合成数据生成参数与哈希；
+- 压测脚本、开始/结束时间、并发、请求模型和随机种子；
+- P50/P95/P99、吞吐、错误码分布和重试统计；
+- 容器 CPU/RSS、宿主 load/IO wait、磁盘 IOPS/延迟/容量曲线；
+- PostgreSQL 连接、锁、死锁、长事务、慢 SQL 与执行计划；
+- Redis 内存、连接、AOF、eviction/rejected writes；
+- MinIO 请求、503、容量、Multipart 与对象校验；
+- 队列深度、最老任务年龄、重试与死信；
+- LLM prompt/completion/review token、费用、429、超时和供应商请求 ID 的脱敏统计；
+- 测试异常、人工干预、重启和证据缺口。
+
+任何缺少原始证据的项目必须保持 `UNVERIFIED`，不得通过文档推断改写为 `MEASURED`。
+
+## 11. 当前结论
+
+- `MEASURED`：尚无目标场景下可用于通过终验的性能、长稳或 DR 实测；
+- `MODELLED`：50 亿 token/日、三档对话模型、严格离线 4.80 CPU / 8.75 GiB 与受控网关 4.95 CPU / 8.875 GiB 稳态上限、300GB 当前水位边界和 10TB 未来集群扩展量级已经计算；
+- `UNVERIFIED`：供应商或内部模型容量、真实检索性能、数据库饱和点、对象吞吐、告警、备份恢复和零停机升级；
+- 当前判定：**FAIL / NO-GO**。完成阻断项修复和目标环境实测后才能重新评审。
+
+Repository: SuperGokou/knowledgebases
+Version: audit baseline 5298801fa311f437545f764f7a6c11874b6cc9ee; includes uncommitted final-audit evidence at report generation time

@@ -1,0 +1,132 @@
+{
+  "$schema": "schemas/assets-manifest-v1.schema.json",
+  "schema_version": 1,
+  "inventory_roots": [
+    "."
+  ],
+  "asset_extensions": [
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".mp4",
+    ".otf",
+    ".png",
+    ".svg",
+    ".ttf",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2"
+  ],
+  "embedded_text_extensions": [
+    ".css",
+    ".html",
+    ".js",
+    ".json",
+    ".jsx",
+    ".md",
+    ".py",
+    ".ts",
+    ".tsx"
+  ],
+  "excluded_directories": [
+    ".git",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    ".worktrees",
+    "__pycache__",
+    "artifacts",
+    "evidence",
+    "node_modules",
+    "playwright-report",
+    "test-results",
+    "tests",
+    "tmp"
+  ],
+  "assets": [
+    {
+      "id": "file:docs/assets/design-qa/prism-comparison.png",
+      "path": "docs/assets/design-qa/prism-comparison.png",
+      "media_type": "image/png",
+      "bytes": 1555650,
+      "sha256": "abef851bae900318fa2a860bb068b4ffff1e395c38a98851661deb234db2727a",
+      "asset_class": "composite-design-reference",
+      "provenance_status": "unverified",
+      "source_record": "Repository history records the file, but no signed creator or license evidence is present."
+    },
+    {
+      "id": "file:docs/assets/design-qa/prism-implementation.png",
+      "path": "docs/assets/design-qa/prism-implementation.png",
+      "media_type": "image/png",
+      "bytes": 57856,
+      "sha256": "58f8a05861df3cae79a646f6af65de6b71087e39d3ba4f7b65aaf522fa3e74d2",
+      "asset_class": "product-screenshot",
+      "provenance_status": "unverified",
+      "source_record": "Appears to be a project UI capture; creator and authority are not signed."
+    },
+    {
+      "id": "file:docs/assets/design-qa/prism-mobile.png",
+      "path": "docs/assets/design-qa/prism-mobile.png",
+      "media_type": "image/png",
+      "bytes": 30301,
+      "sha256": "99308377814b70ac97fd757e8f6aab81b252be18b6be30d78c041e612f36470b",
+      "asset_class": "product-screenshot",
+      "provenance_status": "unverified",
+      "source_record": "Appears to be a project UI capture; creator and authority are not signed."
+    },
+    {
+      "id": "file:docs/assets/design-qa/prism-reference.png",
+      "path": "docs/assets/design-qa/prism-reference.png",
+      "media_type": "image/png",
+      "bytes": 1303761,
+      "sha256": "de3346d3f91c45c1b66d74778ece0e2f1c805fa67d739e50a1e7dc0704447c51",
+      "asset_class": "design-reference",
+      "provenance_status": "unverified",
+      "source_record": "No source URL, creator record, or signed license evidence is present."
+    },
+    {
+      "id": "file:web/public/brand/heyi-display-logo.webp",
+      "path": "web/public/brand/heyi-display-logo.webp",
+      "media_type": "image/webp",
+      "bytes": 7806,
+      "sha256": "990fa26546b02381da61819f4bd66a14c5e1f1bc9b046238aef4b2bedb906b3e",
+      "asset_class": "company-logo-or-trademark",
+      "provenance_status": "unverified",
+      "source_record": "Provided by the project requester; signed trademark authority is not in the repository."
+    },
+    {
+      "id": "file:web/src/app/favicon.ico",
+      "path": "web/src/app/favicon.ico",
+      "media_type": "image/x-icon",
+      "bytes": 5755,
+      "sha256": "b60f3c46b1d7a4f10a74a00844209f7730701b08dd3e026c3858ddee9e4d6b6a",
+      "asset_class": "application-icon",
+      "provenance_status": "unverified",
+      "source_record": "Brand-derived application icon; signed derivation authority is not in the repository."
+    },
+    {
+      "id": "file:web/src/app/icon.png",
+      "path": "web/src/app/icon.png",
+      "media_type": "image/png",
+      "bytes": 34655,
+      "sha256": "5ec8a4a7c76e7478735ee4533e60aa0f54bef0e281af8475221cf93e71c32d90",
+      "asset_class": "application-icon",
+      "provenance_status": "unverified",
+      "source_record": "Brand-associated application icon; signed derivation authority is not in the repository."
+    },
+    {
+      "id": "embedded:web/src/app/layout.tsx#image/x-icon:b60f3c46b1d7a4f10a74a00844209f7730701b08dd3e026c3858ddee9e4d6b6a",
+      "source_path": "web/src/app/layout.tsx",
+      "media_type": "image/x-icon",
+      "bytes": 5755,
+      "sha256": "b60f3c46b1d7a4f10a74a00844209f7730701b08dd3e026c3858ddee9e4d6b6a",
+      "asset_class": "embedded-application-icon",
+      "provenance_status": "unverified",
+      "source_record": "Byte-identical embedded copy of web/src/app/favicon.ico."
+    }
+  ]
+}

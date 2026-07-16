@@ -2,8 +2,11 @@
 .env
 .env.*
 !.env.example
+deploy/tencent/offline.env
+deploy/tencent/deploy.env
 .vercel/
 .agents/
+.worktrees/
 
 # Python
 .venv/
@@ -13,6 +16,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
 
 # Dependency/tool caches
@@ -30,3 +34,6 @@ Thumbs.db
 # Local logs and temporary files
 *.log
 tmp/
+artifacts/acceptance/
+web/playwright-report/
+web/test-results/

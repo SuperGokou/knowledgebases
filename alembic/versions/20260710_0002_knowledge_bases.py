@@ -46,9 +46,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_knowledge_bases"),
     )
-    op.create_index(
-        "ix_knowledge_bases_owner_id", "knowledge_bases", ["owner_id"], unique=False
-    )
+    op.create_index("ix_knowledge_bases_owner_id", "knowledge_bases", ["owner_id"], unique=False)
     op.create_index(
         "ix_knowledge_bases_owner_updated",
         "knowledge_bases",
@@ -134,9 +132,7 @@ def upgrade() -> None:
         ["id"],
         ondelete="SET NULL",
     )
-    op.create_index(
-        "ix_files_knowledge_base_id", "files", ["knowledge_base_id"], unique=False
-    )
+    op.create_index("ix_files_knowledge_base_id", "files", ["knowledge_base_id"], unique=False)
 
     op.create_table(
         "knowledge_entries",

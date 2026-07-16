@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledgebases.heyi.internal/schemas/enterprise-restored-control-plane-integrity-v1.schema.json",
+  "title": "Enterprise Restored Control-Plane Integrity v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "status",
+    "restore_started_in_maintenance_hold",
+    "chat_safety_hold_materialized_before_runtime",
+    "restore_hold_sentinel_sha256",
+    "api_started_before_reconciliation",
+    "edge_exposed_before_reconciliation",
+    "missing_control_state_fail_closed",
+    "recovery_selection",
+    "reconciliation_completed_at",
+    "hold_cleared_at",
+    "business_services_started_at",
+    "source_contract_sha256",
+    "source_release_sha256",
+    "source_release_manifest_sha256",
+    "source_contract_bindings",
+    "source_manifest_sha256",
+    "restored_manifest_sha256",
+    "records"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "enterprise-restored-control-plane-integrity"},
+    "status": {"const": "passed"},
+    "restore_started_in_maintenance_hold": {"const": true},
+    "chat_safety_hold_materialized_before_runtime": {"const": true},
+    "restore_hold_sentinel_sha256": {"$ref": "#/$defs/sha256"},
+    "api_started_before_reconciliation": {"const": false},
+    "edge_exposed_before_reconciliation": {"const": false},
+    "missing_control_state_fail_closed": {"const": true},
+    "recovery_selection": {"const": "active"},
+    "reconciliation_completed_at": {"$ref": "#/$defs/utcTimestamp"},
+    "hold_cleared_at": {"$ref": "#/$defs/utcTimestamp"},
+    "business_services_started_at": {"$ref": "#/$defs/utcTimestamp"},
+    "source_contract_sha256": {"$ref": "#/$defs/sha256"},
+    "source_release_sha256": {"$ref": "#/$defs/sha256"},
+    "source_release_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "source_contract_bindings": {"$ref": "#/$defs/sourceContractBindings"},
+    "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "restored_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "records": {
+      "type": "array",
+      "minItems": 11,
+      "maxItems": 11,
+      "items": {"$ref": "#/$defs/controlRecord"},
+      "allOf": [
+        {"contains": {"properties": {"id": {"const": "chat_safety_sentinel"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "chat_safety_clear_pending"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "cutover_intent"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "install_in_progress"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "active_release"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "source_installed_receipt"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "highest_release"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "registry_import_receipt"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "active_contract_manifest"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "recovery_state_helper"}}}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "recovery_dispatcher"}}}, "minContains": 1, "maxContains": 1}
+      ]
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableSha256": {
+      "oneOf": [
+        {"$ref": "#/$defs/sha256"},
+        {"type": "null"}
+      ]
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "sourceContractBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_sha256",
+        "release_sha256",
+        "manifest_sha256"
+      ],
+      "properties": {
+        "contract_sha256": {"$ref": "#/$defs/sha256"},
+        "release_sha256": {"$ref": "#/$defs/sha256"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "sourceContractBindings": {
+      "$comment": "scripts/acceptance.py requires every extracted binding to equal the three top-level source digests.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active_release",
+        "source_installed_receipt",
+        "active_contract_manifest",
+        "registry_import_receipt"
+      ],
+      "properties": {
+        "active_release": {"$ref": "#/$defs/sourceContractBinding"},
+        "source_installed_receipt": {"$ref": "#/$defs/sourceContractBinding"},
+        "active_contract_manifest": {"$ref": "#/$defs/sourceContractBinding"},
+        "registry_import_receipt": {"$ref": "#/$defs/sourceContractBinding"}
+      }
+    },
+    "controlRecord": {
+      "$comment": "scripts/acceptance.py additionally requires source_sha256 and restored_sha256 to be byte-for-byte equal for every present record.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "source_state",
+        "restored_state",
+        "source_sha256",
+        "restored_sha256"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "chat_safety_sentinel",
+            "chat_safety_clear_pending",
+            "cutover_intent",
+            "install_in_progress",
+            "active_release",
+            "source_installed_receipt",
+            "highest_release",
+            "registry_import_receipt",
+            "active_contract_manifest",
+            "recovery_state_helper",
+            "recovery_dispatcher"
+          ]
+        },
+        "path": {"type": "string"},
+        "source_state": {"enum": ["present", "absent"]},
+        "restored_state": {"enum": ["present", "absent"]},
+        "source_sha256": {"$ref": "#/$defs/nullableSha256"},
+        "restored_sha256": {"$ref": "#/$defs/nullableSha256"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"source_state": {"const": "absent"}}},
+          "then": {
+            "properties": {
+              "restored_state": {"const": "absent"},
+              "source_sha256": {"type": "null"},
+              "restored_sha256": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "restored_state": {"const": "present"},
+              "source_sha256": {"$ref": "#/$defs/sha256"},
+              "restored_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "id": {
+                "enum": [
+                  "active_release",
+                  "source_installed_receipt",
+                  "highest_release",
+                  "registry_import_receipt",
+                  "active_contract_manifest",
+                  "recovery_state_helper",
+                  "recovery_dispatcher"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source_state": {"const": "present"},
+              "restored_state": {"const": "present"},
+              "source_sha256": {"$ref": "#/$defs/sha256"},
+              "restored_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"id": {"const": "chat_safety_sentinel"}}},
+          "then": {"properties": {"path": {"const": "data/chat-safety/poison.json"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "chat_safety_clear_pending"}}},
+          "then": {"properties": {"path": {"const": "state/chat-safety-clear-pending.json"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "cutover_intent"}}},
+          "then": {"properties": {"path": {"const": "state/cutover-intent.json"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "install_in_progress"}}},
+          "then": {"properties": {"path": {"const": "state/install-in-progress.json"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "active_release"}}},
+          "then": {"properties": {"path": {"const": "state/active-release.json"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "source_installed_receipt"}}},
+          "then": {"properties": {"path": {"pattern": "^state/installed-[0-9a-f]{64}\\.json$"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "highest_release"}}},
+          "then": {"properties": {"path": {"const": "state/highest-release.json"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "registry_import_receipt"}}},
+          "then": {"properties": {"path": {"pattern": "^state/registry-import-[0-9a-f]{64}\\.json$"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "active_contract_manifest"}}},
+          "then": {"properties": {"path": {"pattern": "^contracts/[0-9a-f]{64}/files\\.sha256$"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "recovery_state_helper"}}},
+          "then": {"properties": {"path": {"const": "recovery/offline-recovery-state.py"}}}
+        },
+        {
+          "if": {"properties": {"id": {"const": "recovery_dispatcher"}}},
+          "then": {"properties": {"path": {"const": "recovery/offline-recovery-dispatcher.sh"}}}
+        }
+      ]
+    }
+  }
+}

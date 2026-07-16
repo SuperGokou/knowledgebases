@@ -39,6 +39,7 @@ class KnowledgeBaseRead(BaseModel):
     description: str | None
     external_llm_processing_enabled: bool
     custom_metadata: dict[str, Any]
+    role_grant_version: int = Field(ge=1)
     access_level: KnowledgeBaseAccessLevel
     created_at: datetime
     updated_at: datetime
@@ -50,6 +51,7 @@ class KnowledgeBaseRoleGrantInput(BaseModel):
 
 
 class KnowledgeBaseRoleGrantSet(BaseModel):
+    expected_version: int = Field(ge=1)
     grants: list[KnowledgeBaseRoleGrantInput] = Field(max_length=200)
 
     @field_validator("grants")

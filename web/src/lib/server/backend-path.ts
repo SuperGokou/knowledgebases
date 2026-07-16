@@ -9,9 +9,24 @@ const ALLOWED_ROOTS = new Set([
   "chat",
   "api-keys",
   "llm",
+  "audit-logs",
 ]);
 
 const CANONICAL_SEGMENT = /^[A-Za-z0-9:_-]+$/;
+
+export function backendAcceptHeader(
+  parts: readonly string[],
+  method: string,
+): "application/json" | "text/csv" {
+  return method === "GET"
+    && parts.length === 4
+    && parts[0] === "api"
+    && parts[1] === "v1"
+    && parts[2] === "audit-logs"
+    && parts[3] === "export"
+    ? "text/csv"
+    : "application/json";
+}
 
 export function isAllowedBackendPath(
   parts: readonly string[],

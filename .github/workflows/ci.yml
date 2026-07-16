@@ -28,14 +28,14 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: "24"
+          node-version: "24.18.0"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -43,16 +43,25 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Audit frontend dependencies
-        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+        run: npm audit --audit-level=moderate --registry=https://registry.npmjs.org
 
       - name: Lint frontend
         run: npm run lint
+
+      - name: Type-check frontend
+        run: npm run typecheck
 
       - name: Test frontend
         run: npm test
 
       - name: Build frontend
         run: npm run build
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser and accessibility smoke tests
+        run: npm run test:e2e
 
   backend:
     name: Backend quality and migration gate
@@ -65,7 +74,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:17.5-bookworm
+        image: postgres:17.5-bookworm@sha256:fbcea1bd13b6a882cd6caa6b58db3ae5c102efe50ec625b3e2a5cbc50db5bfe4
         env:
           POSTGRES_DB: knowledge_test
           POSTGRES_USER: knowledge
@@ -79,7 +88,7 @@ jobs:
           --health-retries 20
 
       redis:
-        image: redis:8.0.3-bookworm
+        image: redis:8.0.3-bookworm@sha256:be0a135f1955140436b9114da96dd22fbedb874469400b6ef458cc0d42155de0
         ports:
           - 6379:6379
         options: >-
@@ -90,14 +99,31 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
 
+      - name: Scan complete Git history for secrets
+        env:
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" gitleaks
+          sudo install --owner=root --group=root --mode=0755 \
+            "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          gitleaks git --no-banner --redact --log-opts="--all" .
+
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -110,15 +136,64 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Lint backend
-        run: uv run --frozen ruff check .
+        run: |
+          uv run --frozen ruff check .
+          uv run --frozen ruff format --check .
 
       - name: Type-check backend
-        run: uv run --frozen mypy app scripts
+        run: >-
+          uv run --frozen mypy
+          app
+          scripts
+          deploy/tencent/verify-upgrade-backup.py
+          deploy/tencent/chat-safety-sentinel.py
+          deploy/tencent/offline-pre-migration-abort.py
+
+      - name: Validate shell deployment tooling
+        run: |
+          archive="$RUNNER_TEMP/shellcheck.tar.xz"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  ${archive}" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$archive" --directory "$RUNNER_TEMP"
+          sudo install --owner=root --group=root --mode=0755 \
+            "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" /usr/local/bin/shellcheck
+          find deploy/tencent scripts docker -type f -name '*.sh' -print0 \
+            | sort -z \
+            | xargs -0 -n1 sh -n
+          find deploy/tencent scripts docker -type f -name '*.sh' -print0 \
+            | sort -z \
+            | xargs -0 shellcheck
+
+      - name: Scan critical Python control paths
+        run: >-
+          uv run --frozen bandit -q -ll -r
+          scripts/legacy_offline_adoption.py
+          scripts/offline_ca_restore_drill.py
+          deploy/tencent/offline-pre-migration-abort.py
+          deploy/tencent/verify-upgrade-backup.py
+          app/api/chat_deadline.py
+          app/api/middleware.py
+          app/services/chat_safety.py
+
+      - name: Stress async chat lifecycle
+        env:
+          PYTHONASYNCIODEBUG: "1"
+        run: |
+          uv run --frozen pytest \
+            tests/test_chat_deadline_route.py \
+            tests/test_chat_timeout_budget.py \
+            tests/test_chat_terminalization_safety.py \
+            tests/test_llm_transport_pool.py \
+            --asyncio-debug
+          uv run --frozen pytest tests/test_integration_api.py --asyncio-debug
 
       - name: Audit backend dependencies
         run: |
           uv export --frozen --no-dev --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/requirements.txt"
-          uv tool run --from pip-audit==2.10.1 pip-audit --requirement "$RUNNER_TEMP/requirements.txt"
+          uv run --frozen pip-audit --requirement "$RUNNER_TEMP/requirements.txt"
 
       - name: Verify Redis connectivity
         env:
@@ -160,3 +235,483 @@ jobs:
           --cov-report=term-missing
           --cov-report=xml
           --cov-fail-under=80
+
+  acceptance:
+    name: Enterprise acceptance gate
+    needs:
+      - frontend
+      - backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ACCEPTANCE_GIT_SHA: ${{ github.sha }}
+      CI: "true"
+      KB_ENVIRONMENT: test
+      NEXT_TELEMETRY_DISABLED: "1"
+      UV_NO_PROGRESS: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.15"
+          enable-cache: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.18.0"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Pin trusted Node executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          node_source="$(readlink -f -- "$(command -v node)")"
+          uv_source="$(readlink -f -- "$(command -v uv)")"
+          npm_cli="$(readlink -f -- "$(command -v npm)")"
+          test "$node_source" = \
+            /opt/hostedtoolcache/node/24.18.0/x64/bin/node
+          test "$uv_source" = \
+            /opt/hostedtoolcache/uv/0.11.15/x86_64/uv
+          test "$npm_cli" = \
+            /opt/hostedtoolcache/node/24.18.0/x64/lib/node_modules/npm/bin/npm-cli.js
+          test -x "$node_source"
+          test -x "$uv_source"
+          test -f "$npm_cli"
+          test "$("$node_source" --version)" = "v24.18.0"
+          uv_version="$("$uv_source" --version)"
+          case "$uv_version" in
+            "uv 0.11.15" | "uv 0.11.15 "*) ;;
+            *)
+              echo "Refusing unexpected uv version: $uv_version" >&2
+              exit 1
+              ;;
+          esac
+          test "$("$node_source" "$npm_cli" --version)" = "11.16.0"
+          npm_package_root="${npm_cli%/bin/npm-cli.js}"
+          sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
+          sudo install -o root -g root -m 0755 "$node_source" \
+            /usr/local/lib/heyi-acceptance/node
+          sudo install -o root -g root -m 0755 "$uv_source" \
+            /usr/local/lib/heyi-acceptance/uv
+          sudo cp -aL -- "$npm_package_root" /usr/local/lib/heyi-acceptance/npm
+          sudo chown -R root:root /usr/local/lib/heyi-acceptance/npm
+          sudo chmod -R go-w /usr/local/lib/heyi-acceptance/npm
+          sudo chmod 0755 /usr/local/lib/heyi-acceptance/npm/bin/npm-cli.js
+          sudo install -o root -g root -m 0755 "$node_source" /usr/local/sbin/node
+          sudo ln -sfn /usr/local/lib/heyi-acceptance/npm/bin/npm-cli.js \
+            /usr/local/sbin/npm
+
+      - name: Create exact acceptance source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          acceptance_source=/usr/local/lib/heyi-acceptance/source
+          [[ "$ACCEPTANCE_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          runner_head="$(/usr/bin/git rev-parse HEAD)"
+          test "$runner_head" = "$ACCEPTANCE_GIT_SHA"
+          test -d "$GITHUB_WORKSPACE/.git"
+          test ! -e "$GITHUB_WORKSPACE/.git/objects/info/alternates"
+          /usr/bin/git diff --exit-code -- .
+          /usr/bin/git diff --cached --exit-code -- .
+          runner_status="$(
+            /usr/bin/git status --porcelain=v1 --untracked-files=all
+          )"
+          test -z "$runner_status"
+          runner_index_listing="$(/usr/bin/git ls-files -v)"
+          hidden_index_flags="$(
+            LC_ALL=C awk '/^[a-zS]/ { print }' <<<"$runner_index_listing"
+          )"
+          if test -n "$hidden_index_flags"; then
+            echo "Refusing runner checkout with hidden Git index flags" >&2
+            exit 1
+          fi
+          test ! -e "$acceptance_source"
+          root_git() {
+            sudo -H /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              /usr/bin/git -c core.hooksPath=/dev/null "$@"
+          }
+          root_git -c safe.directory="$GITHUB_WORKSPACE" clone \
+            --no-local \
+            --no-hardlinks \
+            --no-checkout \
+            "$GITHUB_WORKSPACE" \
+            "$acceptance_source"
+          root_git -C "$acceptance_source" checkout --detach "$ACCEPTANCE_GIT_SHA"
+          root_git -C "$acceptance_source" reset --hard "$ACCEPTANCE_GIT_SHA"
+          root_git -C "$acceptance_source" clean -ffdx
+          test -d "$acceptance_source/web"
+          test ! -L "$acceptance_source/web"
+          test ! -e "$acceptance_source/web/node_modules"
+          test ! -L "$acceptance_source/web/node_modules"
+          preinstall_link_list="$(
+            mktemp "${RUNNER_TEMP:?}/acceptance-preinstall-links.XXXXXX"
+          )"
+          cleanup_preinstall_link_list() {
+            rm -f -- "$preinstall_link_list"
+          }
+          trap cleanup_preinstall_link_list EXIT
+          sudo find "$acceptance_source" -type l -print0 |
+            /usr/bin/tee "$preinstall_link_list" >/dev/null
+          while IFS= read -r -d '' link_path; do
+            if ! resolved_path="$(sudo readlink -e -- "$link_path")"; then
+              echo "Refusing dangling pre-install symlink: $link_path" >&2
+              exit 1
+            fi
+            case "$resolved_path" in
+              "$acceptance_source" | "$acceptance_source"/*) ;;
+              *)
+                echo "Refusing external pre-install symlink: $link_path" >&2
+                exit 1
+                ;;
+            esac
+          done <"$preinstall_link_list"
+          cleanup_preinstall_link_list
+          trap - EXIT
+          root_git -C "$acceptance_source" remote remove origin
+          root_git -C "$acceptance_source" fsck --full --strict
+          snapshot_head="$(root_git -C "$acceptance_source" rev-parse HEAD)"
+          test "$snapshot_head" = "$ACCEPTANCE_GIT_SHA"
+          test ! -e "$acceptance_source/.git/objects/info/alternates"
+          sudo chown -hR root:root "$acceptance_source"
+          sudo chmod -R go-w "$acceptance_source"
+
+      - name: Install root-protected acceptance runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /usr/local/lib/heyi-acceptance/source
+          python_source="$(readlink -f -- "$(command -v python)")"
+          test "$python_source" = \
+            /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12
+          test -x "$python_source"
+          test "$("$python_source" --version)" = "Python 3.12.13"
+          python_prefix="${python_source%/bin/python3.12}"
+          python_runtime=/usr/local/lib/heyi-acceptance/python/bin/python3.12
+          python_trust_chain=(
+            /opt
+            /opt/hostedtoolcache
+            /opt/hostedtoolcache/Python
+            /opt/hostedtoolcache/Python/3.12.13
+            "$python_prefix"
+          )
+          for trusted_directory in "${python_trust_chain[@]}"; do
+            test -d "$trusted_directory"
+            test ! -L "$trusted_directory"
+            sudo chown root:root "$trusted_directory"
+            sudo chmod go-w "$trusted_directory"
+          done
+          sudo chown -R root:root "$python_prefix"
+          sudo chmod -R go-w "$python_prefix"
+          sudo cp -aL -- "$python_prefix" /usr/local/lib/heyi-acceptance/python
+          sudo chown -R root:root /usr/local/lib/heyi-acceptance/python
+          sudo chmod -R go-w /usr/local/lib/heyi-acceptance/python
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            "$python_runtime" -I -S - <<'PY'
+          from pathlib import Path
+          import sys
+
+          expected = Path("/usr/local/lib/heyi-acceptance/python").resolve()
+          trusted_hosted_prefix = Path(
+              "/opt/hostedtoolcache/Python/3.12.13/x64"
+          ).resolve()
+          assert Path(sys.base_prefix).resolve() == expected
+          hosted_entries = [
+              line[line.index("/opt/hostedtoolcache/") :]
+              for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines()
+              if "/opt/hostedtoolcache/" in line
+          ]
+          assert all(not entry.endswith(" (deleted)") for entry in hosted_entries)
+          mapped_hosted_paths = {
+              Path(entry).resolve()
+              for entry in hosted_entries
+          }
+          assert all(
+              path.is_file() and path.is_relative_to(trusted_hosted_prefix)
+              for path in mapped_hosted_paths
+          )
+          assert all(
+              item.stat().st_uid == 0 and not item.stat().st_mode & 0o022
+              for path in mapped_hosted_paths
+              for item in (path, *path.parents)
+          )
+          print(f"root-protected hosted Python mappings: {len(mapped_hosted_paths)}")
+          PY
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            "$python_runtime" -I -S -m venv --copies --without-pip \
+            /usr/local/lib/heyi-acceptance/venv
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            UV_NO_PROGRESS=1 \
+            UV_PYTHON="$python_runtime" \
+            UV_PROJECT_ENVIRONMENT=/usr/local/lib/heyi-acceptance/venv \
+            /usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev \
+            --no-build --no-install-project
+          for python_name in python python3 python3.12; do
+            python_target="/usr/local/lib/heyi-acceptance/venv/bin/$python_name"
+            python_staged="${python_target}.acceptance"
+            sudo install -o root -g root -m 0755 "$python_runtime" "$python_staged"
+            sudo mv -fT -- "$python_staged" "$python_target"
+          done
+          sudo chown -hR root:root /usr/local/lib/heyi-acceptance
+          sudo chmod -R go-w /usr/local/lib/heyi-acceptance
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            "$python_runtime" -I -S - <<'PY'
+          from pathlib import Path
+          import stat
+
+          def assert_root_protected_executable(path_text: str) -> Path:
+              path = Path(path_text)
+              link_metadata = path.lstat()
+              assert link_metadata.st_uid == 0
+              if not stat.S_ISLNK(link_metadata.st_mode):
+                  assert not link_metadata.st_mode & 0o022
+              for parent in (path.parent, *path.parent.parents):
+                  metadata = parent.stat()
+                  assert metadata.st_uid == 0
+                  assert not metadata.st_mode & 0o022
+              resolved = path.resolve(strict=True)
+              metadata = resolved.stat()
+              assert stat.S_ISREG(metadata.st_mode)
+              for item in (resolved, *resolved.parents):
+                  metadata = item.stat()
+                  assert metadata.st_uid == 0
+                  assert not metadata.st_mode & 0o022
+              return resolved
+
+          python_executable = assert_root_protected_executable(
+              "/usr/local/lib/heyi-acceptance/venv/bin/python"
+          )
+          npm_executable = assert_root_protected_executable("/usr/local/sbin/npm")
+          config_path = Path(
+              "/usr/local/lib/heyi-acceptance/venv/pyvenv.cfg"
+          ).resolve(strict=True)
+          config = config_path.read_text(encoding="utf-8")
+          assert "/opt/hostedtoolcache" not in config
+          settings = {
+              key.strip(): value.strip()
+              for line in config.splitlines()
+              if "=" in line
+              for key, value in (line.split("=", maxsplit=1),)
+          }
+          expected_home = Path(
+              "/usr/local/lib/heyi-acceptance/python/bin"
+          ).resolve(strict=True)
+          expected_executable = Path(
+              "/usr/local/lib/heyi-acceptance/python/bin/python3.12"
+          ).resolve(strict=True)
+          assert Path(settings["home"]).resolve(strict=True) == expected_home
+          assert (
+              Path(settings["executable"]).resolve(strict=True)
+              == expected_executable
+          )
+          print(f"root-protected Python runtime: PASS ({python_executable})")
+          print(f"root-protected npm: PASS ({npm_executable})")
+          PY
+
+      - name: Install document parser sandbox tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bubblewrap libreoffice-nogui poppler-utils procps
+
+      - name: Install locked frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          acceptance_source=/usr/local/lib/heyi-acceptance/source
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          assert_git_root_protected() {
+            local non_root_git_paths
+            local symlink_git_paths
+            local writable_git_paths
+            test -d "$acceptance_source/.git"
+            test ! -L "$acceptance_source/.git"
+            non_root_git_paths="$(
+              sudo find "$acceptance_source/.git" ! -user root -print -quit
+            )"
+            test -z "$non_root_git_paths"
+            writable_git_paths="$(
+              sudo find "$acceptance_source/.git" \
+                ! -type l -perm /022 -print -quit
+            )"
+            test -z "$writable_git_paths"
+            symlink_git_paths="$(
+              sudo find "$acceptance_source/.git" -type l -print -quit
+            )"
+            test -z "$symlink_git_paths"
+          }
+          assert_git_root_protected
+          sudo chown -hR "$runner_uid:$runner_gid" "$acceptance_source/web"
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/local/sbin/npm ci \
+            --prefix "$acceptance_source/web" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund
+          assert_git_root_protected
+
+      - name: Seal acceptance source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          acceptance_source=/usr/local/lib/heyi-acceptance/source
+          test -d "$acceptance_source"
+          test ! -L "$acceptance_source"
+          sudo chown -hR root:root "$acceptance_source"
+          sudo chmod -R go-w "$acceptance_source"
+          test -d "$acceptance_source/.git"
+          test ! -L "$acceptance_source/.git"
+          test ! -e "$acceptance_source/.git/objects/info/alternates"
+          root_git() {
+            sudo -H /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              /usr/bin/git -c core.hooksPath=/dev/null "$@"
+          }
+          root_git -C "$acceptance_source" fsck --full --strict
+          sealed_sha="$(
+            root_git -C "$acceptance_source" rev-parse HEAD
+          )"
+          test "$sealed_sha" = "$ACCEPTANCE_GIT_SHA"
+          root_git -C "$acceptance_source" diff --exit-code -- .
+          root_git -C "$acceptance_source" diff --cached --exit-code -- .
+          sealed_status="$(
+            root_git -C "$acceptance_source" \
+              status --porcelain=v1 --untracked-files=all
+          )"
+          test -z "$sealed_status"
+          sealed_index_listing="$(
+            root_git -C "$acceptance_source" ls-files -v
+          )"
+          hidden_index_flags="$(
+            LC_ALL=C awk '/^[a-zS]/ { print }' <<<"$sealed_index_listing"
+          )"
+          if test -n "$hidden_index_flags"; then
+            echo "Refusing sealed source with hidden Git index flags" >&2
+            exit 1
+          fi
+          ignored_path_list=
+          seal_link_list=
+          cleanup_seal_lists() {
+            if test -n "$ignored_path_list"; then
+              rm -f -- "$ignored_path_list"
+            fi
+            if test -n "$seal_link_list"; then
+              rm -f -- "$seal_link_list"
+            fi
+          }
+          trap cleanup_seal_lists EXIT
+          ignored_path_list="$(
+            mktemp "${RUNNER_TEMP:?}/acceptance-ignored-paths.XXXXXX"
+          )"
+          seal_link_list="$(
+            mktemp "${RUNNER_TEMP:?}/acceptance-seal-links.XXXXXX"
+          )"
+          root_git -C "$acceptance_source" \
+            ls-files -z --others --ignored --exclude-standard \
+            >"$ignored_path_list"
+          while IFS= read -r -d '' ignored_path; do
+            case "$ignored_path" in
+              web/node_modules/*) ;;
+              *)
+                echo "Refusing unexpected ignored acceptance file: $ignored_path" >&2
+                exit 1
+                ;;
+            esac
+          done <"$ignored_path_list"
+          non_root_paths="$(
+            sudo find "$acceptance_source" ! -user root -print -quit
+          )"
+          test -z "$non_root_paths"
+          writable_paths="$(
+            sudo find "$acceptance_source" ! -type l -perm /022 -print -quit
+          )"
+          test -z "$writable_paths"
+          sudo find "$acceptance_source" -type l -print0 |
+            /usr/bin/tee "$seal_link_list" >/dev/null
+          while IFS= read -r -d '' link_path; do
+            if ! resolved_path="$(sudo readlink -e -- "$link_path")"; then
+              echo "Refusing dangling acceptance symlink: $link_path" >&2
+              exit 1
+            fi
+            case "$resolved_path" in
+              "$acceptance_source" | "$acceptance_source"/*) ;;
+              *)
+                echo "Refusing external acceptance symlink: $link_path" >&2
+                exit 1
+                ;;
+            esac
+          done <"$seal_link_list"
+          cleanup_seal_lists
+          trap - EXIT
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/local/lib/heyi-acceptance/python/bin/python3.12 \
+            -I -S - <<'PY'
+          from pathlib import Path
+
+          source = Path("/usr/local/lib/heyi-acceptance/source").resolve(strict=True)
+          for item in (source, *source.parents):
+              metadata = item.stat()
+              assert metadata.st_uid == 0
+              assert not metadata.st_mode & 0o022
+          print("root-protected acceptance source ancestors: PASS")
+          PY
+
+      - name: Run enterprise acceptance profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /usr/local/lib/heyi-acceptance/source
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            CI="$CI" \
+            KB_ENVIRONMENT="$KB_ENVIRONMENT" \
+            NEXT_TELEMETRY_DISABLED="$NEXT_TELEMETRY_DISABLED" \
+            /usr/local/lib/heyi-acceptance/venv/bin/python scripts/acceptance.py \
+            --profile ci \
+            --report-dir artifacts/acceptance \
+            --node-executable /usr/local/lib/heyi-acceptance/node
+
+      - name: Publish redacted acceptance summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report=/usr/local/lib/heyi-acceptance/source/artifacts/acceptance/acceptance.md
+          if sudo --non-interactive test -f "$report"; then
+            sudo --non-interactive cat "$report" |
+              tee -a "$GITHUB_STEP_SUMMARY"
+          fi

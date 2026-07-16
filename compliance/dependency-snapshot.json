@@ -1,0 +1,63 @@
+{
+  "$schema": "schemas/dependency-snapshot-v1.schema.json",
+  "schema_version": 1,
+  "inputs": [
+    {
+      "path": "pyproject.toml",
+      "sha256": "c0dd484200b2d89e6d788736c30c20b7a616c84a4d56a4ed515af3f95bf24594"
+    },
+    {
+      "path": "uv.lock",
+      "sha256": "64337849840d92b76de9141eaefe037421bbd947a101328ee310cd7935ef6059"
+    },
+    {
+      "path": "web/package.json",
+      "sha256": "721cc6cf67ba4d467e48e802023580c84f527e1d509837504655f294cc2897c1"
+    },
+    {
+      "path": "web/package-lock.json",
+      "sha256": "3dcd055eebcd015434df5d053488a8b5b1f297b5a6e9193e528a466e3d17a34b"
+    }
+  ],
+  "sboms": [
+    {
+      "ecosystem": "python",
+      "marker_environment": {
+        "implementation_name": "cpython",
+        "implementation_version": "3.12.13",
+        "os_name": "nt",
+        "platform_machine": "AMD64",
+        "platform_python_implementation": "CPython",
+        "platform_release": "",
+        "platform_system": "Windows",
+        "platform_version": "",
+        "python_full_version": "3.12.13",
+        "python_version": "3.12",
+        "sys_platform": "win32"
+      },
+      "path": "artifacts/acceptance/sbom-python.cdx.json",
+      "sha256": "6895e628cde5244d3654749a9dc631c98e62139c92d928a034abd84d164d97c9",
+      "format": "CycloneDX",
+      "spec_version": "1.6",
+      "component_count": 52,
+      "dependency_count": 53,
+      "root": {
+        "name": "enterprise-knowledge-base",
+        "version": "0.1.0"
+      }
+    },
+    {
+      "ecosystem": "web",
+      "path": "artifacts/acceptance/sbom-web.cdx.json",
+      "sha256": "8c90b3bb154fdd42558a9e1d36310a5d9af2d6ee496d89e8989633c082f00f1d",
+      "format": "CycloneDX",
+      "spec_version": "1.6",
+      "component_count": 56,
+      "dependency_count": 57,
+      "root": {
+        "name": "enterprise-knowledge-base-web",
+        "version": "0.1.0"
+      }
+    }
+  ]
+}

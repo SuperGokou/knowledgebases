@@ -6,10 +6,18 @@ set -eu
 : "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}"
 : "${MINIO_BUCKET:?MINIO_BUCKET is required}"
 
+MC_CONFIG_DIR="${MC_CONFIG_DIR:-/tmp/.mc}"
+export MC_CONFIG_DIR
+
 max_age="${MINIO_MULTIPART_MAX_AGE:-2d}"
 interval="${MINIO_MULTIPART_CLEANUP_INTERVAL_SECONDS:-86400}"
 
-until mc alias set local "${MINIO_ENDPOINT}" "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" >/dev/null 2>&1; do
+until mc alias set local \
+    "${MINIO_ENDPOINT}" \
+    "${MINIO_ROOT_USER}" \
+    "${MINIO_ROOT_PASSWORD}" \
+    --api S3v4 \
+    --path on >/dev/null 2>&1; do
     sleep 2
 done
 

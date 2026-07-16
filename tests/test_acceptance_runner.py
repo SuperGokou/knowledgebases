@@ -1,0 +1,3481 @@
+from __future__ import annotations
+
+import ast
+import base64
+import copy
+import hashlib
+import json
+import platform
+import re
+import shutil
+import subprocess
+import sysconfig
+import textwrap
+from dataclasses import asdict, replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from xml.etree import ElementTree as StdlibElementTree
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+import scripts.acceptance as acceptance_module
+from scripts.acceptance import (
+    AcceptanceGate,
+    AcceptanceResult,
+    BrowserCollectionContract,
+    CommandOutcome,
+    _browser_e2e_exit_code,
+    _formal_signature_payload,
+    _verify_browser_e2e_document,
+    build_profile,
+    calculate_verdict,
+    collect_worktree_evidence,
+    execute_command,
+    initialize_acceptance_identity,
+    redact_output,
+    resolve_browser_e2e_suite_timeout_seconds,
+    resolve_command,
+    run_browser_e2e,
+    run_gate,
+    run_gates_bound_to_identity,
+    verify_bound_child_evidence,
+    verify_browser_e2e_collection,
+    verify_browser_e2e_evidence,
+    verify_formal_evidence,
+    verify_offline_runtime_evidence,
+    write_reports,
+)
+from scripts.acceptance_gate import (
+    GateIdentity,
+    TrustedExecutableBinding,
+    discover_postgres_test_files,
+    parse_pytest_junit,
+)
+from scripts.functional_acceptance import (
+    ExternalTrustContext,
+    _signature_payload,
+    _trusted_policy,
+    _validate_external_provenance,
+    evaluate_contract,
+    load_manifest,
+)
+from scripts.postgres_acceptance import (
+    POSTGRES_BUSINESS_CHECK_NODES,
+    postgres_business_checks_from_nodes,
+)
+
+
+def result(gate_id: str, severity: str, status: str) -> AcceptanceResult:
+    return AcceptanceResult(
+        gate_id=gate_id,
+        severity=severity,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        duration_seconds=0.1,
+        summary="test result",
+    )
+
+
+def final_browser_e2e_gate() -> AcceptanceGate:
+    repository = Path(__file__).resolve().parents[1]
+    worktree = collect_worktree_evidence(repository)
+    identity = GateIdentity(worktree.git_head, worktree.content_fingerprint, "c" * 32)
+    return next(
+        gate
+        for gate in build_profile(
+            "final",
+            offline_contract_sha256="a" * 64,
+            offline_image_manifest_sha256="b" * 64,
+            e2e_evidence_path=str(repository / "artifacts/acceptance/functional/browser-e2e.json"),
+            functional_trust_store_path="/secure/trust.json",
+            functional_challenge_store_path="/secure/challenges",
+            e2e_signing_key_path="/secure/browser-e2e.key",
+            e2e_signing_key_id="browser-e2e-ed25519",
+            deployment_base_url="https://knowledge.example.invalid",
+            release_id=identity.git_head,
+            acceptance_identity=identity,
+        )
+        if gate.gate_id == "E2E-P0-001"
+    )
+
+
+_REQUIRED_BROWSER_TITLES = (
+    "@enterprise preflight 真实前端、API 与故障控制面必须可达",
+    "@enterprise TLS validates trusted identity and short-lived certificate renewal architecture",
+    "@enterprise unified login routes accounts by effective role",
+    "@enterprise account lifecycle rejects duplicates and revokes active access",
+    "@enterprise password reset enforces scope and revokes old credentials and sessions",
+    "@enterprise role administration edits and deletes safely under references and concurrency",
+    "@enterprise knowledge grants are visible then fail closed immediately after revocation",
+    "@enterprise all nine document formats complete scan, OKF, approval, retrieval and cited chat",
+    "@enterprise chat renders citations, no-answer, audited rejection and sourced table",
+    "@enterprise configured model switches and provider failure degrades safely",
+    "@enterprise API key enforces knowledge scope, rate limit and revocation",
+    "@enterprise audit query, pagination, CSV export and permission revocation fail closed",
+    "@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly",
+)
+
+_REQUIRED_BROWSER_CHECKS = (
+    "login_role_routing",
+    "account_lifecycle",
+    "knowledge_acl",
+    "file_upload_scan_okf_approval_download",
+    "chat_citations_audit_table",
+    "model_switch",
+    "model_deepseek_success",
+    "model_qwen_success",
+    "model_minimax_success",
+    "api_key_lifecycle",
+    "audit_log_query_export",
+    "error_loading_states",
+    "tls_ca_trust",
+    "tls_san_identity",
+    "tls_validity_and_renewal",
+    "tls_strict_client",
+)
+
+
+def _browser_collection_output() -> str:
+    lines = ["Listing tests:"]
+    for project in ("enterprise-desktop", "enterprise-mobile"):
+        lines.extend(
+            f"  [{project}] › enterprise-business.spec.ts:1:1 › {title}"
+            for title in _REQUIRED_BROWSER_TITLES
+        )
+    lines.append("Total: 26 tests in 3 files")
+    return "\n".join(lines)
+
+
+def test_failed_or_blocked_p0_forces_fail() -> None:
+    required = ("AUTH-P0-001",)
+    assert (
+        calculate_verdict(
+            [result("AUTH-P0-001", "P0", "failed")],
+            required_gate_ids=required,
+        )
+        == "FAIL"
+    )
+    assert (
+        calculate_verdict(
+            [result("AUTH-P0-001", "P0", "blocked")],
+            required_gate_ids=required,
+        )
+        == "FAIL"
+    )
+
+
+def test_unverified_p1_is_conditional_but_p2_does_not_block() -> None:
+    assert (
+        calculate_verdict(
+            [
+                result("AUTH-P0-001", "P0", "passed"),
+                result("OPS-P1-001", "P1", "blocked"),
+            ],
+            required_gate_ids=("AUTH-P0-001", "OPS-P1-001"),
+        )
+        == "CONDITIONAL"
+    )
+    assert (
+        calculate_verdict(
+            [
+                result("AUTH-P0-001", "P0", "passed"),
+                result("UX-P2-001", "P2", "failed"),
+            ],
+            required_gate_ids=("AUTH-P0-001", "UX-P2-001"),
+        )
+        == "PASS"
+    )
+
+
+def test_verdict_rejects_missing_duplicate_extra_or_empty_gate_sets() -> None:
+    required = ("AUTH-P0-001", "OPS-P1-001")
+    passed = result("AUTH-P0-001", "P0", "passed")
+    ops = result("OPS-P1-001", "P1", "passed")
+
+    assert calculate_verdict([], required_gate_ids=required) == "FAIL"
+    assert calculate_verdict([passed], required_gate_ids=required) == "FAIL"
+    assert calculate_verdict([passed, passed], required_gate_ids=required) == "FAIL"
+    assert (
+        calculate_verdict(
+            [passed, ops, result("UNEXPECTED-P0-001", "P0", "passed")],
+            required_gate_ids=required,
+        )
+        == "FAIL"
+    )
+    assert calculate_verdict([passed, ops], required_gate_ids=required) == "PASS"
+
+
+def test_redaction_removes_credentials_tokens_and_presigned_queries() -> None:
+    raw = "\n".join(
+        [
+            "Authorization: Bearer secret-token-value",
+            "postgresql://admin:db-password@db.internal/knowledge",
+            "KB_JWT_SECRET=super-secret-value",
+            "https://objects.internal/file?X-Amz-Credential=user&X-Amz-Signature=abc123",
+        ]
+    )
+
+    redacted = redact_output(raw)
+
+    for secret in ("secret-token-value", "db-password", "super-secret-value", "abc123"):
+        assert secret not in redacted
+    assert "[REDACTED]" in redacted
+    assert "https://objects.internal/file?[REDACTED]" in redacted
+
+
+def test_nonzero_exit_is_failed_and_summary_is_bounded() -> None:
+    gate = AcceptanceGate(
+        gate_id="CODE-P0-001",
+        severity="P0",
+        command=("tool", "check"),
+        cwd=".",
+        timeout_seconds=30,
+    )
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        return CommandOutcome(returncode=2, stdout="x" * 20_000, stderr="failed")
+
+    outcome = run_gate(gate, executor=executor)
+
+    assert outcome.status == "failed"
+    assert len(outcome.summary) <= 4_096
+
+
+def test_gate_subprocess_inherits_the_single_parent_deployment_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(acceptance_module, "_active_offline_lock_fd", 9)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(acceptance_module, "_root_protected_executable", lambda command: command)
+
+    outcome = execute_command(AcceptanceGate("LOCK", "P0", ("tool",), ".", 10))
+
+    assert outcome.returncode == 0
+    assert captured["pass_fds"] == (9,)
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["KB_OFFLINE_LOCK_HELD"] == "heyi-kb-offline-operation-v2"
+
+
+def test_functional_gate_passes_only_the_bound_node_path_and_digest() -> None:
+    binding = TrustedExecutableBinding("/opt/trusted/node", "b" * 64, require_root_owner=True)
+
+    gate = next(
+        item
+        for item in build_profile("ci", functional_node_binding=binding)
+        if item.gate_id == "FUNCTIONAL-P0-001"
+    )
+
+    assert gate.command[-5:] == (
+        "--node-executable",
+        binding.path,
+        "--node-executable-sha256",
+        binding.sha256,
+        "--node-executable-require-root-owner",
+    )
+    assert not gate.environment
+
+
+@pytest.mark.parametrize("profile", ("local", "ci", "final"))
+def test_functional_gate_uses_the_repository_module_entrypoint(profile: str) -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+
+    gate = next(item for item in build_profile(profile) if item.gate_id == "FUNCTIONAL-P0-001")
+
+    assert gate.command[1:3] == ("-m", "scripts.functional_acceptance")
+    assert gate.cwd == str(repository)
+    assert not any(argument.endswith("functional_acceptance.py") for argument in gate.command)
+
+
+@pytest.mark.parametrize(
+    ("profile", "gate_id", "module"),
+    (
+        ("ci", "FUNCTIONAL-P0-001", "scripts.functional_acceptance"),
+        ("final", "TOKEN-GOV-P0-001", "scripts.postgres_acceptance"),
+        (
+            "final",
+            "LINUX-HOST-EVIDENCE-P0-001",
+            "scripts.linux_host_evidence_collector",
+        ),
+        ("final", "BACKEND-P0-001", "scripts.backend_acceptance"),
+    ),
+)
+def test_package_gate_module_entrypoint_starts_in_sanitized_environment(
+    profile: str,
+    gate_id: str,
+    module: str,
+) -> None:
+    gate = next(item for item in build_profile(profile) if item.gate_id == gate_id)
+    environment = acceptance_module.sanitized_test_environment()
+
+    completed = subprocess.run(
+        (*gate.command[:3], "--help"),
+        cwd=gate.cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "PYTHONPATH" not in environment
+    assert "PYTHONHOME" not in environment
+    assert gate.command[1:3] == ("-m", module)
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+
+
+@pytest.mark.parametrize("profile", ("local", "ci", "final"))
+def test_repository_python_child_gates_require_reviewed_entrypoints(profile: str) -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    scripts_root = (repository / "scripts").resolve()
+    reviewed_direct_entrypoints = {
+        (scripts_root / "acceptance.py").resolve(),
+        (scripts_root / "supply_chain_gate.py").resolve(),
+    }
+
+    for gate in build_profile(profile):
+        if len(gate.command) < 2 or gate.command[0] != acceptance_module.sys.executable:
+            continue
+        candidate = Path(gate.command[1])
+        if candidate.suffix != ".py":
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(scripts_root):
+            continue
+        assert resolved in reviewed_direct_entrypoints, (
+            f"{gate.gate_id} must use '-m scripts.<module>' or receive an explicit bootstrap review"
+        )
+
+
+@pytest.mark.parametrize("script_name", ("acceptance.py", "supply_chain_gate.py"))
+def test_reviewed_direct_entrypoints_start_isolated_from_the_repository_cwd(
+    script_name: str,
+    tmp_path: Path,
+) -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    environment = acceptance_module.sanitized_test_environment()
+    purelib = sysconfig.get_path("purelib")
+    assert purelib
+    launcher = (
+        "import runpy,sys;"
+        "script=sys.argv[1];"
+        "sys.path.append(sys.argv[2]);"
+        "sys.argv=[script,'--help'];"
+        "runpy.run_path(script,run_name='__main__')"
+    )
+
+    completed = subprocess.run(
+        (
+            acceptance_module.sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            launcher,
+            str(repository / "scripts" / script_name),
+            purelib,
+        ),
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "PYTHONPATH" not in environment
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+
+
+def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+    pin_step = "- name: Pin trusted Node executable"
+    snapshot_step = "- name: Create exact acceptance source snapshot"
+    runtime_step = "- name: Install root-protected acceptance runtime"
+    dependency_step = "- name: Install locked frontend dependencies"
+    seal_step = "- name: Seal acceptance source snapshot"
+
+    assert "ACCEPTANCE_GIT_SHA: ${{ github.sha }}" in acceptance_job
+    assert 'python-version: "3.12.13"' in acceptance_job
+    assert 'node-version: "24.18.0"' in acceptance_job
+    assert 'version: "0.11.15"' in acceptance_job
+    assert pin_step in acceptance_job
+    assert snapshot_step in acceptance_job
+    assert runtime_step in acceptance_job
+    assert dependency_step in acceptance_job
+    assert seal_step in acceptance_job
+    assert (
+        "sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance" in acceptance_job
+    )
+    assert (
+        'sudo install -o root -g root -m 0755 "$node_source" \\\n'
+        "            /usr/local/lib/heyi-acceptance/node" in acceptance_job
+    )
+    assert "npm root --global" not in acceptance_job
+
+    checkout_block = acceptance_job.split("      - name: Check out repository\n", maxsplit=1)[
+        1
+    ].split("      - name: Set up Python\n", maxsplit=1)[0]
+    assert "fetch-depth: 0" in checkout_block
+    assert "persist-credentials: false" in checkout_block
+
+    setup_uv_block = acceptance_job.split("      - name: Set up uv\n", maxsplit=1)[1].split(
+        "      - name: Set up Node.js\n", maxsplit=1
+    )[0]
+    assert "enable-cache: false" in setup_uv_block
+    assert "cache-dependency-glob" not in setup_uv_block
+
+    pin_block = acceptance_job.split("      - name: Pin trusted Node executable\n", maxsplit=1)[
+        1
+    ].split("      - name: Create exact acceptance source snapshot\n", maxsplit=1)[0]
+    assert 'node_source="$(readlink -f -- "$(command -v node)")"' in pin_block
+    assert 'uv_source="$(readlink -f -- "$(command -v uv)")"' in pin_block
+    assert 'npm_cli="$(readlink -f -- "$(command -v npm)")"' in pin_block
+    assert (
+        'test "$node_source" = \\\n'
+        "            /opt/hostedtoolcache/node/24.18.0/x64/bin/node" in pin_block
+    )
+    assert (
+        'test "$uv_source" = \\\n            /opt/hostedtoolcache/uv/0.11.15/x86_64/uv' in pin_block
+    )
+    assert 'uv_version="$("$uv_source" --version)"' in pin_block
+    assert '"uv 0.11.15" | "uv 0.11.15 "*' in pin_block
+    assert 'test "$("$uv_source" --version)" = "uv 0.11.15"' not in pin_block
+    assert (
+        'test "$npm_cli" = \\\n'
+        "            /opt/hostedtoolcache/node/24.18.0/x64/lib/node_modules/"
+        "npm/bin/npm-cli.js" in pin_block
+    )
+    assert 'test "$("$node_source" "$npm_cli" --version)" = "11.16.0"' in pin_block
+    assert 'npm_package_root="${npm_cli%/bin/npm-cli.js}"' in pin_block
+
+    setup_python_index = acceptance_job.index("- name: Set up Python")
+    setup_uv_index = acceptance_job.index("- name: Set up uv")
+    setup_node_index = acceptance_job.index("- name: Set up Node.js")
+    pin_index = acceptance_job.index(pin_step)
+    snapshot_index = acceptance_job.index(snapshot_step)
+    runtime_index = acceptance_job.index(runtime_step)
+    dependency_index = acceptance_job.index(dependency_step)
+    seal_index = acceptance_job.index(seal_step)
+    npm_ci_index = acceptance_job.index("/usr/local/sbin/npm ci")
+
+    assert (
+        setup_python_index
+        < setup_uv_index
+        < setup_node_index
+        < pin_index
+        < snapshot_index
+        < runtime_index
+        < dependency_index
+        < npm_ci_index
+        < seal_index
+    )
+    parser_index = acceptance_job.index("- name: Install document parser sandbox tools")
+    assert runtime_index < parser_index < dependency_index
+    assert seal_index < acceptance_job.index("- name: Run enterprise acceptance profile")
+    assert "--node-executable /usr/local/lib/heyi-acceptance/node" in acceptance_job
+
+
+def test_enterprise_acceptance_workflow_builds_exact_root_owned_source_snapshot() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+    snapshot_step = acceptance_job.split(
+        "      - name: Create exact acceptance source snapshot\n", maxsplit=1
+    )[1].split("      - name: Install root-protected acceptance runtime\n", maxsplit=1)[0]
+
+    assert '[[ "$ACCEPTANCE_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]' in snapshot_step
+    assert 'runner_head="$(/usr/bin/git rev-parse HEAD)"' in snapshot_step
+    assert 'test "$runner_head" = "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert 'test ! -e "$GITHUB_WORKSPACE/.git/objects/info/alternates"' in snapshot_step
+    assert "status --porcelain=v1 --untracked-files=all" in snapshot_step
+    assert "runner_status=" in snapshot_step
+    assert 'test -z "$runner_status"' in snapshot_step
+    assert 'runner_index_listing="$(/usr/bin/git ls-files -v)"' in snapshot_step
+    assert "awk '/^[a-zS]/ { print }'" in snapshot_step
+    assert "|| true" not in snapshot_step
+    assert 'if test -n "$hidden_index_flags"; then' in snapshot_step
+    assert re.search(
+        r"root_git\(\)\s*\{\s*sudo -H /usr/bin/env -i",
+        snapshot_step,
+        flags=re.DOTALL,
+    )
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in snapshot_step
+    assert "GIT_CONFIG_NOSYSTEM=1" in snapshot_step
+    assert 'safe.directory="$GITHUB_WORKSPACE"' in snapshot_step
+    normalized_snapshot = re.sub(r"\s+", " ", snapshot_step.replace("\\\n", " "))
+    assert re.search(
+        r'root_git -c safe\.directory="\$GITHUB_WORKSPACE" clone '
+        r"--no-local --no-hardlinks --no-checkout "
+        r'"\$GITHUB_WORKSPACE" "\$acceptance_source"',
+        normalized_snapshot,
+    )
+    assert 'checkout --detach "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert 'reset --hard "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert "clean -ffdx" in snapshot_step
+    assert 'test -d "$acceptance_source/web"' in snapshot_step
+    assert 'test ! -L "$acceptance_source/web"' in snapshot_step
+    assert 'test ! -e "$acceptance_source/web/node_modules"' in snapshot_step
+    assert 'test ! -L "$acceptance_source/web/node_modules"' in snapshot_step
+    assert 'sudo find "$acceptance_source" -type l -print0' in snapshot_step
+    assert '/usr/bin/tee "$preinstall_link_list" >/dev/null' in snapshot_step
+    assert 'done <"$preinstall_link_list"' in snapshot_step
+    assert "< <(" not in snapshot_step
+    assert 'sudo readlink -e -- "$link_path"' in snapshot_step
+    assert '"$acceptance_source" | "$acceptance_source"/*) ;;' in snapshot_step
+    assert re.search(
+        r"Refusing dangling pre-install symlink:[^\n]*\n\s+exit 1",
+        snapshot_step,
+    )
+    assert re.search(
+        r"Refusing external pre-install symlink:[^\n]*\n\s+exit 1",
+        snapshot_step,
+    )
+    assert "remote remove origin" in snapshot_step
+    assert "fsck --full --strict" in snapshot_step
+    assert 'snapshot_head="$(root_git -C "$acceptance_source" rev-parse HEAD)"' in snapshot_step
+    assert 'test "$snapshot_head" = "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert 'sudo chown -hR root:root "$acceptance_source"' in snapshot_step
+    assert 'sudo chmod -R go-w "$acceptance_source"' in snapshot_step
+    assert not re.search(r"(?m)(?:^|\s)(?:/[^\s]+/)?cp(?:\s|$)", snapshot_step)
+    assert "--shared" not in snapshot_step
+    assert "--reference" not in snapshot_step
+
+
+def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+
+    assert "- name: Install root-protected acceptance runtime" in acceptance_job
+    assert "UV_PROJECT_ENVIRONMENT=/usr/local/lib/heyi-acceptance/venv" in acceptance_job
+    assert "/usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev" in acceptance_job
+    assert "/usr/local/sbin/npm" in acceptance_job
+    assert "/usr/local/sbin/node" in acceptance_job
+    runtime_step = acceptance_job.split(
+        "      - name: Install root-protected acceptance runtime\n", maxsplit=1
+    )[1].split("      - name: Install document parser sandbox tools\n", maxsplit=1)[0]
+    assert "cd /usr/local/lib/heyi-acceptance/source" in runtime_step
+    assert 'python_source="$(readlink -f -- "$(command -v python)")"' in runtime_step
+    assert (
+        'test "$python_source" = \\\n'
+        "            /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12" in runtime_step
+    )
+    assert (
+        '"$python_runtime" -I -S -m venv --copies --without-pip \\\n'
+        "            /usr/local/lib/heyi-acceptance/venv" in runtime_step
+    )
+    assert 'python_prefix="${python_source%/bin/python3.12}"' in runtime_step
+    assert "python_runtime=/usr/local/lib/heyi-acceptance/python/bin/python3.12" in runtime_step
+    assert 'sudo cp -aL -- "$python_prefix" /usr/local/lib/heyi-acceptance/python' in runtime_step
+    assert "python_trust_chain=(" in runtime_step
+    assert 'sudo chown -R root:root "$python_prefix"' in runtime_step
+    assert 'sudo chmod -R go-w "$python_prefix"' in runtime_step
+    assert "sudo chown -R root:root /usr/local/lib/heyi-acceptance/python" in runtime_step
+    assert "sudo chmod -R go-w /usr/local/lib/heyi-acceptance/python" in runtime_step
+    assert "Path(sys.base_prefix).resolve() == expected" in runtime_step
+    assert 'Path("/proc/self/maps").read_text' in runtime_step
+    assert 'assert all(not entry.endswith(" (deleted)")' in runtime_step
+    assert "path.is_relative_to(trusted_hosted_prefix)" in runtime_step
+    assert "item.stat().st_uid == 0" in runtime_step
+    assert runtime_step.count("\"$python_runtime\" -I -S - <<'PY'") >= 2
+    assert "--no-build --no-install-project" in runtime_step
+    assert 'UV_PYTHON="$python_runtime"' in runtime_step
+    assert "for python_name in python python3 python3.12; do" in runtime_step
+    assert 'python_staged="${python_target}.acceptance"' in runtime_step
+    assert 'sudo install -o root -g root -m 0755 "$python_runtime" "$python_staged"' in runtime_step
+    assert 'sudo mv -fT -- "$python_staged" "$python_target"' in runtime_step
+    assert "sudo chown -hR root:root /usr/local/lib/heyi-acceptance" in runtime_step
+    assert "sudo chmod -R go-w /usr/local/lib/heyi-acceptance" in runtime_step
+    assert 'assert "/opt/hostedtoolcache" not in config' in runtime_step
+    assert "resolve(strict=True)" in runtime_step
+    assert "stat.S_ISREG" in runtime_step
+    assert "st_uid == 0" in runtime_step
+    assert "st_mode & 0o022" in runtime_step
+    assert "pyvenv.cfg" in runtime_step
+    assert 'settings["home"]' in runtime_step
+    assert 'settings["executable"]' in runtime_step
+    assert "root-protected Python runtime: PASS" in runtime_step
+    assert "root-protected npm: PASS" in runtime_step
+    shell_only_runtime = re.sub(
+        r"<<'PY'\n.*?\n\s+PY",
+        "<<'PY'\nPY",
+        runtime_step,
+        flags=re.DOTALL,
+    )
+    assert "/usr/local/lib/heyi-acceptance/venv/bin/python" not in shell_only_runtime
+    assert not re.search(
+        r"(?m)^\s*(?:sudo[^\n]*\s+)?"
+        r"/usr/local/lib/heyi-acceptance/venv/bin/python(?:\s|$)",
+        shell_only_runtime,
+    )
+    isolated_bodies = re.findall(
+        r'"\$python_runtime" -I -S - <<\'PY\'\n(.*?)\n\s+PY',
+        runtime_step,
+        flags=re.DOTALL,
+    )
+    assert len(isolated_bodies) == 2
+    allowed_import_roots = {"pathlib", "stat", "sys"}
+    for body in isolated_bodies:
+        tree = ast.parse(textwrap.dedent(body))
+        imported_roots = {
+            alias.name.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        imported_roots.update(
+            node.module.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        )
+        assert imported_roots <= allowed_import_roots
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"__import__", "compile", "eval", "exec"}
+            for node in ast.walk(tree)
+        )
+        assert not any(
+            isinstance(node, ast.ImportFrom) and (node.level > 0 or node.module is None)
+            for node in ast.walk(tree)
+        )
+    assert "/opt/heyi-acceptance" not in runtime_step
+
+
+def test_enterprise_acceptance_workflow_seals_the_exact_source_after_npm_install() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+    dependency_step = acceptance_job.split(
+        "      - name: Install locked frontend dependencies\n", maxsplit=1
+    )[1].split("      - name: Seal acceptance source snapshot\n", maxsplit=1)[0]
+    assert "uv sync" not in dependency_step
+    assert 'sudo chown -hR "$runner_uid:$runner_gid" "$acceptance_source/web"' in dependency_step
+    assert 'sudo chown -hR "$runner_uid:$runner_gid" "$acceptance_source"' not in dependency_step
+    assert "assert_git_root_protected()" in dependency_step
+    assert 'find "$acceptance_source/.git" ! -user root -print -quit' in dependency_step
+    assert (
+        'find "$acceptance_source/.git" \\\n'
+        "                ! -type l -perm /022 -print -quit" in dependency_step
+    )
+    assert 'find "$acceptance_source/.git" -type l -print -quit' in dependency_step
+    assert 'test -z "$non_root_git_paths"' in dependency_step
+    assert 'test -z "$writable_git_paths"' in dependency_step
+    assert 'test -z "$symlink_git_paths"' in dependency_step
+    git_protection_calls = [
+        match.start()
+        for match in re.finditer(
+            r"(?m)^\s+assert_git_root_protected\s*$",
+            dependency_step,
+        )
+    ]
+    assert len(git_protection_calls) == 2
+    assert all(
+        ".git" not in line for line in dependency_step.splitlines() if re.search(r"\bchown\b", line)
+    )
+    normalized_dependency = re.sub(r"\s+", " ", dependency_step.replace("\\\n", " "))
+    npm_contract = (
+        '/usr/local/sbin/npm ci --prefix "$acceptance_source/web" '
+        "--ignore-scripts --no-audit --no-fund"
+    )
+    assert npm_contract in normalized_dependency
+    assert (
+        git_protection_calls[0]
+        < dependency_step.index("/usr/local/sbin/npm ci")
+        < git_protection_calls[1]
+    )
+    assert "npm ci --prefix web" not in dependency_step
+
+    seal_step = acceptance_job.split("      - name: Seal acceptance source snapshot\n", maxsplit=1)[
+        1
+    ].split("      - name: Run enterprise acceptance profile\n", maxsplit=1)[0]
+    assert 'sudo chown -hR root:root "$acceptance_source"' in seal_step
+    assert 'sudo chmod -R go-w "$acceptance_source"' in seal_step
+    assert 'test -d "$acceptance_source/.git"' in seal_step
+    assert 'test ! -e "$acceptance_source/.git/objects/info/alternates"' in seal_step
+    assert re.search(
+        r"root_git\(\)\s*\{\s*sudo -H /usr/bin/env -i",
+        seal_step,
+        flags=re.DOTALL,
+    )
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in seal_step
+    assert "GIT_CONFIG_NOSYSTEM=1" in seal_step
+    assert "fsck --full --strict" in seal_step
+    assert 'test "$sealed_sha" = "$ACCEPTANCE_GIT_SHA"' in seal_step
+    assert "diff --exit-code -- ." in seal_step
+    assert "diff --cached --exit-code -- ." in seal_step
+    assert "status --porcelain=v1 --untracked-files=all" in seal_step
+    assert 'test -z "$sealed_status"' in seal_step
+    assert "sealed_index_listing=" in seal_step
+    assert "awk '/^[a-zS]/ { print }'" in seal_step
+    assert "|| true" not in seal_step
+    assert 'if test -n "$hidden_index_flags"; then' in seal_step
+    assert "ls-files -z --others --ignored --exclude-standard" in seal_step
+    assert '>"$ignored_path_list"' in seal_step
+    assert 'done <"$ignored_path_list"' in seal_step
+    assert "web/node_modules/*" in seal_step
+    assert 'find "$acceptance_source" ! -user root -print -quit' in seal_step
+    assert 'find "$acceptance_source" ! -type l -perm /022 -print -quit' in seal_step
+    assert 'test -z "$non_root_paths"' in seal_step
+    assert 'test -z "$writable_paths"' in seal_step
+    assert 'sudo find "$acceptance_source" -type l -print0' in seal_step
+    assert '/usr/bin/tee "$seal_link_list" >/dev/null' in seal_step
+    assert 'done <"$seal_link_list"' in seal_step
+    assert "< <(" not in seal_step
+    assert 'sudo readlink -e -- "$link_path"' in seal_step
+    assert '"$acceptance_source" | "$acceptance_source"/*) ;;' in seal_step
+    assert re.search(
+        r"Refusing dangling acceptance symlink:[^\n]*\n\s+exit 1",
+        seal_step,
+    )
+    assert re.search(
+        r"Refusing external acceptance symlink:[^\n]*\n\s+exit 1",
+        seal_step,
+    )
+    assert "resolve(strict=True)" in seal_step
+    assert "metadata.st_uid == 0" in seal_step
+    assert "metadata.st_mode & 0o022" in seal_step
+    assert "root-protected acceptance source ancestors: PASS" in seal_step
+    assert not re.search(r"(?m)(?:^|\s)(?:/[^\s]+/)?cp(?:\s|$)", seal_step)
+    assert "checked_out_sha" not in seal_step
+
+    run_step = acceptance_job.split(
+        "      - name: Run enterprise acceptance profile\n", maxsplit=1
+    )[1].split("      - name: Publish redacted acceptance summary\n", maxsplit=1)[0]
+    assert "sudo -H /usr/bin/env -i" in run_step
+    assert "cd /usr/local/lib/heyi-acceptance/source" in run_step
+    assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in run_step
+    assert "/usr/local/lib/heyi-acceptance/venv/bin/python scripts/acceptance.py" in run_step
+    assert "uv run" not in run_step
+
+    publish_step = acceptance_job.split(
+        "      - name: Publish redacted acceptance summary\n", maxsplit=1
+    )[1]
+    assert "if: always()" in publish_step
+    assert (
+        "report=/usr/local/lib/heyi-acceptance/source/artifacts/acceptance/acceptance.md"
+        in publish_step
+    )
+    assert 'sudo --non-interactive cat "$report"' in publish_step
+    assert "hashFiles('artifacts/acceptance/acceptance.md')" not in publish_step
+
+
+def test_declared_preflight_exit_code_is_reported_as_blocked() -> None:
+    gate = AcceptanceGate(
+        gate_id="HOST-P0-001",
+        severity="P0",
+        command=("python", "host_preflight.py"),
+        cwd=".",
+        timeout_seconds=30,
+        blocked_exit_codes=(2,),
+    )
+
+    outcome = run_gate(
+        gate,
+        executor=lambda _gate: CommandOutcome(
+            returncode=2,
+            stdout='{"status":"blocked"}',
+            stderr="",
+        ),
+    )
+
+    assert outcome.status == "blocked"
+    assert '"status":"blocked"' in outcome.summary
+
+
+def test_target_gate_rejects_missing_or_symlinked_required_evidence(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+    gate = AcceptanceGate(
+        gate_id="HOST-P0-001",
+        severity="P0",
+        command=("tool",),
+        cwd=".",
+        timeout_seconds=30,
+        required_regular_files=(str(missing),),
+    )
+    called = False
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        nonlocal called
+        called = True
+        return CommandOutcome(returncode=0, stdout="ok", stderr="")
+
+    assert run_gate(gate, executor=executor).status == "blocked"
+    assert called is False
+
+    actual = tmp_path / "actual.json"
+    actual.write_text("{}", encoding="utf-8")
+    linked = tmp_path / "linked.json"
+    try:
+        linked.symlink_to(actual)
+    except OSError:
+        pytest.skip("creating symlinks is unavailable on this test host")
+    linked_gate = replace(gate, required_regular_files=(str(linked),))
+    assert run_gate(linked_gate, executor=executor).status == "blocked"
+    assert called is False
+
+
+def test_e2e_block_marker_is_blocked_but_real_failure_is_failed() -> None:
+    gate = AcceptanceGate(
+        gate_id="E2E-P0-001",
+        severity="P0",
+        command=("npm", "run", "test:e2e"),
+        cwd="web",
+        timeout_seconds=30,
+        blocked_output_markers=("E2E_BLOCKED",),
+    )
+
+    blocked = run_gate(
+        gate,
+        executor=lambda _gate: CommandOutcome(
+            returncode=1,
+            stdout="E2E_BLOCKED: enterprise topology is incomplete",
+            stderr="",
+        ),
+    )
+    failed = run_gate(
+        gate,
+        executor=lambda _gate: CommandOutcome(
+            returncode=1,
+            stdout="assertion failed",
+            stderr="",
+        ),
+    )
+
+    assert blocked.status == "blocked"
+    assert failed.status == "failed"
+
+
+def test_successful_browser_process_cannot_pass_without_verified_evidence() -> None:
+    successful_process = CommandOutcome(returncode=0, stdout="18 passed", stderr="")
+
+    assert _browser_e2e_exit_code(successful_process, evidence_verified=False) == 2
+    assert _browser_e2e_exit_code(successful_process, evidence_verified=True) == 0
+    assert (
+        _browser_e2e_exit_code(
+            CommandOutcome(returncode=1, stdout="assertion failed", stderr=""),
+            evidence_verified=True,
+        )
+        == 1
+    )
+
+
+def test_browser_e2e_suite_timeout_defaults_to_two_hours() -> None:
+    assert resolve_browser_e2e_suite_timeout_seconds({}) == 7_200
+
+
+def test_browser_collection_requires_exact_count_projects_and_critical_titles() -> None:
+    repository = Path(__file__).parents[1]
+    contract = acceptance_module._browser_collection_contract(repository)
+
+    accepted, _ = verify_browser_e2e_collection(_browser_collection_output(), contract)
+    missing, _ = verify_browser_e2e_collection(
+        _browser_collection_output().replace(_REQUIRED_BROWSER_TITLES[0], "renamed", 1),
+        contract,
+    )
+    filtered, _ = verify_browser_e2e_collection(
+        _browser_collection_output().replace("Total: 26 tests", "Total: 25 tests"),
+        contract,
+    )
+
+    assert accepted is True
+    assert contract.required_projects == ("enterprise-desktop", "enterprise-mobile")
+    assert missing is False
+    assert filtered is False
+
+
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [
+        ({"KB_E2E_SUITE_TIMEOUT_MS": "not-an-integer"}, "integer"),
+        ({"KB_E2E_SUITE_TIMEOUT_MS": "1799999"}, "between"),
+        ({"KB_E2E_SUITE_TIMEOUT_MS": "43200001"}, "between"),
+        (
+            {
+                "KB_E2E_SUITE_TIMEOUT_MS": "1800000",
+                "KB_E2E_TEST_TIMEOUT_MS": "1800001",
+            },
+            "shorter",
+        ),
+        ({"KB_E2E_TEST_TIMEOUT_MS": "invalid"}, "integer"),
+    ],
+)
+def test_browser_e2e_suite_timeout_rejects_unsafe_values(
+    environment: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        resolve_browser_e2e_suite_timeout_seconds(environment)
+
+
+def test_browser_e2e_runner_and_outer_gate_use_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    signing_key = tmp_path / "browser-e2e.key"
+    signing_key.write_text("synthetic", encoding="utf-8")
+    challenge = tmp_path / "challenge.json"
+    challenge.write_text("{}", encoding="utf-8")
+    evidence = tmp_path / "browser-e2e.json"
+    trust_store = tmp_path / "trust.json"
+    challenge_store = tmp_path / "challenges"
+    captured: dict[str, object] = {}
+    calls: list[list[str]] = []
+    child_environments: list[dict[str, str]] = []
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    audit_controls = {
+        "KB_E2E_AUDIT_PAGE_ACTION": "e2e.acceptance.audit.page.trusted-run",
+        "KB_E2E_AUDIT_OVERSIZED_ACTION": "e2e.acceptance.audit.oversized.trusted-run",
+        "KB_E2E_AUDIT_REDACTION_SENTINEL": "E2E_REDACT_TRUSTED_RUN",
+    }
+
+    monkeypatch.setenv("KB_E2E_TEST_TIMEOUT_MS", "1800000")
+    monkeypatch.setenv("KB_E2E_SUITE_TIMEOUT_MS", "3600000")
+    monkeypatch.setenv("KB_E2E_RELEASE_ID", identity.git_head)
+    monkeypatch.setenv("KB_E2E_OFFLINE_CONTRACT_SHA256", "a" * 64)
+    monkeypatch.setenv("KB_E2E_IMAGE_MANIFEST_SHA256", "b" * 64)
+    monkeypatch.setenv("KB_E2E_BASE_URL", "https://knowledge.example.invalid")
+    for name, value in audit_controls.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        acceptance_module,
+        "_protected_regular_file",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "_browser_collection_contract",
+        lambda _repository: BrowserCollectionContract(
+            26,
+            ("enterprise-desktop", "enterprise-mobile"),
+            _REQUIRED_BROWSER_TITLES,
+        ),
+    )
+    monkeypatch.setattr(acceptance_module, "_root_protected_executable", lambda command: command)
+    monkeypatch.setattr(
+        acceptance_module,
+        "_browser_challenge_path",
+        lambda *_args, **_kwargs: challenge,
+    )
+    e2e_gate = final_browser_e2e_gate()
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        captured["timeout"] = kwargs["timeout"]
+        captured["environment"] = kwargs["env"]
+        child_environment = kwargs["env"]
+        assert isinstance(child_environment, dict)
+        child_environments.append(child_environment)
+        if command[-2:] == ["--", "--list"]:
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout=_browser_collection_output(),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="26 passed",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        acceptance_module,
+        "verify_browser_e2e_evidence",
+        lambda *_args, **_kwargs: (True, "verified"),
+    )
+
+    exit_code, _summary = run_browser_e2e(
+        repository=repository,
+        evidence_file=evidence,
+        trust_store=trust_store,
+        challenge_store=challenge_store,
+        signing_key=signing_key,
+        signing_key_id="browser-e2e-ed25519",
+        identity=identity,
+        identity_collector=lambda _repository: identity,
+    )
+    assert exit_code == 0, _summary
+    assert len(calls) == 2
+    assert calls[0][-2:] == ["--", "--list"]
+    assert captured["timeout"] == 3_600
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert environment["KB_E2E_PROFILE"] == "enterprise"
+    assert environment["KB_E2E_RUN_ID"] == f"acceptance-browser-{identity.run_nonce}"
+    assert all(
+        {name: child_environment[name] for name in audit_controls} == audit_controls
+        for child_environment in child_environments
+    )
+    outer_gate_environment = dict(e2e_gate.environment)
+    assert {name: outer_gate_environment[name] for name in audit_controls} == audit_controls
+    assert e2e_gate.timeout_seconds == 3_660
+    assert e2e_gate.blocked_reason is None
+
+
+def test_invalid_browser_e2e_timeout_blocks_outer_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KB_E2E_SUITE_TIMEOUT_MS", "1")
+
+    e2e_gate = final_browser_e2e_gate()
+
+    assert e2e_gate.blocked_reason == "browser E2E timeout configuration is invalid"
+
+
+def test_invalid_browser_e2e_timeout_blocks_before_starting_npm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KB_E2E_SUITE_TIMEOUT_MS", "1")
+
+    def unexpected_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("npm must not start with an unsafe timeout")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+
+    exit_code, summary = run_browser_e2e(
+        repository=tmp_path / "repository",
+        evidence_file=tmp_path / "browser-e2e.json",
+        trust_store=tmp_path / "trust.json",
+        challenge_store=tmp_path / "challenges",
+        signing_key=tmp_path / "browser-e2e.key",
+        signing_key_id="browser-e2e-ed25519",
+    )
+
+    assert exit_code == 2
+    assert summary == "browser E2E timeout configuration is invalid"
+
+
+def test_sha_only_browser_evidence_is_never_accepted(tmp_path: Path) -> None:
+    evidence = tmp_path / "browser-e2e.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "evidence_id": "EXT-BROWSER-E2E-001",
+                "status": "complete",
+                "attestation": {"type": "sha256-chain-v1", "digest": "a" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accepted, _summary = verify_browser_e2e_evidence(
+        evidence,
+        tmp_path / "trust.json",
+        tmp_path / "challenges",
+        tmp_path,
+        expected_key_id="browser-e2e-ed25519",
+        expected_run_id="acceptance-" + "c" * 32,
+    )
+
+    assert accepted is False
+
+
+def test_signed_browser_evidence_passes_once_and_replay_blocks(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    evidence = tmp_path / "browser-e2e.json"
+    raw = tmp_path / "raw/browser-result.json"
+    raw.parent.mkdir()
+    raw_content = b'{"browser":"passed"}\n'
+    raw.write_bytes(raw_content)
+    identity = collect_worktree_evidence(repository)
+    run_id = "acceptance-browser-final-001"
+    deployment = {
+        "release_id": identity.git_head,
+        "offline_contract_sha256": "a" * 64,
+        "image_manifest_sha256": "b" * 64,
+        "base_url": "https://knowledge.example.invalid",
+        "host_identity": "knowledge.example.invalid",
+    }
+    target = {
+        "git_head": identity.git_head,
+        "content_fingerprint": identity.content_fingerprint,
+        "run_id": run_id,
+        "deployment": deployment,
+    }
+    checks = {
+        check: {"status": "passed", "artifact_ids": ["browser-result"]}
+        for check in _REQUIRED_BROWSER_CHECKS
+    }
+    document: dict[str, object] = {
+        "schema_version": 2,
+        "evidence_id": "EXT-BROWSER-E2E-001",
+        "status": "complete",
+        "collector": {"id": "heyi-browser-e2e", "version": "1.0.0"},
+        "target": target,
+        "collected_at": datetime.now(UTC).isoformat(),
+        "artifacts": [
+            {
+                "id": "browser-result",
+                "path": "raw/browser-result.json",
+                "sha256": hashlib.sha256(raw_content).hexdigest(),
+                "bytes": len(raw_content),
+            }
+        ],
+        "checks": checks,
+        "collection": {
+            "collected": 26,
+            "passed": 26,
+            "failed": 0,
+            "skipped": 0,
+            "pending": 0,
+            "tests": [
+                {
+                    "project": project,
+                    "title": title,
+                    "status": "passed",
+                }
+                for project in ("enterprise-desktop", "enterprise-mobile")
+                for title in _REQUIRED_BROWSER_TITLES
+            ],
+        },
+    }
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    key_id = "browser-e2e-ed25519"
+    challenge_id = "challenge-browser-final-001"
+    nonce = base64.b64encode(b"unpredictable-browser-challenge-001").decode()
+    document["attestation"] = {
+        "type": "ed25519-challenge-v1",
+        "key_id": key_id,
+        "challenge_id": challenge_id,
+        "challenge_nonce": nonce,
+        "signature": base64.b64encode(
+            private_key.sign(
+                _signature_payload(
+                    document,
+                    key_id=key_id,
+                    challenge_id=challenge_id,
+                    challenge_nonce=nonce,
+                )
+            )
+        ).decode(),
+    }
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    context = ExternalTrustContext(
+        public_keys={("heyi-browser-e2e", key_id): public_key},
+        challenges={
+            challenge_id: {
+                "status": "issued",
+                "evidence_id": "EXT-BROWSER-E2E-001",
+                "nonce": nonce,
+                "target": target,
+                "issued_at": datetime.now(UTC).isoformat(),
+                "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+            }
+        },
+        consumed_challenges=set(),
+    )
+
+    preverified = _verify_browser_e2e_document(
+        evidence,
+        repository,
+        expected_key_id=key_id,
+        expected_run_id=run_id,
+        trust_context=context,
+    )
+    manifest = load_manifest(repository / "docs/functional_acceptance_manifest.json")
+    policy = _trusted_policy(repository, manifest, required=True)
+    contract = next(
+        item
+        for item in manifest["external_evidence"]  # type: ignore[index]
+        if item["id"] == "EXT-BROWSER-E2E-001"  # type: ignore[index]
+    )
+    accepted = _validate_external_provenance(
+        repository,
+        evidence,
+        contract,  # type: ignore[arg-type]
+        document,
+        policy=policy,
+        trust_context=context,
+    )
+    replayed = _validate_external_provenance(
+        repository,
+        evidence,
+        contract,  # type: ignore[arg-type]
+        document,
+        policy=policy,
+        trust_context=context,
+    )
+
+    assert preverified is True
+    assert accepted is True
+    assert replayed is False
+
+
+def test_long_command_summary_preserves_the_trailing_verdict() -> None:
+    gate = AcceptanceGate("BACKEND-P0-001", "P0", ("pytest",), ".", 30)
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        return CommandOutcome(
+            returncode=0,
+            stdout=("test output\n" * 1_000) + "TOTAL 84.40%\n146 passed",
+            stderr="",
+        )
+
+    outcome = run_gate(gate, executor=executor)
+
+    assert len(outcome.summary) <= 4_096
+    assert "TOTAL 84.40%" in outcome.summary
+    assert outcome.summary.endswith("146 passed")
+
+
+def test_timeout_is_failed_without_leaking_command_output() -> None:
+    gate = AcceptanceGate(
+        gate_id="BUILD-P0-001",
+        severity="P0",
+        command=("build-tool",),
+        cwd="web",
+        timeout_seconds=1,
+    )
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        raise subprocess.TimeoutExpired(cmd=["build-tool"], timeout=1, output="secret")
+
+    outcome = run_gate(gate, executor=executor)
+
+    assert outcome.status == "failed"
+    assert outcome.summary == "command timed out after 1 seconds"
+
+
+def test_missing_executable_is_a_controlled_gate_failure() -> None:
+    gate = AcceptanceGate(
+        gate_id="TOOL-P0-001",
+        severity="P0",
+        command=("missing-tool",),
+        cwd=".",
+        timeout_seconds=1,
+    )
+
+    def executor(_gate: AcceptanceGate) -> CommandOutcome:
+        raise FileNotFoundError("sensitive local path")
+
+    outcome = run_gate(gate, executor=executor)
+
+    assert outcome.status == "failed"
+    assert outcome.summary == "command executable was not found"
+
+
+def test_platform_command_shim_is_resolved_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _value: "C:/tools/npm.CMD")
+
+    assert resolve_command(("npm", "test")) == ("C:/tools/npm.CMD", "test")
+
+
+def test_command_capture_uses_explicit_fault_tolerant_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=["tool"], returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(acceptance_module, "_root_protected_executable", lambda command: command)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    gate = AcceptanceGate("CODE-P0-001", "P0", ("tool",), ".", 10)
+
+    assert execute_command(gate).returncode == 0
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+
+
+def test_local_profile_contains_required_deterministic_gates() -> None:
+    gates = build_profile("local")
+    ids = {gate.gate_id for gate in gates}
+
+    assert {
+        "CODE-P0-001",
+        "BACKEND-P0-001",
+        "FRONTEND-P0-001",
+        "BUILD-P0-001",
+        "OFFLINE-P0-001",
+        "SERVER-P1-001",
+    } <= ids
+    offline_gate = next(gate for gate in gates if gate.gate_id == "OFFLINE-P0-001")
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    runtime_index = offline_gate.command.index(
+        str(repository / "deploy/tencent/offline.env.example")
+    )
+    release_index = offline_gate.command.index(
+        str(repository / "deploy/tencent/release.env.example")
+    )
+    assert runtime_index < release_index
+    assert offline_gate.command.count("--env-file") == 2
+    assert "maintenance" in offline_gate.command
+
+
+def test_python_quality_gates_use_the_bound_acceptance_interpreter() -> None:
+    by_id = {gate.gate_id: gate for gate in build_profile("ci")}
+
+    assert by_id["CODE-P0-001"].command[:3] == (
+        acceptance_module.sys.executable,
+        "-m",
+        "ruff",
+    )
+    assert by_id["TYPE-P1-001"].command[:3] == (
+        acceptance_module.sys.executable,
+        "-m",
+        "mypy",
+    )
+    assert by_id["BACKEND-P0-001"].command[:3] == (
+        acceptance_module.sys.executable,
+        "-m",
+        "pytest",
+    )
+
+
+def test_final_profile_rejects_the_deprecated_single_environment_file() -> None:
+    gates = build_profile(
+        "final",
+        offline_env_file="/etc/heyi/offline.env",
+        offline_image_manifest_path="/evidence/offline-images.txt",
+    )
+    by_id = {gate.gate_id: gate for gate in gates}
+
+    for gate_id in ("OFFLINE-P0-001", "OFFLINE-IMAGES-P0-001"):
+        blocker = by_id[gate_id].blocked_reason
+        assert blocker is not None
+        assert "deprecated" in blocker
+        assert "forbidden for the final profile" in blocker
+
+
+@pytest.mark.parametrize(
+    ("runtime_env", "release_env", "missing_option"),
+    [
+        (None, "/srv/heyi/releases/approved/release.env", "--offline-runtime-env-file"),
+        ("/etc/heyi/runtime.env", None, "--offline-release-env-file"),
+    ],
+)
+def test_final_profile_requires_both_offline_environment_files(
+    runtime_env: str | None,
+    release_env: str | None,
+    missing_option: str,
+) -> None:
+    gates = build_profile(
+        "final",
+        offline_runtime_env_file=runtime_env,
+        offline_release_env_file=release_env,
+        offline_image_manifest_path="/evidence/offline-images.txt",
+    )
+    offline_gate = next(gate for gate in gates if gate.gate_id == "OFFLINE-P0-001")
+
+    assert offline_gate.blocked_reason is not None
+    assert missing_option in offline_gate.blocked_reason
+
+
+def test_final_profile_adds_executable_target_evidence_gates() -> None:
+    contract_dir = "/run/heyi-kb-offline/contracts/contract.acceptance"
+    contract_sha256 = "d" * 64
+    gates = build_profile(
+        "final",
+        host_disk_path="/data/knowledge",
+        host_io_evidence_path="/evidence/host-io.json",
+        storage_chain_evidence_path="/evidence/watermark-chain.json",
+        offline_runtime_env_file="/etc/heyi/runtime.env",
+        offline_release_env_file="/srv/heyi/releases/approved/release.env",
+        offline_image_manifest_path="/srv/heyi/releases/approved/release.env.images",
+        offline_contract_dir=contract_dir,
+        offline_contract_sha256=contract_sha256,
+        offline_runtime_evidence_path="/evidence/offline-runtime-evidence.json",
+        e2e_evidence_path="/evidence/browser-e2e.json",
+        functional_trust_store_path="/secure/functional-trust.json",
+        functional_challenge_store_path="/secure/challenges",
+        e2e_signing_key_path="/secure/browser-e2e.key",
+        e2e_signing_key_id="browser-e2e-ed25519",
+        malware_evidence_path="/evidence/malware.json",
+        security_scan_evidence_path="/evidence/security.json",
+    )
+    by_id = {gate.gate_id: gate for gate in gates}
+
+    format_gate = by_id["FORMAT-P0-001"]
+    assert format_gate.severity == "P0"
+    assert format_gate.blocked_reason is None
+    assert format_gate.blocked_exit_codes == (2,)
+    assert format_gate.command[-3:] == (
+        "-m",
+        "app.document_parser_preflight",
+        "--require-all",
+    )
+
+    backend_gate = by_id["BACKEND-P0-001"]
+    assert backend_gate.blocked_exit_codes == (2,)
+    assert backend_gate.command[1:3] == ("-m", "scripts.backend_acceptance")
+    assert backend_gate.command[-2:] == (
+        "--postgres-evidence",
+        "artifacts/acceptance/evidence/postgres.json",
+    )
+    ordered_ids = [gate.gate_id for gate in gates]
+    assert ordered_ids.index("TOKEN-GOV-P0-001") < ordered_ids.index("BACKEND-P0-001")
+    e2e_gate = by_id["E2E-P0-001"]
+    assert Path(e2e_gate.command[1]).name == "acceptance.py"
+    assert "--run-browser-e2e" in e2e_gate.command
+    assert e2e_gate.command[-8:] == (
+        "--functional-trust-store",
+        "/secure/functional-trust.json",
+        "--functional-challenge-store",
+        "/secure/challenges",
+        "--e2e-signing-key-path",
+        "/secure/browser-e2e.key",
+        "--e2e-signing-key-id",
+        "browser-e2e-ed25519",
+    )
+    assert e2e_gate.environment == ()
+    assert e2e_gate.blocked_exit_codes == (2,)
+    assert e2e_gate.required_regular_files == (
+        "/secure/functional-trust.json",
+        "/secure/browser-e2e.key",
+    )
+    host_gate = by_id["HOST-P0-001"]
+    assert host_gate.severity == "P0"
+    assert host_gate.blocked_reason is None
+    assert host_gate.blocked_exit_codes == (2,)
+    assert host_gate.command[-4:] == (
+        "--disk-path",
+        "/data/knowledge",
+        "--io-evidence",
+        "/evidence/host-io.json",
+    )
+    assert host_gate.command[1:3] == ("-m", "scripts.host_preflight")
+    assert host_gate.required_regular_files == ("/evidence/host-io.json",)
+    storage_gate = by_id["STORAGE-WATERMARK-P0-001"]
+    assert storage_gate.severity == "P0"
+    assert storage_gate.blocked_reason is None
+    assert storage_gate.blocked_exit_codes == (2,)
+    assert storage_gate.command[1:3] == ("-m", "scripts.storage_watermark_preflight")
+    assert "--object-root" in storage_gate.command
+    assert storage_gate.command[-2:] == (
+        "--chain-evidence",
+        "/evidence/watermark-chain.json",
+    )
+    assert storage_gate.required_regular_files == ("/evidence/watermark-chain.json",)
+    token_gate = by_id["TOKEN-GOV-P0-001"]
+    assert token_gate.severity == "P0"
+    assert token_gate.blocked_reason is None
+    assert token_gate.blocked_exit_codes == (2,)
+    assert token_gate.command[1:3] == ("-m", "scripts.postgres_acceptance")
+    assert token_gate.command[-2:] == (
+        "--image",
+        "postgres:17.5-bookworm",
+    )
+    for gate_id in ("CAPACITY-P0-001", "DR-P0-001"):
+        gate = by_id[gate_id]
+        assert gate.severity == "P0"
+        assert gate.command
+        assert "--verify-operational-evidence" in gate.command
+        assert gate.blocked_reason is not None
+        assert "--release-id" in gate.blocked_reason
+
+    malware_gate = by_id["MALWARE-P0-001"]
+    assert malware_gate.blocked_reason is None
+    assert malware_gate.blocked_exit_codes == (2,)
+    assert malware_gate.command[2:] == (
+        "--verify-evidence",
+        "malware",
+        "--evidence-file",
+        "/evidence/malware.json",
+        "--functional-trust-store",
+        "/secure/functional-trust.json",
+        "--functional-challenge-store",
+        "/secure/challenges",
+    )
+    assert malware_gate.required_regular_files == (
+        "/evidence/malware.json",
+        "/secure/functional-trust.json",
+    )
+
+    security_gate = by_id["SECURITY-SCAN-P0-001"]
+    assert security_gate.blocked_reason is None
+    assert security_gate.blocked_exit_codes == (2,)
+    assert security_gate.command[2:] == (
+        "--verify-evidence",
+        "security-scan",
+        "--evidence-file",
+        "/evidence/security.json",
+        "--functional-trust-store",
+        "/secure/functional-trust.json",
+        "--functional-challenge-store",
+        "/secure/challenges",
+    )
+    assert security_gate.required_regular_files == (
+        "/evidence/security.json",
+        "/secure/functional-trust.json",
+    )
+
+    worktree_gate = by_id["WORKTREE-P0-001"]
+    assert worktree_gate.blocked_reason is None
+    assert worktree_gate.blocked_exit_codes == (2,)
+    assert worktree_gate.command[-1] == "--verify-clean-worktree"
+
+    offline_gate = by_id["OFFLINE-P0-001"]
+    assert Path(offline_gate.command[1]).name == "preflight-offline.sh"
+    assert offline_gate.command[2:] == (
+        "--upgrade",
+        "--contract-dir",
+        contract_dir,
+        "--contract-sha256",
+        contract_sha256,
+    )
+    assert {66, 77} <= set(offline_gate.blocked_exit_codes)
+    assert offline_gate.required_regular_files == (
+        f"{contract_dir}/runtime.env",
+        f"{contract_dir}/release.env",
+        f"{contract_dir}/release.env.images",
+        f"{contract_dir}/contract.sha256",
+    )
+    image_gate = by_id["OFFLINE-IMAGES-P0-001"]
+    assert Path(image_gate.command[1]).name == "verify-offline-images.sh"
+    assert image_gate.command[2:] == (
+        "verify",
+        "--contract-dir",
+        contract_dir,
+        "--contract-sha256",
+        contract_sha256,
+    )
+    assert image_gate.required_regular_files == (
+        f"{contract_dir}/runtime.env",
+        f"{contract_dir}/release.env",
+        f"{contract_dir}/release.env.images",
+        f"{contract_dir}/contract.sha256",
+    )
+    runtime_gate = by_id["OFFLINE-RUNTIME-P0-001"]
+    assert runtime_gate.command[-3:] == (
+        "--verify-offline-runtime-evidence",
+        "--evidence-file",
+        "/evidence/offline-runtime-evidence.json",
+    )
+    assert runtime_gate.blocked_exit_codes == (2,)
+    assert runtime_gate.required_regular_files == ("/evidence/offline-runtime-evidence.json",)
+    assert "STORAGE-P0-001" not in by_id
+
+
+def test_final_runtime_functional_is_last_consumer_of_one_deployment_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    browser_evidence = repository / "artifacts/acceptance/functional/browser-e2e.json"
+    linux_evidence = repository / "artifacts/acceptance/functional/linux-host.json"
+    linux_challenge = Path("/secure/challenges/linux-deployment-001.json")
+    monkeypatch.setattr(
+        acceptance_module,
+        "_external_challenge_path",
+        lambda *_args, **_kwargs: linux_challenge,
+    )
+
+    gates = build_profile(
+        "final",
+        acceptance_identity=identity,
+        release_id=identity.git_head,
+        offline_contract_sha256="d" * 64,
+        offline_image_manifest_sha256="e" * 64,
+        deployment_base_url="https://knowledge.example.invalid",
+        e2e_evidence_path=str(browser_evidence),
+        linux_host_evidence_path=str(linux_evidence),
+        functional_trust_store_path="/secure/functional-trust.json",
+        functional_challenge_store_path="/secure/challenges",
+        e2e_signing_key_path="/secure/browser-e2e.key",
+        e2e_signing_key_id="browser-e2e-ed25519",
+        linux_host_signing_key_path="/secure/linux-host.key",
+    )
+    by_id = {gate.gate_id: gate for gate in gates}
+    ordered = [gate.gate_id for gate in gates]
+
+    assert ordered.index("LINUX-HOST-EVIDENCE-P0-001") < ordered.index("E2E-P0-001")
+    assert ordered.index("E2E-P0-001") < ordered.index("FUNCTIONAL-P0-001")
+
+    linux_gate = by_id["LINUX-HOST-EVIDENCE-P0-001"]
+    assert linux_gate.blocked_reason is None
+    assert linux_gate.command[1:3] == ("-m", "scripts.linux_host_evidence_collector")
+    assert linux_gate.command[linux_gate.command.index("--release-id") + 1] == identity.git_head
+    assert linux_gate.command[linux_gate.command.index("--offline-contract-sha256") + 1] == (
+        "d" * 64
+    )
+    assert linux_gate.command[linux_gate.command.index("--image-manifest-sha256") + 1] == ("e" * 64)
+    assert linux_gate.command[linux_gate.command.index("--challenge") + 1] == str(linux_challenge)
+
+    browser_gate = by_id["E2E-P0-001"]
+    browser_environment = dict(browser_gate.environment)
+    assert browser_gate.blocked_reason is None
+    assert browser_environment["KB_E2E_RELEASE_ID"] == identity.git_head
+    assert browser_environment["KB_E2E_OFFLINE_CONTRACT_SHA256"] == "d" * 64
+    assert browser_environment["KB_E2E_IMAGE_MANIFEST_SHA256"] == "e" * 64
+    assert browser_environment["KB_E2E_BASE_URL"] == "https://knowledge.example.invalid"
+    assert (
+        browser_environment["KB_E2E_RUN_ID"]
+        != linux_gate.command[linux_gate.command.index("--run-id") + 1]
+    )
+
+    runtime_gate = by_id["FUNCTIONAL-P0-001"]
+    assert runtime_gate.blocked_reason is None
+    assert runtime_gate.command[runtime_gate.command.index("--profile") + 1] == (
+        "runtime-functional"
+    )
+    assert "--trust-store" in runtime_gate.command
+    assert "--challenge-store" in runtime_gate.command
+    assert runtime_gate.required_regular_files == (
+        "/secure/functional-trust.json",
+        str(browser_evidence),
+        str(linux_evidence),
+    )
+
+
+def test_final_supply_chain_gate_is_release_only_and_identity_bound() -> None:
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    gates = build_profile(
+        "final",
+        supply_chain_attestation_path="/secure/release-rights-attestation.json",
+        supply_chain_artifact_root="/srv/heyi/releases/approved/supply-chain",
+        release_id=identity.git_head,
+        acceptance_identity=identity,
+    )
+    by_id = {gate.gate_id: gate for gate in gates}
+    gate = by_id["SUPPLY-CHAIN-P0-001"]
+
+    assert gate.severity == "P0"
+    assert gate.blocked_reason is None
+    assert Path(gate.command[1]).name == "supply_chain_gate.py"
+    assert gate.command[gate.command.index("--mode") + 1] == "release"
+    assert "inventory" not in gate.command
+    assert gate.command[gate.command.index("--attestation") + 1] == (
+        "/secure/release-rights-attestation.json"
+    )
+    assert gate.command[gate.command.index("--artifact-root") + 1] == (
+        "/srv/heyi/releases/approved/supply-chain"
+    )
+    assert gate.command[gate.command.index("--expected-release-id") + 1] == identity.git_head
+    assert gate.required_regular_files == ("/secure/release-rights-attestation.json",)
+
+    ordered_ids = [item.gate_id for item in gates]
+    assert ordered_ids.index("CODE-P0-001") < ordered_ids.index("SUPPLY-CHAIN-P0-001")
+    assert ordered_ids.index("SUPPLY-CHAIN-P0-001") < ordered_ids.index("FUNCTIONAL-P0-001")
+
+
+def _init_git_repository(path: Path) -> None:
+    path.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "acceptance@example.invalid"], cwd=path, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Acceptance Test"], cwd=path, check=True)
+    (path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "baseline"], cwd=path, check=True)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_malware_evidence_requires_all_target_linux_chain_artifacts(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    identity = collect_worktree_evidence(repository)
+    evidence_dir = tmp_path / "malware-evidence"
+    evidence_dir.mkdir()
+    checks: dict[str, dict[str, str]] = {}
+    for name in (
+        "clamav_database_preflight",
+        "eicar_quarantined",
+        "clean_file_released",
+        "minio_scan_approval_download",
+    ):
+        artifact = evidence_dir / f"{name}.json"
+        artifact.write_text('{"status":"passed"}\n', encoding="utf-8")
+        checks[name] = {
+            "status": "passed",
+            "artifact": artifact.name,
+            "sha256": _sha256(artifact),
+        }
+    evidence = evidence_dir / "malware.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "malware",
+                "status": "complete",
+                "target": {
+                    "os": "linux",
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                },
+                "checks": checks,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accepted, summary = verify_formal_evidence("malware", evidence, repository)
+
+    assert accepted is False
+    assert summary == (
+        "malware evidence is unsigned, replayed, incomplete, or does not match this acceptance run"
+    )
+
+    checks["eicar_quarantined"]["status"] = "blocked"
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "malware",
+                "status": "complete",
+                "target": {
+                    "os": "linux",
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                },
+                "checks": checks,
+            }
+        ),
+        encoding="utf-8",
+    )
+    accepted, summary = verify_formal_evidence("malware", evidence, repository)
+    assert accepted is False
+    assert summary == (
+        "malware evidence is unsigned, replayed, incomplete, or does not match this acceptance run"
+    )
+
+
+def test_security_scan_evidence_requires_complete_matching_report(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    identity = collect_worktree_evidence(repository)
+    evidence_dir = tmp_path / "security-evidence"
+    evidence_dir.mkdir()
+    report = evidence_dir / "security-report.json"
+    report.write_text('{"status":"complete"}\n', encoding="utf-8")
+    evidence = evidence_dir / "security.json"
+    document = {
+        "schema_version": 1,
+        "kind": "security-scan",
+        "status": "complete",
+        "policy_status": "passed",
+        "target": {
+            "git_head": identity.git_head,
+            "content_fingerprint": identity.content_fingerprint,
+        },
+        "report": {"artifact": report.name, "sha256": _sha256(report)},
+        "summary": {"open_critical": 0, "open_high": 0, "open_medium": 2, "open_low": 1},
+    }
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+
+    accepted, summary = verify_formal_evidence("security-scan", evidence, repository)
+
+    assert accepted is False
+    assert summary == (
+        "security scan evidence is unsigned, replayed, incomplete, or does not match this "
+        "acceptance run"
+    )
+
+    document["target"]["content_fingerprint"] = "0" * 64
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    accepted, summary = verify_formal_evidence("security-scan", evidence, repository)
+    assert accepted is False
+    assert summary == (
+        "security scan evidence is unsigned, replayed, incomplete, or does not match this "
+        "acceptance run"
+    )
+
+
+def _signed_formal_evidence(
+    tmp_path: Path,
+    kind: str,
+) -> tuple[
+    Path,
+    Path,
+    GateIdentity,
+    ExternalTrustContext,
+    dict[str, object],
+    Ed25519PrivateKey,
+    str,
+    str,
+    str,
+]:
+    repository = tmp_path / f"{kind}-repository"
+    _init_git_repository(repository)
+    worktree = collect_worktree_evidence(repository)
+    identity = GateIdentity(worktree.git_head, worktree.content_fingerprint, "c" * 32)
+    run_id = f"acceptance-{identity.run_nonce}"
+    evidence_dir = tmp_path / f"{kind}-signed-evidence"
+    evidence_dir.mkdir()
+    if kind == "malware":
+        evidence_id = "EXT-MALWARE-001"
+        collector_id = "heyi-malware-acceptance"
+        check_names = (
+            "clamav_database_preflight",
+            "eicar_quarantined",
+            "clean_file_released",
+            "minio_scan_approval_download",
+        )
+    else:
+        evidence_id = "EXT-SECURITY-SCAN-001"
+        collector_id = "heyi-security-acceptance"
+        check_names = ("security_scan_complete", "no_open_critical", "no_open_high")
+
+    artifacts: list[dict[str, object]] = []
+    checks: dict[str, dict[str, object]] = {}
+    for index, check_name in enumerate(check_names):
+        artifact = evidence_dir / f"{index:02d}-{check_name}.json"
+        artifact.write_text(json.dumps({"check": check_name, "status": "passed"}), encoding="utf-8")
+        artifact_id = f"artifact-{index:02d}"
+        artifacts.append(
+            {
+                "id": artifact_id,
+                "path": artifact.name,
+                "sha256": _sha256(artifact),
+                "bytes": artifact.stat().st_size,
+            }
+        )
+        checks[check_name] = {"status": "passed", "artifact_ids": [artifact_id]}
+
+    now = datetime.now(UTC)
+    document: dict[str, object] = {
+        "schema_version": 2,
+        "evidence_id": evidence_id,
+        "kind": kind,
+        "status": "complete",
+        "collector": {"id": collector_id, "version": "1.0.0"},
+        "target": {
+            "git_head": identity.git_head,
+            "content_fingerprint": identity.content_fingerprint,
+            "run_id": run_id,
+        },
+        "collected_at": now.isoformat(),
+        "artifacts": artifacts,
+        "checks": checks,
+    }
+    if kind == "security-scan":
+        document["policy_status"] = "passed"
+        document["summary"] = {
+            "open_critical": 0,
+            "open_high": 0,
+            "open_medium": 2,
+            "open_low": 1,
+        }
+
+    private_key = Ed25519PrivateKey.generate()
+    key_id = f"{kind}-ed25519"
+    challenge_id = f"{kind}-challenge"
+    challenge_nonce = f"{kind}-one-time-challenge-nonce"
+    signature = private_key.sign(
+        _formal_signature_payload(
+            document,
+            key_id=key_id,
+            challenge_id=challenge_id,
+            challenge_nonce=challenge_nonce,
+        )
+    )
+    document["attestation"] = {
+        "type": "ed25519-challenge-v1",
+        "key_id": key_id,
+        "challenge_id": challenge_id,
+        "challenge_nonce": challenge_nonce,
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }
+    evidence = evidence_dir / f"{kind}.json"
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    trust_context = ExternalTrustContext(
+        public_keys={(collector_id, key_id): public_key},
+        challenges={
+            challenge_id: {
+                "schema_version": 1,
+                "challenge_id": challenge_id,
+                "evidence_id": evidence_id,
+                "nonce": challenge_nonce,
+                "status": "issued",
+                "target": {
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                    "run_id": run_id,
+                },
+                "issued_at": (now - timedelta(minutes=1)).isoformat(),
+                "expires_at": (now + timedelta(minutes=10)).isoformat(),
+            }
+        },
+        consumed_challenges=set(),
+    )
+    return (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        document,
+        private_key,
+        key_id,
+        challenge_id,
+        challenge_nonce,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "success_summary"),
+    (
+        ("malware", "malware target-host evidence verified (4/4 checks)"),
+        (
+            "security-scan",
+            "signed complete security scan report verified for this acceptance run",
+        ),
+    ),
+)
+def test_formal_evidence_requires_full_signature_identity_and_one_time_challenge(
+    tmp_path: Path,
+    kind: str,
+    success_summary: str,
+) -> None:
+    (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        _document,
+        _private_key,
+        _key_id,
+        _challenge_id,
+        _challenge_nonce,
+    ) = _signed_formal_evidence(tmp_path, kind)
+
+    accepted, summary = verify_formal_evidence(
+        kind,  # type: ignore[arg-type]
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+        require_protected_evidence=False,
+    )
+    assert accepted is True
+    assert summary == success_summary
+
+    replayed, _ = verify_formal_evidence(
+        kind,  # type: ignore[arg-type]
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+        require_protected_evidence=False,
+    )
+    assert replayed is False
+
+
+@pytest.mark.parametrize("kind", ("malware", "security-scan"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "extra_run_nonce",
+        "extra_os",
+        "missing_run_id",
+        "mismatched_run_id",
+        "mismatched_challenge_target",
+    ),
+)
+def test_formal_evidence_rejects_noncanonical_or_unbound_run_target(
+    tmp_path: Path,
+    kind: str,
+    mutation: str,
+) -> None:
+    (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        document,
+        private_key,
+        key_id,
+        challenge_id,
+        challenge_nonce,
+    ) = _signed_formal_evidence(tmp_path, kind)
+    target = document["target"]
+    assert isinstance(target, dict)
+    if mutation == "extra_run_nonce":
+        target["run_nonce"] = identity.run_nonce
+    elif mutation == "extra_os":
+        target["os"] = "linux"
+    elif mutation == "missing_run_id":
+        target.pop("run_id")
+    elif mutation == "mismatched_run_id":
+        target["run_id"] = "acceptance-" + "d" * 32
+
+    challenge = trust_context.challenges[challenge_id]
+    challenge["target"] = dict(target)
+    if mutation == "mismatched_challenge_target":
+        challenge_target = challenge["target"]
+        assert isinstance(challenge_target, dict)
+        challenge_target["run_id"] = "acceptance-" + "d" * 32
+
+    document["attestation"] = {
+        "type": "ed25519-challenge-v1",
+        "key_id": key_id,
+        "challenge_id": challenge_id,
+        "challenge_nonce": challenge_nonce,
+        "signature": base64.b64encode(
+            private_key.sign(
+                _formal_signature_payload(
+                    document,
+                    key_id=key_id,
+                    challenge_id=challenge_id,
+                    challenge_nonce=challenge_nonce,
+                )
+            )
+        ).decode("ascii"),
+    }
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+
+    accepted, _summary = verify_formal_evidence(
+        kind,  # type: ignore[arg-type]
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+        require_protected_evidence=False,
+    )
+
+    assert accepted is False
+
+
+def test_formal_malware_evidence_keeps_protected_linux_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        repository,
+        evidence,
+        identity,
+        trust_context,
+        _document,
+        _private_key,
+        _key_id,
+        _challenge_id,
+        _challenge_nonce,
+    ) = _signed_formal_evidence(tmp_path, "malware")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(acceptance_module, "_protected_regular_file", lambda *_a, **_k: True)
+    assert not verify_formal_evidence(
+        "malware",
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+    )[0]
+
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(acceptance_module, "_protected_regular_file", lambda *_a, **_k: False)
+    assert not verify_formal_evidence(
+        "malware",
+        evidence,
+        repository,
+        identity=identity,
+        trust_context=trust_context,
+    )[0]
+
+
+def test_formal_evidence_rejects_symlinked_artifact(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    identity = collect_worktree_evidence(repository)
+    evidence_dir = tmp_path / "security-evidence"
+    evidence_dir.mkdir()
+    actual_report = evidence_dir / "actual-report.json"
+    actual_report.write_text('{"status":"complete"}\n', encoding="utf-8")
+    linked_report = evidence_dir / "linked-report.json"
+    try:
+        linked_report.symlink_to(actual_report)
+    except OSError:
+        pytest.skip("creating symlinks is unavailable on this test host")
+    evidence = evidence_dir / "security.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "security-scan",
+                "status": "complete",
+                "policy_status": "passed",
+                "target": {
+                    "git_head": identity.git_head,
+                    "content_fingerprint": identity.content_fingerprint,
+                },
+                "report": {"artifact": linked_report.name, "sha256": _sha256(actual_report)},
+                "summary": {
+                    "open_critical": 0,
+                    "open_high": 0,
+                    "open_medium": 0,
+                    "open_low": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    accepted, _summary = verify_formal_evidence("security-scan", evidence, repository)
+
+    assert accepted is False
+
+
+def _offline_runtime_document(
+    repository: Path,
+    evidence_dir: Path,
+    *,
+    result: str = "passed",
+    runner: str = "subprocess-v1",
+    egress_mode: str = "strict_offline",
+) -> dict[str, object]:
+    identity = collect_worktree_evidence(repository)
+    raw_dir = evidence_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    artifact = raw_dir / "000-runtime.json"
+    artifact.write_text('{"status":"passed"}\n', encoding="utf-8")
+    descriptor = {
+        "id": "runtime",
+        "path": "raw/000-runtime.json",
+        "sha256": _sha256(artifact),
+        "bytes": artifact.stat().st_size,
+    }
+    checks = {
+        check: {"status": "passed", "artifact_ids": ["runtime"]}
+        for check in (
+            "offline_network_isolation",
+            "cold_start",
+            "login",
+            "rbac",
+            "acl",
+            "upload",
+            "approval",
+            "download",
+            "question_answer",
+            "restart_persistence",
+            "network_recovery",
+        )
+    }
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "evidence_id": "EXT-OFFLINE-RUNTIME-001",
+        "status": "complete",
+        "result": result,
+        "runner": runner,
+        "collector": {"id": "heyi-offline-runtime", "version": "1.0.0"},
+        "collected_at": datetime.now(UTC).isoformat(),
+        "challenge": "A" * 24,
+        "test_tenant": "kb-acceptance-final",
+        "target": {
+            "git_head": identity.git_head,
+            "content_fingerprint": identity.content_fingerprint,
+            "host_fingerprint": "a" * 64,
+            "project_name": "heyi-kb-offline",
+            "egress_mode": egress_mode,
+        },
+        "checks": checks,
+        "artifacts": [descriptor],
+    }
+    canonical = lambda value: hashlib.sha256(  # noqa: E731
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    document["result_sha256"] = canonical(
+        {"target": document["target"], "checks": checks, "artifacts": [descriptor]}
+    )
+    document["attestation"] = {"type": "sha256-chain-v1", "digest": canonical(document)}
+    return document
+
+
+def test_offline_runtime_evidence_requires_real_target_bound_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    evidence_dir = tmp_path / "offline-runtime"
+    evidence_dir.mkdir()
+    evidence = evidence_dir / "offline-runtime-evidence.json"
+    document = _offline_runtime_document(repository, evidence_dir)
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr("scripts.acceptance.platform.system", lambda: "Linux")
+    monkeypatch.setattr("scripts.acceptance._offline_runtime_host_fingerprint", lambda: "a" * 64)
+    monkeypatch.setattr(
+        "scripts.acceptance._protected_regular_file",
+        lambda path, *, maximum_bytes: (
+            path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= maximum_bytes
+        ),
+    )
+
+    accepted, summary = verify_offline_runtime_evidence(evidence, repository)
+
+    assert accepted is True
+    assert summary == "offline runtime target evidence verified"
+
+    controlled = _offline_runtime_document(
+        repository,
+        evidence_dir,
+        egress_mode="controlled_gateway",
+    )
+    evidence.write_text(json.dumps(controlled), encoding="utf-8")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is True
+
+    invalid_mode = _offline_runtime_document(repository, evidence_dir)
+    invalid_target = invalid_mode["target"]
+    assert isinstance(invalid_target, dict)
+    invalid_target["egress_mode"] = "direct"
+    evidence.write_text(json.dumps(invalid_mode), encoding="utf-8")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is False
+
+    wrong_project = _offline_runtime_document(repository, evidence_dir)
+    wrong_target = wrong_project["target"]
+    assert isinstance(wrong_target, dict)
+    wrong_target["project_name"] = "another-project"
+    evidence.write_text(json.dumps(wrong_project), encoding="utf-8")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is False
+
+    document["runner"] = "test-double"
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    accepted, _summary = verify_offline_runtime_evidence(evidence, repository)
+    assert accepted is False
+
+    document = _offline_runtime_document(repository, evidence_dir)
+    document["result"] = "blocked"
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is False
+
+    document = _offline_runtime_document(repository, evidence_dir)
+    target = document["target"]
+    assert isinstance(target, dict)
+    target["content_fingerprint"] = "0" * 64
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is False
+
+
+def test_offline_runtime_evidence_blocks_windows_and_tampered_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    evidence_dir = tmp_path / "offline-runtime"
+    evidence_dir.mkdir()
+    evidence = evidence_dir / "offline-runtime-evidence.json"
+    document = _offline_runtime_document(repository, evidence_dir)
+    evidence.write_text(json.dumps(document), encoding="utf-8")
+
+    monkeypatch.setattr("scripts.acceptance.platform.system", lambda: "Windows")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is False
+
+    monkeypatch.setattr("scripts.acceptance.platform.system", lambda: "Linux")
+    monkeypatch.setattr("scripts.acceptance._offline_runtime_host_fingerprint", lambda: "a" * 64)
+    (evidence_dir / "raw/000-runtime.json").write_text("tampered\n", encoding="utf-8")
+    assert verify_offline_runtime_evidence(evidence, repository)[0] is False
+
+
+def test_final_profile_is_guaranteed_to_fail_while_local_and_ci_semantics_are_unchanged() -> None:
+    local_ids = {gate.gate_id for gate in build_profile("local")}
+    ci_ids = {gate.gate_id for gate in build_profile("ci")}
+    final_gates = build_profile("final")
+    final_results = [
+        run_gate(
+            gate,
+            executor=lambda _gate: CommandOutcome(returncode=0, stdout="ok", stderr=""),
+        )
+        for gate in final_gates
+    ]
+
+    assert "E2E-P0-001" not in local_ids | ci_ids
+    assert "FORMAT-P0-001" not in local_ids
+    assert "FORMAT-P0-001" in ci_ids
+    assert "CAPACITY-P0-001" not in local_ids | ci_ids
+    assert "SERVER-P1-001" in local_ids
+    assert "SERVER-P1-001" not in ci_ids
+    assert "SERVER-P1-001" not in {gate.gate_id for gate in final_gates}
+    assert "HOST-P0-001" in {gate.gate_id for gate in final_gates}
+    assert (
+        calculate_verdict(
+            final_results,
+            required_gate_ids=tuple(gate.gate_id for gate in final_gates),
+        )
+        == "FAIL"
+    )
+
+
+def test_final_profile_without_explicit_target_evidence_is_blocked_before_execution() -> None:
+    by_id = {gate.gate_id: gate for gate in build_profile("final")}
+
+    for gate_id in (
+        "HOST-P0-001",
+        "STORAGE-WATERMARK-P0-001",
+        "SUPPLY-CHAIN-P0-001",
+        "OFFLINE-P0-001",
+        "OFFLINE-IMAGES-P0-001",
+        "OFFLINE-RUNTIME-P0-001",
+        "E2E-P0-001",
+    ):
+        gate = by_id[gate_id]
+        assert gate.blocked_reason is not None
+        assert run_gate(gate).status == "blocked"
+
+
+def test_executor_signature_is_injectable() -> None:
+    gate = AcceptanceGate(
+        gate_id="CODE-P0-001",
+        severity="P0",
+        command=("tool",),
+        cwd=".",
+        timeout_seconds=30,
+    )
+    calls: list[str] = []
+
+    def executor(item: AcceptanceGate) -> CommandOutcome:
+        calls.append(item.gate_id)
+        return CommandOutcome(returncode=0, stdout="ok", stderr="")
+
+    assert run_gate(gate, executor=executor).status == "passed"
+    assert calls == ["CODE-P0-001"]
+
+
+def test_reports_are_redacted_and_preserve_blocked_status(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    results = [
+        AcceptanceResult(
+            gate_id="AUTH-P0-001",
+            severity="P0",
+            status="passed",
+            duration_seconds=0.25,
+            summary="Authorization: Bearer secret-token-value",
+        ),
+        AcceptanceResult(
+            gate_id="SERVER-P1-001",
+            severity="P1",
+            status="blocked",
+            duration_seconds=0.0,
+            summary="real server unavailable",
+        ),
+    ]
+
+    json_path, markdown_path = write_reports(
+        results,
+        report_dir=tmp_path,
+        profile="local",
+        revision="abc123",
+        repository=repository,
+        required_gate_ids=("AUTH-P0-001", "SERVER-P1-001"),
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 3
+    assert payload["publication_status"] == "complete"
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert (
+        payload["report_integrity"]["markdown_sha256"]
+        == hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    )
+    assert payload["verdict"] == "CONDITIONAL"
+    assert payload["revision"] == payload["worktree"]["git_head"]
+    assert payload["results"][1]["status"] == "blocked"
+    assert payload["evidence_class"] == "development_smoke_not_for_signoff"
+    assert len(payload["worktree"]["content_fingerprint"]) == 64
+    assert payload["worktree"]["dirty"] is False
+    assert payload["worktree"]["status_counts"]["total"] == 0
+    assert len(payload["worktree"]["tracked_diff_sha256"]) == 64
+    assert len(payload["worktree"]["untracked_manifest_sha256"]) == 64
+    assert "secret-token-value" not in json_path.read_text(encoding="utf-8")
+    assert "secret-token-value" not in markdown
+    assert "SERVER-P1-001" in markdown
+    assert "blocked" in markdown
+    assert "NON-SIGNING DEVELOPMENT SMOKE" in markdown
+
+
+def test_report_rejects_an_incomplete_required_gate_set(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+
+    json_path, _markdown_path = write_reports(
+        [result("AUTH-P0-001", "P0", "passed")],
+        report_dir=tmp_path / "reports",
+        profile="local",
+        revision="ignored",
+        repository=repository,
+        required_gate_ids=("AUTH-P0-001", "FUNCTIONAL-P0-001"),
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "FAIL"
+    assert payload["gate_set_verified"] is False
+    assert payload["required_gate_ids"] == ["AUTH-P0-001", "FUNCTIONAL-P0-001"]
+
+
+def test_partial_report_publication_removes_the_already_written_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    report_dir = tmp_path / "reports"
+    atomic_write = acceptance_module._atomic_write
+
+    def fail_markdown(path: Path, content: str) -> None:
+        if path.name == "acceptance.md":
+            raise OSError("simulated markdown publication failure")
+        atomic_write(path, content)
+
+    monkeypatch.setattr(acceptance_module, "_atomic_write", fail_markdown)
+
+    with pytest.raises(OSError, match="simulated markdown publication failure"):
+        write_reports(
+            [result("AUTH-P0-001", "P0", "passed")],
+            report_dir=report_dir,
+            profile="local",
+            revision="ignored",
+            repository=repository,
+            required_gate_ids=("AUTH-P0-001",),
+        )
+
+    assert not (report_dir / "acceptance.json").exists()
+    assert not (report_dir / "acceptance.md").exists()
+
+
+def test_abrupt_report_interruption_leaves_only_a_non_passing_preparation_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    report_dir = tmp_path / "reports"
+    atomic_write = acceptance_module._atomic_write
+
+    def interrupt_before_markdown(path: Path, content: str) -> None:
+        if path.name == "acceptance.md":
+            raise KeyboardInterrupt
+        atomic_write(path, content)
+
+    monkeypatch.setattr(acceptance_module, "_atomic_write", interrupt_before_markdown)
+
+    with pytest.raises(KeyboardInterrupt):
+        write_reports(
+            [result("AUTH-P0-001", "P0", "passed")],
+            report_dir=report_dir,
+            profile="local",
+            revision="ignored",
+            repository=repository,
+            required_gate_ids=("AUTH-P0-001",),
+        )
+
+    persisted = json.loads((report_dir / "acceptance.json").read_text(encoding="utf-8"))
+    assert persisted["publication_status"] == "preparing"
+    assert persisted["verdict"] == "FAIL"
+    assert "not signable" in persisted["report_integrity"]["signature_boundary"]
+    assert not (report_dir / "acceptance.md").exists()
+
+
+def test_dirty_final_report_cannot_claim_pass_and_does_not_expose_paths(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    (repository / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    secret_named_file = repository / "PRIVATE_TOKEN_do_not_report.txt"
+    secret_named_file.write_text("not-a-real-secret-value", encoding="utf-8")
+
+    json_path, markdown_path = write_reports(
+        [result("ALL-P0-001", "P0", "passed")],
+        report_dir=tmp_path / "reports",
+        profile="final",
+        revision="stale-revision-argument",
+        repository=repository,
+        required_gate_ids=("ALL-P0-001",),
+    )
+
+    raw_json = json_path.read_text(encoding="utf-8")
+    raw_markdown = markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_json)
+    assert payload["verdict"] == "FAIL"
+    assert payload["evidence_class"] == "final_signoff_candidate"
+    assert payload["worktree"]["dirty"] is True
+    assert payload["worktree"]["status_counts"] == {
+        "total": 2,
+        "staged": 0,
+        "unstaged": 1,
+        "untracked": 1,
+        "conflicts": 0,
+    }
+    assert payload["revision"] == payload["worktree"]["git_head"]
+    assert "PRIVATE_TOKEN_do_not_report.txt" not in raw_json + raw_markdown
+    assert "not-a-real-secret-value" not in raw_json + raw_markdown
+    assert "DIRTY WORKTREE: NOT SIGNABLE" in raw_markdown
+
+
+def _identity_arguments(command: tuple[str, ...]) -> dict[str, str]:
+    options = (
+        "--expected-git-head",
+        "--expected-content-fingerprint",
+        "--acceptance-run-nonce",
+    )
+    return {option: command[command.index(option) + 1] for option in options}
+
+
+def test_machine_child_gates_share_one_top_level_acceptance_identity() -> None:
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    expected = {
+        "--expected-git-head": identity.git_head,
+        "--expected-content-fingerprint": identity.content_fingerprint,
+        "--acceptance-run-nonce": identity.run_nonce,
+    }
+
+    local = {gate.gate_id: gate for gate in build_profile("local", acceptance_identity=identity)}
+    final = {gate.gate_id: gate for gate in build_profile("final", acceptance_identity=identity)}
+
+    evidence_contracts = {
+        "FUNCTIONAL-P0-001": (
+            "artifacts/acceptance/evidence/functional.json",
+            "functional-acceptance",
+        ),
+        "TOKEN-GOV-P0-001": (
+            "artifacts/acceptance/evidence/postgres.json",
+            "postgres-acceptance",
+        ),
+        "BACKEND-P0-001": (
+            "artifacts/acceptance/evidence/backend.json",
+            "backend-acceptance",
+        ),
+    }
+    local_functional = local["FUNCTIONAL-P0-001"]
+    assert _identity_arguments(local_functional.command) == expected
+    assert local_functional.child_evidence_path == evidence_contracts["FUNCTIONAL-P0-001"][0]
+    assert local_functional.child_evidence_kind == evidence_contracts["FUNCTIONAL-P0-001"][1]
+    e2e = final["E2E-P0-001"]
+    assert _identity_arguments(e2e.command) == expected
+    assert dict(e2e.environment)["KB_E2E_RUN_ID"] == f"acceptance-browser-{identity.run_nonce}"
+    for gate_id, (evidence_path, evidence_kind) in evidence_contracts.items():
+        gate = final[gate_id]
+        command = gate.command
+        assert _identity_arguments(command) == expected
+        assert all(command.count(option) == 1 for option in expected)
+        assert command.count("--evidence-file") == 1
+        assert command[command.index("--evidence-file") + 1] == evidence_path
+        assert gate.child_evidence_path == evidence_path
+        assert gate.child_evidence_kind == evidence_kind
+
+
+def test_gate_orchestrator_checks_identity_before_after_each_gate_and_at_end() -> None:
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    current = acceptance_module.WorktreeEvidence(
+        git_head=identity.git_head,
+        dirty=False,
+        status_counts={"total": 0},
+        tracked_diff_sha256="d" * 64,
+        untracked_manifest_sha256="e" * 64,
+        content_fingerprint=identity.content_fingerprint,
+    )
+    identity_checks: list[Path] = []
+    executed: list[str] = []
+
+    def collector(repository: Path) -> acceptance_module.WorktreeEvidence:
+        identity_checks.append(repository)
+        return current
+
+    def executor(gate: AcceptanceGate) -> CommandOutcome:
+        executed.append(gate.gate_id)
+        return CommandOutcome(0, "ok", "")
+
+    gates = (
+        AcceptanceGate("ONE", "P0", ("one",), ".", 1),
+        AcceptanceGate("TWO", "P1", ("two",), ".", 1),
+    )
+    results = run_gates_bound_to_identity(
+        gates,
+        repository=Path.cwd(),
+        identity=identity,
+        executor=executor,
+        identity_collector=collector,
+    )
+
+    assert [item.status for item in results] == ["passed", "passed"]
+    assert executed == ["ONE", "TWO"]
+    assert len(identity_checks) == 5
+
+
+def test_gate_orchestrator_stops_when_a_gate_changes_repository_identity() -> None:
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    matching = acceptance_module.WorktreeEvidence(
+        git_head=identity.git_head,
+        dirty=False,
+        status_counts={"total": 0},
+        tracked_diff_sha256="d" * 64,
+        untracked_manifest_sha256="e" * 64,
+        content_fingerprint=identity.content_fingerprint,
+    )
+    changed = replace(matching, content_fingerprint="f" * 64)
+    observations = iter((matching, changed))
+    executed: list[str] = []
+
+    def executor(gate: AcceptanceGate) -> CommandOutcome:
+        executed.append(gate.gate_id)
+        return CommandOutcome(0, "ok", "")
+
+    results = run_gates_bound_to_identity(
+        (
+            AcceptanceGate("MUTATING", "P1", ("mutate",), ".", 1),
+            AcceptanceGate("MUST-NOT-RUN", "P0", ("later",), ".", 1),
+        ),
+        repository=Path.cwd(),
+        identity=identity,
+        executor=executor,
+        identity_collector=lambda _repository: next(observations),
+    )
+
+    assert executed == ["MUTATING"]
+    assert len(results) == 1
+    assert results[0].gate_id == "ACCEPTANCE-IDENTITY-P0-001"
+    assert results[0].severity == "P0"
+    assert results[0].status == "failed"
+    assert "after MUTATING" in results[0].summary
+
+
+_CHILD_EVIDENCE_CASES = (
+    (
+        "functional-acceptance",
+        "artifacts/acceptance/evidence/functional.json",
+    ),
+    (
+        "postgres-acceptance",
+        "artifacts/acceptance/evidence/postgres.json",
+    ),
+    (
+        "backend-acceptance",
+        "artifacts/acceptance/evidence/backend.json",
+    ),
+)
+
+
+def _child_document(kind: str, identity: GateIdentity) -> dict[str, object]:
+    document: dict[str, object] = {
+        "schema_version": 2,
+        "kind": kind,
+        "status": "complete",
+        "policy_status": "passed",
+        "target": identity.target(),
+    }
+    if kind == "functional-acceptance":
+        document.update({"verdict": "PASS", "source_verdict": "PASS"})
+    return document
+
+
+@pytest.mark.parametrize(("kind", "relative_path"), _CHILD_EVIDENCE_CASES)
+def test_machine_child_evidence_requires_exact_nonce_bound_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    relative_path: str,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    evidence_path = repository / relative_path
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(_child_document(kind, identity)),
+        encoding="utf-8",
+    )
+    gate = AcceptanceGate(
+        "CHILD-P0-001",
+        "P0",
+        ("child",),
+        str(repository),
+        1,
+        child_evidence_path=relative_path,
+        child_evidence_kind=kind,  # type: ignore[arg-type]
+    )
+    validator_name = {
+        "functional-acceptance": "_validate_functional_child_document",
+        "postgres-acceptance": "_validate_postgres_child_document",
+        "backend-acceptance": "_validate_backend_child_document",
+    }[kind]
+    monkeypatch.setattr(acceptance_module, validator_name, lambda *_args, **_kwargs: True)
+
+    accepted, summary, evidence_sha256 = verify_bound_child_evidence(
+        gate,
+        repository=repository,
+        identity=identity,
+    )
+
+    assert accepted is True
+    assert "exact acceptance target" in summary
+    assert f"kind={kind}" in summary
+    assert evidence_sha256 == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "schema",
+        "kind",
+        "status",
+        "policy",
+        "missing_target_key",
+        "extra_target_key",
+        "old_nonce",
+        "wrong_git_head",
+        "wrong_fingerprint",
+        "functional_verdict",
+    ),
+)
+def test_machine_child_evidence_rejects_self_reported_or_stale_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    relative_path = "artifacts/acceptance/evidence/functional.json"
+    evidence_path = repository / relative_path
+    evidence_path.parent.mkdir(parents=True)
+    document = _child_document("functional-acceptance", identity)
+    if mutation == "schema":
+        document["schema_version"] = 1
+    elif mutation == "kind":
+        document["kind"] = "postgres-acceptance"
+    elif mutation == "status":
+        document["status"] = "failed"
+    elif mutation == "policy":
+        document["policy_status"] = "failed"
+    elif mutation == "functional_verdict":
+        document["verdict"] = "FAIL"
+    else:
+        target = dict(identity.target())
+        if mutation == "missing_target_key":
+            target.pop("run_nonce")
+        elif mutation == "extra_target_key":
+            target["unexpected"] = "value"
+        elif mutation == "old_nonce":
+            target["run_nonce"] = "d" * 32
+        elif mutation == "wrong_git_head":
+            target["git_head"] = "d" * 40
+        else:
+            target["content_fingerprint"] = "d" * 64
+        document["target"] = target
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
+    gate = AcceptanceGate(
+        "FUNCTIONAL-P0-001",
+        "P0",
+        ("child",),
+        str(repository),
+        1,
+        child_evidence_path=relative_path,
+        child_evidence_kind="functional-acceptance",
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "_validate_functional_child_document",
+        lambda document, **_kwargs: (
+            document.get("verdict") == "PASS" and document.get("source_verdict") == "PASS"
+        ),
+    )
+
+    accepted, _, evidence_sha256 = verify_bound_child_evidence(
+        gate,
+        repository=repository,
+        identity=identity,
+    )
+
+    assert accepted is False
+    assert evidence_sha256 is None
+
+
+@pytest.mark.parametrize(("kind", "relative_path"), _CHILD_EVIDENCE_CASES)
+def test_machine_child_evidence_rejects_minimal_self_reported_success(
+    tmp_path: Path,
+    kind: str,
+    relative_path: str,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    evidence_path = repository / relative_path
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(_child_document(kind, identity)),
+        encoding="utf-8",
+    )
+    gate = AcceptanceGate(
+        "CHILD-P0-001",
+        "P0",
+        ("child",),
+        str(repository),
+        1,
+        child_evidence_path=relative_path,
+        child_evidence_kind=kind,  # type: ignore[arg-type]
+    )
+
+    accepted, _, evidence_sha256 = verify_bound_child_evidence(
+        gate,
+        repository=repository,
+        identity=identity,
+    )
+
+    assert accepted is False
+    assert evidence_sha256 is None
+
+
+def test_functional_child_contract_survives_persisted_json_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    manifest = load_manifest(repository / "docs/functional_acceptance_manifest.json")
+    command_entries = manifest["test_commands"]
+    external_entries = manifest["external_evidence"]
+    assert isinstance(command_entries, list)
+    assert isinstance(external_entries, list)
+    emitted_document = {
+        "schema_version": 2,
+        "profile": "source",
+        "source_verdict": "PASS",
+        "runtime_functional_verdict": "BLOCKED",
+        "verdict": "PASS",
+        "contract": asdict(evaluate_contract(repository, manifest)),
+        "test_commands": [
+            {"command_id": entry["id"]} for entry in command_entries if isinstance(entry, dict)
+        ],
+        "external_evidence": {
+            "verdict": "BLOCKED",
+            "results": [
+                {
+                    "evidence_id": entry["id"],
+                    "status": "blocked",
+                    "summary": "external runtime evidence is unavailable in source profile",
+                }
+                for entry in external_entries
+                if isinstance(entry, dict)
+            ],
+        },
+        "kind": "functional-acceptance",
+        "target": GateIdentity("a" * 40, "b" * 64, "c" * 32).target(),
+        "status": "complete",
+        "policy_status": "passed",
+    }
+    persisted_document = json.loads(json.dumps(emitted_document))
+    monkeypatch.setattr(
+        acceptance_module,
+        "_validate_functional_test_result",
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert acceptance_module._validate_functional_child_document(
+        persisted_document,
+        repository=repository,
+        identity=GateIdentity("a" * 40, "b" * 64, "c" * 32),
+    )
+
+
+def _write_child_junit(
+    evidence_path: Path,
+    *,
+    artifact_name: str,
+    node_ids: list[str],
+) -> dict[str, object]:
+    raw_directory = evidence_path.parent / "raw"
+    raw_directory.mkdir(parents=True, exist_ok=True)
+    artifact = raw_directory / artifact_name
+    suites = StdlibElementTree.Element("testsuites")
+    suite = StdlibElementTree.SubElement(suites, "testsuite")
+    for node_id in node_ids:
+        parts = node_id.split("::")
+        module = parts[0].removesuffix(".py").replace("/", ".")
+        classname = ".".join((module, *parts[1:-1]))
+        StdlibElementTree.SubElement(
+            suite,
+            "testcase",
+            {"classname": classname, "name": parts[-1]},
+        )
+    StdlibElementTree.ElementTree(suites).write(
+        artifact,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+    return parse_pytest_junit(artifact, node_ids).as_dict(path=f"raw/{artifact_name}")
+
+
+def test_postgres_child_evidence_requires_exact_checks_counts_and_junit_hash(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    tests = repository / "tests"
+    tests.mkdir(parents=True)
+    mapped_files = discover_postgres_test_files(Path.cwd())
+    for relative_path in mapped_files:
+        target = repository / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# acceptance mapping fixture\n", encoding="utf-8")
+    node_ids = sorted(
+        {node for selectors in POSTGRES_BUSINESS_CHECK_NODES.values() for node in selectors}
+    )
+    represented_files = {node.split("::", 1)[0] for node in node_ids}
+    node_ids.extend(
+        f"{relative_path}::test_acceptance_mapping"
+        for relative_path in mapped_files
+        if relative_path not in represented_files
+    )
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    evidence_path = repository / "artifacts/acceptance/evidence/postgres.json"
+    evidence_path.parent.mkdir(parents=True)
+    pytest_evidence = _write_child_junit(
+        evidence_path,
+        artifact_name="postgres-fixture.xml",
+        node_ids=node_ids,
+    )
+    document: dict[str, object] = {
+        "schema_version": 2,
+        "kind": "postgres-acceptance",
+        "started_at": "2026-07-16T00:00:00+00:00",
+        "finished_at": "2026-07-16T00:01:00+00:00",
+        "image_id": f"sha256:{'d' * 64}",
+        "target": identity.target(),
+        "status": "complete",
+        "policy_status": "passed",
+        "checks": postgres_business_checks_from_nodes(tuple(node_ids)),
+        "pytest": pytest_evidence,
+    }
+
+    assert acceptance_module._validate_postgres_child_document(
+        document,
+        repository=repository,
+        evidence_path=evidence_path,
+        identity=identity,
+    )
+
+    extra_key = copy.deepcopy(document)
+    extra_key["unexpected"] = True
+    missing_check = copy.deepcopy(document)
+    checks = dict(missing_check["checks"])  # type: ignore[arg-type]
+    checks.pop(next(iter(checks)))
+    missing_check["checks"] = checks
+    skipped = copy.deepcopy(document)
+    cast_pytest = skipped["pytest"]
+    assert isinstance(cast_pytest, dict)
+    cast_pytest["skipped"] = 1
+    bad_hash = copy.deepcopy(document)
+    cast_pytest = bad_hash["pytest"]
+    assert isinstance(cast_pytest, dict)
+    cast_pytest["sha256"] = "e" * 64
+
+    for invalid in (extra_key, missing_check, skipped, bad_hash):
+        assert not acceptance_module._validate_postgres_child_document(
+            invalid,
+            repository=repository,
+            evidence_path=evidence_path,
+            identity=identity,
+        )
+
+
+def test_backend_child_evidence_requires_full_suite_and_postgres_hash_closure(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / "docs").mkdir(parents=True)
+    (repository / "docs/functional_acceptance_manifest.json").write_text(
+        json.dumps(
+            {
+                "test_commands": [
+                    {
+                        "id": "backend-functional",
+                        "minimum_passed_tests": 2,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    postgres_test = repository / "tests/test_fixture_postgres.py"
+    postgres_test.parent.mkdir(parents=True)
+    postgres_test.write_text("# mapped PostgreSQL fixture\n", encoding="utf-8")
+    postgres_path = repository / "artifacts/acceptance/evidence/postgres.json"
+    postgres_path.parent.mkdir(parents=True)
+    postgres_path.write_text('{"status":"complete"}\n', encoding="utf-8")
+    postgres_sha256 = hashlib.sha256(postgres_path.read_bytes()).hexdigest()
+    evidence_path = repository / "artifacts/acceptance/evidence/backend.json"
+    pytest_evidence = _write_child_junit(
+        evidence_path,
+        artifact_name="backend-fixture.xml",
+        node_ids=[
+            "tests/test_backend_one.py::test_one",
+            "tests/test_backend_two.py::test_two",
+        ],
+    )
+    document: dict[str, object] = {
+        "schema_version": 2,
+        "kind": "backend-acceptance",
+        "status": "complete",
+        "policy_status": "passed",
+        "started_at": "2026-07-16T00:00:00+00:00",
+        "finished_at": "2026-07-16T00:01:00+00:00",
+        "target": GateIdentity("a" * 40, "b" * 64, "c" * 32).target(),
+        "checks": {"coverage_minimum_percent": 80},
+        "pytest": pytest_evidence,
+        "postgres_skip_closure": {
+            "gate_id": "TOKEN-GOV-P0-001",
+            "evidence_kind": "postgres-acceptance",
+            "evidence_file_name": "postgres.json",
+            "evidence_sha256": postgres_sha256,
+            "mapped_test_files": ["tests/test_fixture_postgres.py"],
+        },
+    }
+
+    assert acceptance_module._validate_backend_child_document(
+        document,
+        repository=repository,
+        evidence_path=evidence_path,
+    )
+
+    wrong_checks = copy.deepcopy(document)
+    wrong_checks["checks"] = {"coverage_minimum_percent": 0}
+    skipped = copy.deepcopy(document)
+    cast_pytest = skipped["pytest"]
+    assert isinstance(cast_pytest, dict)
+    cast_pytest["skipped"] = 1
+    wrong_postgres = copy.deepcopy(document)
+    closure = wrong_postgres["postgres_skip_closure"]
+    assert isinstance(closure, dict)
+    closure["evidence_sha256"] = "f" * 64
+
+    for invalid in (wrong_checks, skipped, wrong_postgres):
+        assert not acceptance_module._validate_backend_child_document(
+            invalid,
+            repository=repository,
+            evidence_path=evidence_path,
+        )
+
+
+def test_machine_child_evidence_rejects_missing_invalid_and_symlink_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    relative_path = "artifacts/acceptance/evidence/backend.json"
+    evidence_path = repository / relative_path
+    evidence_path.parent.mkdir(parents=True)
+    gate = AcceptanceGate(
+        "BACKEND-P0-001",
+        "P0",
+        ("child",),
+        str(repository),
+        1,
+        child_evidence_path=relative_path,
+        child_evidence_kind="backend-acceptance",
+    )
+
+    assert not verify_bound_child_evidence(gate, repository=repository, identity=identity)[0]
+    evidence_path.write_text("[]", encoding="utf-8")
+    assert not verify_bound_child_evidence(gate, repository=repository, identity=identity)[0]
+    evidence_path.write_bytes(b"x" * (1024 * 1024 + 1))
+    assert not verify_bound_child_evidence(gate, repository=repository, identity=identity)[0]
+
+    actual = tmp_path / "actual.json"
+    actual.write_text(
+        json.dumps(_child_document("backend-acceptance", identity)),
+        encoding="utf-8",
+    )
+    evidence_path.unlink()
+    try:
+        evidence_path.symlink_to(actual)
+    except OSError:
+        return
+    assert not verify_bound_child_evidence(gate, repository=repository, identity=identity)[0]
+
+
+def test_invalid_child_evidence_stops_dependent_gates(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    relative_path = "artifacts/acceptance/evidence/postgres.json"
+    evidence_path = repository / relative_path
+    evidence_path.parent.mkdir(parents=True)
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    current = acceptance_module.WorktreeEvidence(
+        git_head=identity.git_head,
+        dirty=False,
+        status_counts={"total": 0},
+        tracked_diff_sha256="d" * 64,
+        untracked_manifest_sha256="e" * 64,
+        content_fingerprint=identity.content_fingerprint,
+    )
+    executed: list[str] = []
+
+    def executor(gate: AcceptanceGate) -> CommandOutcome:
+        executed.append(gate.gate_id)
+        if gate.gate_id == "TOKEN-GOV-P0-001":
+            stale_identity = GateIdentity(identity.git_head, identity.content_fingerprint, "d" * 32)
+            evidence_path.write_text(
+                json.dumps(_child_document("postgres-acceptance", stale_identity)),
+                encoding="utf-8",
+            )
+        return CommandOutcome(0, "ok", "")
+
+    results = run_gates_bound_to_identity(
+        (
+            AcceptanceGate(
+                "TOKEN-GOV-P0-001",
+                "P0",
+                ("postgres",),
+                str(repository),
+                1,
+                child_evidence_path=relative_path,
+                child_evidence_kind="postgres-acceptance",
+            ),
+            AcceptanceGate("BACKEND-P0-001", "P0", ("backend",), str(repository), 1),
+        ),
+        repository=repository,
+        identity=identity,
+        executor=executor,
+        identity_collector=lambda _repository: current,
+    )
+
+    assert executed == ["TOKEN-GOV-P0-001"]
+    assert len(results) == 1
+    assert results[0].gate_id == "TOKEN-GOV-P0-001"
+    assert results[0].status == "failed"
+
+
+def test_acceptance_identity_initialization_binds_clean_and_dirty_snapshots(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+
+    clean_snapshot, clean_identity = initialize_acceptance_identity(repository)
+    assert clean_snapshot.dirty is False
+    assert clean_identity.git_head == clean_snapshot.git_head
+    assert clean_identity.content_fingerprint == clean_snapshot.content_fingerprint
+
+    (repository / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    dirty_snapshot, dirty_identity = initialize_acceptance_identity(repository)
+    assert dirty_snapshot.dirty is True
+    assert dirty_identity.content_fingerprint == dirty_snapshot.content_fingerprint
+    assert dirty_identity.content_fingerprint != clean_identity.content_fingerprint
+
+
+def test_final_profile_fails_before_contract_creation_or_gate_build_on_dirty_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    dirty = acceptance_module.WorktreeEvidence(
+        git_head=identity.git_head,
+        dirty=True,
+        status_counts={"total": 1},
+        tracked_diff_sha256="d" * 64,
+        untracked_manifest_sha256="e" * 64,
+        content_fingerprint=identity.content_fingerprint,
+    )
+    forbidden_calls: list[str] = []
+
+    monkeypatch.setattr(
+        acceptance_module,
+        "initialize_acceptance_identity",
+        lambda _repository: (dirty, identity),
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "write_reports",
+        lambda *_args, **_kwargs: (tmp_path / "acceptance.json", tmp_path / "acceptance.md"),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        forbidden_calls.append("called")
+        raise AssertionError("dirty final acceptance must fail before external setup")
+
+    monkeypatch.setattr(acceptance_module, "_create_offline_contract", forbidden)
+    monkeypatch.setattr(acceptance_module, "build_profile", forbidden)
+
+    exit_code = acceptance_module.main(
+        ["--profile", "final", "--report-dir", str(tmp_path / "reports")]
+    )
+
+    assert exit_code == 1
+    assert forbidden_calls == []
+
+
+def test_final_report_is_nonce_bound_and_fails_closed_without_matching_identity(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    worktree = collect_worktree_evidence(repository)
+    identity = GateIdentity(worktree.git_head, worktree.content_fingerprint, "c" * 32)
+
+    json_path, _ = write_reports(
+        [result("ALL-P0-001", "P0", "passed")],
+        report_dir=tmp_path / "valid",
+        profile="final",
+        revision=worktree.git_head,
+        repository=repository,
+        acceptance_identity=identity,
+        required_gate_ids=("ALL-P0-001",),
+        release_binding={
+            "release_id": worktree.git_head,
+            "offline_contract_sha256": "d" * 64,
+            "offline_image_manifest_sha256": "e" * 64,
+        },
+    )
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "PASS"
+    assert payload["identity_verified"] is True
+    assert payload["target"] == identity.target()
+    assert payload["gate_set_verified"] is True
+    assert payload["release_binding_verified"] is True
+    integrity = payload.pop("report_integrity")
+    assert integrity["report_sha256"] == acceptance_module._canonical_digest(payload)
+    assert integrity["signature_status"] == "unsigned"
+    assert payload["publication_status"] == "complete"
+
+    (repository / "tracked.txt").write_text("changed during acceptance\n", encoding="utf-8")
+    changed_path, _ = write_reports(
+        [result("ALL-P0-001", "P0", "passed")],
+        report_dir=tmp_path / "changed",
+        profile="final",
+        revision=worktree.git_head,
+        repository=repository,
+        acceptance_identity=identity,
+        required_gate_ids=("ALL-P0-001",),
+        release_binding={
+            "release_id": worktree.git_head,
+            "offline_contract_sha256": "d" * 64,
+            "offline_image_manifest_sha256": "e" * 64,
+        },
+    )
+    changed_payload = json.loads(changed_path.read_text(encoding="utf-8"))
+    assert changed_payload["verdict"] == "FAIL"
+    assert changed_payload["identity_verified"] is False
+
+    unsigned_repository = tmp_path / "unsigned"
+    _init_git_repository(unsigned_repository)
+    unsigned_path, _ = write_reports(
+        [result("ALL-P0-001", "P0", "passed")],
+        report_dir=tmp_path / "unsigned-report",
+        profile="final",
+        revision="ignored",
+        repository=unsigned_repository,
+        required_gate_ids=("ALL-P0-001",),
+        release_binding={
+            "release_id": "a" * 40,
+            "offline_contract_sha256": "d" * 64,
+            "offline_image_manifest_sha256": "e" * 64,
+        },
+    )
+    unsigned_payload = json.loads(unsigned_path.read_text(encoding="utf-8"))
+    assert unsigned_payload["verdict"] == "FAIL"
+    assert unsigned_payload["identity_verified"] is False
+
+
+def _acceptance_main_identity() -> tuple[
+    GateIdentity,
+    acceptance_module.WorktreeEvidence,
+    acceptance_module.WorktreeEvidence,
+]:
+    identity = GateIdentity("a" * 40, "b" * 64, "c" * 32)
+    clean = acceptance_module.WorktreeEvidence(
+        git_head=identity.git_head,
+        dirty=False,
+        status_counts={
+            "total": 0,
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "conflicts": 0,
+        },
+        tracked_diff_sha256="d" * 64,
+        untracked_manifest_sha256="e" * 64,
+        content_fingerprint=identity.content_fingerprint,
+    )
+    changed = acceptance_module.WorktreeEvidence(
+        git_head="f" * 40,
+        dirty=True,
+        status_counts={
+            "total": 1,
+            "staged": 0,
+            "unstaged": 1,
+            "untracked": 0,
+            "conflicts": 0,
+        },
+        tracked_diff_sha256="1" * 64,
+        untracked_manifest_sha256="2" * 64,
+        content_fingerprint="3" * 64,
+    )
+    return identity, clean, changed
+
+
+def _patch_minimal_final_main(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    identity: GateIdentity,
+    initial: acceptance_module.WorktreeEvidence,
+) -> None:
+    gate = AcceptanceGate("ONLY-P0-001", "P0", ("true",), ".", 1)
+    monkeypatch.setattr(
+        acceptance_module,
+        "bind_trusted_executable",
+        lambda *_args, **_kwargs: TrustedExecutableBinding("C:/node.exe", "9" * 64),
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "initialize_acceptance_identity",
+        lambda _repository: (initial, identity),
+    )
+    monkeypatch.setattr(acceptance_module, "acquire_offline_acceptance_lock", lambda: 99)
+    monkeypatch.setattr(
+        acceptance_module,
+        "release_offline_acceptance_lock",
+        lambda _descriptor: None,
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "_create_offline_contract",
+        lambda *_args, **_kwargs: (
+            "/run/heyi-kb-offline/contracts/contract.test",
+            "d" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "_offline_image_manifest_digest",
+        lambda _contract_dir: "e" * 64,
+        raising=False,
+    )
+    monkeypatch.setattr(acceptance_module, "_remove_offline_contract", lambda *_a, **_k: True)
+    monkeypatch.setattr(acceptance_module, "build_profile", lambda *_a, **_k: (gate,))
+    monkeypatch.setattr(
+        acceptance_module,
+        "run_gates_bound_to_identity",
+        lambda *_a, **_k: [result("ONLY-P0-001", "P0", "passed")],
+    )
+    monkeypatch.setattr(acceptance_module, "assert_gate_identity", lambda *_a, **_k: None)
+
+
+def test_final_identity_failure_after_report_publication_persists_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity, clean, changed = _acceptance_main_identity()
+    _patch_minimal_final_main(monkeypatch, identity=identity, initial=clean)
+    snapshots = iter((clean, changed))
+    monkeypatch.setattr(
+        acceptance_module,
+        "collect_worktree_evidence",
+        lambda _repository: next(snapshots),
+    )
+    report_dir = tmp_path / "reports"
+
+    exit_code = acceptance_module.main(
+        [
+            "--profile",
+            "final",
+            "--report-dir",
+            str(report_dir),
+            "--release-id",
+            identity.git_head,
+            "--offline-runtime-env-file",
+            "/runtime.env",
+            "--offline-release-env-file",
+            "/release.env",
+        ]
+    )
+
+    persisted = json.loads((report_dir / "acceptance.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert persisted["verdict"] == "FAIL"
+    assert persisted["identity_verified"] is False
+
+
+@pytest.mark.parametrize(
+    ("release_id", "expected_exit_code", "expected_verdict"),
+    (
+        ("a" * 40, 0, "PASS"),
+        ("f" * 40, 1, "FAIL"),
+    ),
+)
+def test_final_main_requires_one_release_identity_across_report_and_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_id: str,
+    expected_exit_code: int,
+    expected_verdict: str,
+) -> None:
+    identity, clean, _changed = _acceptance_main_identity()
+    _patch_minimal_final_main(monkeypatch, identity=identity, initial=clean)
+    monkeypatch.setattr(
+        acceptance_module,
+        "collect_worktree_evidence",
+        lambda _repository: clean,
+    )
+    report_dir = tmp_path / "reports"
+
+    exit_code = acceptance_module.main(
+        [
+            "--profile",
+            "final",
+            "--report-dir",
+            str(report_dir),
+            "--release-id",
+            release_id,
+            "--offline-runtime-env-file",
+            "/runtime.env",
+            "--offline-release-env-file",
+            "/release.env",
+        ]
+    )
+
+    persisted = json.loads((report_dir / "acceptance.json").read_text(encoding="utf-8"))
+    assert exit_code == expected_exit_code
+    assert persisted["verdict"] == expected_verdict
+    assert persisted["release_binding_verified"] is (expected_exit_code == 0)
+    assert persisted["gate_set_verified"] is True
+
+
+def test_final_report_write_failure_removes_stale_pass_and_returns_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity, clean, _changed = _acceptance_main_identity()
+    _patch_minimal_final_main(monkeypatch, identity=identity, initial=clean)
+    monkeypatch.setattr(
+        acceptance_module,
+        "collect_worktree_evidence",
+        lambda _repository: clean,
+    )
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    stale = report_dir / "acceptance.json"
+    stale.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        acceptance_module,
+        "write_reports",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    exit_code = acceptance_module.main(
+        [
+            "--profile",
+            "final",
+            "--report-dir",
+            str(report_dir),
+            "--release-id",
+            identity.git_head,
+            "--offline-runtime-env-file",
+            "/runtime.env",
+            "--offline-release-env-file",
+            "/release.env",
+        ]
+    )
+
+    assert exit_code == 1
+    assert not stale.exists()

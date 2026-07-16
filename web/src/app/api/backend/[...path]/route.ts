@@ -5,13 +5,18 @@ import {
   backendUrl,
   safeBackendFetch,
 } from "@/lib/server/backend";
-import { isAllowedBackendPath } from "@/lib/server/backend-path";
+import { backendAcceptHeader, isAllowedBackendPath } from "@/lib/server/backend-path";
 import { readBoundedBody, RequestBodyTooLargeError } from "@/lib/server/bounded-body";
+import {
+  BackendResponseTooLargeError,
+  readBoundedResponseBody,
+} from "@/lib/server/bounded-response";
 import {
   BffSigningConfigurationError,
   signedClientIpHeaders,
 } from "@/lib/server/client-ip";
-import { refreshSessionOnce } from "@/lib/server/session-refresh";
+import { isValidIdempotencyKey } from "@/lib/chat-idempotency";
+import { refreshSessionOnce, refreshSessionStatus } from "@/lib/server/session-refresh";
 import {
   hasSameOrigin,
   requestTokens,
@@ -21,12 +26,14 @@ import {
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const MAX_CONTROL_PLANE_BODY_BYTES = 1024 * 1024;
+const MAX_BACKEND_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 async function handleBackendRequest(
   request: NextRequest,
   context: { params: Promise<{ path: string[] }> },
 ): Promise<NextResponse> {
   const { path } = await context.params;
+  const isAuditExport = backendAcceptHeader(path, request.method) === "text/csv";
   if (!isAllowedBackendPath(path, request.method, request.nextUrl.pathname)) {
     return NextResponse.json(
       { error: { code: "route_not_allowed", message: "该后台路径未开放给 Web BFF。" } },
@@ -60,6 +67,19 @@ async function handleBackendRequest(
     );
   }
 
+  const idempotencyKey = request.headers.get("idempotency-key");
+  if (idempotencyKey !== null && !isValidIdempotencyKey(idempotencyKey)) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "invalid_idempotency_key",
+          message: "幂等键格式无效。",
+        },
+      },
+      { status: 400, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
   let body: ArrayBuffer | undefined;
   try {
     body = await readBoundedBody(request, MAX_CONTROL_PLANE_BODY_BYTES);
@@ -76,9 +96,8 @@ async function handleBackendRequest(
     );
   }
   const forward = async (access: string | undefined): Promise<Response> => {
-    const headers = new Headers({ Accept: "application/json" });
+    const headers = new Headers({ Accept: isAuditExport ? "text/csv" : "application/json" });
     const contentType = request.headers.get("content-type");
-    const idempotencyKey = request.headers.get("idempotency-key");
     if (contentType) headers.set("Content-Type", contentType);
     if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
     if (access) headers.set("Authorization", `Bearer ${access}`);
@@ -139,7 +158,30 @@ async function handleBackendRequest(
     return response;
   }
 
-  const responseBody = backend.status === 204 ? null : await backend.arrayBuffer();
+  let responseBody: ArrayBuffer | null;
+  try {
+    responseBody = backend.status === 204
+      ? null
+      : await readBoundedResponseBody(backend, MAX_BACKEND_RESPONSE_BYTES);
+  } catch (error) {
+    if (!(error instanceof BackendResponseTooLargeError)) throw error;
+    const response = NextResponse.json(
+      {
+        error: {
+          code: "backend_response_too_large",
+          message: "后台响应超过安全大小限制，请缩小查询范围后重试。",
+        },
+      },
+      { status: 502, headers: { "Cache-Control": "no-store" } },
+    );
+    if (
+      replacement
+      && await refreshSessionStatus(replacement.refresh_token, request) === "active"
+    ) {
+      setSessionCookies(response, replacement, tokens.email);
+    }
+    return response;
+  }
   const response = new NextResponse(responseBody, { status: backend.status });
   for (const name of [
     "content-type",
@@ -151,9 +193,21 @@ async function handleBackendRequest(
     const value = backend.headers.get(name);
     if (value) response.headers.set(name, value);
   }
-  response.headers.set("Cache-Control", "no-store");
+  if (isAuditExport) {
+    const contentDisposition = backend.headers.get("content-disposition");
+    if (contentDisposition) response.headers.set("content-disposition", contentDisposition);
+    response.headers.set("Cache-Control", "no-store, private");
+    response.headers.set("X-Content-Type-Options", "nosniff");
+  } else {
+    response.headers.set("Cache-Control", "no-store");
+  }
 
-  if (replacement) setSessionCookies(response, replacement, tokens.email);
+  if (
+    replacement
+    && await refreshSessionStatus(replacement.refresh_token, request) === "active"
+  ) {
+    setSessionCookies(response, replacement, tokens.email);
+  }
   return response;
 }
 

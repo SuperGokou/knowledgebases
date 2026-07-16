@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "kind": "postgres-acceptance",
+  "started_at": "2026-07-13T13:28:12.864403+00:00",
+  "finished_at": "2026-07-13T13:28:28.105223+00:00",
+  "image_id": "sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
+  "target": {
+    "git_head": "38627430eee7ec5bd2e5388c5d86c8daf1928a59",
+    "content_fingerprint": "88cac7c70d6bf5aa8c87fb1f676f7d1d1fbb5b112c311a915ec45ff0664d857e"
+  },
+  "status": "complete",
+  "policy_status": "passed",
+  "checks": {
+    "real_migrations": "passed",
+    "budget_concurrency": "passed",
+    "idempotency_single_winner": "passed",
+    "malware_scan_lease": "passed",
+    "rbac_acl_revocation_concurrency": "passed",
+    "audit_append_only_runtime_role": "passed",
+    "isolated_migration_0011": "passed",
+    "pytest_passed": 17,
+    "pytest_skipped": 0,
+    "covered_test_files": [
+      "tests/test_llm_usage_postgres.py",
+      "tests/test_scan_audit_postgres.py",
+      "tests/test_rbac_acl_revocation_postgres.py",
+      "tests/test_migration_0011_postgres.py"
+    ]
+  }
+}

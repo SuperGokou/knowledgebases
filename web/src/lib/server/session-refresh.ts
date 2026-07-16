@@ -11,7 +11,9 @@ export type RefreshOutcome =
   | { kind: "expired" }
   | { kind: "unavailable"; status: number };
 
-const refreshFlights = new Map<string, Promise<RefreshOutcome>>();
+export type RefreshSessionStatus = "active" | "inactive" | "unavailable";
+
+const refreshFlights = new Set<string>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -58,17 +60,43 @@ async function refreshSession(
   }
 }
 
-export function refreshSessionOnce(
+export async function refreshSessionOnce(
   refreshToken: string,
   request: NextRequest,
 ): Promise<RefreshOutcome> {
+  // Never share a one-time rotated credential result between requests. A
+  // concurrent bearer receives a retryable response while the first caller is
+  // the sole recipient of the backend rotation result.
   const fingerprint = createHash("sha256").update(refreshToken).digest("hex");
-  const current = refreshFlights.get(fingerprint);
-  if (current) return current;
+  if (refreshFlights.has(fingerprint)) {
+    return { kind: "unavailable", status: 409 };
+  }
+  refreshFlights.add(fingerprint);
+  try {
+    return await refreshSession(refreshToken, request);
+  } finally {
+    refreshFlights.delete(fingerprint);
+  }
+}
 
-  const pending = refreshSession(refreshToken, request).finally(() => {
-    if (refreshFlights.get(fingerprint) === pending) refreshFlights.delete(fingerprint);
-  });
-  refreshFlights.set(fingerprint, pending);
-  return pending;
+export async function refreshSessionStatus(
+  refreshToken: string,
+  request: NextRequest,
+): Promise<RefreshSessionStatus> {
+  try {
+    const response = await safeBackendFetch(backendUrl("/api/v1/auth/refresh/status"), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...signedClientIpHeaders(request),
+      },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    if (response.status === 204) return "active";
+    if (response.status === 401) return "inactive";
+    return "unavailable";
+  } catch {
+    return "unavailable";
+  }
 }

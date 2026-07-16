@@ -8,7 +8,7 @@ from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
-from sqlalchemy import and_, exists, false, or_, select
+from sqlalchemy import and_, exists, false, func, or_, select, text
 
 from app.api.dependencies import DatabaseSession, get_storage_service, require_permission
 from app.api.errors import ApiError
@@ -22,11 +22,16 @@ from app.db.models import (
     KnowledgeBaseRoleGrant,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    KnowledgeIngestionStatus,
+    MalwareScanStatus,
     OkfConversionJob,
     OkfConversionStatus,
+    QuotaReservation,
     ReservationStatus,
     UploadSession,
     UploadSessionStatus,
+    User,
+    UserStatus,
 )
 from app.domain.errors import FilePolicyViolation
 from app.domain.files import UploadMode, plan_upload, validate_upload
@@ -42,14 +47,24 @@ from app.schemas.files import (
     UploadInitiateResponse,
     UploadSessionRead,
 )
-from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.access import AccessContext, AccessService
+from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
-from app.services.okf_conversion import enqueue_okf_conversion
+from app.services.list_search import literal_contains_pattern
 from app.services.quota import QuotaService, QuotaSpec, daily_window_start, lifetime_window_start
-from app.services.storage import StorageService
+from app.services.rbac_mutation import acquire_rbac_authorization_lock
+from app.services.storage import StorageService, StoredObject, checksum_sha256_base64_to_hex
+from app.services.storage_capacity import (
+    FilesystemCapacity,
+    StoragePolicyViolation,
+    assess_storage_capacity,
+    effective_upload_limit,
+)
+from app.services.user_activity import ActivityLockMode, acquire_user_activity_locks
 
 router = APIRouter()
+
+_STORAGE_CAPACITY_ADVISORY_LOCK = 0x4B4253544F524147
 
 
 def _checksum_base64(checksum_hex: str | None) -> str | None:
@@ -93,6 +108,25 @@ def _initiate_response(
     )
 
 
+async def _cleanup_completed_upload_objects(
+    storage: StorageService,
+    *,
+    mode: str,
+    source_key: str,
+    final_key: str,
+    upload_session_id: UUID,
+) -> None:
+    if mode == UploadMode.SINGLE.value:
+        if final_key != source_key:
+            await storage.delete(key=final_key)
+        await storage.seal_single_upload(
+            key=source_key,
+            upload_session_id=str(upload_session_id),
+        )
+        return
+    await storage.delete(key=source_key)
+
+
 async def _owned_upload(
     session: DatabaseSession,
     *,
@@ -106,11 +140,189 @@ async def _owned_upload(
         .where(UploadSession.id == upload_session_id, UploadSession.user_id == user_id)
     )
     if lock:
-        statement = statement.with_for_update()
+        statement = statement.execution_options(populate_existing=True).with_for_update()
     row = (await session.execute(statement)).one_or_none()
     if row is None:
         raise ApiError(status_code=404, code="upload_not_found", message="Upload session not found")
     return row[0], row[1]
+
+
+async def _has_held_upload_reservation(
+    session: DatabaseSession,
+    *,
+    upload_session_id: UUID,
+) -> bool:
+    return bool(
+        await session.scalar(
+            select(
+                exists().where(
+                    QuotaReservation.upload_session_id == upload_session_id,
+                    QuotaReservation.status == ReservationStatus.HELD,
+                )
+            )
+        )
+    )
+
+
+async def _locked_object_usage(session: DatabaseSession) -> tuple[int, int]:
+    bind = session.get_bind()
+    if bind.dialect.name == "postgresql":
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": _STORAGE_CAPACITY_ADVISORY_LOCK},
+        )
+    used = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(File.size_bytes), 0),
+                func.count(File.id),
+            ).where(
+                File.deleted_at.is_(None),
+                File.status.not_in((FileStatus.FAILED, FileStatus.DELETED)),
+            )
+        )
+    ).one()
+    return int(used[0] or 0), int(used[1] or 0)
+
+
+def _effective_count_limit(role_limit: int | None, *, platform_limit: int) -> int:
+    if role_limit is None:
+        return platform_limit
+    return min(role_limit, platform_limit)
+
+
+async def _enforce_storage_policy(
+    *,
+    session: DatabaseSession,
+    settings: Settings,
+    response: Response,
+    incoming_bytes: int,
+    is_bulk: bool,
+) -> None:
+    object_used_bytes, object_count = await _locked_object_usage(session)
+    if incoming_bytes > 0 and object_count >= settings.platform_max_files_total:
+        raise ApiError(
+            status_code=507,
+            code="platform_file_count_limit_reached",
+            message="The platform file-count safety limit has been reached",
+        )
+    if settings.storage_capacity_probe_path is None:
+        return
+    try:
+        filesystem = FilesystemCapacity.from_path(settings.storage_capacity_probe_path)
+    except StoragePolicyViolation as error:
+        raise ApiError(
+            status_code=503,
+            code=error.reason_code,
+            message="Storage capacity evidence is temporarily unavailable",
+        ) from error
+    assessment = assess_storage_capacity(
+        filesystem=filesystem,
+        object_used_bytes=object_used_bytes,
+        incoming_bytes=incoming_bytes,
+        is_bulk=is_bulk,
+        warning_percent=settings.storage_warning_percent,
+        bulk_stop_percent=settings.storage_bulk_stop_percent,
+        reject_percent=settings.storage_reject_percent,
+        object_stop_bytes=settings.storage_object_stop_bytes,
+    )
+    response.headers["X-KB-Storage-Policy"] = assessment.level
+    if not assessment.allowed:
+        raise ApiError(
+            status_code=507,
+            code=assessment.reason_code or "storage_capacity_rejected",
+            message="Storage safety policy rejected this upload",
+        )
+
+
+async def _record_finalization_rejection(
+    *,
+    session: DatabaseSession,
+    access: AccessContext,
+    upload_session_id: UUID,
+    request: Request,
+    action: str,
+    details: dict[str, object] | None = None,
+) -> bool:
+    upload, file = await _owned_upload(
+        session,
+        upload_session_id=upload_session_id,
+        user_id=access.user.id,
+        lock=True,
+    )
+    if upload.status is not UploadSessionStatus.FINALIZING:
+        await session.rollback()
+        return False
+    if file.knowledge_base_id is not None:
+        await require_knowledge_base_access(
+            session,
+            access,
+            file.knowledge_base_id,
+            minimum=KnowledgeBaseAccessLevel.EDITOR,
+            lock=True,
+        )
+    upload.status = UploadSessionStatus.FAILED
+    file.status = FileStatus.FAILED
+    await QuotaService().release_upload_reservations(
+        session,
+        upload_session_id=upload.id,
+        status=ReservationStatus.RELEASED,
+    )
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action=action,
+        result=AuditResult.DENIED,
+        resource_type="file",
+        resource_id=str(file.id),
+        request_id=getattr(request.state, "request_id", None),
+        details=details,
+    )
+    await session.commit()
+    return True
+
+
+async def _reauthorize_upload_finalization(
+    session: DatabaseSession,
+    *,
+    user_id: UUID,
+    expected_token_version: int,
+) -> AccessContext:
+    """Refresh the actor after storage I/O and hold revocation locks through commit."""
+
+    await acquire_rbac_authorization_lock(session)
+    await acquire_user_activity_locks(
+        session,
+        {user_id: ActivityLockMode.SHARED},
+    )
+    user = await session.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if user is None or user.status is not UserStatus.ACTIVE or user.retired_at is not None:
+        raise ApiError(
+            status_code=401,
+            code="inactive_user",
+            message="The user is not active",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if user.token_version != expected_token_version:
+        raise ApiError(
+            status_code=401,
+            code="token_revoked",
+            message="The access token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    current = await AccessService().resolve(session, user)
+    if not current.allows("file:upload"):
+        raise ApiError(
+            status_code=403,
+            code="permission_denied",
+            message="Permission required: file:upload",
+        )
+    return current
 
 
 @router.get("", response_model=list[FileRead])
@@ -119,6 +331,7 @@ async def list_files(
     access: Annotated[AccessContext, Depends(require_permission("file:read"))],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    search: Annotated[str | None, Query(max_length=200)] = None,
 ) -> list[File]:
     statement = select(File).where(File.deleted_at.is_(None))
     if not access.allows("file:read:any"):
@@ -144,6 +357,10 @@ async def list_files(
                 role_grant,
             )
         )
+    term = search.strip() if search else ""
+    if term:
+        pattern = literal_contains_pattern(term)
+        statement = statement.where(File.original_name.ilike(pattern, escape="\\"))
     statement = statement.order_by(File.created_at.desc(), File.id).limit(limit).offset(offset)
     return list((await session.scalars(statement)).all())
 
@@ -173,9 +390,13 @@ async def initiate_upload(
             access,
             payload.knowledge_base_id,
             minimum=KnowledgeBaseAccessLevel.EDITOR,
+            lock=True,
         )
 
-    maximum = access.limits.get("max_upload_bytes", 0)
+    maximum = effective_upload_limit(
+        access.limits.get("max_upload_bytes", 0),
+        platform_limit_bytes=settings.platform_max_upload_bytes,
+    )
     try:
         validated = validate_upload(
             payload.filename,
@@ -231,21 +452,57 @@ async def initiate_upload(
                 upload_session_id=str(existing.id),
                 expected_size_bytes=existing.expected_size_bytes,
                 plan=plan,
-                expected_checksum_sha256_base64=_checksum_base64(
-                    existing_file.checksum_value
-                ),
+                expected_checksum_sha256_base64=_checksum_base64(existing_file.checksum_value),
             )
             return _initiate_response(
                 existing,
                 upload_url=signed.url,
                 required_headers=signed.required_headers,
             )
+        if existing.storage_upload_id is None:
+            # The admission transaction may have committed before a prior S3
+            # initiation attempt failed. Release the read transaction before
+            # retrying external I/O; the persisted reservation remains the
+            # authoritative admission decision.
+            await session.commit()
+            initiated = await storage.initiate(
+                key=existing_file.object_key,
+                content_type=existing_file.content_type,
+                upload_session_id=str(existing.id),
+                expected_size_bytes=existing.expected_size_bytes,
+                plan=plan,
+                expected_checksum_sha256_base64=None,
+            )
+            persisted, _ = await _owned_upload(
+                session,
+                upload_session_id=existing.id,
+                user_id=access.user.id,
+                lock=True,
+            )
+            duplicate_upload_id: str | None = None
+            if persisted.storage_upload_id is None:
+                persisted.storage_upload_id = initiated.upload_id
+            elif initiated.upload_id != persisted.storage_upload_id:
+                duplicate_upload_id = initiated.upload_id
+            await session.commit()
+            if duplicate_upload_id is not None:
+                await storage.abort_multipart(
+                    key=existing_file.object_key,
+                    upload_id=duplicate_upload_id,
+                )
         return _initiate_response(existing)
 
     plan = plan_upload(
         size_bytes=validated.size_bytes,
         multipart_threshold_bytes=settings.multipart_threshold_bytes,
         preferred_part_size=settings.multipart_part_size_bytes,
+    )
+    await _enforce_storage_policy(
+        session=session,
+        settings=settings,
+        response=response,
+        incoming_bytes=validated.size_bytes,
+        is_bulk=plan.mode is UploadMode.MULTIPART,
     )
     if payload.checksum_sha256 is not None and plan.mode is UploadMode.MULTIPART:
         raise ApiError(
@@ -305,10 +562,22 @@ async def initiate_upload(
                 limit=access.limits.get("storage_bytes", 0),
                 window_start=lifetime_window_start(),
             ),
+            QuotaSpec(
+                key="file_count",
+                amount=1,
+                limit=_effective_count_limit(
+                    access.limits.get("file_count"),
+                    platform_limit=settings.platform_max_files_per_user,
+                ),
+                window_start=lifetime_window_start(),
+            ),
         ],
         expires_at=expires_at,
     )
-
+    # Persist admission and release quota/capacity locks before the network
+    # call. If S3 is unavailable, the INITIATED row and reservation are safely
+    # retryable by the same idempotency key and expire through maintenance.
+    await session.commit()
     initiated = await storage.initiate(
         key=file.object_key,
         content_type=file.content_type,
@@ -317,31 +586,41 @@ async def initiate_upload(
         plan=plan,
         expected_checksum_sha256_base64=_checksum_base64(file.checksum_value),
     )
-    upload.storage_upload_id = initiated.upload_id
+    persisted_upload, persisted_file = await _owned_upload(
+        session,
+        upload_session_id=upload.id,
+        user_id=access.user.id,
+        lock=True,
+    )
+    redundant_upload_id: str | None = None
+    if persisted_upload.storage_upload_id is None:
+        persisted_upload.storage_upload_id = initiated.upload_id
+    elif initiated.upload_id != persisted_upload.storage_upload_id:
+        redundant_upload_id = initiated.upload_id
     add_audit_event(
         session,
         actor_id=access.user.id,
         action="upload.initiated",
+        result=AuditResult.SUCCESS,
         resource_type="file",
-        resource_id=str(file.id),
+        resource_id=str(persisted_file.id),
         request_id=getattr(request.state, "request_id", None),
         details={
-            "size_bytes": file.size_bytes,
+            "size_bytes": persisted_file.size_bytes,
             "mode": plan.mode.value,
-            "knowledge_base_id": str(file.knowledge_base_id)
-            if file.knowledge_base_id
+            "knowledge_base_id": str(persisted_file.knowledge_base_id)
+            if persisted_file.knowledge_base_id
             else None,
         },
     )
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        if initiated.upload_id:
-            await storage.abort_multipart(key=file.object_key, upload_id=initiated.upload_id)
-        raise
+    await session.commit()
+    if redundant_upload_id is not None:
+        await storage.abort_multipart(
+            key=persisted_file.object_key,
+            upload_id=redundant_upload_id,
+        )
     return _initiate_response(
-        upload,
+        persisted_upload,
         upload_url=initiated.url,
         required_headers=initiated.required_headers,
     )
@@ -368,6 +647,7 @@ async def create_part_urls(
             access,
             file.knowledge_base_id,
             minimum=KnowledgeBaseAccessLevel.EDITOR,
+            lock=True,
         )
     if upload.mode != UploadMode.MULTIPART.value or not upload.storage_upload_id:
         raise ApiError(status_code=409, code="not_multipart", message="Upload is not multipart")
@@ -375,9 +655,15 @@ async def create_part_urls(
         raise ApiError(
             status_code=409, code="upload_state_conflict", message="Upload is not active"
         )
-    if (
-        upload.status is UploadSessionStatus.INITIATED
-        and as_utc(upload.expires_at) <= datetime.now(UTC)
+    await _enforce_storage_policy(
+        session=session,
+        settings=settings,
+        response=response,
+        incoming_bytes=0,
+        is_bulk=True,
+    )
+    if upload.status is UploadSessionStatus.INITIATED and as_utc(upload.expires_at) <= datetime.now(
+        UTC
     ):
         raise ApiError(status_code=410, code="upload_expired", message="Upload session has expired")
     if any(number < 1 or number > upload.part_count for number in payload.part_numbers):
@@ -423,6 +709,7 @@ async def complete_upload(
             access,
             file.knowledge_base_id,
             minimum=KnowledgeBaseAccessLevel.EDITOR,
+            lock=True,
         )
     if upload.status is UploadSessionStatus.COMPLETED:
         return file
@@ -431,15 +718,25 @@ async def complete_upload(
         UploadSessionStatus.FINALIZING,
     }:
         raise ApiError(
-            status_code=409, code="upload_state_conflict", message="Upload is not active"
+            status_code=409,
+            code="upload_state_conflict",
+            message="Upload is not active",
         )
-    if (
-        upload.status is UploadSessionStatus.INITIATED
-        and as_utc(upload.expires_at) <= datetime.now(UTC)
+    if upload.status is UploadSessionStatus.INITIATED and as_utc(upload.expires_at) <= datetime.now(
+        UTC
     ):
         raise ApiError(status_code=410, code="upload_expired", message="Upload session has expired")
 
-    if upload.mode == UploadMode.MULTIPART.value:
+    mode = upload.mode
+    source_key = file.object_key
+    final_key = _final_object_key(source_key) if mode == UploadMode.SINGLE.value else source_key
+    expected_size = upload.expected_size_bytes
+    expected_checksum = _checksum_base64(file.checksum_value)
+    storage_upload_id = upload.storage_upload_id
+    actor_id = access.user.id
+    expected_token_version = access.user.token_version
+    parts: list[dict[str, object]] = []
+    if mode == UploadMode.MULTIPART.value:
         numbers = sorted(item.part_number for item in payload.parts)
         if numbers != list(range(1, upload.part_count + 1)):
             raise ApiError(
@@ -447,139 +744,203 @@ async def complete_upload(
                 code="incomplete_parts",
                 message="Every multipart part must be supplied exactly once",
             )
-        if not upload.storage_upload_id:
+        if not storage_upload_id:
             raise ApiError(
-                status_code=409, code="missing_upload_id", message="Storage upload ID is missing"
+                status_code=409,
+                code="missing_upload_id",
+                message="Storage upload ID is missing",
             )
-        parts = []
         for item in sorted(payload.parts, key=lambda value: value.part_number):
             part: dict[str, object] = {"PartNumber": item.part_number, "ETag": item.etag}
             if item.checksum_sha256:
                 part["ChecksumSHA256"] = item.checksum_sha256
             parts.append(part)
-        if upload.status is UploadSessionStatus.INITIATED:
-            upload.status = UploadSessionStatus.FINALIZING
-            # Keep the maintenance worker away while CompleteMultipartUpload is
-            # in flight. A crashed request becomes eligible for reconciliation
-            # after this bounded grace period.
-            upload.expires_at = max(
-                as_utc(upload.expires_at),
-                datetime.now(UTC) + timedelta(minutes=15),
-            )
-            await session.commit()
-        await storage.complete_multipart(
-            key=file.object_key,
-            upload_id=upload.storage_upload_id,
-            parts=parts,
-        )
     elif payload.parts:
         raise ApiError(
-            status_code=422, code="unexpected_parts", message="Single upload has no parts"
+            status_code=422,
+            code="unexpected_parts",
+            message="Single upload has no parts",
         )
 
-    if upload.mode == UploadMode.SINGLE.value:
-        final_key = _final_object_key(file.object_key)
-        stored = await storage.try_head(key=file.object_key)
+    upload.status = UploadSessionStatus.FINALIZING
+    current_expiry = (
+        as_utc(upload.expires_at) if upload.expires_at is not None else datetime.now(UTC)
+    )
+    upload.expires_at = max(current_expiry, datetime.now(UTC) + timedelta(minutes=15))
+    # This commit releases both the upload and KB row locks before every S3
+    # operation for both single and multipart completion attempts.
+    await session.commit()
+
+    stored: StoredObject | None
+    if mode == UploadMode.MULTIPART.value:
+        await storage.complete_multipart(
+            key=source_key,
+            upload_id=cast(str, storage_upload_id),
+            parts=parts,
+        )
+        stored = await storage.head(key=source_key)
+    else:
+        # Prefer an already-promoted final object so a retry after a process
+        # crash does not mistake the staging tombstone for uploaded content.
+        stored = await storage.try_head(key=final_key)
         if stored is None:
-            stored = await storage.try_head(key=final_key)
+            stored = await storage.try_head(key=source_key)
             if stored is None:
                 raise ApiError(
                     status_code=409,
                     code="stored_object_missing",
                     message="The uploaded object is not available in storage",
                 )
-            file.object_key = final_key
-    else:
-        stored = await storage.head(key=file.object_key)
-    if stored.size_bytes != upload.expected_size_bytes:
-        await storage.delete(key=file.object_key)
-        upload.status = UploadSessionStatus.FAILED
-        file.status = FileStatus.FAILED
-        await QuotaService().release_upload_reservations(
-            session, upload_session_id=upload.id, status=ReservationStatus.RELEASED
+            stored = await storage.promote(
+                source_key=source_key,
+                destination_key=final_key,
+                upload_session_id=str(upload_session_id),
+            )
+    if stored is None:
+        raise ApiError(
+            status_code=409,
+            code="stored_object_missing",
+            message="The uploaded object is not available in storage",
         )
-        add_audit_event(
+
+    rejection_code: str | None = None
+    rejection_action: str | None = None
+    rejection_message: str | None = None
+    rejection_details: dict[str, object] | None = None
+    if stored.size_bytes != expected_size:
+        rejection_code = "uploaded_size_mismatch"
+        rejection_action = "upload.rejected_size_mismatch"
+        rejection_message = "Stored object size differs from the declared size"
+        rejection_details = {"expected": expected_size, "actual": stored.size_bytes}
+    elif expected_checksum is not None and (
+        stored.checksum_sha256 is None
+        or not hmac.compare_digest(stored.checksum_sha256, expected_checksum)
+    ):
+        rejection_code = "uploaded_checksum_mismatch"
+        rejection_action = "upload.rejected_checksum_mismatch"
+        rejection_message = "Stored object SHA-256 differs from the declared checksum"
+
+    if rejection_code is not None:
+        # Cleanup happens while no database transaction is open. Only then do
+        # we conditionally transition FINALIZING -> FAILED.
+        await _cleanup_completed_upload_objects(
+            storage,
+            mode=mode,
+            source_key=source_key,
+            final_key=final_key,
+            upload_session_id=upload_session_id,
+        )
+        finalization_access = await _reauthorize_upload_finalization(
             session,
-            actor_id=access.user.id,
-            action="upload.rejected_size_mismatch",
-            resource_type="file",
-            resource_id=str(file.id),
-            request_id=getattr(request.state, "request_id", None),
-            details={"expected": upload.expected_size_bytes, "actual": stored.size_bytes},
+            user_id=actor_id,
+            expected_token_version=expected_token_version,
         )
-        await session.commit()
+        recorded = await _record_finalization_rejection(
+            session=session,
+            access=finalization_access,
+            upload_session_id=upload_session_id,
+            request=request,
+            action=cast(str, rejection_action),
+            details=rejection_details,
+        )
+        if not recorded:
+            raise ApiError(
+                status_code=409,
+                code="upload_state_conflict",
+                message="Upload state changed while finalization was in progress",
+            )
         raise ApiError(
             status_code=422,
-            code="uploaded_size_mismatch",
-            message="Stored object size differs from the declared size",
+            code=rejection_code,
+            message=cast(str, rejection_message),
         )
 
-    if file.checksum_value is not None:
-        actual_checksum = stored.checksum_sha256
-        expected_checksum = _checksum_base64(file.checksum_value)
-        if actual_checksum is None or expected_checksum is None or not hmac.compare_digest(
-            actual_checksum,
-            expected_checksum,
-        ):
-            await storage.delete(key=file.object_key)
-            upload.status = UploadSessionStatus.FAILED
-            file.status = FileStatus.FAILED
-            await QuotaService().release_upload_reservations(
-                session,
-                upload_session_id=upload.id,
-                status=ReservationStatus.RELEASED,
-            )
-            add_audit_event(
-                session,
-                actor_id=access.user.id,
-                action="upload.rejected_checksum_mismatch",
-                resource_type="file",
-                resource_id=str(file.id),
-                request_id=getattr(request.state, "request_id", None),
-            )
-            await session.commit()
-            raise ApiError(
-                status_code=422,
-                code="uploaded_checksum_mismatch",
-                message="Stored object SHA-256 differs from the declared checksum",
-            )
-
-    if file.object_key.startswith("staging/"):
-        final_key = _final_object_key(file.object_key)
-        stored = await storage.promote(
-            source_key=file.object_key,
-            destination_key=final_key,
+    try:
+        finalization_access = await _reauthorize_upload_finalization(
+            session,
+            user_id=actor_id,
+            expected_token_version=expected_token_version,
         )
-        file.object_key = final_key
+    except ApiError:
+        await session.rollback()
+        await _cleanup_completed_upload_objects(
+            storage,
+            mode=mode,
+            source_key=source_key,
+            final_key=final_key,
+            upload_session_id=upload_session_id,
+        )
+        raise
 
+    # Re-read under lock with populate_existing. Objects retained across the
+    # pre-S3 commit are not authoritative after abort/finalization races.
+    upload, file = await _owned_upload(
+        session,
+        upload_session_id=upload_session_id,
+        user_id=finalization_access.user.id,
+        lock=True,
+    )
+    if upload.status is UploadSessionStatus.COMPLETED:
+        await session.rollback()
+        return file
+    if upload.status is not UploadSessionStatus.FINALIZING:
+        concurrent_status = upload.status
+        await session.rollback()
+        await _cleanup_completed_upload_objects(
+            storage,
+            mode=mode,
+            source_key=source_key,
+            final_key=final_key,
+            upload_session_id=upload_session_id,
+        )
+        raise ApiError(
+            status_code=409,
+            code="upload_state_conflict",
+            message=f"Upload became {concurrent_status.value} during finalization",
+        )
+    if file.knowledge_base_id is not None:
+        try:
+            await require_knowledge_base_access(
+                session,
+                finalization_access,
+                file.knowledge_base_id,
+                minimum=KnowledgeBaseAccessLevel.EDITOR,
+                lock=True,
+            )
+        except ApiError:
+            # The object cannot remain recoverable after a concurrent KB grant
+            # revocation. Otherwise maintenance could later publish content that
+            # the actor no longer had permission to finalize.
+            await session.rollback()
+            await _cleanup_completed_upload_objects(
+                storage,
+                mode=mode,
+                source_key=source_key,
+                final_key=final_key,
+                upload_session_id=upload_session_id,
+            )
+            raise
+
+    file.object_key = final_key
     await QuotaService().consume_upload_reservations(session, upload_session_id=upload.id)
     upload.status = UploadSessionStatus.COMPLETED
     upload.completed_at = datetime.now(UTC)
     file.size_bytes = stored.size_bytes
-    file.status = FileStatus.PROCESSING
-    if stored.checksum_sha256 and file.checksum_value is None:
+    file.status = FileStatus.QUARANTINED
+    stored_checksum_hex = checksum_sha256_base64_to_hex(stored.checksum_sha256)
+    if stored_checksum_hex is not None and file.checksum_value is None:
         file.checksum_algorithm = "SHA256"
-        file.checksum_value = stored.checksum_sha256
+        file.checksum_value = stored_checksum_hex
     add_audit_event(
         session,
-        actor_id=access.user.id,
+        actor_id=finalization_access.user.id,
         action="upload.completed",
+        result=AuditResult.SUCCESS,
         resource_type="file",
         resource_id=str(file.id),
         request_id=getattr(request.state, "request_id", None),
-        details={"status": "processing"},
+        details={"status": "quarantined", "malware_scan_status": "pending"},
     )
-    conversion = await enqueue_okf_conversion(session, file)
-    if conversion is not None:
-        add_audit_event(
-            session,
-            actor_id=access.user.id,
-            action="okf.conversion_queued",
-            resource_type="okf_conversion_job",
-            resource_id=str(conversion.id),
-            request_id=getattr(request.state, "request_id", None),
-            details={"file_id": str(file.id), "prompt_version": conversion.prompt_version},
-        )
     await session.commit()
     await session.refresh(file)
     return file
@@ -651,6 +1012,7 @@ async def retry_okf_conversion(
         access,
         conversion.knowledge_base_id,
         minimum=KnowledgeBaseAccessLevel.MANAGER,
+        lock=True,
     )
     if file.status is not FileStatus.PROCESSING:
         raise ApiError(
@@ -669,15 +1031,19 @@ async def retry_okf_conversion(
         )
     conversion.status = OkfConversionStatus.PENDING
     conversion.attempts = 0
+    conversion.retry_generation += 1
     conversion.error_code = None
     conversion.next_attempt_at = None
     conversion.locked_at = None
     conversion.lease_id = None
     conversion.completed_at = None
+    file.knowledge_status = KnowledgeIngestionStatus.PENDING
+    file.knowledge_error_code = None
     add_audit_event(
         session,
         actor_id=access.user.id,
         action="okf.conversion_retried",
+        result=AuditResult.SUCCESS,
         resource_type="okf_conversion_job",
         resource_id=str(conversion.id),
         request_id=getattr(request.state, "request_id", None),
@@ -705,19 +1071,47 @@ async def abort_upload(
         raise ApiError(
             status_code=409, code="upload_completed", message="Completed upload cannot be aborted"
         )
-    if upload.status in {UploadSessionStatus.ABORTED, UploadSessionStatus.EXPIRED}:
+    if upload.status is UploadSessionStatus.EXPIRED:
         return
+    if upload.status is UploadSessionStatus.ABORTED and not await _has_held_upload_reservation(
+        session,
+        upload_session_id=upload.id,
+    ):
+        return
+    if upload.status is not UploadSessionStatus.ABORTED:
+        # Persist a terminal application state before releasing the DB lock.
+        # The held reservation is intentionally retained until storage cleanup
+        # succeeds; a failed request is retryable and maintenance can reconcile
+        # it after expires_at.
+        upload.status = UploadSessionStatus.ABORTED
+        upload.expires_at = datetime.now(UTC)
+        file.status = FileStatus.FAILED
+        await session.commit()
+    else:
+        # This is a cleanup retry for an already terminal row. Release the row
+        # lock before idempotent S3 cleanup.
+        await session.commit()
     if upload.storage_upload_id:
         await storage.abort_multipart(key=file.object_key, upload_id=upload.storage_upload_id)
     else:
-        await storage.delete(key=file.object_key)
+        await storage.seal_single_upload(
+            key=file.object_key,
+            upload_session_id=str(upload.id),
+        )
+    upload, file = await _owned_upload(
+        session,
+        upload_session_id=upload_session_id,
+        user_id=access.user.id,
+        lock=True,
+    )
+    if not await _has_held_upload_reservation(session, upload_session_id=upload.id):
+        return
     await QuotaService().release_upload_reservations(session, upload_session_id=upload.id)
-    upload.status = UploadSessionStatus.ABORTED
-    file.status = FileStatus.FAILED
     add_audit_event(
         session,
         actor_id=access.user.id,
         action="upload.aborted",
+        result=AuditResult.SUCCESS,
         resource_type="file",
         resource_id=str(file.id),
         request_id=getattr(request.state, "request_id", None),
@@ -753,6 +1147,7 @@ async def approve_processed_file(
             access,
             file.knowledge_base_id,
             minimum=KnowledgeBaseAccessLevel.MANAGER,
+            lock=True,
         )
     elif (
         file.owner_id != access.user.id
@@ -760,61 +1155,69 @@ async def approve_processed_file(
         and "file:approve:any" not in access.permissions
     ):
         raise ApiError(status_code=404, code="file_not_found", message="File not found")
+    if file.malware_scan_status is not MalwareScanStatus.CLEAN:
+        raise ApiError(
+            status_code=409,
+            code="malware_scan_not_clean",
+            message="File cannot be approved before a clean malware scan",
+            details={"status": file.malware_scan_status.value},
+        )
     if file.status is not FileStatus.PROCESSING:
         raise ApiError(
             status_code=409, code="file_state_conflict", message="File is not awaiting approval"
         )
 
     latest_conversion = await session.scalar(
-        select(OkfConversionJob)
-        .where(OkfConversionJob.file_id == file.id)
-        .order_by(OkfConversionJob.file_version.desc())
-        .limit(1)
+        select(OkfConversionJob).where(
+            OkfConversionJob.file_id == file.id,
+            OkfConversionJob.file_version == file.version,
+        )
     )
-    if latest_conversion is not None and latest_conversion.status in {
-        OkfConversionStatus.PENDING,
-        OkfConversionStatus.PROCESSING,
-        OkfConversionStatus.RETRY_WAIT,
-    }:
+    if latest_conversion is None or latest_conversion.status is not OkfConversionStatus.SUCCEEDED:
         raise ApiError(
             status_code=409,
-            code="okf_conversion_in_progress",
-            message="The latest OKF conversion must finish before this file can be approved",
-            details={"status": latest_conversion.status.value},
+            code="okf_conversion_not_completed",
+            message=(
+                "The current file version requires a successful OKF conversion before approval"
+            ),
+            details={
+                "file_version": file.version,
+                "status": latest_conversion.status.value if latest_conversion is not None else None,
+            },
         )
 
-    generated_entry: KnowledgeEntry | None = None
-    if latest_conversion is not None and latest_conversion.status is OkfConversionStatus.SUCCEEDED:
-        if latest_conversion.output_entry_id is None:
-            raise ApiError(
-                status_code=409,
-                code="okf_conversion_result_missing",
-                message="The completed OKF conversion has no generated draft to approve",
-            )
-        generated_entry = await session.scalar(
-            select(KnowledgeEntry)
-            .where(
-                KnowledgeEntry.id == latest_conversion.output_entry_id,
-                KnowledgeEntry.source_file_id == file.id,
-                KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
-            )
-            .with_for_update()
+    if latest_conversion.output_entry_id is None:
+        raise ApiError(
+            status_code=409,
+            code="okf_conversion_result_missing",
+            message="The completed OKF conversion has no generated draft to approve",
         )
-        if generated_entry is None:
-            raise ApiError(
-                status_code=409,
-                code="okf_conversion_result_missing",
-                message="The completed OKF conversion draft is unavailable for approval",
-            )
+    generated_entry = await session.scalar(
+        select(KnowledgeEntry)
+        .where(
+            KnowledgeEntry.id == latest_conversion.output_entry_id,
+            KnowledgeEntry.source_file_id == file.id,
+            KnowledgeEntry.publication_status == KnowledgeEntryPublicationStatus.DRAFT,
+        )
+        .with_for_update()
+    )
+    if generated_entry is None:
+        raise ApiError(
+            status_code=409,
+            code="okf_conversion_result_missing",
+            message="The completed OKF conversion draft is unavailable for approval",
+        )
 
     file.status = FileStatus.AVAILABLE
     file.available_at = datetime.now(UTC)
-    if generated_entry is not None:
-        generated_entry.publication_status = KnowledgeEntryPublicationStatus.PUBLISHED
+    generated_entry.publication_status = KnowledgeEntryPublicationStatus.PUBLISHED
+    file.knowledge_status = KnowledgeIngestionStatus.INDEXED
+    file.knowledge_error_code = None
     add_audit_event(
         session,
         actor_id=access.user.id,
         action="file.approved",
+        result=AuditResult.SUCCESS,
         resource_type="file",
         resource_id=str(file.id),
         request_id=getattr(request.state, "request_id", None),
@@ -846,6 +1249,13 @@ async def create_download_grant(
                 code="permission_denied",
                 message="File access denied",
             )
+    if file.malware_scan_status is not MalwareScanStatus.CLEAN:
+        raise ApiError(
+            status_code=409,
+            code="malware_scan_not_clean",
+            message="File cannot be downloaded without a clean malware scan",
+            details={"status": file.malware_scan_status.value},
+        )
     if file.status is not FileStatus.AVAILABLE:
         raise ApiError(
             status_code=409, code="file_not_available", message="File is not available for download"
@@ -864,6 +1274,7 @@ async def create_download_grant(
         session,
         actor_id=access.user.id,
         action="file.download_grant.issued",
+        result=AuditResult.SUCCESS,
         resource_type="file",
         resource_id=str(file.id),
         request_id=getattr(request.state, "request_id", None),

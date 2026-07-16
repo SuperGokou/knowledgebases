@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import time
 from datetime import UTC, datetime
-from ipaddress import ip_address
 from typing import Annotated
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from redis.asyncio import Redis
 from sqlalchemy import select
 
+from app.api.client_ip import request_client_ip
 from app.api.dependencies import (
     DatabaseSession,
     get_access_context,
@@ -27,88 +27,14 @@ from app.core.time import as_utc
 from app.db.models import RefreshToken, User, UserStatus
 from app.schemas.auth import AuthMe, RefreshRequest, TokenPair
 from app.services.access import AccessContext
-from app.services.audit import add_audit_event
+from app.services.audit import AuditResult, add_audit_event
 from app.services.rate_limit import RateLimiter
+from app.services.user_activity import ActivityLockMode, acquire_user_activity_locks
 
 router = APIRouter()
 
-_BFF_CLIENT_IP_WINDOW_SECONDS = 60
-_BFF_CLIENT_IP_HEADERS = (
-    "x-kb-client-ip",
-    "x-kb-client-timestamp",
-    "x-kb-client-signature",
-)
-
-
-def _normalized_ip(value: str | None) -> str | None:
-    if value is None or not value or value != value.strip() or len(value) > 64 or "%" in value:
-        return None
-    try:
-        return str(ip_address(value))
-    except ValueError:
-        return None
-
-
-def _verified_bff_client_ip(request: Request, settings: Settings) -> str | None:
-    client_ip = request.headers.get(_BFF_CLIENT_IP_HEADERS[0])
-    timestamp = request.headers.get(_BFF_CLIENT_IP_HEADERS[1])
-    signature = request.headers.get(_BFF_CLIENT_IP_HEADERS[2])
-    if client_ip is None or timestamp is None or signature is None:
-        return None
-
-    secret = (
-        settings.bff_shared_secret.get_secret_value()
-        if settings.bff_shared_secret is not None
-        else ""
-    )
-    normalized_ip = _normalized_ip(client_ip)
-    if not secret or normalized_ip is None:
-        return None
-    if (
-        not timestamp.isascii()
-        or not timestamp.isdigit()
-        or len(timestamp) > 20
-        or str(int(timestamp)) != timestamp
-    ):
-        return None
-    timestamp_value = int(timestamp)
-    if abs(int(time.time()) - timestamp_value) > _BFF_CLIENT_IP_WINDOW_SECONDS:
-        return None
-    if len(signature) != 64 or any(character not in "0123456789abcdef" for character in signature):
-        return None
-
-    canonical = f"v1\n{timestamp}\n{client_ip}".encode()
-    expected = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return None
-    return normalized_ip
-
-
-def _auth_client_ip(request: Request, settings: Settings) -> str:
-    peer_ip = request.client.host if request.client else "unknown"
-    bff_secret_configured = bool(
-        settings.bff_shared_secret is not None
-        and settings.bff_shared_secret.get_secret_value()
-    )
-    signed_headers_present = any(
-        request.headers.get(name) is not None for name in _BFF_CLIENT_IP_HEADERS
-    )
-    if bff_secret_configured and signed_headers_present:
-        verified_ip = _verified_bff_client_ip(request, settings)
-        if verified_ip is None:
-            raise ApiError(
-                status_code=400,
-                code="invalid_bff_signature",
-                message="BFF client IP signature is invalid or expired",
-            )
-        return verified_ip
-
-    if settings.serverless:
-        for header in ("x-vercel-forwarded-for", "x-forwarded-for"):
-            forwarded_ip = _normalized_ip(request.headers.get(header))
-            if forwarded_ip is not None:
-                return forwarded_ip
-    return peer_ip
+MAX_LOGIN_EMAIL_CHARACTERS = 320
+MAX_LOGIN_PASSWORD_CHARACTERS = 256
 
 
 @router.get("/me", response_model=AuthMe)
@@ -154,14 +80,22 @@ async def _check_auth_rate_limit(
         )
 
 
-def _pair(tokens: TokenService, user: User) -> tuple[TokenPair, RefreshToken]:
+def _pair(
+    tokens: TokenService,
+    user: User,
+    *,
+    family_id: UUID | None = None,
+    parent_id: UUID | None = None,
+) -> tuple[TokenPair, RefreshToken]:
     settings = get_settings()
     access = tokens.create_access_token(user_id=user.id, token_version=user.token_version)
     refresh = tokens.create_refresh_token(user_id=user.id, token_version=user.token_version)
     claims = tokens.decode(refresh, expected_type="refresh")
     record = RefreshToken(
         id=claims.token_id,
+        family_id=family_id or uuid4(),
         user_id=user.id,
+        parent_id=parent_id,
         token_hash=tokens.fingerprint(refresh),
         expires_at=claims.expires_at,
     )
@@ -187,12 +121,34 @@ async def login(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenPair:
     email = form.username.strip().lower()
-    client_ip = _auth_client_ip(request, settings)
+    client_ip = request_client_ip(request, settings)
     await _check_auth_rate_limit(
         redis=redis,
         key=f"auth:login:ip:{client_ip}",
         limit=settings.login_attempts_per_minute,
     )
+    if (
+        not email
+        or not form.password
+        or len(email) > MAX_LOGIN_EMAIL_CHARACTERS
+        or len(form.password) > MAX_LOGIN_PASSWORD_CHARACTERS
+    ):
+        add_audit_event(
+            session,
+            action="auth.login.denied",
+            result=AuditResult.DENIED,
+            resource_type="user",
+            request_id=getattr(request.state, "request_id", None),
+            ip_address=request.client.host if request.client else None,
+            details={"reason": "credential_shape_invalid"},
+        )
+        await session.commit()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_credentials",
+            message="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     account_key = hashlib.sha256(email.encode("utf-8")).hexdigest()
     await _check_auth_rate_limit(
         redis=redis,
@@ -200,12 +156,26 @@ async def login(
         limit=settings.login_attempts_per_account_per_minute,
     )
     user = await session.scalar(select(User).where(User.email == email))
+    if user is not None:
+        await acquire_user_activity_locks(
+            session,
+            {user.id: ActivityLockMode.SHARED},
+        )
+        user = await session.scalar(
+            select(User).where(User.id == user.id).execution_options(populate_existing=True)
+        )
     encoded_hash = user.password_hash if user is not None else passwords.dummy_hash
     password_is_valid = await verify_password(passwords, form.password, encoded_hash)
-    if user is None or user.status is not UserStatus.ACTIVE or not password_is_valid:
+    if (
+        user is None
+        or user.status is not UserStatus.ACTIVE
+        or user.retired_at is not None
+        or not password_is_valid
+    ):
         add_audit_event(
             session,
             action="auth.login.denied",
+            result=AuditResult.DENIED,
             resource_type="user",
             request_id=getattr(request.state, "request_id", None),
             ip_address=request.client.host if request.client else None,
@@ -225,6 +195,7 @@ async def login(
     add_audit_event(
         session,
         action="auth.login.succeeded",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         actor_id=user.id,
@@ -247,7 +218,7 @@ async def refresh_tokens(
     redis: Annotated[Redis, Depends(redis_dependency)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenPair:
-    client_ip = _auth_client_ip(request, settings)
+    client_ip = request_client_ip(request, settings)
     await _check_auth_rate_limit(
         redis=redis,
         key=f"auth:refresh:ip:{client_ip}",
@@ -262,23 +233,86 @@ async def refresh_tokens(
             message="Refresh token is invalid or expired",
         ) from error
 
-    record = await session.scalar(
-        select(RefreshToken).where(RefreshToken.id == claims.token_id).with_for_update()
+    await acquire_user_activity_locks(
+        session,
+        {claims.user_id: ActivityLockMode.SHARED},
     )
-    user = await session.scalar(select(User).where(User.id == claims.user_id))
-    now = datetime.now(UTC)
-    if record is None or user is None:
+
+    # All refresh paths use one global lock order: user, token, then family.
+    # The user lock serializes token_version changes across independent token
+    # families, while the ordered family lock prevents self-referential cycles.
+    user = await session.scalar(select(User).where(User.id == claims.user_id).with_for_update())
+    if user is None:
         await session.rollback()
         raise ApiError(
             status_code=status.HTTP_401_UNAUTHORIZED,
             code="invalid_refresh_token",
             message="Refresh token is invalid or has been revoked",
         )
+    record = await session.scalar(
+        select(RefreshToken)
+        .where(
+            RefreshToken.id == claims.token_id,
+            RefreshToken.user_id == user.id,
+        )
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    if record is None:
+        await session.rollback()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_refresh_token",
+            message="Refresh token is invalid or has been revoked",
+        )
+    fingerprint_matches = hmac.compare_digest(
+        record.token_hash,
+        tokens.fingerprint(payload.refresh_token),
+    )
+    reuse_attempt = record.revoked_at is not None or not fingerprint_matches
+    if reuse_attempt:
+        if record.reuse_detected_at is None:
+            family = list(
+                (
+                    await session.scalars(
+                        select(RefreshToken)
+                        .where(
+                            RefreshToken.family_id == record.family_id,
+                            RefreshToken.user_id == user.id,
+                        )
+                        .order_by(RefreshToken.id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for family_token in family:
+                if family_token.revoked_at is None:
+                    family_token.revoked_at = now
+                family_token.reuse_detected_at = now
+            user.token_version += 1
+            add_audit_event(
+                session,
+                action="auth.token.reuse_detected",
+                result=AuditResult.DENIED,
+                resource_type="refresh_token_family",
+                resource_id=str(record.family_id),
+                actor_id=user.id,
+                request_id=getattr(request.state, "request_id", None),
+                details={"compromised_token_id": str(record.id)},
+            )
+            await session.commit()
+        else:
+            await session.rollback()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="refresh_token_reuse_detected",
+            message="Refresh token reuse was detected and the session was revoked",
+        )
+
     invalid = (
-        record.revoked_at is not None
-        or as_utc(record.expires_at) <= now
-        or record.token_hash != tokens.fingerprint(payload.refresh_token)
+        as_utc(record.expires_at) <= now
         or user.status is not UserStatus.ACTIVE
+        or user.retired_at is not None
         or user.token_version != claims.token_version
     )
     if invalid:
@@ -290,11 +324,22 @@ async def refresh_tokens(
         )
 
     record.revoked_at = now
-    pair, replacement = _pair(tokens, user)
+    pair, replacement = _pair(
+        tokens,
+        user,
+        family_id=record.family_id,
+        parent_id=record.id,
+    )
     session.add(replacement)
+    # The replacement row must exist before the current token points to it.
+    # SQLAlchemy cannot infer ordering from UUID scalar assignments alone, and
+    # PostgreSQL checks this self-referential foreign key immediately.
+    await session.flush()
+    record.replaced_by_id = replacement.id
     add_audit_event(
         session,
         action="auth.token.refreshed",
+        result=AuditResult.SUCCESS,
         resource_type="user",
         resource_id=str(user.id),
         actor_id=user.id,
@@ -306,6 +351,64 @@ async def refresh_tokens(
     return pair
 
 
+@router.post("/refresh/status", status_code=status.HTTP_204_NO_CONTENT)
+async def refresh_session_status(
+    payload: RefreshRequest,
+    response: Response,
+    session: DatabaseSession,
+    tokens: Annotated[TokenService, Depends(get_token_service)],
+) -> None:
+    """Confirm that a refresh credential is still the live member of its family."""
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    try:
+        claims = tokens.decode(payload.refresh_token, expected_type="refresh")
+    except TokenError as error:
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_refresh_token",
+            message="Refresh token is invalid or has been revoked",
+        ) from error
+
+    await acquire_user_activity_locks(
+        session,
+        {claims.user_id: ActivityLockMode.SHARED},
+    )
+
+    user = await session.scalar(
+        select(User).where(User.id == claims.user_id).execution_options(populate_existing=True)
+    )
+    record = await session.scalar(
+        select(RefreshToken).where(
+            RefreshToken.id == claims.token_id,
+            RefreshToken.user_id == claims.user_id,
+        )
+    )
+    now = datetime.now(UTC)
+    valid = (
+        user is not None
+        and user.status is UserStatus.ACTIVE
+        and user.retired_at is None
+        and user.token_version == claims.token_version
+        and record is not None
+        and record.revoked_at is None
+        and as_utc(record.expires_at) > now
+        and hmac.compare_digest(
+            record.token_hash,
+            tokens.fingerprint(payload.refresh_token),
+        )
+    )
+    if not valid:
+        await session.rollback()
+        raise ApiError(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_refresh_token",
+            message="Refresh token is invalid or has been revoked",
+        )
+    await session.rollback()
+
+
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     payload: RefreshRequest,
@@ -314,7 +417,7 @@ async def logout(
     session: DatabaseSession,
     tokens: Annotated[TokenService, Depends(get_token_service)],
 ) -> None:
-    """Revoke one refresh-token family member without exposing token validity."""
+    """Revoke the presented refresh-token family without exposing token validity."""
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     try:
@@ -322,8 +425,25 @@ async def logout(
     except TokenError:
         return
 
+    await acquire_user_activity_locks(
+        session,
+        {claims.user_id: ActivityLockMode.SHARED},
+    )
+
+    # Match refresh rotation's global lock order (user, token, then family).
+    # Revoking the whole family closes the interleaving where rotation commits
+    # a successor immediately before logout locks the presented ancestor.
+    user = await session.scalar(select(User).where(User.id == claims.user_id).with_for_update())
+    if user is None:
+        await session.rollback()
+        return
     record = await session.scalar(
-        select(RefreshToken).where(RefreshToken.id == claims.token_id).with_for_update()
+        select(RefreshToken)
+        .where(
+            RefreshToken.id == claims.token_id,
+            RefreshToken.user_id == user.id,
+        )
+        .with_for_update()
     )
     if record is None or not hmac.compare_digest(
         record.token_hash,
@@ -332,14 +452,36 @@ async def logout(
         await session.rollback()
         return
 
-    if record.revoked_at is None:
-        record.revoked_at = datetime.now(UTC)
+    family = list(
+        (
+            await session.scalars(
+                select(RefreshToken)
+                .where(
+                    RefreshToken.family_id == record.family_id,
+                    RefreshToken.user_id == user.id,
+                )
+                .order_by(RefreshToken.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    now = datetime.now(UTC)
+    revoked_count = 0
+    for family_token in family:
+        if family_token.revoked_at is None:
+            family_token.revoked_at = now
+            revoked_count += 1
+    if revoked_count:
         add_audit_event(
             session,
             action="auth.logout.succeeded",
-            resource_type="user",
-            resource_id=str(record.user_id),
-            actor_id=record.user_id,
+            result=AuditResult.SUCCESS,
+            resource_type="refresh_token_family",
+            resource_id=str(record.family_id),
+            actor_id=user.id,
             request_id=getattr(request.state, "request_id", None),
+            details={"revoked_refresh_tokens": revoked_count},
         )
         await session.commit()
+    else:
+        await session.rollback()

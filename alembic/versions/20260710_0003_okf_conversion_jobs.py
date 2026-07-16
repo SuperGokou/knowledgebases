@@ -127,7 +127,5 @@ def downgrade() -> None:
     op.drop_table("okf_conversion_jobs")
     sa.Enum(name="okf_conversion_status").drop(op.get_bind(), checkfirst=True)
     op.drop_column("knowledge_entries", "publication_status")
-    sa.Enum(name="knowledge_entry_publication_status").drop(
-        op.get_bind(), checkfirst=True
-    )
+    sa.Enum(name="knowledge_entry_publication_status").drop(op.get_bind(), checkfirst=True)
     op.drop_column("knowledge_bases", "external_llm_processing_enabled")

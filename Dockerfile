@@ -20,6 +20,14 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        bubblewrap=0.8.0-2+deb12u1 \
+        libreoffice-nogui=4:7.4.7-1+deb12u14 \
+        poppler-utils=22.12.0-2+deb12u2 \
+        procps=2:4.0.2-3 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home --home-dir /home/app app
 

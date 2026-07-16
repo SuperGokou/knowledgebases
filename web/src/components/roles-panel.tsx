@@ -17,6 +17,31 @@ import {
   roleCopy,
   type LimitMode,
 } from "@/lib/role-policy";
+import {
+  createLatestRolePolicyRequestController,
+  loadRoleCatalogAndDetail,
+  openRolePolicyEditor,
+  SAVED_ROLE_POLICY_REFRESH_FAILED_MESSAGE,
+  saveRolePolicy,
+  STALE_ROLE_POLICY_MESSAGE,
+  STALE_ROLE_POLICY_REFRESH_FAILED_MESSAGE,
+  type RolePolicyDraftInvalidationReason,
+  type LatestRolePolicyRequestOutcome,
+} from "@/lib/role-policy-assignment";
+import {
+  deleteRole,
+  openRoleMetadataEditor,
+  saveRoleMetadata,
+  type RoleAdministrationInvalidationReason,
+  type RoleDeleteEditor,
+  type RoleMetadataEditor,
+} from "@/lib/role-administration";
+import {
+  mergeRoleCatalogItems,
+  roleCatalogPagePath,
+  roleOptionsForSelection,
+  splitRoleCatalogPage,
+} from "@/lib/role-catalog";
 import type { LimitDefinition, Permission, Role } from "@/lib/types";
 
 function roleCreateError(error: unknown): string {
@@ -34,9 +59,32 @@ function roleCreateError(error: unknown): string {
   return readableError(error);
 }
 
+function roleAdministrationError(error: unknown): string {
+  if (error instanceof ApiClientError && error.code === "role_in_use") {
+    const details = error.details && typeof error.details === "object"
+      ? error.details as { references?: unknown }
+      : null;
+    const references = details?.references && typeof details.references === "object"
+      ? details.references as { user_assignments?: unknown; knowledge_base_grants?: unknown }
+      : null;
+    const users = typeof references?.user_assignments === "number" ? references.user_assignments : 0;
+    const grants = typeof references?.knowledge_base_grants === "number" ? references.knowledge_base_grants : 0;
+    return `角色仍被 ${users} 个成员账号和 ${grants} 项知识库授权引用。请先解除全部引用，再删除角色。`;
+  }
+  return roleCreateError(error);
+}
+
+const ROLE_REFRESH_SUPERSEDED_MESSAGE = "角色刷新被更新的操作取代，不能把当前页面视为已刷新。";
+const DELETED_ROLE_REFRESH_FAILED_MESSAGE = "角色已删除，但最新角色列表刷新失败；刷新成功前请勿继续管理角色。";
+
 export function RolesPanel() {
   const { can, loading: accessLoading } = useAccess();
   const [roles, setRoles] = useState<Role[] | null>(null);
+  const [roleQuery, setRoleQuery] = useState("");
+  const [activeRoleQuery, setActiveRoleQuery] = useState("");
+  const [roleHasMore, setRoleHasMore] = useState(false);
+  const [roleCatalogLoading, setRoleCatalogLoading] = useState(false);
+  const [roleCatalogError, setRoleCatalogError] = useState("");
   const [permissions, setPermissions] = useState<Permission[]>([]);
   const [definitions, setDefinitions] = useState<LimitDefinition[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -44,69 +92,195 @@ export function RolesPanel() {
   const [limitValues, setLimitValues] = useState<Record<string, string>>({});
   const [policyLoading, setPolicyLoading] = useState(false);
   const [policyReady, setPolicyReady] = useState(false);
+  const [policyVersion, setPolicyVersion] = useState<number | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [success, setSuccess] = useState("");
   const [pending, setPending] = useState(false);
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("0");
+  const [metadataEditor, setMetadataEditor] = useState<RoleMetadataEditor | null>(null);
+  const [deleteEditor, setDeleteEditor] = useState<RoleDeleteEditor | null>(null);
+  const metadataNameInputRef = useRef<HTMLInputElement>(null);
+  const deleteConfirmationInputRef = useRef<HTMLInputElement>(null);
   const selectedIdRef = useRef("");
-  const policyRequestId = useRef(0);
+  const activeRoleQueryRef = useRef("");
+  const roleCandidatesRef = useRef<Role[]>([]);
+  const knownRolesRef = useRef<Role[]>([]);
+  const catalogLoadController = useMemo(() => createLatestRolePolicyRequestController(), []);
+  const policyLoadController = useMemo(() => createLatestRolePolicyRequestController(), []);
 
-  const selectRole = useCallback((roleId: string) => {
+  const selectRole = useCallback(async (
+    roleId: string,
+    { propagateError = false }: { propagateError?: boolean } = {},
+  ): Promise<LatestRolePolicyRequestOutcome> => {
     selectedIdRef.current = roleId;
-    const requestId = ++policyRequestId.current;
     setSelectedId(roleId);
+    setMetadataEditor(null);
+    setDeleteEditor(null);
     setPermissionCodes([]);
     setLimitValues({});
+    setPolicyVersion(null);
     setPolicyReady(false);
     setPolicyLoading(Boolean(roleId));
     setError("");
-    if (!roleId) return;
-    void (async () => {
-      try {
-        const role = await apiRequest<Role>(`/api/v1/roles/${roleId}`);
-        if (policyRequestId.current !== requestId) return;
-        setRoles((current) => current?.map((item) => item.id === role.id ? role : item) ?? current);
-        setPermissionCodes(role.permission_codes);
-        setLimitValues(Object.fromEntries(Object.entries(role.limits).map(([key, value]) => [key, value === null ? "unlimited" : String(value)])));
-        setPolicyReady(true);
-      } catch (reason) {
-        if (policyRequestId.current === requestId) setError(readableError(reason));
-      } finally {
-        if (policyRequestId.current === requestId) setPolicyLoading(false);
-      }
-    })();
-  }, []);
+    if (!roleId) {
+      policyLoadController.invalidate();
+      setPolicyLoading(false);
+      return "applied";
+    }
+    try {
+      const outcome = await policyLoadController.run(
+        () => apiRequest<Role>(`/api/v1/roles/${roleId}`),
+        (role) => {
+          knownRolesRef.current = mergeRoleCatalogItems(knownRolesRef.current, [role], false);
+          setRoles(roleOptionsForSelection(
+            roleCandidatesRef.current,
+            knownRolesRef.current,
+            [role.id],
+          ));
+          setPermissionCodes(role.permission_codes);
+          setLimitValues(Object.fromEntries(Object.entries(role.limits).map(([key, value]) => [key, value === null ? "unlimited" : String(value)])));
+          setPolicyVersion(openRolePolicyEditor(role).expectedVersion);
+          setPolicyReady(true);
+        },
+      );
+      if (outcome === "applied") setPolicyLoading(false);
+      return outcome;
+    } catch (reason) {
+      setError(readableError(reason));
+      setPolicyLoading(false);
+      if (propagateError) throw reason;
+      return "superseded";
+    }
+  }, [policyLoadController]);
 
-  const load = useCallback(async () => {
-    if (accessLoading) return;
+  const loadRoleCandidates = useCallback(async ({
+    query,
+    offset,
+    replace,
+  }: {
+    query: string;
+    offset: number;
+    replace: boolean;
+  }) => {
+    if (accessLoading || !can("role:read")) return;
+    setRoleCatalogLoading(true);
+    setRoleCatalogError("");
+    let nextSelectedId = selectedIdRef.current;
+    try {
+      const outcome = await catalogLoadController.run(
+        () => apiRequest<Role[]>(roleCatalogPagePath({ offset, query })),
+        (roleItems) => {
+          const page = splitRoleCatalogPage(roleItems);
+          roleCandidatesRef.current = mergeRoleCatalogItems(
+            roleCandidatesRef.current,
+            page.items,
+            replace,
+          );
+          knownRolesRef.current = mergeRoleCatalogItems(
+            knownRolesRef.current,
+            page.items,
+            false,
+          );
+          const knownIds = new Set(knownRolesRef.current.map((role) => role.id));
+          if (!nextSelectedId || !knownIds.has(nextSelectedId)) {
+            nextSelectedId = roleCandidatesRef.current[0]?.id ?? "";
+          }
+          setRoles(roleOptionsForSelection(
+            roleCandidatesRef.current,
+            knownRolesRef.current,
+            nextSelectedId ? [nextSelectedId] : [],
+          ));
+          setRoleHasMore(page.hasMore);
+        },
+      );
+      if (outcome === "applied" && nextSelectedId !== selectedIdRef.current) {
+        await selectRole(nextSelectedId);
+      }
+    } catch (reason) {
+      setRoleCatalogError(readableError(reason));
+    } finally {
+      setRoleCatalogLoading(false);
+    }
+  }, [accessLoading, can, catalogLoadController, selectRole]);
+
+  const load = useCallback(async (
+    { propagateError = false }: { propagateError?: boolean } = {},
+  ) => {
+    if (accessLoading) {
+      catalogLoadController.invalidate();
+      policyLoadController.invalidate();
+      return;
+    }
     if (!can("role:read")) {
+      catalogLoadController.invalidate();
+      policyLoadController.invalidate();
       setRoles([]);
       return;
     }
     setError("");
+    setRoleCatalogLoading(true);
+    setRoleCatalogError("");
     try {
-      const [roleItems, permissionItems, limitItems] = await Promise.all([
-        apiRequest<Role[]>("/api/v1/roles"),
-        apiRequest<Permission[]>("/api/v1/permissions"),
-        apiRequest<LimitDefinition[]>("/api/v1/limits"),
-      ]);
-      setRoles(roleItems);
-      setPermissions(permissionItems);
-      setDefinitions(limitItems);
-      const currentId = selectedIdRef.current;
-      selectRole(roleItems.some((item) => item.id === currentId) ? currentId : roleItems[0]?.id || "");
+      const outcome = await loadRoleCatalogAndDetail({
+        catalogController: catalogLoadController,
+        requestCatalog: () => Promise.all([
+          apiRequest<Role[]>(roleCatalogPagePath({ offset: 0, query: activeRoleQueryRef.current })),
+          apiRequest<Permission[]>("/api/v1/permissions"),
+          apiRequest<LimitDefinition[]>("/api/v1/limits"),
+        ]),
+        applyCatalog: ([roleItems, permissionItems, limitItems]) => {
+          const page = splitRoleCatalogPage(roleItems);
+          roleCandidatesRef.current = [...page.items];
+          knownRolesRef.current = mergeRoleCatalogItems(
+            knownRolesRef.current,
+            page.items,
+            false,
+          );
+          setPermissions(permissionItems);
+          setDefinitions(limitItems);
+          setRoleHasMore(page.hasMore);
+          const currentId = selectedIdRef.current;
+          const nextSelectedId = currentId
+            && knownRolesRef.current.some((item) => item.id === currentId)
+            ? currentId
+            : page.items[0]?.id ?? "";
+          setRoles(roleOptionsForSelection(
+            roleCandidatesRef.current,
+            knownRolesRef.current,
+            nextSelectedId ? [nextSelectedId] : [],
+          ));
+          return nextSelectedId;
+        },
+        requestDetail: (roleId) => selectRole(roleId, { propagateError: true }),
+      });
+      if (outcome === "superseded" && propagateError) {
+        throw new Error(ROLE_REFRESH_SUPERSEDED_MESSAGE);
+      }
     } catch (reason) {
       setError(readableError(reason));
+      if (propagateError) throw reason;
+    } finally {
+      setRoleCatalogLoading(false);
     }
-  }, [accessLoading, can, selectRole]);
+  }, [accessLoading, can, catalogLoadController, policyLoadController, selectRole]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timeout);
-  }, [load]);
+    return () => {
+      window.clearTimeout(timeout);
+      catalogLoadController.invalidate();
+      policyLoadController.invalidate();
+    };
+  }, [catalogLoadController, load, policyLoadController]);
+
+  useEffect(() => {
+    if (metadataEditor) metadataNameInputRef.current?.focus();
+    else if (deleteEditor) deleteConfirmationInputRef.current?.focus();
+  }, [deleteEditor, metadataEditor]);
 
   const selected = useMemo(() => roles?.find((role) => role.id === selectedId) ?? null, [roles, selectedId]);
   const selectedCopy = selected ? roleCopy(selected) : null;
@@ -145,6 +319,7 @@ export function RolesPanel() {
     }
     setPending(true);
     setError("");
+    setNotice("");
     setSuccess("");
     try {
       const created = await apiRequest<Role>("/api/v1/roles", {
@@ -155,8 +330,9 @@ export function RolesPanel() {
       setName("");
       setDescription("");
       setPriority("0");
-      await load();
-      selectRole(created.id);
+      knownRolesRef.current = mergeRoleCatalogItems(knownRolesRef.current, [created], false);
+      selectedIdRef.current = created.id;
+      await load({ propagateError: true });
       setSuccess(`角色“${created.name}”已创建，接下来可以配置权限能力和资源限额。`);
     } catch (reason) {
       setError(roleCreateError(reason));
@@ -166,7 +342,13 @@ export function RolesPanel() {
   }
 
   async function savePolicy() {
-    if (!selected || !mutable || !policyReady || policyLoading) return;
+    if (
+      !selected
+      || !mutable
+      || !policyReady
+      || policyLoading
+      || policyVersion === null
+    ) return;
     const limits: Record<string, number | null> = {};
     for (const definition of definitions) {
       const raw = limitValues[definition.key]?.trim().toLowerCase();
@@ -183,18 +365,117 @@ export function RolesPanel() {
     }
     setPending(true);
     setError("");
+    setNotice("");
+    setSuccess("");
+    let draftInvalidatedFor: RolePolicyDraftInvalidationReason | null = null;
+    try {
+      const result = await saveRolePolicy({
+        roleId: selected.id,
+        expectedVersion: policyVersion,
+        permissionCodes: [...permissionCodes],
+        limits: { ...limits },
+      }, {
+        invalidateDraft: (reason) => {
+          draftInvalidatedFor = reason;
+          invalidateRoleWorkspace(reason);
+        },
+        reloadLatest: () => load({ propagateError: true }),
+      });
+      if (result.status === "stale") {
+        setNotice(STALE_ROLE_POLICY_MESSAGE);
+        return;
+      }
+      setSuccess(`角色“${result.role.name}”的权限与限额已保存，角色策略已刷新。`);
+    } catch (reason) {
+      setNotice("");
+      const message = draftInvalidatedFor === "saved"
+        ? SAVED_ROLE_POLICY_REFRESH_FAILED_MESSAGE
+        : STALE_ROLE_POLICY_REFRESH_FAILED_MESSAGE;
+      setError(draftInvalidatedFor
+        ? `${message} ${readableError(reason)}`
+        : readableError(reason));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function invalidateRoleWorkspace(reason: RoleAdministrationInvalidationReason) {
+    catalogLoadController.invalidate();
+    policyLoadController.invalidate();
+    if (reason === "deleted") selectedIdRef.current = "";
+    setRoles(null);
+    setPermissionCodes([]);
+    setLimitValues({});
+    setPolicyVersion(null);
+    setPolicyReady(false);
+    setPolicyLoading(false);
+    setMetadataEditor(null);
+    setDeleteEditor(null);
+  }
+
+  async function saveMetadata() {
+    if (!metadataEditor || pending) return;
+    const editorSnapshot = { ...metadataEditor };
+    let draftInvalidatedFor: RoleAdministrationInvalidationReason | null = null;
+    setPending(true);
+    setError("");
+    setNotice("");
     setSuccess("");
     try {
-      const updated = await apiRequest<Role>(`/api/v1/roles/${selected.id}/policy`, {
-        method: "PUT",
-        body: JSON.stringify({ permission_codes: permissionCodes, limits }),
+      const result = await saveRoleMetadata(editorSnapshot, {
+        invalidateDraft: (reason) => {
+          draftInvalidatedFor = reason;
+          invalidateRoleWorkspace(reason);
+        },
+        reloadLatest: () => load({ propagateError: true }),
       });
-      setRoles((current) => current?.map((item) => item.id === updated.id ? updated : item) ?? current);
-      setPermissionCodes(updated.permission_codes);
-      setLimitValues(Object.fromEntries(Object.entries(updated.limits).map(([key, value]) => [key, value === null ? "unlimited" : String(value)])));
-      setSuccess(`角色“${updated.name}”的权限与限额已保存。`);
+      if (result.status === "stale") {
+        setNotice(STALE_ROLE_POLICY_MESSAGE);
+        return;
+      }
+      setSuccess(`角色“${editorSnapshot.name.trim()}”的名称、描述和优先级已保存。`);
     } catch (reason) {
-      setError(readableError(reason));
+      setNotice("");
+      const message = draftInvalidatedFor === "saved"
+        ? SAVED_ROLE_POLICY_REFRESH_FAILED_MESSAGE
+        : STALE_ROLE_POLICY_REFRESH_FAILED_MESSAGE;
+      setError(draftInvalidatedFor
+        ? `${message} ${readableError(reason)}`
+        : roleAdministrationError(reason));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function deleteSelectedRole() {
+    if (!deleteEditor || pending) return;
+    const editorSnapshot = { ...deleteEditor };
+    let draftInvalidatedFor: RoleAdministrationInvalidationReason | null = null;
+    setPending(true);
+    setError("");
+    setNotice("");
+    setSuccess("");
+    try {
+      const result = await deleteRole(editorSnapshot, {
+        invalidateDraft: (reason) => {
+          draftInvalidatedFor = reason;
+          invalidateRoleWorkspace(reason);
+        },
+        reloadLatest: () => load({ propagateError: true }),
+      });
+      if (result.status === "stale") {
+        setNotice(STALE_ROLE_POLICY_MESSAGE);
+        return;
+      }
+      setSuccess(`角色“${editorSnapshot.roleName}”已删除，角色列表已刷新。`);
+    } catch (reason) {
+      setNotice("");
+      const refreshMessage = draftInvalidatedFor === "deleted"
+        ? DELETED_ROLE_REFRESH_FAILED_MESSAGE
+        : STALE_ROLE_POLICY_REFRESH_FAILED_MESSAGE;
+      setError(draftInvalidatedFor
+        ? `${refreshMessage} ${readableError(reason)}`
+        : roleAdministrationError(reason));
     } finally {
       setPending(false);
     }
@@ -207,30 +488,87 @@ export function RolesPanel() {
   return (
     <div className="page-stack">
       {error ? <ErrorState title="操作未完成" message={error} onRetry={() => void load()} /> : null}
+      {notice ? <div className="notice info-notice" role="status"><Icon name="refresh" /><div><strong>角色数据已同步</strong><p>{notice}</p></div></div> : null}
       {success ? <div className="notice role-success" role="status"><Icon name="check" /><div><strong>设置已生效</strong><p>{success}</p></div></div> : null}
       <section className="panel">
+        {roleCatalogError ? (
+          <div className="panel-body">
+            <ErrorState
+              title="角色目录暂时不可用"
+              message={`${roleCatalogError}。当前已打开的角色策略仍可查看和管理。`}
+              onRetry={() => void loadRoleCandidates({
+                query: activeRoleQuery,
+                offset: 0,
+                replace: true,
+              })}
+            />
+          </div>
+        ) : null}
         {roles === null && !error ? <LoadingRows count={5} /> : null}
         {roles?.length === 0 ? <EmptyState compact icon="shield" title="还没有角色" description="创建第一个自定义角色，再配置权限与资源限额。" /> : null}
         {roles?.length ? (
           <div className="role-layout">
             <aside className="role-list">
-              {roles.map((role) => {
-                const copy = roleCopy(role);
-                return (
-                  <button className={`role-item${role.id === selectedId ? " active" : ""}`} type="button" onClick={() => selectRole(role.id)} disabled={pending} key={role.id}>
-                    <span className="role-symbol">{copy.name.slice(0, 1).toUpperCase()}</span>
-                    <span><strong>{copy.name}</strong><small>{role.code}{role.is_system ? " · 系统" : ""}</small></span>
-                    <span className="role-priority">P{role.priority}</span>
-                  </button>
-                );
-              })}
+              <form className="role-catalog-toolbar" role="search" onSubmit={(event) => {
+                event.preventDefault();
+                const query = roleQuery.trim();
+                activeRoleQueryRef.current = query;
+                setActiveRoleQuery(query);
+                void loadRoleCandidates({ query, offset: 0, replace: true });
+              }}>
+                <input aria-label="搜索角色目录" type="search" maxLength={200} value={roleQuery} onChange={(event) => setRoleQuery(event.target.value)} placeholder="搜索名称或代码" />
+                <button className="button secondary small" type="submit" disabled={roleCatalogLoading}>{roleCatalogLoading ? "搜索中…" : "搜索"}</button>
+              </form>
+              <div className="role-list-items">
+                {roles.map((role) => {
+                  const copy = roleCopy(role);
+                  return (
+                    <button className={`role-item${role.id === selectedId ? " active" : ""}`} type="button" onClick={() => void selectRole(role.id)} disabled={pending} key={role.id}>
+                      <span className="role-symbol">{copy.name.slice(0, 1).toUpperCase()}</span>
+                      <span><strong>{copy.name}</strong><small>{role.code}{role.is_system ? " · 系统" : ""}</small></span>
+                      <span className="role-priority">P{role.priority}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {roleHasMore ? (
+                <button className="button secondary role-load-more" type="button" disabled={roleCatalogLoading} onClick={() => void loadRoleCandidates({
+                  query: activeRoleQuery,
+                  offset: roleCandidatesRef.current.length,
+                  replace: false,
+                })}>
+                  {roleCatalogLoading ? "正在加载…" : "加载更多角色"}
+                </button>
+              ) : null}
             </aside>
             {selected ? (
               <div className="role-detail" aria-busy={policyLoading}>
                 <div className="detail-heading">
                   <div><h2>{selectedCopy?.name}</h2><p>{selectedCopy?.description}</p></div>
-                  <StatusBadge tone={selected.is_system ? "info" : "neutral"}>{selected.is_system ? "系统角色" : `优先级 ${selected.priority}`}</StatusBadge>
+                  <div className="button-row">
+                    <StatusBadge tone={selected.is_system ? "info" : "neutral"}>{selected.is_system ? "系统角色" : `优先级 ${selected.priority}`}</StatusBadge>
+                    {mutable && policyReady ? <button className="button secondary small" type="button" aria-haspopup="dialog" aria-controls="role-metadata-editor" disabled={pending || policyLoading} onClick={() => { setDeleteEditor(null); setMetadataEditor(openRoleMetadataEditor(selected)); }}>编辑角色</button> : null}
+                    {mutable && policyReady ? <button className="button danger small" type="button" aria-haspopup="dialog" aria-controls="role-delete-editor" disabled={pending || policyLoading} onClick={() => { setMetadataEditor(null); setDeleteEditor({ roleId: selected.id, roleName: selected.name, isSystem: selected.is_system, expectedVersion: selected.policy_version, confirmation: "" }); }}>删除角色</button> : null}
+                  </div>
                 </div>
+                {metadataEditor ? (
+                  <form id="role-metadata-editor" className="inline-editor" role="dialog" aria-modal="false" aria-labelledby="role-metadata-editor-title" onSubmit={(event) => { event.preventDefault(); void saveMetadata(); }}>
+                    <div><strong id="role-metadata-editor-title">编辑角色资料</strong><p>名称、描述和优先级与权限策略共享同一版本，保存时会检查其他管理员是否已经修改。</p></div>
+                    <div className="form-grid">
+                      <label>角色名称<input ref={metadataNameInputRef} value={metadataEditor.name} maxLength={200} required disabled={pending} onChange={(event) => setMetadataEditor((current) => current ? { ...current, name: event.target.value } : current)} /></label>
+                      <label>优先级<input type="number" min={-10000} max={10000} step="1" value={metadataEditor.priority} required disabled={pending} onChange={(event) => setMetadataEditor((current) => current ? { ...current, priority: Number(event.target.value) } : current)} /></label>
+                      <label className="full">描述<input value={metadataEditor.description ?? ""} maxLength={2000} disabled={pending} onChange={(event) => setMetadataEditor((current) => current ? { ...current, description: event.target.value || null } : current)} /></label>
+                    </div>
+                    <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setMetadataEditor(null)}>取消</button><button className="button primary" type="submit" disabled={pending}>{pending ? "正在保存…" : "保存角色资料"}</button></div>
+                  </form>
+                ) : null}
+                {deleteEditor ? (
+                  <form id="role-delete-editor" className="inline-editor" role="dialog" aria-modal="false" aria-labelledby="role-delete-editor-title" onSubmit={(event) => { event.preventDefault(); void deleteSelectedRole(); }}>
+                    <div><strong id="role-delete-editor-title">删除自定义角色</strong><p>仅未分配给成员、且未用于知识库授权的角色可以删除。删除后无法恢复。</p></div>
+                    <label className="full">请输入角色名称“{deleteEditor.roleName}”确认<input ref={deleteConfirmationInputRef} value={deleteEditor.confirmation} autoComplete="off" disabled={pending} onChange={(event) => setDeleteEditor((current) => current ? { ...current, confirmation: event.target.value } : current)} /></label>
+                    <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setDeleteEditor(null)}>取消</button><button className="button danger" type="submit" disabled={pending || deleteEditor.confirmation !== deleteEditor.roleName}>{pending ? "正在删除…" : "永久删除角色"}</button></div>
+                  </form>
+                ) : null}
                 <details className="detail-section policy-disclosure" key={`permissions-${selected.id}`}>
                   <summary className="policy-disclosure-summary">
                     <span className="policy-disclosure-title"><strong>权限能力</strong><small>{policyLoading ? "正在载入角色策略…" : `${permissionCodes.length} 项已启用 · 共 ${permissions.length} 项`}</small></span>
@@ -261,7 +599,7 @@ export function RolesPanel() {
                     <div className="limit-legend">
                       <span><b>未设置</b><small>该角色不参与此项额度合并</small></span>
                       <span><b>有限制</b><small>按填写的数字限制；0 表示禁止</small></span>
-                      <span><b>无限制</b><small>该角色不为此项设置上限</small></span>
+                      <span><b>无限制</b><small>仅不设角色额度；仍受平台安全硬上限</small></span>
                     </div>
                     <div className="limit-grid">
                       {definitions.map((definition) => {
@@ -278,7 +616,7 @@ export function RolesPanel() {
                                   <option value="limited">有限制</option>
                                   <option value="unlimited">无限制</option>
                                 </select>
-                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "此角色不设置上限" : "不参与角色额度合并"}</small>}
+                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "不设角色额度，仍受平台安全限制" : "不参与角色额度合并"}</small>}
                               </div>
                             ) : (
                               <div className="limit-readout"><strong>{displayLimit(definition, storedValue)}</strong><small>{storedValue === undefined ? "该角色未配置" : storedValue === null ? "此角色不设置上限" : "该角色的数值上限"}</small></div>
@@ -287,7 +625,7 @@ export function RolesPanel() {
                         );
                       })}
                     </div>
-                    <div className="limit-policy-note"><strong>最终额度如何计算</strong><p>用户拥有多个角色时，数值取最大值；任一角色为“无限制”，角色合并结果就是无限制；用户级覆盖值最后生效。若所有角色都未设置，请求频率使用系统默认值，其余上传、累计存储写入与下载额度按 0 处理。每日限额按 UTC 00:00 重置。</p></div>
+                    <div className="limit-policy-note"><strong>最终额度如何计算</strong><p>用户拥有多个角色时，数值取最大值；任一角色为“无限制”，角色合并结果就是无限制；用户级覆盖值最后生效。若所有角色都未设置，请求频率使用系统默认值，其余上传、累计存储写入与下载额度按 0 处理。每日限额按 UTC 00:00 重置。“无限制”永远不会绕过单文件平台安全硬上限、恶意软件扫描上限或磁盘水位门禁。</p></div>
                     {mutable ? <p className="field-hint">容量类限额请输入原始字节数，保存后会自动换算为 KB、MB、GB 或 TB 显示。非超级管理员不能授予高于自身的额度。</p> : null}
                   </div>
                 </details>
@@ -303,7 +641,7 @@ export function RolesPanel() {
               <label>角色标识（可选）<input value={code} onChange={(event) => setCode(event.target.value)} onBlur={() => setCode(normalizeRoleCode(code))} placeholder="例如 knowledge_editor" maxLength={100} /><small className="input-help">留空将自动生成；可输入英文字母、数字、下划线或短横线。</small></label>
               <label>角色名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder="知识编辑" maxLength={200} required /></label>
               <label>优先级<input type="number" min={-10000} max={10000} value={priority} onChange={(event) => setPriority(event.target.value)} required /></label>
-              <label>描述<input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+              <label>描述<input value={description} maxLength={2000} onChange={(event) => setDescription(event.target.value)} /></label>
               <div className="form-actions full"><button className="button primary" type="submit" disabled={pending}>{pending ? "正在创建…" : "创建角色"}</button></div>
             </form>
           </details>

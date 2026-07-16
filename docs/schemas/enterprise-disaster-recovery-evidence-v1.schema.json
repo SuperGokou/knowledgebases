@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://knowledgebases.heyi.internal/schemas/enterprise-disaster-recovery-evidence-v1.schema.json",
+  "title": "Enterprise Disaster-Recovery Evidence Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "status",
+    "evidence_classification",
+    "issued_at",
+    "expires_at",
+    "target",
+    "signing_key_sha256",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "enterprise-disaster-recovery"},
+    "status": {"const": "complete"},
+    "evidence_classification": {"const": "measured_full_restore_drill"},
+    "issued_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "expires_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_head", "content_fingerprint", "release_id"],
+      "properties": {
+        "git_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "release_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+        }
+      }
+    },
+    "signing_key_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/artifact"},
+      "allOf": [
+        {"contains": {"properties": {"id": {"const": "restore_drill_report"}}}},
+        {"contains": {"properties": {"id": {"const": "database_integrity"}}}},
+        {"contains": {"properties": {"id": {"const": "object_integrity"}}}},
+        {"contains": {"properties": {"id": {"const": "control_plane_integrity"}}}},
+        {"contains": {"properties": {"id": {"const": "functional_smoke"}}}}
+      ]
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256", "bytes"],
+      "properties": {
+        "id": {
+          "enum": [
+            "restore_drill_report",
+            "database_integrity",
+            "object_integrity",
+            "control_plane_integrity",
+            "functional_smoke"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.json$"
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 1, "maximum": 8388608}
+      }
+    }
+  }
+}

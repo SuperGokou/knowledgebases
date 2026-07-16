@@ -1,0 +1,126 @@
+{
+  "$schema": "schemas/release-rights-attestation-v1.schema.json",
+  "schema_version": 1,
+  "release_id": "REPLACE_WITH_IMMUTABLE_RELEASE_SHA",
+  "status": "pending",
+  "project_license": {
+    "status": "pending",
+    "expression": null,
+    "path": null,
+    "sha256": null,
+    "evidence": {
+      "reference": null,
+      "sha256": null
+    }
+  },
+  "license_reviews": [
+    {
+      "expression": "Apache-2.0 AND LGPL-3.0-or-later",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "expression": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "expression": "CC-BY-4.0",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "expression": "LGPL-3.0-only",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "expression": "LGPL-3.0-or-later",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "expression": "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "expression": "MPL-2.0",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    }
+  ],
+  "asset_approvals": [
+    {
+      "asset_id": "file:docs/assets/design-qa/prism-comparison.png",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "file:docs/assets/design-qa/prism-implementation.png",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "file:docs/assets/design-qa/prism-mobile.png",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "file:docs/assets/design-qa/prism-reference.png",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "file:web/public/brand/heyi-display-logo.webp",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "file:web/src/app/favicon.ico",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "file:web/src/app/icon.png",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    },
+    {
+      "asset_id": "embedded:web/src/app/layout.tsx#image/x-icon:b60f3c46b1d7a4f10a74a00844209f7730701b08dd3e026c3858ddee9e4d6b6a",
+      "status": "pending",
+      "evidence": { "reference": null, "sha256": null }
+    }
+  ],
+  "third_party_notices": {
+    "status": "draft",
+    "path": "docs/THIRD-PARTY-NOTICES.md",
+    "sha256": null,
+    "evidence": { "reference": null, "sha256": null }
+  },
+  "image_sbom_index": {
+    "status": "pending",
+    "path": null,
+    "sha256": null,
+    "image_manifest_path": null,
+    "image_manifest_sha256": null,
+    "bundle_checksum_manifest_path": null,
+    "bundle_checksum_manifest_sha256": null
+  },
+  "rights_owner_approval": {
+    "status": "pending",
+    "name": null,
+    "organization": null,
+    "role": null,
+    "signed_at": null,
+    "evidence": { "reference": null, "sha256": null }
+  },
+  "legal_approval": {
+    "status": "pending",
+    "name": null,
+    "organization": null,
+    "role": null,
+    "signed_at": null,
+    "evidence": { "reference": null, "sha256": null }
+  }
+}

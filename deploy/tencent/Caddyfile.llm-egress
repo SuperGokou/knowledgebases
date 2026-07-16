@@ -1,0 +1,222 @@
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	# Access logs are intentionally discarded. Provider responses and credentials
+	# must never be copied into the local deployment's operational log stream.
+	log {
+		output discard
+	}
+	request_body {
+		max_size 8MB
+	}
+
+	# Docker health and release-gate probes are available only from the gateway
+	# network namespace.  The fixed body is hashed by BusyBox; a process that
+	# merely opens port 8080 can therefore never be reported as healthy.
+	@local_liveness {
+		method GET
+		path /_heyi/health/live
+		remote_ip 127.0.0.1 ::1
+	}
+	handle @local_liveness {
+		header Cache-Control "no-store"
+		header Content-Type "text/plain; charset=utf-8"
+		respond "heyi-llm-egress-live-v1" 200
+	}
+
+	# These one-shot routes prove provider DNS, TLS hostname validation and the
+	# reviewed HTTP path without ever forwarding credentials or business data.
+	# Only an expected unauthenticated rejection becomes a fixed local success
+	# body.  Redirects, success responses and upstream failures are fail closed.
+	@probe_deepseek {
+		method GET
+		path /_heyi/probe/deepseek
+		remote_ip 127.0.0.1 ::1
+	}
+	handle @probe_deepseek {
+		rewrite * /chat/completions
+		reverse_proxy https://api.deepseek.com {
+			method POST
+			header_up Host api.deepseek.com
+			header_up User-Agent "heyi-egress-route-probe/1"
+			header_up Content-Length "0"
+			header_up -Authorization
+			header_up -Cookie
+			header_up -Proxy-Authorization
+			header_up -X-Api-Key
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			transport http {
+				tls_server_name api.deepseek.com
+			}
+			@deepseek_expected_rejection status 400 401 403
+			handle_response @deepseek_expected_rejection {
+				header -Location
+				header -Set-Cookie
+				header -WWW-Authenticate
+				header Cache-Control "no-store"
+				header Content-Type "text/plain; charset=utf-8"
+				respond "heyi-provider-route-deepseek-v1" 200
+			}
+			handle_response {
+				header -Location
+				header -Set-Cookie
+				header -WWW-Authenticate
+				header Cache-Control "no-store"
+				header Content-Type "text/plain; charset=utf-8"
+				respond "heyi-provider-route-failed-v1" 502
+			}
+		}
+	}
+
+	@probe_qwen {
+		method GET
+		path /_heyi/probe/qwen
+		remote_ip 127.0.0.1 ::1
+	}
+	handle @probe_qwen {
+		rewrite * /compatible-mode/v1/chat/completions
+		reverse_proxy https://dashscope.aliyuncs.com {
+			method POST
+			header_up Host dashscope.aliyuncs.com
+			header_up User-Agent "heyi-egress-route-probe/1"
+			header_up Content-Length "0"
+			header_up -Authorization
+			header_up -Cookie
+			header_up -Proxy-Authorization
+			header_up -X-Api-Key
+			header_up -X-DashScope-SSE
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			transport http {
+				tls_server_name dashscope.aliyuncs.com
+			}
+			@qwen_expected_rejection status 400 401 403
+			handle_response @qwen_expected_rejection {
+				header -Location
+				header -Set-Cookie
+				header -WWW-Authenticate
+				header Cache-Control "no-store"
+				header Content-Type "text/plain; charset=utf-8"
+				respond "heyi-provider-route-qwen-v1" 200
+			}
+			handle_response {
+				header -Location
+				header -Set-Cookie
+				header -WWW-Authenticate
+				header Cache-Control "no-store"
+				header Content-Type "text/plain; charset=utf-8"
+				respond "heyi-provider-route-failed-v1" 502
+			}
+		}
+	}
+
+	@probe_minimax {
+		method GET
+		path /_heyi/probe/minimax
+		remote_ip 127.0.0.1 ::1
+	}
+	handle @probe_minimax {
+		rewrite * /v1/chat/completions
+		reverse_proxy https://api.minimax.io {
+			method POST
+			header_up Host api.minimax.io
+			header_up User-Agent "heyi-egress-route-probe/1"
+			header_up Content-Length "0"
+			header_up -Authorization
+			header_up -Cookie
+			header_up -Proxy-Authorization
+			header_up -X-Api-Key
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			transport http {
+				tls_server_name api.minimax.io
+			}
+			@minimax_expected_rejection status 400 401 403
+			handle_response @minimax_expected_rejection {
+				header -Location
+				header -Set-Cookie
+				header -WWW-Authenticate
+				header Cache-Control "no-store"
+				header Content-Type "text/plain; charset=utf-8"
+				respond "heyi-provider-route-minimax-v1" 200
+			}
+			handle_response {
+				header -Location
+				header -Set-Cookie
+				header -WWW-Authenticate
+				header Cache-Control "no-store"
+				header Content-Type "text/plain; charset=utf-8"
+				respond "heyi-provider-route-failed-v1" 502
+			}
+		}
+	}
+
+	@deepseek {
+		method POST
+		path /deepseek/chat/completions
+	}
+	handle @deepseek {
+		rewrite * /chat/completions
+		reverse_proxy https://api.deepseek.com {
+			header_up Host api.deepseek.com
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			transport http {
+				tls_server_name api.deepseek.com
+			}
+		}
+	}
+
+	@qwen {
+		method POST
+		path /qwen/compatible-mode/v1/chat/completions
+	}
+	handle @qwen {
+		rewrite * /compatible-mode/v1/chat/completions
+		reverse_proxy https://dashscope.aliyuncs.com {
+			header_up Host dashscope.aliyuncs.com
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			transport http {
+				tls_server_name dashscope.aliyuncs.com
+			}
+		}
+	}
+
+	@minimax {
+		method POST
+		path /minimax/v1/chat/completions
+	}
+	handle @minimax {
+		rewrite * /v1/chat/completions
+		reverse_proxy https://api.minimax.io {
+			header_up Host api.minimax.io
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			transport http {
+				tls_server_name api.minimax.io
+			}
+		}
+	}
+
+	@reviewed_path {
+		path /deepseek/chat/completions /qwen/compatible-mode/v1/chat/completions /minimax/v1/chat/completions
+	}
+	handle @reviewed_path {
+		respond 405
+	}
+
+	handle {
+		respond 404
+	}
+}

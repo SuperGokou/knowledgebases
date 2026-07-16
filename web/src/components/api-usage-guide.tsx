@@ -1,11 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 
 import { Icon } from "@/components/icon";
 import {
   buildApiUsageExample,
-  PUBLIC_API_ORIGIN,
+  API_ORIGIN_PLACEHOLDER,
   type ApiExampleLanguage,
   type PublicApiOperation,
 } from "@/lib/api-usage-examples";
@@ -21,11 +21,30 @@ const operations: Array<{ id: PublicApiOperation; label: string; path: string }>
   { id: "search", label: "知识检索", path: "/api/v1/public/knowledge-bases/{id}/search" },
 ];
 
-export function ApiUsageGuide() {
+function subscribeToApiOrigin(): () => void {
+  return () => undefined;
+}
+
+function readBrowserApiOrigin(): string {
+  return window.location.origin;
+}
+
+function readServerApiOrigin(): string {
+  return API_ORIGIN_PLACEHOLDER;
+}
+
+export function ApiUsageGuide({ configuredApiOrigin }: { configuredApiOrigin?: string }) {
   const [language, setLanguage] = useState<ApiExampleLanguage>("curl");
   const [operation, setOperation] = useState<PublicApiOperation>("chat");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  const example = buildApiUsageExample(language, operation);
+  const browserApiOrigin = useSyncExternalStore(
+    subscribeToApiOrigin,
+    readBrowserApiOrigin,
+    readServerApiOrigin,
+  );
+  const apiOrigin = configuredApiOrigin ?? browserApiOrigin;
+  const example = buildApiUsageExample(language, operation, apiOrigin);
+  const openApiUrl = `${apiOrigin}/openapi.json`;
 
   async function copyExample() {
     try {
@@ -46,7 +65,7 @@ export function ApiUsageGuide() {
         <ol className="api-onboarding-steps">
           <li><span>1</span><div><strong>生成凭证</strong><p>为每个系统单独创建 API Key，便于独立撤销和审计。</p></div></li>
           <li><span>2</span><div><strong>保存到密钥管理器</strong><p>将明文写入服务端环境变量，不要放进前端代码或 Git。</p></div></li>
-          <li><span>3</span><div><strong>发送请求</strong><p>使用 <code>X-API-Key</code> 请求头；平台仍会执行权限与限额检查。</p></div></li>
+          <li><span>3</span><div><strong>发送请求</strong><p>使用 <code>X-API-Key</code>；知识问答还必须携带每次操作唯一的 <code>Idempotency-Key</code>。</p></div></li>
         </ol>
 
         <div className="api-endpoint-list" aria-label="公开 API 端点">
@@ -87,7 +106,10 @@ export function ApiUsageGuide() {
         </div>
 
         <div className="api-origin-row">
-          <span>API Origin</span><code>{PUBLIC_API_ORIGIN}</code>
+          <span>API Origin</span><code>{apiOrigin}</code>
+          <a className="button ghost small" href={openApiUrl} target="_blank" rel="noreferrer">
+            OpenAPI JSON
+          </a>
         </div>
         {operation === "chat" ? (
           <div className="notice api-security-notice">
@@ -98,6 +120,8 @@ export function ApiUsageGuide() {
                 每个成功回答都会返回正文来源脚注、结构化 <code>citations</code> 与
                 <code> source_status</code>。请用稳定 <code>entry_id</code> 核验来源；
                 <code>retrieval_fallback</code> 表示模型回答已被安全检索结果替代。
+                首次提问生成新的 <code>Idempotency-Key</code>，仅在重试同一请求时复用；
+                修改问题或开始新对话必须换新键。
               </p>
             </div>
           </div>

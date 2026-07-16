@@ -39,7 +39,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   if (session.kind === "unauthenticated") return redirectToLogin(request);
   if (session.kind === "unavailable") {
     const response = unavailableResponse(session.status);
-    persistReplacementSession(response, session);
+    await persistReplacementSession(response, request, session);
     return response;
   }
 
@@ -47,7 +47,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   if (!canAccessPath(path, session.me)) {
     const landing = new URL(defaultLandingPath(session.me), request.url);
     const response = NextResponse.redirect(landing);
-    persistWorkspaceSession(response, request, session);
+    await persistWorkspaceSession(response, request, session);
     response.headers.set("Cache-Control", "no-store");
     return response;
   }
@@ -55,7 +55,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const response = NextResponse.next({
     request: { headers: authorizedWorkspaceHeaders(request, session.me) },
   });
-  persistWorkspaceSession(response, request, session);
+  await persistWorkspaceSession(response, request, session);
   response.headers.set("Cache-Control", "no-store, private");
   return response;
 }

@@ -32,6 +32,10 @@ export type User = {
   display_name: string | null;
   status: UserStatus;
   is_superuser: boolean;
+  role_assignment_version: number;
+  retired_at: string | null;
+  retired_by_id: string | null;
+  retirement_reason: string | null;
   created_at: string;
   updated_at: string;
   role_ids: string[];
@@ -44,6 +48,7 @@ export type Role = {
   description: string | null;
   priority: number;
   is_system: boolean;
+  policy_version: number;
   created_at: string;
   updated_at: string;
   permission_codes: string[];
@@ -84,6 +89,16 @@ export type FileRecord = {
     | "quarantined"
     | "failed"
     | "deleted";
+  malware_scan_status: "pending" | "processing" | "clean" | "infected" | "error";
+  knowledge_status:
+    | "not_requested"
+    | "pending"
+    | "draft_ready"
+    | "indexed"
+    | "failed"
+    | "unsupported";
+  knowledge_error_code: string | null;
+  searchable: boolean;
   custom_metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -114,6 +129,7 @@ export type KnowledgeBase = {
   custom_metadata: Record<string, unknown>;
   external_llm_processing_enabled: boolean;
   access_level: "reader" | "editor" | "manager";
+  role_grant_version: number;
   created_at: string;
   updated_at: string;
 };
@@ -149,12 +165,17 @@ export type ChatSourceStatus = {
     | "provider_unconfigured"
     | "provider_configuration_error"
     | "provider_unavailable"
+    | "usage_governance_unavailable"
+    | "usage_budget_exceeded"
+    | "usage_metering_unavailable"
+    | "duplicate_request"
     | "missing_model_citations"
     | "invalid_model_citations"
     | "invalid_model_response"
     | "answer_review_rejected"
     | "answer_review_unavailable"
     | "answer_review_invalid"
+    | "independent_reviewer_unavailable"
     | "no_matching_content";
   citation_count: number;
 };
@@ -174,6 +195,8 @@ export type ChatDataTable = {
   columns: string[];
   rows: string[][];
   citation_numbers: number[];
+  /** Per-row evidence map. Optional only for compatibility with pre-upgrade responses. */
+  row_citation_numbers?: number[][] | null;
 };
 
 export type ChatReply = {
@@ -205,6 +228,7 @@ export type ChatMessage = {
 
 export type ManagedApiKey = {
   id: string;
+  credential_family_id: string;
   user_id: string;
   created_by: string | null;
   name: string;
@@ -228,6 +252,9 @@ export type LlmProviderSettings = {
   configured: boolean;
   credential_source: "database" | "environment" | "none";
   updated_at: string | null;
+  pricing_configured: boolean;
+  input_micro_usd_per_million_tokens: number | null;
+  output_micro_usd_per_million_tokens: number | null;
 };
 
 export type LlmProvidersResponse = {

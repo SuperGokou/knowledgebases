@@ -2,10 +2,13 @@ import { ApiKeysPanel } from "@/components/api-keys-panel";
 import { ApiUsageGuide } from "@/components/api-usage-guide";
 import { ModelSettingsPanel } from "@/components/model-settings-panel";
 import { PageHeader } from "@/components/ui";
+import { publicApiOrigin } from "@/lib/server/backend";
 
 export const metadata = { title: "API 与模型" };
 
 export default function ApiModelsPage() {
+  const configuredPublicApiOrigin = publicApiOrigin();
+
   return (
     <div className="page-stack developer-platform-page">
       <PageHeader
@@ -26,7 +29,7 @@ export default function ApiModelsPage() {
       </div>
       <ApiKeysPanel />
       <ModelSettingsPanel />
-      <ApiUsageGuide />
+      <ApiUsageGuide configuredApiOrigin={configuredPublicApiOrigin} />
     </div>
   );
 }

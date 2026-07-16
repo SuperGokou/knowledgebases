@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,26 +16,37 @@ import httpx
 import pytest
 import pytest_asyncio
 from pydantic import SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from app.api.dependencies import get_storage_service, redis_dependency
+from app.api.dependencies import get_storage_service, get_token_service, redis_dependency
+from app.api.v1.routes import knowledge_bases as knowledge_base_routes
 from app.core.config import Settings, get_settings
-from app.core.security import PasswordService
+from app.core.security import PasswordService, TokenService
 from app.db.base import Base
 from app.db.models import (
     ApiKey,
+    AuditLog,
+    AuditResult,
     File,
     FileStatus,
     KnowledgeBase,
+    KnowledgeBaseRoleGrant,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    KnowledgeIngestionStatus,
     LimitDefinition,
+    LlmBudgetPolicy,
+    LlmModelPrice,
     LlmProviderConfig,
+    LlmUsageRecord,
+    LlmUsageStatus,
+    MalwareScanStatus,
     OkfConversionJob,
     OkfConversionStatus,
     Permission,
+    QuotaCounter,
     QuotaReservation,
     ReservationStatus,
     Role,
@@ -44,12 +58,15 @@ from app.db.models import (
     UserRole,
     UserStatus,
 )
+from app.db.schema_version import EXPECTED_ALEMBIC_HEADS
 from app.db.session import get_db
 from app.main import app
-from app.maintenance import cleanup_expired_uploads
+from app.maintenance import cleanup_expired_uploads, process_malware_scan_batch
 from app.services.llm_provider import LlmChatResult, LlmProviderError
 from app.services.llm_settings import LlmConfigurationError
+from app.services.malware_scanner import ScanResult, ScanVerdict
 from app.services.storage import InitiatedStorageUpload, PresignedPart, StoredObject
+from app.services.storage_capacity import FilesystemCapacity
 
 
 class FakeRedis:
@@ -67,10 +84,13 @@ class FakeRedis:
 @dataclass
 class FakeStorage:
     head_size: int = 1
+    head_checksum_sha256: str | None = None
     initiated_keys: list[str] = field(default_factory=list)
     completed_uploads: list[str] = field(default_factory=list)
     deleted_keys: list[str] = field(default_factory=list)
     promoted_keys: list[tuple[str, str]] = field(default_factory=list)
+    sealed_keys: list[tuple[str, str]] = field(default_factory=list)
+    object_bytes: bytes = b"clean test object"
 
     async def initiate(self, **kwargs: Any) -> InitiatedStorageUpload:
         key = str(kwargs["key"])
@@ -117,7 +137,7 @@ class FakeStorage:
             size_bytes=self.head_size,
             etag='"etag"',
             version_id=None,
-            checksum_sha256=None,
+            checksum_sha256=self.head_checksum_sha256,
             content_type="application/pdf",
         )
 
@@ -132,14 +152,37 @@ class FakeStorage:
     async def delete(self, *, key: str) -> None:
         self.deleted_keys.append(key)
 
-    async def promote(self, *, source_key: str, destination_key: str) -> StoredObject:
+    async def seal_single_upload(self, *, key: str, upload_session_id: str) -> None:
+        self.sealed_keys.append((key, upload_session_id))
+
+    async def promote(
+        self,
+        *,
+        source_key: str,
+        destination_key: str,
+        upload_session_id: str,
+    ) -> StoredObject:
         self.promoted_keys.append((source_key, destination_key))
         self.initiated_keys.append(destination_key)
-        self.deleted_keys.append(source_key)
+        await self.seal_single_upload(
+            key=source_key,
+            upload_session_id=upload_session_id,
+        )
         return await self.head(key=destination_key)
+
+    async def iter_chunks(self, *, key: str, chunk_size: int) -> Any:
+        assert key in self.initiated_keys
+        for offset in range(0, len(self.object_bytes), chunk_size):
+            yield self.object_bytes[offset : offset + chunk_size]
 
     def presign_download(self, *, key: str, filename: str) -> str:
         return f"http://storage.local/download/{key}?filename={filename}"
+
+
+class FakeCleanScanner:
+    async def scan(self, chunks: Any) -> ScanResult:
+        assert [chunk async for chunk in chunks]
+        return ScanResult(verdict=ScanVerdict.CLEAN)
 
 
 @dataclass
@@ -178,6 +221,13 @@ async def api_harness() -> ApiHarness:
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            text("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)")
+        )
+        await connection.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": next(iter(EXPECTED_ALEMBIC_HEADS))},
+        )
 
     async with session_factory() as session:
         permissions = [
@@ -210,7 +260,11 @@ async def api_harness() -> ApiHarness:
                 ("daily_downloads", "downloads", "day"),
             )
         ]
-        role = Role(code="admin", name="Administrator", is_system=True)
+        # Model a delegated administrator explicitly above the ordinary roles
+        # created by these integration scenarios.  The production RBAC boundary
+        # requires every created or assigned role to be strictly lower priority
+        # than the actor's highest role.
+        role = Role(code="admin", name="Administrator", priority=100, is_system=True)
         user = User(
             email="admin@example.com",
             password_hash=PasswordService().hash("Admin-password-123!"),
@@ -253,6 +307,24 @@ async def api_harness() -> ApiHarness:
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[redis_dependency] = override_redis
     app.dependency_overrides[get_storage_service] = lambda: fake_storage
+    test_settings = Settings(
+        _env_file=None,
+        environment="test",
+        chat_replay_encryption_keys={1: base64.urlsafe_b64encode(b"i" * 32).decode("ascii")},
+        chat_replay_active_key_version=1,
+    )
+    test_token_service = TokenService(
+        secret=test_settings.jwt_secret.get_secret_value(),
+        issuer=test_settings.jwt_issuer,
+        audience=test_settings.jwt_audience,
+        algorithm=test_settings.jwt_algorithm,
+        access_minutes=test_settings.access_token_minutes,
+        refresh_days=test_settings.refresh_token_days,
+        clock_skew_seconds=test_settings.jwt_clock_skew_seconds,
+    )
+    get_token_service.cache_clear()
+    app.dependency_overrides[get_settings] = lambda: test_settings
+    app.dependency_overrides[get_token_service] = lambda: test_token_service
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield ApiHarness(
@@ -263,6 +335,7 @@ async def api_harness() -> ApiHarness:
         )
 
     app.dependency_overrides.clear()
+    get_token_service.cache_clear()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
     await engine.dispose()
@@ -276,7 +349,7 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     forbidden_escalation = await api_harness.client.post(
         "/api/v1/roles",
         headers=headers,
-        json={"code": "higher", "name": "Higher", "priority": 1},
+        json={"code": "higher", "name": "Higher", "priority": 101},
     )
     assert forbidden_escalation.status_code == 403
 
@@ -298,6 +371,9 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     )
     assert revoked_refresh.status_code == 401
 
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
     role = await api_harness.client.post(
         "/api/v1/roles",
         headers=headers,
@@ -312,26 +388,29 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     assert role.status_code == 201, role.text
     assert role.json()["permission_codes"] == ["file:read", "file:upload"]
     assert role.json()["limits"] == {"daily_downloads": 2, "max_upload_bytes": 1_000}
+    assert role.json()["policy_version"] == 1
     role_id = role.json()["id"]
-    assert (
-        await api_harness.client.patch(
-            f"/api/v1/roles/{role_id}", headers=headers, json={"name": "Data Uploader"}
-        )
-    ).status_code == 200
-    assert (
-        await api_harness.client.put(
-            f"/api/v1/roles/{role_id}/permissions",
-            headers=headers,
-            json={"permission_codes": ["file:read"]},
-        )
-    ).status_code == 200
-    assert (
-        await api_harness.client.put(
-            f"/api/v1/roles/{role_id}/limits",
-            headers=headers,
-            json={"limits": {"max_upload_bytes": 2_000}},
-        )
-    ).status_code == 200
+    renamed = await api_harness.client.patch(
+        f"/api/v1/roles/{role_id}",
+        headers=headers,
+        json={"expected_version": 1, "name": "Data Uploader"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["policy_version"] == 2
+    permissions_replaced = await api_harness.client.put(
+        f"/api/v1/roles/{role_id}/permissions",
+        headers=headers,
+        json={"expected_version": 2, "permission_codes": ["file:read"]},
+    )
+    assert permissions_replaced.status_code == 200
+    assert permissions_replaced.json()["policy_version"] == 3
+    limits_replaced = await api_harness.client.put(
+        f"/api/v1/roles/{role_id}/limits",
+        headers=headers,
+        json={"expected_version": 3, "limits": {"max_upload_bytes": 2_000}},
+    )
+    assert limits_replaced.status_code == 200
+    assert limits_replaced.json()["policy_version"] == 4
     assert (await api_harness.client.get("/api/v1/roles", headers=headers)).status_code == 200
     assert (await api_harness.client.get("/api/v1/permissions", headers=headers)).status_code == 200
     limit_catalog = await api_harness.client.get("/api/v1/limits", headers=headers)
@@ -355,6 +434,7 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     assert user.status_code == 201, user.text
     assert user.json()["role_ids"] == [role_id]
     user_id = user.json()["id"]
+    role_assignment_version = user.json()["role_assignment_version"]
     assert (
         await api_harness.client.patch(
             f"/api/v1/users/{user_id}", headers=headers, json={"display_name": "Renamed"}
@@ -362,7 +442,12 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     ).status_code == 200
     assert (
         await api_harness.client.put(
-            f"/api/v1/users/{user_id}/roles", headers=headers, json={"role_ids": [role_id]}
+            f"/api/v1/users/{user_id}/roles",
+            headers=headers,
+            json={
+                "expected_version": role_assignment_version,
+                "role_ids": [role_id],
+            },
         )
     ).status_code == 200
     assert (await api_harness.client.get("/api/v1/users", headers=headers)).status_code == 200
@@ -372,7 +457,10 @@ async def test_admin_role_user_and_refresh_workflow(api_harness: ApiHarness) -> 
     forbidden_system_assignment = await api_harness.client.put(
         f"/api/v1/users/{user_id}/roles",
         headers=headers,
-        json={"role_ids": [system_admin_id]},
+        json={
+            "expected_version": role_assignment_version,
+            "role_ids": [system_admin_id],
+        },
     )
     assert forbidden_system_assignment.status_code == 403
 
@@ -382,6 +470,17 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
     tokens = await api_harness.login()
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
     api_harness.storage.head_size = 5
+    stored_checksum = hashlib.sha256(b"12345")
+    api_harness.storage.head_checksum_sha256 = base64.b64encode(stored_checksum.digest()).decode(
+        "ascii"
+    )
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Single upload approval"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    knowledge_base_id = knowledge_base.json()["id"]
 
     initiated = await api_harness.client.post(
         "/api/v1/files/uploads",
@@ -390,6 +489,7 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
             "filename": "report.pdf",
             "size_bytes": 5,
             "content_type": "application/pdf",
+            "knowledge_base_id": knowledge_base_id,
             "custom_metadata": {"department": "finance"},
             "idempotency_key": "single-upload-001",
         },
@@ -405,13 +505,90 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
         json={"parts": []},
     )
     assert completed.status_code == 200, completed.text
-    assert completed.json()["status"] == "processing"
+    assert completed.json()["status"] == "quarantined"
+    assert completed.json()["malware_scan_status"] == "pending"
+    assert completed.json()["checksum_algorithm"] == "SHA256"
+    assert completed.json()["checksum_value"] == stored_checksum.hexdigest()
     assert api_harness.storage.promoted_keys
+    assert api_harness.storage.sealed_keys == [
+        (api_harness.storage.promoted_keys[0][0], upload["upload_session_id"])
+    ]
     file_id = completed.json()["id"]
+
+    approved = await api_harness.client.post(f"/api/v1/files/{file_id}/approve", headers=headers)
+    assert approved.status_code == 409, approved.text
+    assert approved.json()["error"]["code"] == "malware_scan_not_clean"
+
+    # Defense in depth: even a forged primary state cannot bypass scan evidence.
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        persisted.status = FileStatus.PROCESSING
+        await session.commit()
+    forged_approval = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/approve",
+        headers=headers,
+    )
+    assert forged_approval.status_code == 409
+    assert forged_approval.json()["error"]["code"] == "malware_scan_not_clean"
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        persisted.status = FileStatus.AVAILABLE
+        await session.commit()
+    forged_download = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/download",
+        headers=headers,
+    )
+    assert forged_download.status_code == 409
+    assert forged_download.json()["error"]["code"] == "malware_scan_not_clean"
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        persisted.status = FileStatus.QUARANTINED
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        scanned = await process_malware_scan_batch(
+            session,
+            api_harness.storage,
+            FakeCleanScanner(),
+            get_settings(),
+        )
+    assert scanned == 1
+
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, UUID(file_id))
+        assert persisted is not None
+        conversion = await session.scalar(
+            select(OkfConversionJob).where(
+                OkfConversionJob.file_id == persisted.id,
+                OkfConversionJob.file_version == persisted.version,
+            )
+        )
+        assert conversion is not None
+        draft = KnowledgeEntry(
+            knowledge_base_id=UUID(knowledge_base_id),
+            source_file_id=persisted.id,
+            entry_type="document",
+            title="report.pdf",
+            content="Synthetic approved report content.",
+            publication_status=KnowledgeEntryPublicationStatus.DRAFT,
+        )
+        session.add(draft)
+        await session.flush()
+        conversion.status = OkfConversionStatus.SUCCEEDED
+        conversion.output_entry_id = draft.id
+        conversion.error_code = None
+        conversion.completed_at = datetime.now(UTC)
+        persisted.knowledge_status = KnowledgeIngestionStatus.DRAFT_READY
+        persisted.knowledge_error_code = None
+        await session.commit()
 
     approved = await api_harness.client.post(f"/api/v1/files/{file_id}/approve", headers=headers)
     assert approved.status_code == 200, approved.text
     assert approved.json()["status"] == "available"
+    assert approved.json()["malware_scan_status"] == "clean"
 
     grant = await api_harness.client.post(f"/api/v1/files/{file_id}/download", headers=headers)
     assert grant.status_code == 200, grant.text
@@ -424,20 +601,108 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
 
 
 @pytest.mark.parametrize(
+    ("outcome", "expected_scan_status", "expected_error_code"),
+    [
+        ("infected", "infected", "malware_detected"),
+        ("timeout", "error", "scanner_timeout"),
+        ("unavailable", "error", "scanner_unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_malware_scan_failures_remain_quarantined_and_inaccessible(
+    api_harness: ApiHarness,
+    outcome: str,
+    expected_scan_status: str,
+    expected_error_code: str,
+) -> None:
+    from app.services.malware_scanner import (
+        MalwareScannerTimeout,
+        MalwareScannerUnavailable,
+    )
+
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    object_key = f"objects/malware-{outcome}-{uuid4()}.txt"
+    async with api_harness.session_factory() as session:
+        owner = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert owner is not None
+        file = File(
+            owner_id=owner.id,
+            bucket="kb",
+            object_key=object_key,
+            original_name="eicar.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=5,
+            status=FileStatus.QUARANTINED,
+        )
+        session.add(file)
+        await session.commit()
+        file_id = file.id
+    api_harness.storage.initiated_keys.append(object_key)
+
+    class Scanner:
+        async def scan(self, chunks: Any) -> ScanResult:
+            assert [chunk async for chunk in chunks]
+            if outcome == "infected":
+                return ScanResult(
+                    verdict=ScanVerdict.INFECTED,
+                    signature="Win.Test.EICAR_HDB-1",
+                )
+            if outcome == "timeout":
+                raise MalwareScannerTimeout("test timeout")
+            raise MalwareScannerUnavailable("test unavailable")
+
+    async with api_harness.session_factory() as session:
+        assert (
+            await process_malware_scan_batch(
+                session,
+                api_harness.storage,
+                Scanner(),
+                get_settings(),
+            )
+            == 1
+        )
+
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(File, file_id)
+        assert persisted is not None
+        assert persisted.status is FileStatus.QUARANTINED
+        assert persisted.malware_scan_status.value == expected_scan_status
+        assert persisted.malware_scan_error_code == expected_error_code
+        if outcome == "infected":
+            assert persisted.malware_signature == "Win.Test.EICAR_HDB-1"
+
+    approval = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/approve",
+        headers=headers,
+    )
+    assert approval.status_code == 409
+    assert approval.json()["error"]["code"] == "malware_scan_not_clean"
+    download = await api_harness.client.post(
+        f"/api/v1/files/{file_id}/download",
+        headers=headers,
+    )
+    assert download.status_code == 409
+    assert download.json()["error"]["code"] == "malware_scan_not_clean"
+
+
+@pytest.mark.parametrize(
     ("latest_status", "expected_status_code"),
     [
+        (None, 409),
         (OkfConversionStatus.PENDING, 409),
         (OkfConversionStatus.PROCESSING, 409),
         (OkfConversionStatus.RETRY_WAIT, 409),
         (OkfConversionStatus.SUCCEEDED, 200),
-        (OkfConversionStatus.FAILED, 200),
-        (OkfConversionStatus.UNSUPPORTED, 200),
+        (OkfConversionStatus.FAILED, 409),
+        (OkfConversionStatus.UNSUPPORTED, 409),
     ],
 )
 @pytest.mark.asyncio
 async def test_file_approval_follows_latest_okf_job_state(
     api_harness: ApiHarness,
-    latest_status: OkfConversionStatus,
+    latest_status: OkfConversionStatus | None,
     expected_status_code: int,
 ) -> None:
     tokens = await api_harness.login()
@@ -446,7 +711,8 @@ async def test_file_approval_follows_latest_okf_job_state(
     async with api_harness.session_factory() as session:
         owner = await session.scalar(select(User).where(User.email == "admin@example.com"))
         assert owner is not None
-        knowledge_base = KnowledgeBase(owner_id=owner.id, name=f"Approval {latest_status.value}")
+        status_label = latest_status.value if latest_status is not None else "missing-current-job"
+        knowledge_base = KnowledgeBase(owner_id=owner.id, name=f"Approval {status_label}")
         session.add(knowledge_base)
         await session.flush()
         file = File(
@@ -459,6 +725,7 @@ async def test_file_approval_follows_latest_okf_job_state(
             content_type="text/plain",
             size_bytes=1,
             status=FileStatus.PROCESSING,
+            malware_scan_status=MalwareScanStatus.CLEAN,
             version=2,
         )
         session.add(file)
@@ -497,20 +764,23 @@ async def test_file_approval_follows_latest_okf_job_state(
             )
             session.add(latest_entry)
             await session.flush()
-        latest_job = OkfConversionJob(
-            file_id=file.id,
-            knowledge_base_id=knowledge_base.id,
-            file_version=2,
-            prompt_version="test-v2",
-            status=latest_status,
-            output_entry_id=latest_entry.id if latest_entry is not None else None,
-            error_code=(
-                "test_terminal_failure"
-                if latest_status in {OkfConversionStatus.FAILED, OkfConversionStatus.UNSUPPORTED}
-                else None
-            ),
-        )
-        session.add(latest_job)
+        if latest_status is not None:
+            latest_job = OkfConversionJob(
+                file_id=file.id,
+                knowledge_base_id=knowledge_base.id,
+                file_version=2,
+                prompt_version="test-v2",
+                status=latest_status,
+                output_entry_id=latest_entry.id if latest_entry is not None else None,
+                error_code=(
+                    "parser_active_content_forbidden"
+                    if latest_status is OkfConversionStatus.UNSUPPORTED
+                    else "test_terminal_failure"
+                    if latest_status is OkfConversionStatus.FAILED
+                    else None
+                ),
+            )
+            session.add(latest_job)
         await session.commit()
         file_id = file.id
         previous_entry_id = previous_entry.id
@@ -521,6 +791,16 @@ async def test_file_approval_follows_latest_okf_job_state(
         headers=headers,
     )
     assert response.status_code == expected_status_code, response.text
+    if response.status_code == 200:
+        expected_knowledge_status = {
+            OkfConversionStatus.SUCCEEDED: KnowledgeIngestionStatus.INDEXED,
+            OkfConversionStatus.FAILED: KnowledgeIngestionStatus.FAILED,
+            OkfConversionStatus.UNSUPPORTED: KnowledgeIngestionStatus.UNSUPPORTED,
+        }[latest_status]
+        assert response.json()["knowledge_status"] == expected_knowledge_status.value
+        assert response.json()["searchable"] is (
+            expected_knowledge_status is KnowledgeIngestionStatus.INDEXED
+        )
 
     async with api_harness.session_factory() as session:
         persisted_file = await session.get(File, file_id)
@@ -529,17 +809,15 @@ async def test_file_approval_follows_latest_okf_job_state(
         assert persisted_previous is not None
         assert persisted_previous.publication_status is KnowledgeEntryPublicationStatus.DRAFT
         if expected_status_code == 409:
-            assert response.json()["error"]["code"] == "okf_conversion_in_progress"
+            assert response.json()["error"]["code"] == "okf_conversion_not_completed"
             assert persisted_file.status is FileStatus.PROCESSING
         else:
             assert persisted_file.status is FileStatus.AVAILABLE
+            assert persisted_file.knowledge_status is expected_knowledge_status
         if latest_entry_id is not None:
             persisted_latest = await session.get(KnowledgeEntry, latest_entry_id)
             assert persisted_latest is not None
-            assert (
-                persisted_latest.publication_status
-                is KnowledgeEntryPublicationStatus.PUBLISHED
-            )
+            assert persisted_latest.publication_status is KnowledgeEntryPublicationStatus.PUBLISHED
 
 
 @pytest.mark.parametrize(
@@ -615,6 +893,7 @@ async def test_okf_retry_requires_file_to_remain_in_processing(
         else:
             assert persisted.status is OkfConversionStatus.PENDING
             assert persisted.attempts == 0
+            assert persisted.retry_generation == 1
             assert persisted.error_code is None
 
 
@@ -692,14 +971,15 @@ async def test_expired_finalizing_upload_can_be_retried_idempotently(
         headers=headers,
         json={
             "parts": [
-                {"part_number": number, "etag": f'\"etag-{number}\"'}
+                {"part_number": number, "etag": f'"etag-{number}"'}
                 for number in range(1, upload["part_count"] + 1)
             ]
         },
     )
 
     assert completed.status_code == 200, completed.text
-    assert completed.json()["status"] == "processing"
+    assert completed.json()["status"] == "quarantined"
+    assert completed.json()["malware_scan_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -738,15 +1018,177 @@ async def test_maintenance_reconciles_stale_finalizing_upload(
         reservations = list(
             (
                 await session.scalars(
-                    select(QuotaReservation).where(
-                        QuotaReservation.upload_session_id == upload_id
-                    )
+                    select(QuotaReservation).where(QuotaReservation.upload_session_id == upload_id)
                 )
             ).all()
         )
         assert upload.status is UploadSessionStatus.COMPLETED
-        assert file is not None and file.status is FileStatus.PROCESSING
+        assert file is not None and file.status is FileStatus.QUARANTINED
+        assert file.malware_scan_status.value == "pending"
         assert {item.status for item in reservations} == {ReservationStatus.CONSUMED}
+
+
+@pytest.mark.asyncio
+async def test_maintenance_promotes_stale_single_finalization_without_db_locking_s3(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    api_harness.storage.head_size = 5
+    stored_checksum = hashlib.sha256(b"12345")
+    api_harness.storage.head_checksum_sha256 = base64.b64encode(stored_checksum.digest()).decode(
+        "ascii"
+    )
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "single-maintenance-recovery.pdf",
+            "size_bytes": 5,
+            "idempotency_key": "single-maintenance-recovery-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        upload.status = UploadSessionStatus.FINALIZING
+        upload.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        cleaned = await cleanup_expired_uploads(session, api_harness.storage)
+
+    assert cleaned == 1
+    assert api_harness.storage.promoted_keys
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        file = await session.get(File, upload.file_id)
+        assert upload.status is UploadSessionStatus.COMPLETED
+        assert file is not None
+        assert file.status is FileStatus.QUARANTINED
+        assert file.object_key.startswith("objects/")
+        assert file.checksum_algorithm == "SHA256"
+        assert file.checksum_value == stored_checksum.hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_rejects_stale_finalization_with_wrong_declared_checksum(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    expected_checksum = hashlib.sha256(b"expected bytes").hexdigest()
+    stored_checksum = base64.b64encode(hashlib.sha256(b"tampered bytes").digest()).decode("ascii")
+    api_harness.storage.head_size = 5
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "checksum-recovery.txt",
+            "size_bytes": 5,
+            "checksum_sha256": expected_checksum,
+            "idempotency_key": "single-maintenance-checksum-recovery-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+
+    async def mismatched_head(*, key: str) -> StoredObject:
+        assert key in api_harness.storage.initiated_keys
+        return StoredObject(
+            size_bytes=5,
+            etag='"tampered"',
+            version_id=None,
+            checksum_sha256=stored_checksum,
+            content_type="text/plain",
+        )
+
+    monkeypatch.setattr(api_harness.storage, "head", mismatched_head)
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        upload.status = UploadSessionStatus.FINALIZING
+        upload.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        cleaned = await cleanup_expired_uploads(session, api_harness.storage)
+
+    assert cleaned == 1
+    assert api_harness.storage.promoted_keys == []
+    assert api_harness.storage.deleted_keys
+    assert api_harness.storage.sealed_keys
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        file = await session.get(File, upload.file_id)
+        reservations = list(
+            (
+                await session.scalars(
+                    select(QuotaReservation).where(QuotaReservation.upload_session_id == upload_id)
+                )
+            ).all()
+        )
+        rejection = await session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "upload.rejected_checksum_mismatch",
+                AuditLog.resource_id == str(upload.file_id),
+            )
+        )
+        assert upload.status is UploadSessionStatus.FAILED
+        assert file is not None and file.status is FileStatus.FAILED
+        assert file.checksum_algorithm == "SHA256"
+        assert file.checksum_value == expected_checksum
+        assert {item.status for item in reservations} == {ReservationStatus.RELEASED}
+        assert rejection is not None and rejection.result is AuditResult.DENIED
+
+
+@pytest.mark.asyncio
+async def test_maintenance_retries_aborted_upload_storage_cleanup(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    size = get_settings().multipart_threshold_bytes + 1
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "abort-reconcile.pdf",
+            "size_bytes": size,
+            "idempotency_key": "abort-reconcile-001",  # gitleaks:allow -- deterministic test label
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        upload.status = UploadSessionStatus.ABORTED
+        upload.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        cleaned = await cleanup_expired_uploads(session, api_harness.storage)
+    assert cleaned == 1
+    assert api_harness.storage.deleted_keys
+
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        assert upload.status is UploadSessionStatus.ABORTED
+        held = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held is None
 
 
 @pytest.mark.asyncio
@@ -770,7 +1212,12 @@ async def test_internal_maintenance_requires_cron_secret(api_harness: ApiHarness
     assert denied.status_code == 401
     assert wrong.status_code == 401
     assert accepted.status_code == 200
-    assert accepted.json() == {"cleaned": 0, "converted": 0}
+    assert accepted.json() == {
+        "cleaned": 0,
+        "chat_idempotency": 0,
+        "scanned": 0,
+        "converted": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -784,6 +1231,44 @@ async def test_login_endpoint_is_ip_rate_limited(api_harness: ApiHarness) -> Non
     ]
 
     assert responses[-1].status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_oversized_credentials_before_password_hashing(
+    api_harness: ApiHarness,
+) -> None:
+    oversized_password = "A1!" + ("x" * 254)
+    oversized_email = ("x" * 309) + "@example.com"
+
+    password_response = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "admin@example.com", "password": oversized_password},
+    )
+    email_response = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": oversized_email, "password": "Wrong-password-123!"},
+    )
+
+    for response in (password_response, email_response):
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_credentials"
+
+    async with api_harness.session_factory() as session:
+        events = list(
+            (
+                await session.scalars(
+                    select(AuditLog)
+                    .where(AuditLog.action == "auth.login.denied")
+                    .order_by(AuditLog.id.desc())
+                    .limit(2)
+                )
+            ).all()
+        )
+    assert len(events) == 2
+    assert all(event.details == {"reason": "credential_shape_invalid"} for event in events)
+    serialized = json.dumps([event.details for event in events], sort_keys=True)
+    assert oversized_email not in serialized
+    assert oversized_password not in serialized
 
 
 @pytest.mark.asyncio
@@ -808,17 +1293,66 @@ async def test_authentication_rejects_bad_credentials_tokens_and_refresh_replay(
         json={"refresh_token": tokens["refresh_token"]},
     )
     assert first_refresh.status_code == 200
+    successor = first_refresh.json()
     replay = await api_harness.client.post(
         "/api/v1/auth/refresh",
         json={"refresh_token": tokens["refresh_token"]},
     )
     assert replay.status_code == 401
 
+    compromised_successor = await api_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": successor["refresh_token"]},
+    )
+    assert compromised_successor.status_code == 401
+    invalidated_access = await api_harness.client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {successor['access_token']}"},
+    )
+    assert invalidated_access.status_code == 401
+
     invalid_access = await api_harness.client.get(
         "/api/v1/files",
         headers={"Authorization": "Bearer invalid-token"},
     )
     assert invalid_access.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_with_a_rotated_ancestor_revokes_its_successor_family(
+    api_harness: ApiHarness,
+) -> None:
+    original = await api_harness.login()
+    rotated = await api_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": original["refresh_token"]},
+    )
+    assert rotated.status_code == 200, rotated.text
+    active_successor = await api_harness.client.post(
+        "/api/v1/auth/refresh/status",
+        json={"refresh_token": rotated.json()["refresh_token"]},
+    )
+    assert active_successor.status_code == 204, active_successor.text
+
+    logout = await api_harness.client.post(
+        "/api/v1/auth/logout",
+        json={"refresh_token": original["refresh_token"]},
+    )
+    assert logout.status_code == 204, logout.text
+
+    inactive_successor = await api_harness.client.post(
+        "/api/v1/auth/refresh/status",
+        json={"refresh_token": rotated.json()["refresh_token"]},
+    )
+    assert inactive_successor.status_code == 401
+    assert inactive_successor.json()["error"]["code"] == "invalid_refresh_token"
+
+    successor_refresh = await api_harness.client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": rotated.json()["refresh_token"]},
+    )
+    assert successor_refresh.status_code == 401
+    assert successor_refresh.json()["error"]["code"] == "refresh_token_reuse_detected"
 
 
 @pytest.mark.asyncio
@@ -862,7 +1396,9 @@ async def test_admin_rejects_duplicate_and_unknown_user_role_mutations(
     missing = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     assert (
         await api_harness.client.patch(
-            f"/api/v1/roles/{missing}", headers=headers, json={"name": "Missing"}
+            f"/api/v1/roles/{missing}",
+            headers=headers,
+            json={"expected_version": 1, "name": "Missing"},
         )
     ).status_code == 404
     assert (
@@ -949,6 +1485,10 @@ async def test_file_policy_idempotency_and_abort_rejection_paths(
         f"/api/v1/files/uploads/{upload['upload_session_id']}", headers=headers
     )
     assert aborted.status_code == 204
+    assert api_harness.storage.sealed_keys[-1] == (
+        api_harness.storage.initiated_keys[-1],
+        upload["upload_session_id"],
+    )
     assert (
         await api_harness.client.delete(
             f"/api/v1/files/uploads/{upload['upload_session_id']}", headers=headers
@@ -979,7 +1519,7 @@ async def test_upload_size_mismatch_and_multipart_validation_paths(
         json={"parts": []},
     )
     assert mismatch.status_code == 422
-    assert api_harness.storage.deleted_keys
+    assert api_harness.storage.sealed_keys[-1][1] == single.json()["upload_session_id"]
 
     size = get_settings().multipart_threshold_bytes + 1
     api_harness.storage.head_size = size
@@ -989,7 +1529,7 @@ async def test_upload_size_mismatch_and_multipart_validation_paths(
         json={
             "filename": "invalid-parts.pdf",
             "size_bytes": size,
-            "idempotency_key": "invalid-parts-001",
+            "idempotency_key": "invalid-parts-001",  # gitleaks:allow -- deterministic test label
         },
     )
     upload = multipart.json()
@@ -1024,6 +1564,155 @@ async def test_readiness_uses_database_and_redis(api_harness: ApiHarness) -> Non
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+@pytest.mark.asyncio
+async def test_knowledge_grant_cas_rejects_stale_writes_without_side_effects(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    created = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Grant CAS boundary"},
+    )
+    assert created.status_code == 201, created.text
+    knowledge_base_id = created.json()["id"]
+    assert created.json()["role_grant_version"] == 1
+
+    role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=headers,
+        json={
+            "code": "grant_cas_reader",
+            "name": "Grant CAS reader",
+            "permission_codes": ["knowledge:read"],
+        },
+    )
+    assert role.status_code == 201, role.text
+    role_id = role.json()["id"]
+    egress_calls: list[str] = []
+
+    async def observe_egress(*_args: object, **_kwargs: object) -> None:
+        egress_calls.append("checked")
+
+    monkeypatch.setattr(
+        knowledge_base_routes,
+        "deny_if_active_external_llm_egress",
+        observe_egress,
+    )
+
+    async def persisted_state() -> tuple[int, set[tuple[str, str]], list[dict[str, Any]]]:
+        async with api_harness.session_factory() as session:
+            knowledge_base = await session.get(KnowledgeBase, UUID(knowledge_base_id))
+            assert knowledge_base is not None
+            grants = list(
+                (
+                    await session.scalars(
+                        select(KnowledgeBaseRoleGrant).where(
+                            KnowledgeBaseRoleGrant.knowledge_base_id == UUID(knowledge_base_id)
+                        )
+                    )
+                ).all()
+            )
+            audits = list(
+                (
+                    await session.scalars(
+                        select(AuditLog)
+                        .where(
+                            AuditLog.action == "knowledge_base.role_grants_replaced",
+                            AuditLog.resource_id == knowledge_base_id,
+                        )
+                        .order_by(AuditLog.id)
+                    )
+                ).all()
+            )
+        return (
+            knowledge_base.role_grant_version,
+            {(str(item.role_id), item.access_level.value) for item in grants},
+            [item.details for item in audits],
+        )
+
+    missing_version = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=headers,
+        json={"grants": []},
+    )
+    assert missing_version.status_code == 422
+
+    no_op_empty = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=headers,
+        json={"expected_version": 1, "grants": []},
+    )
+    assert no_op_empty.status_code == 200, no_op_empty.text
+    assert no_op_empty.json() == []
+    assert await persisted_state() == (1, set(), [])
+    assert egress_calls == []
+
+    added = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=headers,
+        json={
+            "expected_version": 1,
+            "grants": [{"role_id": role_id, "access_level": "reader"}],
+        },
+    )
+    assert added.status_code == 200, added.text
+    version, grants, audits = await persisted_state()
+    assert version == 2
+    assert grants == {(role_id, "reader")}
+    assert len(audits) == 1
+    assert audits[0]["from_version"] == 1
+    assert audits[0]["to_version"] == 2
+    assert egress_calls == ["checked"]
+
+    stale_no_op = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=headers,
+        json={
+            "expected_version": 1,
+            "grants": [{"role_id": role_id, "access_level": "reader"}],
+        },
+    )
+    assert stale_no_op.status_code == 409, stale_no_op.text
+    assert stale_no_op.json()["error"] == {
+        "code": "stale_knowledge_grants",
+        "message": "Knowledge-base grants changed; reload them before retrying",
+        "details": {"current_version": 2},
+    }
+    assert await persisted_state() == (version, grants, audits)
+    assert egress_calls == ["checked"]
+
+    current_no_op = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=headers,
+        json={
+            "expected_version": 2,
+            "grants": [{"role_id": role_id, "access_level": "reader"}],
+        },
+    )
+    assert current_no_op.status_code == 200, current_no_op.text
+    assert await persisted_state() == (version, grants, audits)
+    assert egress_calls == ["checked"]
+
+    cleared = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=headers,
+        json={"expected_version": 2, "grants": []},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json() == []
+    final_version, final_grants, final_audits = await persisted_state()
+    assert final_version == 3
+    assert final_grants == set()
+    assert [(item["from_version"], item["to_version"]) for item in final_audits] == [
+        (1, 2),
+        (2, 3),
+    ]
+    assert egress_calls == ["checked", "checked"]
 
 
 @pytest.mark.asyncio
@@ -1115,7 +1804,10 @@ async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarne
     grants = await api_harness.client.put(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
         headers=admin_headers,
-        json={"grants": [{"role_id": viewer_role_id, "access_level": "reader"}]},
+        json={
+            "expected_version": 1,
+            "grants": [{"role_id": viewer_role_id, "access_level": "reader"}],
+        },
     )
     assert grants.status_code == 200, grants.text
     assert grants.json()[0]["role_id"] == viewer_role_id
@@ -1145,9 +1837,7 @@ async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarne
         "/api/v1/auth/token",
         data={"username": "viewer@example.com", "password": "Viewer-password-123!"},
     )
-    viewer_headers = {
-        "Authorization": f"Bearer {viewer_login.json()['access_token']}"
-    }
+    viewer_headers = {"Authorization": f"Bearer {viewer_login.json()['access_token']}"}
     me = await api_harness.client.get("/api/v1/auth/me", headers=viewer_headers)
     assert me.status_code == 200, me.text
     assert set(me.json()["permission_codes"]) == {"knowledge:read", "chat:query", "file:read"}
@@ -1175,7 +1865,7 @@ async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarne
 
     chat = await api_harness.client.post(
         "/api/v1/chat/query",
-        headers=viewer_headers,
+        headers={**viewer_headers, "Idempotency-Key": "knowledge-chat-viewer"},
         json={
             "knowledge_base_id": knowledge_base_id,
             "message": "How do I reset my password?",
@@ -1195,8 +1885,7 @@ async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarne
     }
     chat_entry_id = chat.json()["citations"][0]["entry_id"]
     assert chat.json()["answer"].endswith(
-        "答案来源（知识库）：\n"
-        f"[1] Reset a password（entry:{chat_entry_id} · path:index.md）"
+        f"答案来源（知识库）：\n[1] Reset a password（entry:{chat_entry_id} · path:index.md）"
     )
 
     viewer_files = await api_harness.client.get("/api/v1/files", headers=viewer_headers)
@@ -1213,15 +1902,13 @@ async def test_knowledge_base_chat_demo_and_acl_boundaries(api_harness: ApiHarne
         "/api/v1/auth/token",
         data={"username": "outsider@example.com", "password": "Outsider-password-123!"},
     )
-    outsider_headers = {
-        "Authorization": f"Bearer {outsider_login.json()['access_token']}"
-    }
+    outsider_headers = {"Authorization": f"Bearer {outsider_login.json()['access_token']}"}
     hidden = await api_harness.client.get("/api/v1/knowledge-bases", headers=outsider_headers)
     assert hidden.status_code == 200
     assert hidden.json() == []
     denied_chat = await api_harness.client.post(
         "/api/v1/chat/query",
-        headers=outsider_headers,
+        headers={**outsider_headers, "Idempotency-Key": "knowledge-chat-outsider"},
         json={"knowledge_base_id": knowledge_base_id, "message": "password"},
     )
     assert denied_chat.status_code == 404
@@ -1277,7 +1964,10 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
         await api_harness.client.put(
             f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
             headers=admin_headers,
-            json={"grants": [{"role_id": editor_role_id, "access_level": "editor"}]},
+            json={
+                "expected_version": 1,
+                "grants": [{"role_id": editor_role_id, "access_level": "editor"}],
+            },
         )
     ).status_code == 200
     assert (
@@ -1291,13 +1981,12 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
             },
         )
     ).status_code == 201
+
     editor_login = await api_harness.client.post(
         "/api/v1/auth/token",
         data={"username": "editor@example.com", "password": "Editor-password-123!"},
     )
-    editor_headers = {
-        "Authorization": f"Bearer {editor_login.json()['access_token']}"
-    }
+    editor_headers = {"Authorization": f"Bearer {editor_login.json()['access_token']}"}
 
     api_harness.storage.head_size = 1
     completed_upload = await api_harness.client.post(
@@ -1311,26 +2000,50 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
         },
     )
     completed_file_id = completed_upload.json()["file_id"]
-    assert (
-        await api_harness.client.post(
-            f"/api/v1/files/uploads/{completed_upload.json()['upload_session_id']}/complete",
-            headers=editor_headers,
-            json={"parts": []},
+    completed = await api_harness.client.post(
+        f"/api/v1/files/uploads/{completed_upload.json()['upload_session_id']}/complete",
+        headers=editor_headers,
+        json={"parts": []},
+    )
+    assert completed.status_code == 200, completed.text
+    async with api_harness.session_factory() as session:
+        assert (
+            await process_malware_scan_batch(
+                session,
+                api_harness.storage,
+                FakeCleanScanner(),
+                get_settings(),
+            )
+            == 1
         )
-    ).status_code == 200
     async with api_harness.session_factory() as session:
         conversion = await session.scalar(
             select(OkfConversionJob).where(OkfConversionJob.file_id == UUID(completed_file_id))
         )
         assert conversion is not None
-        conversion.status = OkfConversionStatus.UNSUPPORTED
-        conversion.error_code = "parser_required"
-        await session.commit()
-    assert (
-        await api_harness.client.post(
-            f"/api/v1/files/{completed_file_id}/approve", headers=admin_headers
+        persisted = await session.get(File, UUID(completed_file_id))
+        assert persisted is not None
+        draft = KnowledgeEntry(
+            knowledge_base_id=UUID(knowledge_base_id),
+            source_file_id=persisted.id,
+            entry_type="document",
+            title="completed.txt",
+            content="Synthetic completed document.",
+            publication_status=KnowledgeEntryPublicationStatus.DRAFT,
         )
-    ).status_code == 200
+        session.add(draft)
+        await session.flush()
+        conversion.status = OkfConversionStatus.SUCCEEDED
+        conversion.output_entry_id = draft.id
+        conversion.error_code = None
+        conversion.completed_at = datetime.now(UTC)
+        persisted.knowledge_status = KnowledgeIngestionStatus.DRAFT_READY
+        persisted.knowledge_error_code = None
+        await session.commit()
+    approval = await api_harness.client.post(
+        f"/api/v1/files/{completed_file_id}/approve", headers=admin_headers
+    )
+    assert approval.status_code == 200, approval.text
 
     multipart_size = get_settings().multipart_threshold_bytes + 1
     api_harness.storage.head_size = multipart_size
@@ -1350,7 +2063,7 @@ async def test_revoked_knowledge_grant_removes_file_and_upload_access(
         await api_harness.client.put(
             f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
             headers=admin_headers,
-            json={"grants": []},
+            json={"expected_version": 2, "grants": []},
         )
     ).status_code == 200
 
@@ -1423,9 +2136,7 @@ async def test_bff_signed_client_ip_requires_valid_fresh_hmac(api_harness: ApiHa
 
         api_harness.redis.counters.clear()
         forged_ip = "203.0.113.11"
-        forged_headers = _signed_bff_headers(
-            secret=secret, client_ip=forged_ip, timestamp=now
-        )
+        forged_headers = _signed_bff_headers(secret=secret, client_ip=forged_ip, timestamp=now)
         forged_headers["X-KB-Client-Signature"] = "0" * 64
         forged = await api_harness.client.post(
             "/api/v1/auth/token",
@@ -1509,6 +2220,27 @@ async def test_unsigned_forwarded_ip_is_trusted_only_on_vercel(api_harness: ApiH
 
 
 @pytest.mark.asyncio
+async def test_unsigned_forwarded_ip_is_trusted_from_configured_proxy_only(
+    api_harness: ApiHarness,
+) -> None:
+    forwarded_ip = "198.51.100.21"
+    trusted = get_settings().model_copy(
+        update={"serverless": False, "trusted_proxy_cidrs": ("127.0.0.0/24",)}
+    )
+    app.dependency_overrides[get_settings] = lambda: trusted
+    try:
+        response = await api_harness.client.post(
+            "/api/v1/auth/token",
+            headers={"X-Vercel-Forwarded-For": forwarded_ip},
+            data={"username": "missing-proxy@example.com", "password": "Wrong-password-123!"},
+        )
+        assert response.status_code == 401
+        assert f"auth:login:ip:{forwarded_ip}" in api_harness.redis.counters
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
 async def test_chat_only_role_can_select_and_query_but_not_browse_entries(
     api_harness: ApiHarness,
 ) -> None:
@@ -1532,7 +2264,10 @@ async def test_chat_only_role_can_select_and_query_but_not_browse_entries(
         await api_harness.client.put(
             f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
             headers=admin_headers,
-            json={"grants": [{"role_id": role_id, "access_level": "reader"}]},
+            json={
+                "expected_version": 1,
+                "grants": [{"role_id": role_id, "access_level": "reader"}],
+            },
         )
     ).status_code == 200
     assert (
@@ -1555,10 +2290,23 @@ async def test_chat_only_role_can_select_and_query_but_not_browse_entries(
     listed = await api_harness.client.get("/api/v1/knowledge-bases", headers=headers)
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()] == [knowledge_base_id]
-    chat = await api_harness.client.post(
+    chat_payload = {"knowledge_base_id": knowledge_base_id, "message": "hello"}
+    missing_idempotency = await api_harness.client.post(
         "/api/v1/chat/query",
         headers=headers,
-        json={"knowledge_base_id": knowledge_base_id, "message": "hello"},
+        json=chat_payload,
+    )
+    invalid_idempotency = await api_harness.client.post(
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "contains spaces"},
+        json=chat_payload,
+    )
+    assert missing_idempotency.status_code == 422
+    assert invalid_idempotency.status_code == 422
+    chat = await api_harness.client.post(
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-only-valid-key"},
+        json=chat_payload,
     )
     assert chat.status_code == 200
     assert chat.json()["citations"] == []
@@ -1653,21 +2401,48 @@ async def test_atomic_role_policy_replaces_both_halves_or_neither(
         json={
             "code": "atomic_policy",
             "name": "Atomic Policy",
+            "priority": -1,
             "permission_codes": ["file:read"],
             "limits": {"max_upload_bytes": 10},
         },
     )
     role_id = role.json()["id"]
 
+    no_op = await api_harness.client.put(
+        f"/api/v1/roles/{role_id}/policy",
+        headers=headers,
+        json={
+            "expected_version": 1,
+            "permission_codes": ["file:read"],
+            "limits": {"max_upload_bytes": 10},
+        },
+    )
+    assert no_op.status_code == 200, no_op.text
+    assert no_op.json()["policy_version"] == 1
+    async with api_harness.session_factory() as session:
+        no_op_audits = list(
+            (
+                await session.scalars(
+                    select(AuditLog).where(
+                        AuditLog.action == "role.policy.replaced",
+                        AuditLog.resource_id == role_id,
+                    )
+                )
+            ).all()
+        )
+    assert no_op_audits == []
+
     replaced = await api_harness.client.put(
         f"/api/v1/roles/{role_id}/policy",
         headers=headers,
         json={
+            "expected_version": 1,
             "permission_codes": ["file:upload"],
             "limits": {"max_upload_bytes": 20, "daily_upload_bytes": 30},
         },
     )
     assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["policy_version"] == 2
     assert replaced.json()["permission_codes"] == ["file:upload"]
     assert replaced.json()["limits"] == {
         "daily_upload_bytes": 30,
@@ -1678,17 +2453,117 @@ async def test_atomic_role_policy_replaces_both_halves_or_neither(
         f"/api/v1/roles/{role_id}/policy",
         headers=headers,
         json={
+            "expected_version": 2,
             "permission_codes": ["file:read"],
             "limits": {"not_in_catalog": 0},
         },
     )
     assert rejected.status_code == 422
+
+    stale = await api_harness.client.put(
+        f"/api/v1/roles/{role_id}/policy",
+        headers=headers,
+        json={
+            "expected_version": 1,
+            "permission_codes": ["file:read"],
+            "limits": {"max_upload_bytes": 1},
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "stale_role_policy"
+    assert stale.json()["error"]["details"] == {"current_version": 2}
     unchanged = await api_harness.client.get(f"/api/v1/roles/{role_id}", headers=headers)
+    assert unchanged.json()["policy_version"] == 2
     assert unchanged.json()["permission_codes"] == ["file:upload"]
     assert unchanged.json()["limits"] == {
         "daily_upload_bytes": 30,
         "max_upload_bytes": 20,
     }
+
+
+@pytest.mark.asyncio
+async def test_all_role_policy_mutations_keep_identical_snapshots_side_effect_free(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    created = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=headers,
+        json={
+            "code": "noop_policy",
+            "name": "No-op Policy",
+            "description": "Unchanged",
+            "priority": -1,
+            "permission_codes": ["file:read"],
+            "limits": {"max_upload_bytes": 10},
+        },
+    )
+    assert created.status_code == 201, created.text
+    role = created.json()
+    role_id = role["id"]
+    assert role["policy_version"] == 1
+
+    mutations = (
+        (
+            "PATCH",
+            f"/api/v1/roles/{role_id}",
+            {
+                "expected_version": 1,
+                "name": "No-op Policy",
+                "description": "Unchanged",
+                "priority": -1,
+            },
+        ),
+        (
+            "PUT",
+            f"/api/v1/roles/{role_id}/permissions",
+            {"expected_version": 1, "permission_codes": ["file:read"]},
+        ),
+        (
+            "PUT",
+            f"/api/v1/roles/{role_id}/limits",
+            {"expected_version": 1, "limits": {"max_upload_bytes": 10}},
+        ),
+        (
+            "PUT",
+            f"/api/v1/roles/{role_id}/policy",
+            {
+                "expected_version": 1,
+                "permission_codes": ["file:read"],
+                "limits": {"max_upload_bytes": 10},
+            },
+        ),
+    )
+    for method, path, payload in mutations:
+        response = await api_harness.client.request(
+            method,
+            path,
+            headers=headers,
+            json=payload,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["policy_version"] == 1
+
+    async with api_harness.session_factory() as session:
+        mutation_audits = list(
+            (
+                await session.scalars(
+                    select(AuditLog).where(
+                        AuditLog.resource_id == role_id,
+                        AuditLog.action.in_(
+                            {
+                                "role.updated",
+                                "role.permissions.replaced",
+                                "role.limits.replaced",
+                                "role.policy.replaced",
+                            }
+                        ),
+                    )
+                )
+            ).all()
+        )
+    assert mutation_audits == []
 
 
 @pytest.mark.asyncio
@@ -1720,7 +2595,10 @@ async def test_upload_only_role_can_select_editor_knowledge_base(
         await api_harness.client.put(
             f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
             headers=admin_headers,
-            json={"grants": [{"role_id": role_id, "access_level": "editor"}]},
+            json={
+                "expected_version": 1,
+                "grants": [{"role_id": role_id, "access_level": "editor"}],
+            },
         )
     ).status_code == 200
     assert (
@@ -1804,6 +2682,7 @@ async def test_scoped_api_key_lifecycle_and_public_endpoints(
     assert created.headers["cache-control"] == "no-store"
     cleartext = created.json()["key"]
     api_key_id = created.json()["id"]
+    credential_family_id = created.json()["credential_family_id"]
     assert cleartext.startswith("kb_live_")
     assert "key_hash" not in created.json()
 
@@ -1826,13 +2705,60 @@ async def test_scoped_api_key_lifecycle_and_public_endpoints(
     assert searched.status_code == 200, searched.text
     assert searched.json()["mode"] == "retrieval"
     assert searched.json()["items"][0]["title"] == "Refund Policy"
-    chatted = await api_harness.client.post(
+    chat_payload = {"knowledge_base_id": knowledge_base_id, "message": "refund"}
+    missing_idempotency = await api_harness.client.post(
         "/api/v1/public/chat/query",
         headers=api_headers,
-        json={"knowledge_base_id": knowledge_base_id, "message": "refund"},
+        json=chat_payload,
+    )
+    invalid_idempotency = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers={**api_headers, "Idempotency-Key": "contains spaces"},
+        json=chat_payload,
+    )
+    assert missing_idempotency.status_code == 422
+    assert invalid_idempotency.status_code == 422
+    chatted = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers={**api_headers, "Idempotency-Key": "public-chat-valid-key"},
+        json=chat_payload,
     )
     assert chatted.status_code == 200, chatted.text
     assert chatted.json()["mode"] == "retrieval"
+    replayed_chat = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers={**api_headers, "Idempotency-Key": "public-chat-valid-key"},
+        json=chat_payload,
+    )
+    assert replayed_chat.status_code == 200, replayed_chat.text
+    assert replayed_chat.json() == chatted.json()
+
+    rotated = await api_harness.client.post(
+        f"/api/v1/api-keys/{api_key_id}/rotate",
+        headers=headers,
+    )
+    assert rotated.status_code == 201, rotated.text
+    assert rotated.headers["cache-control"] == "no-store"
+    assert rotated.json()["id"] != api_key_id
+    assert rotated.json()["credential_family_id"] == credential_family_id
+    rotated_cleartext = rotated.json()["key"]
+    rotated_headers = {"X-API-Key": rotated_cleartext}
+    old_key_rejected = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers={**api_headers, "Idempotency-Key": "public-chat-valid-key"},
+        json=chat_payload,
+    )
+    assert old_key_rejected.status_code == 401
+    family_replay = await api_harness.client.post(
+        "/api/v1/public/chat/query",
+        headers={**rotated_headers, "Idempotency-Key": "public-chat-valid-key"},
+        json=chat_payload,
+    )
+    assert family_replay.status_code == 200, family_replay.text
+    assert family_replay.json() == chatted.json()
+    api_key_id = rotated.json()["id"]
+    api_headers = rotated_headers
+
     used = await api_harness.client.get("/api/v1/api-keys", headers=headers)
     assert used.json()[0]["last_used_at"] is not None
 
@@ -1842,14 +2768,12 @@ async def test_scoped_api_key_lifecycle_and_public_endpoints(
         )
         assert chat_permission_id is not None
         await session.execute(
-            delete(RolePermission).where(
-                RolePermission.permission_id == chat_permission_id
-            )
+            delete(RolePermission).where(RolePermission.permission_id == chat_permission_id)
         )
         await session.commit()
     permission_removed = await api_harness.client.post(
         "/api/v1/public/chat/query",
-        headers=api_headers,
+        headers={**api_headers, "Idempotency-Key": "public-chat-permission-removed"},
         json={"knowledge_base_id": knowledge_base_id, "message": "refund"},
     )
     assert permission_removed.status_code == 403
@@ -1864,13 +2788,11 @@ async def test_scoped_api_key_lifecycle_and_public_endpoints(
     )
     assert denied.status_code == 404
 
-    revoked = await api_harness.client.delete(
-        f"/api/v1/api-keys/{api_key_id}", headers=headers
-    )
+    revoked = await api_harness.client.delete(f"/api/v1/api-keys/{api_key_id}", headers=headers)
     assert revoked.status_code == 204
     rejected = await api_harness.client.post(
         "/api/v1/public/chat/query",
-        headers=api_headers,
+        headers={**api_headers, "Idempotency-Key": "public-chat-revoked"},
         json={"knowledge_base_id": knowledge_base_id, "message": "refund"},
     )
     assert rejected.status_code == 401
@@ -1993,9 +2915,7 @@ async def test_non_superuser_cannot_issue_api_key_for_another_account(
             "password": "API-key-manager-password-123!",
         },
     )
-    manager_headers = {
-        "Authorization": f"Bearer {manager_login.json()['access_token']}"
-    }
+    manager_headers = {"Authorization": f"Bearer {manager_login.json()['access_token']}"}
     denied = await api_harness.client.post(
         "/api/v1/api-keys",
         headers=manager_headers,
@@ -2069,12 +2989,17 @@ async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
                 "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "api_key": "qwen-secret-api-key",
                 "make_default": True,
+                "input_micro_usd_per_million_tokens": 800_000,
+                "output_micro_usd_per_million_tokens": 2_000_000,
             },
         )
         assert updated.status_code == 200, updated.text
         assert updated.json()["is_default"] is True
         assert updated.json()["configured"] is True
         assert updated.json()["credential_source"] == "database"
+        assert updated.json()["pricing_configured"] is True
+        assert updated.json()["input_micro_usd_per_million_tokens"] == 800_000
+        assert updated.json()["output_micro_usd_per_million_tokens"] == 2_000_000
         assert "api_key" not in updated.json()
 
         refreshed = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
@@ -2085,6 +3010,108 @@ async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
             assert stored is not None
             assert stored.api_key_ciphertext
             assert stored.api_key_ciphertext != "qwen-secret-api-key"
+            price = await session.get(LlmModelPrice, ("qwen", "qwen-plus"))
+            assert price is not None
+            assert price.input_micro_usd_per_million_tokens == 800_000
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
+async def test_controlled_gateway_rejects_noncanonical_provider_url_before_commit(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    initial = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
+    assert initial.status_code == 200, initial.text
+    controlled_settings = Settings(
+        _env_file=None,
+        environment="test",
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="deepseek,qwen,minimax",
+        chat_replay_encryption_keys={1: base64.urlsafe_b64encode(b"g" * 32).decode("ascii")},
+        chat_replay_active_key_version=1,
+    )
+    app.dependency_overrides[get_settings] = lambda: controlled_settings
+    try:
+        rejected = await api_harness.client.patch(
+            "/api/v1/llm/providers/qwen",
+            headers=headers,
+            json={
+                "model": "must-not-persist",
+                "base_url": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+            },
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert rejected.json()["error"]["code"] == "invalid_llm_base_url"
+
+        async with api_harness.session_factory() as session:
+            stored = await session.get(LlmProviderConfig, "qwen")
+            assert stored is not None
+            assert stored.model == "qwen-plus"
+            assert stored.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            audits = list(
+                (
+                    await session.scalars(
+                        select(AuditLog).where(
+                            AuditLog.action == "llm.provider_updated",
+                            AuditLog.resource_id == "qwen",
+                        )
+                    )
+                ).all()
+            )
+            assert audits == []
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+@pytest.mark.asyncio
+async def test_controlled_gateway_rejects_admin_patch_outside_approval_set_under_lock(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    initial = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
+    assert initial.status_code == 200, initial.text
+    original_qwen = next(item for item in initial.json()["providers"] if item["provider"] == "qwen")
+    controlled_settings = Settings(
+        _env_file=None,
+        environment="test",
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="deepseek",
+        chat_replay_encryption_keys={1: base64.urlsafe_b64encode(b"h" * 32).decode("ascii")},
+        chat_replay_active_key_version=1,
+    )
+    app.dependency_overrides[get_settings] = lambda: controlled_settings
+    try:
+        rejected = await api_harness.client.patch(
+            "/api/v1/llm/providers/qwen",
+            headers=headers,
+            json={"model": "must-not-persist", "make_default": True},
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert rejected.json()["error"]["code"] == "llm_provider_not_approved"
+
+        async with api_harness.session_factory() as session:
+            stored = await session.get(LlmProviderConfig, "qwen")
+            assert stored is not None
+            assert stored.model == original_qwen["model"]
+            audits = list(
+                (
+                    await session.scalars(
+                        select(AuditLog).where(
+                            AuditLog.action == "llm.provider_updated",
+                            AuditLog.resource_id == "qwen",
+                        )
+                    )
+                ).all()
+            )
+            assert audits == []
     finally:
         app.dependency_overrides.pop(get_settings, None)
 
@@ -2123,13 +3150,51 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         )
     ).status_code == 201
 
+    async with api_harness.session_factory() as session:
+        session.add_all(
+            [
+                LlmModelPrice(
+                    provider="qwen",
+                    model="qwen-plus",
+                    input_micro_usd_per_million_tokens=1_000_000,
+                    output_micro_usd_per_million_tokens=2_000_000,
+                    active=True,
+                ),
+                LlmModelPrice(
+                    provider="minimax",
+                    model="MiniMax-M2.7",
+                    input_micro_usd_per_million_tokens=1_000_000,
+                    output_micro_usd_per_million_tokens=2_000_000,
+                    active=True,
+                ),
+                LlmBudgetPolicy(
+                    name="test tenant LLM budget",
+                    tenant_key="default",
+                    daily_token_limit=100_000,
+                    monthly_token_limit=1_000_000,
+                    daily_cost_limit_micro_usd=100_000,
+                    monthly_cost_limit_micro_usd=1_000_000,
+                    enabled=True,
+                ),
+            ]
+        )
+        await session.commit()
+
     calls: list[list[dict[str, str]]] = []
     model_answer = "Manager approval is required [1]."
 
     class FakeClient:
-        provider = "qwen"
-        model = "qwen-plus"
-        configured = True
+        def __init__(
+            self,
+            provider: str,
+            model: str,
+            *,
+            configured: bool = True,
+        ) -> None:
+            self.provider = provider
+            self.model = model
+            self.configured = configured
+            self.close_calls = 0
 
         async def complete_chat(
             self,
@@ -2153,13 +3218,31 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
                 completion_tokens=8,
             )
 
-    async def fake_resolve(*_args: object, **_kwargs: object) -> FakeClient:
-        return FakeClient()
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            assert self.close_calls == 1
+
+    async def fake_resolve(
+        *_args: object,
+        provider: str | None = None,
+        **_kwargs: object,
+    ) -> FakeClient:
+        if provider is None:
+            return FakeClient("qwen", "qwen-plus")
+        if provider == "deepseek":
+            return FakeClient(
+                "deepseek",
+                "deepseek-chat",
+                configured=False,
+            )
+        return FakeClient("minimax", "MiniMax-M2.7")
 
     monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_resolve)
     payload = {"knowledge_base_id": knowledge_base_id, "message": "travel approval"}
     without_consent = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-without-consent"},
+        json=payload,
     )
     assert without_consent.status_code == 200
     assert without_consent.json()["mode"] == "retrieval"
@@ -2172,7 +3255,9 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
     )
     assert opted_in.status_code == 200
     generated = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "grounded-generation-e2e"},
+        json=payload,
     )
     assert generated.status_code == 200, generated.text
     assert generated.json()["mode"] == "rag"
@@ -2196,6 +3281,13 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         "reason": "semantic_verified",
     }
     assert len(calls) == 2
+    async with api_harness.session_factory() as session:
+        usage_rows = list(
+            (await session.scalars(select(LlmUsageRecord).order_by(LlmUsageRecord.operation))).all()
+        )
+    assert [row.operation for row in usage_rows] == ["chat.answer", "chat.review"]
+    assert all(row.status is LlmUsageStatus.SETTLED for row in usage_rows)
+    assert all(row.actual_token_count == 18 for row in usage_rows)
     llm_payload = json.loads(calls[0][1]["content"])
     assert llm_payload == {
         "question": "travel approval",
@@ -2211,7 +3303,9 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
 
     model_answer = "This answer cites a source that was never retrieved [99]."
     invalid_citation = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-invalid-citation"},
+        json=payload,
     )
     assert invalid_citation.status_code == 200, invalid_citation.text
     assert invalid_citation.json()["mode"] == "retrieval"
@@ -2225,7 +3319,9 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
 
     model_answer = "This answer contains no source marker."
     missing_citation = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-missing-citation"},
+        json=payload,
     )
     assert missing_citation.status_code == 200, missing_citation.text
     assert missing_citation.json()["mode"] == "retrieval"
@@ -2234,19 +3330,20 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
 
     model_answer = "The first paragraph is grounded [1].\n\nThe second paragraph is not."
     partially_cited = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-partially-cited"},
+        json=payload,
     )
     assert partially_cited.status_code == 200, partially_cited.text
     assert partially_cited.json()["mode"] == "retrieval"
     assert partially_cited.json()["source_status"]["reason"] == "missing_model_citations"
     assert "second paragraph" not in partially_cited.json()["answer"]
 
-    model_answer = (
-        "Manager approval is required [1].\n\n"
-        f"{fabricated_source_block}"
-    )
+    model_answer = f"Manager approval is required [1].\n\n{fabricated_source_block}"
     fabricated_sources = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-fabricated-sources"},
+        json=payload,
     )
     assert fabricated_sources.status_code == 200, fabricated_sources.text
     assert fabricated_sources.json()["mode"] == "retrieval"
@@ -2258,16 +3355,17 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         model = "qwen-plus"
         configured = False
 
-    async def fake_unconfigured_resolve(
-        *_args: object, **_kwargs: object
-    ) -> UnconfiguredClient:
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_unconfigured_resolve(*_args: object, **_kwargs: object) -> UnconfiguredClient:
         return UnconfiguredClient()
 
-    monkeypatch.setattr(
-        "app.services.chat.resolve_provider_client", fake_unconfigured_resolve
-    )
+    monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_unconfigured_resolve)
     unconfigured = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-provider-unconfigured"},
+        json=payload,
     )
     assert unconfigured.status_code == 200, unconfigured.text
     assert unconfigured.json()["source_status"] == {
@@ -2280,19 +3378,24 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
     async def fake_invalid_config_resolve(*_args: object, **_kwargs: object) -> None:
         raise LlmConfigurationError("credential_encryption_key_missing")
 
-    monkeypatch.setattr(
-        "app.services.chat.resolve_provider_client", fake_invalid_config_resolve
-    )
+    monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_invalid_config_resolve)
     invalid_config = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-provider-invalid-config"},
+        json=payload,
     )
     assert invalid_config.status_code == 200, invalid_config.text
     assert invalid_config.json()["source_status"]["reason"] == "provider_configuration_error"
+
+    provider_attempts = 0
 
     class FailingClient:
         provider = "qwen"
         model = "qwen-plus"
         configured = True
+
+        async def aclose(self) -> None:
+            return None
 
         async def complete_chat(
             self,
@@ -2301,7 +3404,9 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
             temperature: float = 0.2,
             max_tokens: int | None = None,
         ) -> LlmChatResult:
+            nonlocal provider_attempts
             del messages, temperature, max_tokens
+            provider_attempts += 1
             raise LlmProviderError(
                 "llm_upstream_error",
                 provider=self.provider,
@@ -2314,10 +3419,20 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
 
     monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_failing_resolve)
     provider_unavailable = await api_harness.client.post(
-        "/api/v1/chat/query", headers=headers, json=payload
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-provider-unavailable"},
+        json=payload,
     )
-    assert provider_unavailable.status_code == 200, provider_unavailable.text
-    assert provider_unavailable.json()["source_status"]["reason"] == "provider_unavailable"
+    assert provider_unavailable.status_code == 409, provider_unavailable.text
+    assert provider_unavailable.json()["error"]["code"] == "idempotency_outcome_unknown"
+    provider_unknown_retry = await api_harness.client.post(
+        "/api/v1/chat/query",
+        headers={**headers, "Idempotency-Key": "chat-provider-unavailable"},
+        json=payload,
+    )
+    assert provider_unknown_retry.status_code == 409, provider_unknown_retry.text
+    assert provider_unknown_retry.json()["error"]["code"] == "idempotency_outcome_unknown"
+    assert provider_attempts == 1
 
 
 @pytest.mark.asyncio
@@ -2346,7 +3461,10 @@ async def test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key(
         await api_harness.client.put(
             f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
             headers=admin_headers,
-            json={"grants": [{"role_id": role_id, "access_level": "reader"}]},
+            json={
+                "expected_version": 1,
+                "grants": [{"role_id": role_id, "access_level": "reader"}],
+            },
         )
     ).status_code == 200
     operator = await api_harness.client.post(
@@ -2368,9 +3486,7 @@ async def test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key(
         },
     )
     assert operator_login.status_code == 200
-    operator_headers = {
-        "Authorization": f"Bearer {operator_login.json()['access_token']}"
-    }
+    operator_headers = {"Authorization": f"Bearer {operator_login.json()['access_token']}"}
     issued = await api_harness.client.post(
         "/api/v1/api-keys",
         headers=operator_headers,
@@ -2415,3 +3531,807 @@ async def test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key(
         json={"query": "tenant"},
     )
     assert still_usable.status_code == 200, still_usable.text
+
+
+@pytest.mark.asyncio
+async def test_platform_upload_cap_applies_to_an_unlimited_admin_role(
+    api_harness: ApiHarness,
+) -> None:
+    async with api_harness.session_factory() as session:
+        role_limit = await session.scalar(
+            select(RoleLimit)
+            .join(LimitDefinition, LimitDefinition.id == RoleLimit.limit_definition_id)
+            .where(LimitDefinition.key == "max_upload_bytes")
+        )
+        assert role_limit is not None
+        role_limit.value = None
+        await session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_upload_bytes": 1_024,
+            "malware_scan_max_stream_bytes": 1_024,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        response = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            json={
+                "filename": "platform-capped.pdf",
+                "size_bytes": 1_025,
+                "idempotency_key": "platform-hard-cap-001",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "file_policy_violation"
+
+
+@pytest.mark.asyncio
+async def test_object_storage_stop_line_rejects_before_a_presigned_url_is_issued(
+    api_harness: ApiHarness,
+    tmp_path: Path,
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "storage_capacity_probe_path": tmp_path,
+            "storage_object_stop_bytes": 10,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        response = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            json={
+                "filename": "stop-line.pdf",
+                "size_bytes": 10,
+                "idempotency_key": "storage-stop-line-001",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == "object_storage_stop_line_reached"
+    assert api_harness.storage.initiated_keys == []
+
+
+@pytest.mark.asyncio
+async def test_file_count_quota_blocks_tiny_file_cardinality_amplification(
+    api_harness: ApiHarness,
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_files_per_user": 1,
+            "platform_max_files_total": 10,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        first = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "tiny-1.txt",
+                "size_bytes": 1,
+                "idempotency_key": "tiny-file-count-001",
+            },
+        )
+        second = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "tiny-2.txt",
+                "size_bytes": 1,
+                "idempotency_key": "tiny-file-count-002",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 429, second.text
+    assert second.json()["error"]["code"] == "quota_exceeded"
+    assert len(api_harness.storage.initiated_keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_multipart_storage_initiation_failure_is_idempotently_retryable(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    request = {
+        "filename": "retry-init.pdf",
+        "size_bytes": get_settings().multipart_threshold_bytes + 1,
+        "idempotency_key": "retry-storage-init-001",
+    }
+    original_initiate = api_harness.storage.initiate
+    attempts = 0
+
+    async def flaky_initiate(**kwargs: Any) -> InitiatedStorageUpload:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated object store outage")
+        return await original_initiate(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "initiate", flaky_initiate)
+    first = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json=request,
+    )
+    retried = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json=request,
+    )
+
+    assert first.status_code == 500
+    assert retried.status_code == 201, retried.text
+    upload_id = UUID(retried.json()["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        assert upload.status is UploadSessionStatus.INITIATED
+        assert upload.storage_upload_id == "multipart-123"
+
+
+@pytest.mark.asyncio
+async def test_abort_storage_failure_keeps_cleanup_retryable(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "retry-abort.pdf",
+            "size_bytes": get_settings().multipart_threshold_bytes + 1,
+            "idempotency_key": "retry-storage-abort-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+    original_abort = api_harness.storage.abort_multipart
+    attempts = 0
+
+    async def flaky_abort(**kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated object store outage")
+        await original_abort(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "abort_multipart", flaky_abort)
+    first = await api_harness.client.delete(
+        f"/api/v1/files/uploads/{upload_id}",
+        headers=headers,
+    )
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        assert upload.status is UploadSessionStatus.ABORTED
+        held_before_retry = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held_before_retry is not None
+    retried = await api_harness.client.delete(
+        f"/api/v1/files/uploads/{upload_id}",
+        headers=headers,
+    )
+
+    assert first.status_code == 500
+    assert retried.status_code == 204, retried.text
+    async with api_harness.session_factory() as session:
+        held_after_retry = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held_after_retry is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_abort_wins_over_inflight_multipart_completion(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    size = get_settings().multipart_threshold_bytes + 1
+    api_harness.storage.head_size = size
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "complete-abort-race.pdf",
+            "size_bytes": size,
+            "idempotency_key": "complete-abort-race-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload = initiated.json()
+    entered_storage = asyncio.Event()
+    release_storage = asyncio.Event()
+    original_complete = api_harness.storage.complete_multipart
+
+    async def delayed_complete(**kwargs: Any) -> None:
+        entered_storage.set()
+        await release_storage.wait()
+        await original_complete(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "complete_multipart", delayed_complete)
+    completion_task = asyncio.create_task(
+        api_harness.client.post(
+            f"/api/v1/files/uploads/{upload['upload_session_id']}/complete",
+            headers=headers,
+            json={
+                "parts": [
+                    {"part_number": number, "etag": f'"etag-{number}"'}
+                    for number in range(1, upload["part_count"] + 1)
+                ]
+            },
+        )
+    )
+    await asyncio.wait_for(entered_storage.wait(), timeout=2)
+    aborted = await api_harness.client.delete(
+        f"/api/v1/files/uploads/{upload['upload_session_id']}",
+        headers=headers,
+    )
+    release_storage.set()
+    completed = await asyncio.wait_for(completion_task, timeout=2)
+
+    assert aborted.status_code == 204, aborted.text
+    assert completed.status_code == 409, completed.text
+    assert completed.json()["error"]["code"] == "upload_state_conflict"
+    upload_id = UUID(upload["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(UploadSession, upload_id)
+        assert persisted is not None
+        assert persisted.status is UploadSessionStatus.ABORTED
+        held = await session.scalar(
+            select(QuotaReservation).where(
+                QuotaReservation.upload_session_id == upload_id,
+                QuotaReservation.status == ReservationStatus.HELD,
+            )
+        )
+        assert held is None
+    assert api_harness.storage.deleted_keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revocation_mode", "expected_status", "expected_error_code"),
+    [
+        ("remove_roles", 401, "token_revoked"),
+        ("disable_user", 401, "inactive_user"),
+        ("remove_knowledge_base_grant", 404, "knowledge_base_not_found"),
+    ],
+)
+async def test_concurrent_authorization_revocation_blocks_inflight_multipart_finalization(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    revocation_mode: str,
+    expected_status: int,
+    expected_error_code: str,
+) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=admin_headers,
+        json={"name": "Inflight upload revocation"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    knowledge_base_id = knowledge_base.json()["id"]
+    uploader_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "inflight_upload_editor",
+            "name": "Inflight Upload Editor",
+            "permission_codes": ["file:upload"],
+            "limits": {
+                "requests_per_minute": 1000,
+                "max_upload_bytes": 2_000_000_000,
+                "daily_upload_bytes": 2_000_000_000,
+                "storage_bytes": 2_000_000_000,
+            },
+        },
+    )
+    assert uploader_role.status_code == 201, uploader_role.text
+    role_id = uploader_role.json()["id"]
+    grant = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=admin_headers,
+        json={
+            "expected_version": 1,
+            "grants": [{"role_id": role_id, "access_level": "editor"}],
+        },
+    )
+    assert grant.status_code == 200, grant.text
+    created_user = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "inflight-uploader@example.com",
+            "password": "Inflight-uploader-password-123!",
+            "role_ids": [role_id],
+        },
+    )
+    assert created_user.status_code == 201, created_user.text
+    user = created_user.json()
+    uploader_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": "inflight-uploader@example.com",
+            "password": "Inflight-uploader-password-123!",
+        },
+    )
+    assert uploader_login.status_code == 200, uploader_login.text
+    uploader_headers = {
+        "Authorization": f"Bearer {uploader_login.json()['access_token']}",
+    }
+    size = get_settings().multipart_threshold_bytes + 1
+    api_harness.storage.head_size = size
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=uploader_headers,
+        json={
+            "filename": "revoked-during-finalization.pdf",
+            "size_bytes": size,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "inflight-role-revocation-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload = initiated.json()
+    entered_storage = asyncio.Event()
+    release_storage = asyncio.Event()
+    original_complete = api_harness.storage.complete_multipart
+
+    async def delayed_complete(**kwargs: Any) -> None:
+        entered_storage.set()
+        await release_storage.wait()
+        await original_complete(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "complete_multipart", delayed_complete)
+    completion_task = asyncio.create_task(
+        api_harness.client.post(
+            f"/api/v1/files/uploads/{upload['upload_session_id']}/complete",
+            headers=uploader_headers,
+            json={
+                "parts": [
+                    {"part_number": number, "etag": f'"etag-{number}"'}
+                    for number in range(1, upload["part_count"] + 1)
+                ]
+            },
+        )
+    )
+    await asyncio.wait_for(entered_storage.wait(), timeout=5)
+    if revocation_mode == "remove_roles":
+        revoked = await api_harness.client.put(
+            f"/api/v1/users/{user['id']}/roles",
+            headers=admin_headers,
+            json={
+                "expected_version": user["role_assignment_version"],
+                "role_ids": [],
+            },
+        )
+    elif revocation_mode == "disable_user":
+        revoked = await api_harness.client.patch(
+            f"/api/v1/users/{user['id']}",
+            headers=admin_headers,
+            json={"status": "disabled"},
+        )
+    else:
+        revoked = await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"expected_version": 2, "grants": []},
+        )
+    assert revoked.status_code == 200, revoked.text
+    release_storage.set()
+    completed = await asyncio.wait_for(completion_task, timeout=5)
+
+    assert completed.status_code == expected_status, completed.text
+    assert completed.json()["error"]["code"] == expected_error_code
+    assert api_harness.storage.deleted_keys
+    upload_id = UUID(upload["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(UploadSession, upload_id)
+        assert persisted is not None
+        reservations = list(
+            (
+                await session.scalars(
+                    select(QuotaReservation).where(QuotaReservation.upload_session_id == upload_id)
+                )
+            ).all()
+        )
+        assert persisted.status is UploadSessionStatus.FINALIZING
+        assert {item.status for item in reservations} == {ReservationStatus.HELD}
+
+
+@pytest.mark.asyncio
+async def test_platform_file_count_stop_line_is_global_and_precedes_storage_io(
+    api_harness: ApiHarness,
+) -> None:
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_files_per_user": 10,
+            "platform_max_files_total": 1,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        first = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "global-tiny-1.txt",
+                "size_bytes": 1,
+                "idempotency_key": "global-file-count-001",
+            },
+        )
+        second = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "global-tiny-2.txt",
+                "size_bytes": 1,
+                "idempotency_key": "global-file-count-002",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 507, second.text
+    assert second.json()["error"]["code"] == "platform_file_count_limit_reached"
+    assert len(api_harness.storage.initiated_keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_knowledge_entry_count_and_byte_caps_fail_closed(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Bounded manual entries"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    knowledge_base_id = knowledge_base.json()["id"]
+
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "platform_max_entries_per_knowledge_base": 1,
+            "platform_max_entry_bytes_per_knowledge_base": 5,
+        }
+    )
+    try:
+        first = await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+            headers=headers,
+            json={
+                "entry_type": "manual",
+                "title": "First",
+                "content": "12345",
+            },
+        )
+        count_denied = await api_harness.client.post(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+            headers=headers,
+            json={
+                "entry_type": "manual",
+                "title": "Second",
+                "content": "x",
+            },
+        )
+        bytes_denied = await api_harness.client.patch(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/entries/{first.json()['id']}",
+            headers=headers,
+            json={"content": "123456"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert first.status_code == 201, first.text
+    assert count_denied.status_code == 507, count_denied.text
+    assert count_denied.json()["error"]["code"] == "knowledge_entry_count_limit_reached"
+    assert bytes_denied.status_code == 507, bytes_denied.text
+    assert bytes_denied.json()["error"]["code"] == "knowledge_entry_bytes_limit_reached"
+
+
+async def _set_admin_storage_limit(
+    api_harness: ApiHarness,
+    *,
+    value: int | None,
+) -> None:
+    async with api_harness.session_factory() as session:
+        role_limit = await session.scalar(
+            select(RoleLimit)
+            .join(
+                LimitDefinition,
+                LimitDefinition.id == RoleLimit.limit_definition_id,
+            )
+            .join(Role, Role.id == RoleLimit.role_id)
+            .where(
+                LimitDefinition.key == "storage_bytes",
+                Role.code == "admin",
+            )
+        )
+        assert role_limit is not None
+        role_limit.value = value
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_manual_entry_storage_quota_charges_utf8_growth_without_shrink_refund(
+    api_harness: ApiHarness,
+) -> None:
+    await _set_admin_storage_limit(api_harness, value=7)
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "UTF-8 lifetime quota"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    entries_url = f"/api/v1/knowledge-bases/{knowledge_base.json()['id']}/entries"
+
+    created = await api_harness.client.post(
+        entries_url,
+        headers=headers,
+        json={"entry_type": "manual", "title": "Unicode", "content": "你a"},
+    )
+    assert created.status_code == 201, created.text
+
+    grown = await api_harness.client.patch(
+        f"{entries_url}/{created.json()['id']}",
+        headers=headers,
+        json={"content": "你abc"},
+    )
+    assert grown.status_code == 200, grown.text
+    shrunk = await api_harness.client.patch(
+        f"{entries_url}/{created.json()['id']}",
+        headers=headers,
+        json={"content": "你"},
+    )
+    assert shrunk.status_code == 200, shrunk.text
+
+    final_allowed = await api_harness.client.post(
+        entries_url,
+        headers=headers,
+        json={"entry_type": "manual", "title": "Last byte", "content": "x"},
+    )
+    assert final_allowed.status_code == 201, final_allowed.text
+    denied = await api_harness.client.post(
+        entries_url,
+        headers=headers,
+        json={"entry_type": "manual", "title": "Over quota", "content": "y"},
+    )
+    assert denied.status_code == 429, denied.text
+    error = denied.json()["error"]
+    assert error["code"] == "quota_exceeded"
+    assert error["message"] == "The requested operation exceeds the effective quota"
+    assert error["details"] == {"limit": 7, "remaining": 0, "requested": 1}
+
+    denied_growth = await api_harness.client.patch(
+        f"{entries_url}/{created.json()['id']}",
+        headers=headers,
+        json={"content": "你好"},
+    )
+    assert denied_growth.status_code == 429, denied_growth.text
+    assert denied_growth.json()["error"]["details"] == {
+        "limit": 7,
+        "remaining": 0,
+        "requested": 3,
+    }
+    unchanged = await api_harness.client.get(
+        f"{entries_url}/{created.json()['id']}",
+        headers=headers,
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["content"] == "你"
+
+    async with api_harness.session_factory() as session:
+        counter = await session.scalar(
+            select(QuotaCounter).where(QuotaCounter.limit_key == "storage_bytes")
+        )
+        assert counter is not None
+        # "你a" = 4 bytes, growth to "你abc" = +2, shrink = +0, final "x" = +1.
+        assert counter.used_value == 7
+        assert counter.reserved_value == 0
+        entries = list((await session.scalars(select(KnowledgeEntry))).all())
+        assert sorted(entry.title for entry in entries) == ["Last byte", "Unicode"]
+
+
+@pytest.mark.asyncio
+async def test_manual_entry_storage_charge_rolls_back_with_failed_entry_transaction(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _set_admin_storage_limit(api_harness, value=4)
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Atomic manual entry quota"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    entries_url = f"/api/v1/knowledge-bases/{knowledge_base.json()['id']}/entries"
+
+    original_add_audit_event = knowledge_base_routes.add_audit_event
+
+    def fail_audit_event(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("forced audit persistence failure")
+
+    monkeypatch.setattr(knowledge_base_routes, "add_audit_event", fail_audit_event)
+    failed = await api_harness.client.post(
+        entries_url,
+        headers=headers,
+        json={"entry_type": "manual", "title": "Rolled back", "content": "你"},
+    )
+    assert failed.status_code == 500, failed.text
+
+    async with api_harness.session_factory() as session:
+        assert (
+            await session.scalar(
+                select(QuotaCounter).where(QuotaCounter.limit_key == "storage_bytes")
+            )
+            is None
+        )
+        assert await session.scalar(select(func.count(KnowledgeEntry.id))) == 0
+
+    monkeypatch.setattr(knowledge_base_routes, "add_audit_event", original_add_audit_event)
+    retried = await api_harness.client.post(
+        entries_url,
+        headers=headers,
+        json={"entry_type": "manual", "title": "Committed", "content": "a"},
+    )
+    assert retried.status_code == 201, retried.text
+
+    monkeypatch.setattr(knowledge_base_routes, "add_audit_event", fail_audit_event)
+    failed_update = await api_harness.client.patch(
+        f"{entries_url}/{retried.json()['id']}",
+        headers=headers,
+        json={"content": "你a"},
+    )
+    assert failed_update.status_code == 500, failed_update.text
+
+    async with api_harness.session_factory() as session:
+        counter = await session.scalar(
+            select(QuotaCounter).where(QuotaCounter.limit_key == "storage_bytes")
+        )
+        assert counter is not None
+        assert counter.used_value == 1
+        entries = list((await session.scalars(select(KnowledgeEntry))).all())
+        assert [entry.title for entry in entries] == ["Committed"]
+        assert entries[0].content == "a"
+
+    monkeypatch.setattr(knowledge_base_routes, "add_audit_event", original_add_audit_event)
+    retried_update = await api_harness.client.patch(
+        f"{entries_url}/{retried.json()['id']}",
+        headers=headers,
+        json={"content": "你a"},
+    )
+    assert retried_update.status_code == 200, retried_update.text
+    async with api_harness.session_factory() as session:
+        counter = await session.scalar(
+            select(QuotaCounter).where(QuotaCounter.limit_key == "storage_bytes")
+        )
+        assert counter is not None
+        assert counter.used_value == 4
+
+
+@pytest.mark.asyncio
+async def test_unlimited_manual_entry_quota_still_obeys_platform_hard_cap(
+    api_harness: ApiHarness,
+) -> None:
+    await _set_admin_storage_limit(api_harness, value=None)
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Unlimited policy with platform stop line"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    entries_url = f"/api/v1/knowledge-bases/{knowledge_base.json()['id']}/entries"
+
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={"platform_max_entry_bytes_per_knowledge_base": 4}
+    )
+    try:
+        allowed = await api_harness.client.post(
+            entries_url,
+            headers=headers,
+            json={"entry_type": "manual", "title": "At cap", "content": "1234"},
+        )
+        denied = await api_harness.client.post(
+            entries_url,
+            headers=headers,
+            json={"entry_type": "manual", "title": "Past cap", "content": "x"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert allowed.status_code == 201, allowed.text
+    assert denied.status_code == 507, denied.text
+    assert denied.json()["error"]["code"] == "knowledge_entry_bytes_limit_reached"
+
+    async with api_harness.session_factory() as session:
+        counter = await session.scalar(
+            select(QuotaCounter).where(QuotaCounter.limit_key == "storage_bytes")
+        )
+        assert counter is not None
+        assert counter.used_value == 4
+
+
+@pytest.mark.asyncio
+async def test_bulk_watermark_stops_new_part_urls_for_an_existing_session(
+    api_harness: ApiHarness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacities = iter(
+        [
+            FilesystemCapacity(total_bytes=100, used_bytes=79, free_bytes=21),
+            FilesystemCapacity(total_bytes=100, used_bytes=80, free_bytes=20),
+        ]
+    )
+    monkeypatch.setattr(
+        FilesystemCapacity,
+        "from_path",
+        classmethod(lambda _cls, _path: next(capacities)),
+    )
+    app.dependency_overrides[get_settings] = lambda: get_settings().model_copy(
+        update={
+            "multipart_threshold_bytes": 1,
+            "storage_capacity_probe_path": tmp_path,
+        }
+    )
+    try:
+        tokens = await api_harness.login()
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        initiated = await api_harness.client.post(
+            "/api/v1/files/uploads",
+            headers=headers,
+            json={
+                "filename": "watermark.pdf",
+                "size_bytes": 6,
+                "idempotency_key": "storage-bulk-stop-001",
+            },
+        )
+        assert initiated.status_code == 201, initiated.text
+        response = await api_harness.client.post(
+            f"/api/v1/files/uploads/{initiated.json()['upload_session_id']}/parts",
+            headers=headers,
+            json={"part_numbers": [1]},
+        )
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 507
+    assert response.json()["error"]["code"] == "storage_bulk_uploads_paused"

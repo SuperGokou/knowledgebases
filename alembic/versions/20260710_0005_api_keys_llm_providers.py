@@ -62,9 +62,7 @@ def upgrade() -> None:
     op.create_index("ix_api_keys_key_prefix", "api_keys", ["key_prefix"], unique=False)
     op.create_index("ix_api_keys_revoked_at", "api_keys", ["revoked_at"], unique=False)
     op.create_index("ix_api_keys_user_id", "api_keys", ["user_id"], unique=False)
-    op.create_index(
-        "ix_api_keys_user_created", "api_keys", ["user_id", "created_at"], unique=False
-    )
+    op.create_index("ix_api_keys_user_created", "api_keys", ["user_id", "created_at"], unique=False)
 
     op.create_table(
         "llm_provider_configs",

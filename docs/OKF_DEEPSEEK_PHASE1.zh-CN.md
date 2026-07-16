@@ -4,8 +4,8 @@
 
 ## 当前能力边界
 
-- 仅把不超过 `KB_OKF_SOURCE_MAX_BYTES` 的 UTF-8 `.txt` / `.csv` 发送给 DeepSeek。
-- `.pdf`、Word、Excel、PowerPoint 等二进制格式标记为 `unsupported / parser_required`，等待后续隔离解析器；系统不会把二进制内容伪装成“已解析”。
+- 不超过 `KB_OKF_SOURCE_MAX_BYTES` 的 `.txt/.doc/.docx/.xls/.xlsx/.csv/.pdf/.ppt/.pptx` 均进入统一解析门；只有知识库显式允许外部处理时，解析后的有界文本才会发送给当前选定供应商。
+- TXT/CSV/DOCX/XLSX/PPTX 使用内建解析；PDF 和 DOC/XLS/PPT 只有在固定版本 Poppler、LibreOffice、bubblewrap 与 `prlimit` 全部通过能力预检时启用。能力缺失会标记为 `unsupported / parser_required`，不会把二进制内容伪装成“已解析”。
 - 每个知识库默认禁止外部 LLM 处理。知识库 Manager 必须明确设置 `external_llm_processing_enabled=true`；关闭后，未领取任务不会向第三方发送正文。
 - 模型输出先经过严格 Pydantic Schema 校验，禁止未知字段；空输出、截断输出和无效 JSON 都会重试。
 - 生成的 OKF 条目状态为 `draft`，普通读者、搜索与聊天均不可见。管理员批准源文件后，关联草稿才发布为 `published`。

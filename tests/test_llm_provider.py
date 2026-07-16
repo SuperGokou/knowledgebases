@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from types import TracebackType
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from app.db.base import Base
 from app.db.models import LlmProviderConfig
 from app.services.llm_provider import (
     LlmProviderError,
+    MeteringOutcome,
     OpenAICompatibleClient,
     OpenAICompatibleConfig,
 )
@@ -33,12 +35,16 @@ class StubAsyncClient:
     ) -> None:
         self._responses = responses
         self._calls = calls
+        self.closed = False
 
     async def __aenter__(self) -> StubAsyncClient:
         return self
 
     async def __aexit__(self, *_args: object) -> None:
         return None
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     async def post(
         self,
@@ -49,6 +55,34 @@ class StubAsyncClient:
     ) -> httpx.Response:
         self._calls.append((url, headers, json))
         return self._responses.pop(0)
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+    ) -> StubResponseStream:
+        assert method == "POST"
+        self._calls.append((url, headers, json))
+        return StubResponseStream(self._responses.pop(0))
+
+
+class StubResponseStream:
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self._response
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
 
 
 def _response(status_code: int, body: dict[str, Any]) -> httpx.Response:
@@ -63,6 +97,8 @@ def _response(status_code: int, body: dict[str, Any]) -> httpx.Response:
 async def test_openai_adapter_retries_json_mode_without_provider_specific_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://attacker.invalid:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://attacker.invalid:3128")
     calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
     responses = [
         _response(400, {"error": {"message": "response_format unsupported"}}),
@@ -87,10 +123,13 @@ async def test_openai_adapter_retries_json_mode_without_provider_specific_fields
         ),
     ]
     constructor_options: list[dict[str, Any]] = []
+    created_clients: list[StubAsyncClient] = []
 
     def client_factory(**kwargs: Any) -> StubAsyncClient:
         constructor_options.append(kwargs)
-        return StubAsyncClient(responses, calls)
+        client = StubAsyncClient(responses, calls)
+        created_clients.append(client)
+        return client
 
     monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
     client = OpenAICompatibleClient(
@@ -114,9 +153,39 @@ async def test_openai_adapter_retries_json_mode_without_provider_specific_fields
     assert "thinking" not in calls[0][2]
     assert "user_id" not in calls[0][2]
     assert "user" not in calls[0][2]
-    assert len(constructor_options) == 2
+    assert len(constructor_options) == 1
     assert all(item["follow_redirects"] is False for item in constructor_options)
+    assert all(item["trust_env"] is False for item in constructor_options)
     assert all(item["timeout"].connect == 10 for item in constructor_options)
+    await client.aclose()
+    assert created_clients[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_does_not_retry_ambiguous_validation_failure() -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        ),
+        _http=StubAsyncClient(
+            [_response(400, {"error": {"message": "input validation failed"}})],
+            calls,
+        ),
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.compile_okf("Refund policy", user_id="internal-user-id")
+
+    assert caught.value.code == "llm_upstream_error"
+    assert caught.value.metering_outcome is MeteringOutcome.NOT_STARTED
+    assert len(calls) == 1
+    await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -144,8 +213,166 @@ async def test_openai_adapter_reports_upstream_failure_without_response_body(
     assert caught.value.code == "llm_upstream_error"
     assert caught.value.upstream_status == 429
     assert caught.value.retryable is True
+    assert caught.value.metering_outcome is MeteringOutcome.NOT_STARTED
     assert "sensitive" not in str(caught.value)
     assert calls[0][0] == "https://api.minimax.io/v1/chat/completions"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_aborts_oversized_provider_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient(
+            [
+                httpx.Response(
+                    200,
+                    content=b"x" * 257,
+                    request=httpx.Request("POST", "https://provider.example/chat/completions"),
+                )
+            ],
+            calls,
+        )
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+            max_response_bytes=256,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "hello"}])
+
+    assert caught.value.code == "llm_response_too_large"
+    assert caught.value.retryable is False
+    assert caught.value.metering_outcome is MeteringOutcome.UNKNOWN
+    assert len(calls) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_treats_server_failure_as_unknown_metering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient([_response(503, {"error": {"message": "hidden"}})], calls)
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "hello"}])
+
+    assert caught.value.upstream_status == 503
+    assert caught.value.metering_outcome is MeteringOutcome.UNKNOWN
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_marks_bad_200_with_usage_as_known_metering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient(
+            [
+                _response(
+                    200,
+                    {
+                        "model": "qwen-plus",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "not-json"},
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 17, "completion_tokens": 3},
+                    },
+                )
+            ],
+            calls,
+        )
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.compile_okf("Refund policy", user_id="internal-user-id")
+
+    assert caught.value.code == "llm_invalid_output"
+    assert caught.value.metering_outcome is MeteringOutcome.KNOWN
+    assert caught.value.prompt_tokens == 17
+    assert caught.value.completion_tokens == 3
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_marks_malformed_200_as_unknown_metering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+    def client_factory(**_kwargs: Any) -> StubAsyncClient:
+        return StubAsyncClient(
+            [
+                httpx.Response(
+                    200,
+                    content=b"not-json",
+                    request=httpx.Request("POST", "https://provider.example/chat/completions"),
+                )
+            ],
+            calls,
+        )
+
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "hello"}])
+
+    assert caught.value.code == "llm_invalid_response"
+    assert caught.value.metering_outcome is MeteringOutcome.UNKNOWN
+    await client.aclose()
 
 
 @pytest.mark.parametrize(
@@ -157,14 +384,16 @@ async def test_openai_adapter_reports_upstream_failure_without_response_body(
         ("qwen", "https://workspace.us-east-1.maas.aliyuncs.com/compatible-mode/v1"),
     ],
 )
-def test_provider_base_url_allowlist(provider: str, url: str) -> None:
+def test_provider_base_url_allowlist(
+    provider: Literal["deepseek", "qwen", "minimax"], url: str
+) -> None:
     workspace_hosts = (
         ("workspace.us-east-1.maas.aliyuncs.com",)
         if "workspace.us-east-1.maas.aliyuncs.com" in url
         else ()
     )
     assert (
-        validate_provider_base_url(  # type: ignore[arg-type]
+        validate_provider_base_url(
             provider,
             url,
             qwen_workspace_hosts=workspace_hosts,
@@ -228,6 +457,7 @@ async def test_provider_resolution_without_rows_is_read_only() -> None:
         await connection.run_sync(Base.metadata.create_all)
     settings = Settings(
         environment="test",
+        llm_egress_mode="direct",
         llm_default_provider="qwen",
         qwen_api_key=SecretStr("qwen-environment-secret"),
     )
@@ -237,6 +467,149 @@ async def test_provider_resolution_without_rows_is_read_only() -> None:
         assert client.model == settings.qwen_model
         assert client.configured is True
         assert await session.scalar(select(func.count()).select_from(LlmProviderConfig)) == 0
+        await client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "expected_endpoint"),
+    (
+        ("deepseek", "http://llm-egress:8080/deepseek/chat/completions"),
+        (
+            "qwen",
+            "http://llm-egress:8080/qwen/compatible-mode/v1/chat/completions",
+        ),
+        ("minimax", "http://llm-egress:8080/minimax/v1/chat/completions"),
+    ),
+)
+async def test_controlled_gateway_maps_all_providers_to_fixed_internal_routes(
+    provider: str,
+    expected_endpoint: str,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="deepseek,qwen,minimax",
+        deepseek_api_key=SecretStr("deepseek-environment-secret"),
+        qwen_api_key=SecretStr("qwen-environment-secret"),
+        minimax_api_key=SecretStr("minimax-environment-secret"),
+    )
+
+    async with factory() as session:
+        client = await resolve_provider_client(session, settings, provider=provider)  # type: ignore[arg-type]
+        assert client._endpoint == expected_endpoint
+        assert await session.scalar(select(func.count()).select_from(LlmProviderConfig)) == 0
+        await client.aclose()
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_controlled_gateway_rejects_runtime_provider_outside_approval_set() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="deepseek",
+        qwen_api_key=SecretStr("qwen-environment-secret"),
+    )
+
+    async with factory() as session:
+        with pytest.raises(
+            LlmConfigurationError,
+            match="controlled_gateway_provider_not_approved",
+        ):
+            await resolve_provider_client(session, settings, provider="qwen")
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_controlled_gateway_rejects_noncanonical_qwen_region_url() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="qwen",
+        qwen_api_key=SecretStr("qwen-environment-secret"),
+        qwen_base_url="https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+    )
+
+    async with factory() as session:
+        with pytest.raises(LlmConfigurationError, match="controlled_gateway_provider_url"):
+            await resolve_provider_client(session, settings, provider="qwen")
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_controlled_gateway_preserves_the_logical_provider_url_in_database() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    logical_url = "https://api.minimax.io/v1"
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        deployment_profile="isolated",
+        llm_egress_mode="controlled_gateway",
+        llm_egress_gateway_url="http://llm-egress:8080",
+        llm_egress_approved_providers="minimax",
+        minimax_api_key=SecretStr("minimax-environment-secret"),
+    )
+
+    async with factory() as session:
+        row = LlmProviderConfig(
+            provider="minimax",
+            model="MiniMax-M2.7",
+            base_url=logical_url,
+            is_default=True,
+        )
+        session.add(row)
+        await session.flush()
+        client = await resolve_provider_client(session, settings, provider="minimax")
+        assert client._endpoint == "http://llm-egress:8080/minimax/v1/chat/completions"
+        assert row.base_url == logical_url
+        await client.aclose()
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_strict_offline_denies_resolution_with_legacy_enable_flag() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        llm_egress_mode="strict_offline",
+    )
+
+    async with factory() as session:
+        with pytest.raises(LlmConfigurationError, match="external_llm_disabled"):
+            await resolve_provider_client(session, settings)
+
     await engine.dispose()
 
 
@@ -244,7 +617,7 @@ async def test_provider_resolution_without_rows_is_read_only() -> None:
 async def test_provider_resolution_is_disabled_by_isolated_egress_policy() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    settings = Settings(environment="test", external_llm_enabled=False)
+    settings = Settings(environment="test")
 
     async with factory() as session:
         with pytest.raises(LlmConfigurationError, match="external_llm_disabled"):

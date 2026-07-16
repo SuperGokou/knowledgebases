@@ -8,7 +8,7 @@ import {
   setSessionCookies,
   type TokenPair,
 } from "@/lib/server/session";
-import { refreshSessionOnce } from "@/lib/server/session-refresh";
+import { refreshSessionOnce, refreshSessionStatus } from "@/lib/server/session-refresh";
 import type { AuthMe } from "@/lib/types";
 
 export const WORKSPACE_AUTHORIZED_HEADER = "x-kb-workspace-authorized";
@@ -184,23 +184,31 @@ export function workspaceEmail(headers: Headers): string | undefined {
   }
 }
 
-export function persistWorkspaceSession(
+export async function persistWorkspaceSession(
   response: NextResponse,
   request: NextRequest,
   session: AuthenticatedWorkspaceSession,
-): void {
+): Promise<void> {
   if (session.replacement) {
-    setSessionCookies(response, session.replacement, session.me.email, { resetFence: true });
+    if (
+      await refreshSessionStatus(session.replacement.refresh_token, request) === "active"
+    ) {
+      setSessionCookies(response, session.replacement, session.me.email);
+    }
   } else if (request.cookies.get(IDENTITY_COOKIE)?.value !== session.me.email) {
     setIdentityCookie(response, session.me.email);
   }
 }
 
-export function persistReplacementSession(
+export async function persistReplacementSession(
   response: NextResponse,
+  request: NextRequest,
   session: UnavailableWorkspaceSession,
-): void {
-  if (session.replacement) {
-    setSessionCookies(response, session.replacement, undefined, { resetFence: true });
+): Promise<void> {
+  if (
+    session.replacement
+    && await refreshSessionStatus(session.replacement.refresh_token, request) === "active"
+  ) {
+    setSessionCookies(response, session.replacement);
   }
 }

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/access-routing", async () => import("../src/lib/access-routing"));
 vi.mock("@/lib/server/backend", async () => import("../src/lib/server/backend"));
+vi.mock("@/lib/server/bounded-body", async () => import("../src/lib/server/bounded-body"));
 vi.mock("@/lib/server/same-origin", async () => import("../src/lib/server/same-origin"));
 vi.mock("@/lib/server/session", async () => import("../src/lib/server/session"));
 vi.mock("@/lib/server/client-ip", () => {
@@ -259,6 +260,39 @@ describe("POST /api/auth/login", () => {
     expect(response.status).toBe(503);
     expect((await response.json()).error.code).toBe("login_initialization_failed");
     expectNoSessionCookie(response);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized anonymous login body before JSON parsing or backend work", async () => {
+    const request = new NextRequest(`${APP_ORIGIN}/api/auth/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Host: "knowledge.example",
+        Origin: APP_ORIGIN,
+        "Sec-Fetch-Site": "same-origin",
+      },
+      body: JSON.stringify({
+        email: "member@example.com",
+        password: "x".repeat(20_000),
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(413);
+    expect((await response.json()).error.code).toBe("request_body_too_large");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized login identifiers without constructing an upstream form", async () => {
+    const response = await POST(loginRequest({
+      email: `${"a".repeat(321)}@example.com`,
+      password: "Correct-password-123!",
+    }));
+
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe("invalid_login");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,8 @@
 # 商业版代码审计与交付报告
 
+> [!CAUTION]
+> **历史快照，不代表当前候选版本。** 本报告冻结于 2026-07-11，正文中的功能缺口、部署区域、测试数量和发布判定只适用于当时审计范围。当前事实、门禁与发布结论以[企业终验标准](./ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md)、[企业文档中心](./README.zh-CN.md)及绑定当前 Git 身份和内容指纹的新签名验收证据为准；不得改写本历史正文来冒充当前证据。
+
 > 审计日期：2026-07-11<br>
 > 审计范围：FastAPI、Next.js BFF/前端、PostgreSQL/Supabase、Redis/Upstash、S3/COS、Vercel 部署与工程化门禁<br>
 > 结论：`DONE_WITH_CONCERNS`——可作为受控内部 Beta 运行；在下列 P1 门槛关闭前，不批准作为中国境内企业正式生产系统对外发布。
@@ -69,7 +72,7 @@
 
 ### P1-04 任务吞吐与文档解析
 
-当前 Vercel Hobby Cron 每日运行，默认 OKF 批量很小；只有 UTF-8 TXT/CSV 可以自动转换。必须改为事件队列 + 短事务租约 Worker + DLQ，Cron 只做漏单对账；PDF/Office 解析必须在有 CPU/内存/页数/解压比限制的沙箱中执行。
+当前 Vercel Hobby Cron 每日运行，默认 OKF 批量很小；九类格式的失败关闭解析代码已具备，但 PDF/旧版 Office 只有在固定 Linux 工具链和断网沙箱通过 `--require-all` 后才可启用。正式吞吐仍必须改为事件队列 + 短事务租约 Worker + DLQ，Cron 只做漏单对账，并在真实目标镜像验证 CPU/内存/页数/解压比限制。
 
 验收：上传后任务延迟、队列深度、失败重试、死信、积压恢复均有 SLO 和告警；所有声明支持的格式都有安全解析基准。
 

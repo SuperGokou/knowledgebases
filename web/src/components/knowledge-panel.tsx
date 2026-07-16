@@ -6,11 +6,20 @@ import { useAccess } from "@/components/access-provider";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
+import {
+  knowledgeCandidatePagePath,
+  mergeKnowledgeCandidates,
+  splitKnowledgeCandidatePage,
+} from "@/lib/knowledge-base-catalog";
 import type { KnowledgeBase } from "@/lib/types";
 
 export function KnowledgePanel() {
   const { can, canAny, loading: accessLoading } = useAccess();
   const [items, setItems] = useState<KnowledgeBase[] | null>(null);
+  const [query, setQuery] = useState("");
+  const [activeQuery, setActiveQuery] = useState("");
+  const [hasMore, setHasMore] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
   const [error, setError] = useState("");
   const [unavailable, setUnavailable] = useState(false);
   const [name, setName] = useState("");
@@ -19,15 +28,28 @@ export function KnowledgePanel() {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({
+    search = activeQuery,
+    offset = 0,
+    append = false,
+  }: { search?: string; offset?: number; append?: boolean } = {}) => {
     if (accessLoading) return;
     setError("");
     if (!canAny(["knowledge:read", "chat:query", "file:upload"])) {
       setItems([]);
+      setHasMore(false);
       return;
     }
+    setCatalogLoading(true);
     try {
-      setItems(await apiRequest<KnowledgeBase[]>("/api/v1/knowledge-bases"));
+      const response = await apiRequest<KnowledgeBase[]>(knowledgeCandidatePagePath({
+        offset,
+        query: search,
+        minimumAccessLevel: "reader",
+      }));
+      const page = splitKnowledgeCandidatePage(response);
+      setItems((current) => mergeKnowledgeCandidates(current ?? [], page.items, !append));
+      setHasMore(page.hasMore);
       setUnavailable(false);
     } catch (reason) {
       if (reason instanceof ApiClientError && [404, 501].includes(reason.status)) {
@@ -36,8 +58,10 @@ export function KnowledgePanel() {
       } else {
         setError(readableError(reason));
       }
+    } finally {
+      setCatalogLoading(false);
     }
-  }, [accessLoading, canAny]);
+  }, [accessLoading, activeQuery, canAny]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => void load(), 0);
@@ -60,7 +84,11 @@ export function KnowledgePanel() {
       setName("");
       setDescription("");
       setExternalProcessing(false);
-      if (canAny(["knowledge:read", "chat:query", "file:upload"])) await load();
+      setQuery("");
+      setActiveQuery("");
+      if (canAny(["knowledge:read", "chat:query", "file:upload"])) {
+        await load({ search: "", offset: 0, append: false });
+      }
       else setItems((current) => [...(current ?? []), created]);
     } catch (reason) {
       setError(readableError(reason));
@@ -101,7 +129,14 @@ export function KnowledgePanel() {
       <section className="panel">
         <div className="panel-header">
           <div><h2>知识空间</h2><p>按业务域组织知识与后续检索边界</p></div>
-          {!unavailable ? <StatusBadge tone="info">API 已连接</StatusBadge> : <StatusBadge tone="warning">等待后台 API</StatusBadge>}
+          <form className="toolbar" role="search" onSubmit={(event) => {
+            event.preventDefault();
+            setActiveQuery(query.trim());
+          }}>
+            <input aria-label="搜索知识空间" type="search" maxLength={200} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="按名称搜索全部知识空间" />
+            <button className="button secondary small" type="submit" disabled={catalogLoading}>搜索</button>
+            {!unavailable ? <StatusBadge tone="info">API 已连接</StatusBadge> : <StatusBadge tone="warning">等待后台 API</StatusBadge>}
+          </form>
         </div>
         {items === null && !error ? <LoadingRows count={3} /> : null}
         {items?.length ? (
@@ -130,6 +165,11 @@ export function KnowledgePanel() {
                 </StatusBadge>
               </div>
             ))}
+            {hasMore ? (
+              <button className="button secondary" type="button" disabled={catalogLoading} onClick={() => void load({ search: activeQuery, offset: items.length, append: true })}>
+                {catalogLoading ? "正在加载…" : "加载更多知识空间"}
+              </button>
+            ) : null}
           </div>
         ) : null}
         {items?.length === 0 ? (

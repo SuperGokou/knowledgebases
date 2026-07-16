@@ -120,7 +120,7 @@ export function AnswerSources({
           <header>
             <span><Icon name="file" /></span>
             <div>
-              <p>Source preview</p>
+              <p>来源预览</p>
               <h4>{selectedCitation.title || "未命名知识条目"}</h4>
             </div>
           </header>

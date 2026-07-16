@@ -18,6 +18,7 @@ const validReply = {
     columns: ["项目", "要求"],
     rows: [["发布", "必须先审批"]],
     citation_numbers: [1],
+    row_citation_numbers: [[1]],
   },
   citations: [
     {
@@ -45,38 +46,135 @@ describe("parseChatReply", () => {
   });
 
   it.each([
-    { ...validReply, citations: null },
-    { ...validReply, provider: { name: "deepseek" } },
+    "usage_governance_unavailable",
+    "usage_budget_exceeded",
+    "usage_metering_unavailable",
+    "duplicate_request",
+    "independent_reviewer_unavailable",
+  ] as const)("accepts the documented safe fallback reason %s", (reason) => {
+    const fallbackReply = {
+      ...validReply,
+      mode: "retrieval",
+      answer_review: { status: "fallback", reason: "retrieval_only" },
+      source_status: {
+        ...validReply.source_status,
+        strategy: "retrieval_fallback",
+        reason,
+      },
+    };
+
+    expect(parseChatReply(fallbackReply)).toEqual(fallbackReply);
+  });
+
+  it.each([
+    { caseName: "null citations", payload: { ...validReply, citations: null } },
     {
+      caseName: "object provider",
+      payload: { ...validReply, provider: { name: "deepseek" } },
+    },
+    {
+      caseName: "object citation source path",
+      payload: {
       ...validReply,
       citations: [{ ...validReply.citations[0], source_path: { unsafe: true } }],
+      },
     },
     {
-      ...validReply,
-      source_status: { ...validReply.source_status, citation_count: 9 },
+      caseName: "citation count mismatch",
+      payload: {
+        ...validReply,
+        source_status: { ...validReply.source_status, citation_count: 9 },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, rows: [["缺少第二列"]] },
+      caseName: "table row width mismatch",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, rows: [["缺少第二列"]] },
+      },
     },
     {
-      ...validReply,
-      table: { ...validReply.table, citation_numbers: [99] },
+      caseName: "unknown table citation",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, citation_numbers: [99] },
+      },
     },
     {
-      ...validReply,
-      answer_review: { status: "passed", reason: "retrieval_only" },
+      caseName: "missing table row citations",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, row_citation_numbers: [] },
+      },
     },
     {
-      ...validReply,
-      answer_review: { status: "unknown", reason: "semantic_verified" },
+      caseName: "unknown table row citation",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, row_citation_numbers: [[99]] },
+      },
     },
-  ])("rejects malformed successful JSON before React renders it", (payload) => {
+    {
+      caseName: "duplicate table row citation",
+      payload: {
+        ...validReply,
+        table: { ...validReply.table, row_citation_numbers: [[1, 1]] },
+      },
+    },
+    {
+      caseName: "invalid passed review reason",
+      payload: {
+        ...validReply,
+        answer_review: { status: "passed", reason: "retrieval_only" },
+      },
+    },
+    {
+      caseName: "unknown review status",
+      payload: {
+        ...validReply,
+        answer_review: { status: "unknown", reason: "semantic_verified" },
+      },
+    },
+  ])(
+    "rejects malformed successful JSON before React renders it: $caseName",
+    ({ payload }) => {
     expect(() => parseChatReply(payload)).toThrowError(ApiClientError);
     try {
       parseChatReply(payload);
     } catch (error) {
       expect(error).toMatchObject({ status: 502, code: "invalid_chat_response" });
     }
+    },
+  );
+
+  it("accepts the pre-upgrade table contract without a row evidence map", () => {
+    const legacyTable = { ...validReply.table };
+    delete (legacyTable as Partial<typeof validReply.table>).row_citation_numbers;
+
+    expect(parseChatReply({ ...validReply, table: legacyTable })).toEqual({
+      ...validReply,
+      table: legacyTable,
+    });
+  });
+
+  it("rejects a multi-source table when the row map does not use every declared source", () => {
+    const secondCitation = {
+      ...validReply.citations[0],
+      entry_id: "00000000-0000-4000-8000-000000000003",
+      citation_number: 2,
+      marker: "[2]",
+    };
+    const payload = {
+      ...validReply,
+      citations: [...validReply.citations, secondCitation],
+      table: {
+        ...validReply.table,
+        citation_numbers: [1, 2],
+        row_citation_numbers: [[1]],
+      },
+      source_status: { ...validReply.source_status, citation_count: 2 },
+    };
+
+    expect(() => parseChatReply(payload)).toThrowError(ApiClientError);
   });
 });

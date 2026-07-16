@@ -1,8 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { isAllowedBackendPath } from "../src/lib/server/backend-path";
+import { backendAcceptHeader, isAllowedBackendPath } from "../src/lib/server/backend-path";
 
 describe("isAllowedBackendPath", () => {
+  it("selects CSV only for the exact GET audit export route", () => {
+    expect(backendAcceptHeader(["api", "v1", "audit-logs", "export"], "GET"))
+      .toBe("text/csv");
+    expect(backendAcceptHeader(["api", "v1", "audit-logs"], "GET"))
+      .toBe("application/json");
+    expect(backendAcceptHeader(["api", "v1", "audit-logs", "export", "extra"], "GET"))
+      .toBe("application/json");
+    expect(backendAcceptHeader(["api", "v1", "audit-logs", "export"], "POST"))
+      .toBe("application/json");
+    expect(backendAcceptHeader(["api", "v1", "files", "export"], "GET"))
+      .toBe("application/json");
+  });
+
   it.each([
     "files",
     "users",
@@ -13,6 +26,7 @@ describe("isAllowedBackendPath", () => {
     "chat",
     "api-keys",
     "llm",
+    "audit-logs",
   ])("allows the canonical %s API root", (root) => {
     const parts = ["api", "v1", root, "resource_01"];
     expect(isAllowedBackendPath(parts, "GET", `/api/backend/${parts.join("/")}`)).toBe(true);
@@ -34,6 +48,15 @@ describe("isAllowedBackendPath", () => {
       "POST",
       "/api/backend/api/v1/auth/me",
     )).toBe(false);
+  });
+
+  it("allows the canonical user-retirement DELETE path through the BFF", () => {
+    const parts = ["api", "v1", "users", "00000000-0000-4000-8000-000000000401"];
+    expect(isAllowedBackendPath(
+      parts,
+      "DELETE",
+      `/api/backend/${parts.join("/")}`,
+    )).toBe(true);
   });
 
   it.each([

@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile the Jiangsu Heyi offline knowledge base after interrupted cutovers
+After=docker.service
+
+[Timer]
+# Keep this timer independent from the oneshot service.  A failed recovery
+# attempt must not stop the timer; OnUnitInactiveSec schedules the next retry.
+OnBootSec=5s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=heyi-kb-offline-reconcile.service
+
+[Install]
+WantedBy=timers.target

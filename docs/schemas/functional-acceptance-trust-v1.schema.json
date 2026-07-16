@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:heyi:functional-acceptance-trust:v1",
+  "$defs": {
+    "keyStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "keys"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "keys": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["collector_id", "key_id", "public_key_base64"],
+            "properties": {
+              "collector_id": {"type": "string", "minLength": 1},
+              "key_id": {"type": "string", "minLength": 1},
+              "public_key_base64": {"type": "string", "minLength": 44, "maxLength": 44}
+            }
+          }
+        }
+      }
+    },
+    "challenge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "challenge_id", "evidence_id", "nonce", "issued_at", "expires_at", "status", "target"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "challenge_id": {"type": "string", "minLength": 16},
+        "evidence_id": {"type": "string", "pattern": "^EXT-[A-Z0-9-]+$"},
+        "nonce": {"type": "string", "minLength": 32},
+        "issued_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "status": {"const": "issued"},
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["git_head", "content_fingerprint", "run_id"],
+          "properties": {
+            "git_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+            "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"},
+            "deployment": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "release_id",
+                "offline_contract_sha256",
+                "image_manifest_sha256",
+                "base_url",
+                "host_identity"
+              ],
+              "properties": {
+                "release_id": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+                "offline_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "image_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "base_url": {"type": "string", "pattern": "^https://[^/?#]+$"},
+                "host_identity": {"type": "string", "pattern": "^[A-Za-z0-9.:-]{1,253}$"}
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "evidence_id": {
+                "enum": ["EXT-BROWSER-E2E-001", "EXT-LINUX-HOST-001"]
+              }
+            }
+          },
+          "then": {"properties": {"target": {"required": ["deployment"]}}}
+        }
+      ]
+    }
+  },
+  "oneOf": [{"$ref": "#/$defs/keyStore"}, {"$ref": "#/$defs/challenge"}]
+}

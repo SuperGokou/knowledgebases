@@ -6,6 +6,7 @@ import { useAccess } from "@/components/access-provider";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { apiRequest, readableError } from "@/lib/api-client";
+import { buildProviderUpdate, microUsdToUsd } from "@/lib/model-settings";
 import type { LlmProviderName, LlmProviderSettings, LlmProvidersResponse } from "@/lib/types";
 
 const providerMeta: Record<LlmProviderName, { label: string; short: string; description: string }> = {
@@ -21,6 +22,8 @@ export function ModelSettingsPanel() {
   const [model, setModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [inputPriceUsd, setInputPriceUsd] = useState("");
+  const [outputPriceUsd, setOutputPriceUsd] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [pending, setPending] = useState(false);
@@ -30,6 +33,8 @@ export function ModelSettingsPanel() {
     setModel(provider.model);
     setBaseUrl(provider.base_url);
     setApiKey("");
+    setInputPriceUsd(microUsdToUsd(provider.input_micro_usd_per_million_tokens));
+    setOutputPriceUsd(microUsdToUsd(provider.output_micro_usd_per_million_tokens));
     setSuccess("");
   }
 
@@ -50,6 +55,8 @@ export function ModelSettingsPanel() {
         setModel(first.model);
         setBaseUrl(first.base_url);
         setApiKey("");
+        setInputPriceUsd(microUsdToUsd(first.input_micro_usd_per_million_tokens));
+        setOutputPriceUsd(microUsdToUsd(first.output_micro_usd_per_million_tokens));
       }
     } catch (reason) {
       setError(readableError(reason));
@@ -70,12 +77,13 @@ export function ModelSettingsPanel() {
     setError("");
     setSuccess("");
     try {
-      const payload: Record<string, string | boolean> = {
-        model: model.trim(),
-        base_url: baseUrl.trim(),
-        make_default: true,
-      };
-      if (apiKey.trim()) payload.api_key = apiKey.trim();
+      const payload = buildProviderUpdate({
+        model,
+        baseUrl,
+        apiKey,
+        inputPriceUsd,
+        outputPriceUsd,
+      });
       const updated = await apiRequest<LlmProviderSettings>(`/api/v1/llm/providers/${selected}`, {
         method: "PATCH",
         body: JSON.stringify(payload),
@@ -86,6 +94,8 @@ export function ModelSettingsPanel() {
       setModel(updated.model);
       setBaseUrl(updated.base_url);
       setApiKey("");
+      setInputPriceUsd(microUsdToUsd(updated.input_micro_usd_per_million_tokens));
+      setOutputPriceUsd(microUsdToUsd(updated.output_micro_usd_per_million_tokens));
       setSuccess(`已切换到 ${providerMeta[updated.provider].label}，新请求将使用 ${updated.model}。`);
     } catch (reason) {
       setError(readableError(reason));
@@ -141,6 +151,14 @@ export function ModelSettingsPanel() {
               <div className="form-grid">
                 <label>模型名称<input value={model} maxLength={100} onChange={(event) => setModel(event.target.value)} placeholder="例如：qwen-plus" required /></label>
                 <label>API Base URL<input type="url" value={baseUrl} maxLength={500} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" required /></label>
+                <label>输入价格（美元 / 百万 Token）
+                  <input inputMode="decimal" value={inputPriceUsd} onChange={(event) => setInputPriceUsd(event.target.value)} placeholder="例如：0.8" required />
+                  <span className="field-hint">用于请求前成本预留，最多保留 6 位小数。</span>
+                </label>
+                <label>输出价格（美元 / 百万 Token）
+                  <input inputMode="decimal" value={outputPriceUsd} onChange={(event) => setOutputPriceUsd(event.target.value)} placeholder="例如：2" required />
+                  <span className="field-hint">价格以微美元整数存储，避免浮点误差。</span>
+                </label>
                 <label className="full">供应商 API Key
                   <input type="password" value={apiKey} autoComplete="new-password" onChange={(event) => setApiKey(event.target.value)} placeholder={current.configured ? "已配置 · 留空表示保持不变" : "输入供应商 API Key"} required={!current.configured} />
                   <span className="field-hint">密钥提交后加密保存，此页面永远不会回显已有明文。留空不会覆盖已配置密钥。</span>

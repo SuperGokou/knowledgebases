@@ -40,12 +40,17 @@ class ChatSourceStatus(BaseModel):
         "provider_unconfigured",
         "provider_configuration_error",
         "provider_unavailable",
+        "usage_governance_unavailable",
+        "usage_budget_exceeded",
+        "usage_metering_unavailable",
+        "duplicate_request",
         "missing_model_citations",
         "invalid_model_citations",
         "invalid_model_response",
         "answer_review_rejected",
         "answer_review_unavailable",
         "answer_review_invalid",
+        "independent_reviewer_unavailable",
         "no_matching_content",
     ]
     citation_count: int = Field(ge=0)
@@ -58,6 +63,7 @@ class ChatDataTable(BaseModel):
     columns: list[str] = Field(min_length=1, max_length=8)
     rows: list[list[str]] = Field(min_length=1, max_length=50)
     citation_numbers: list[int] = Field(min_length=1, max_length=20)
+    row_citation_numbers: list[list[int]] | None = Field(default=None, max_length=50)
 
     @field_validator("title")
     @classmethod
@@ -87,6 +93,32 @@ class ChatDataTable(BaseModel):
         if len(set(self.citation_numbers)) != len(self.citation_numbers):
             raise ValueError("table citation numbers must be unique")
         self.rows = [[cell.strip() for cell in row] for row in self.rows]
+
+        # Normalize legacy single-source payloads. A missing map on a historic
+        # multi-source replay remains readable as table-level provenance, while the
+        # live generation parser rejects it before it can become a new answer.
+        if self.row_citation_numbers is None:
+            if len(self.citation_numbers) == 1:
+                self.row_citation_numbers = [self.citation_numbers.copy() for _ in self.rows]
+            return self
+        if len(self.row_citation_numbers) != len(self.rows):
+            raise ValueError("every table row must have a citation mapping")
+
+        table_sources = set(self.citation_numbers)
+        mapped_sources: set[int] = set()
+        for row_sources in self.row_citation_numbers:
+            if not row_sources or len(row_sources) > 20:
+                raise ValueError("every table row must cite 1 to 20 sources")
+            if any(number < 1 for number in row_sources):
+                raise ValueError("row citation numbers must be positive")
+            if len(set(row_sources)) != len(row_sources):
+                raise ValueError("row citation numbers must be unique")
+            if not set(row_sources).issubset(table_sources):
+                raise ValueError("row citations must be declared as table citations")
+            mapped_sources.update(row_sources)
+        if mapped_sources != table_sources:
+            raise ValueError("table citations must exactly match the row citation mappings")
+
         return self
 
 

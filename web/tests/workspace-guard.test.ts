@@ -135,7 +135,33 @@ describe("authoritative workspace proxy guard", () => {
     expect(response.headers.get("x-middleware-next")).toBeNull();
   });
 
-  it("single-flights concurrent refreshes and writes the rotated pair to every response", async () => {
+  it("renders the audit console only after the live profile grants audit:read", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(authMe(["audit:read"])));
+
+    const response = await proxy(workspaceRequest("/admin/audit", {
+      kb_access: "valid-access-token",
+      kb_refresh: "valid-refresh-token",
+    }));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-middleware-next")).toBe("1");
+    expect(response.headers.get("x-middleware-request-x-kb-workspace-authorized")).toBe("v1");
+  });
+
+  it("fails closed before rendering the audit console for an unrelated role", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(authMe(["chat:query"])));
+
+    const response = await proxy(workspaceRequest("/admin/audit", {
+      kb_access: "valid-access-token",
+      kb_refresh: "valid-refresh-token",
+    }));
+
+    expect(response.status).toBe(307);
+    expect(new URL(response.headers.get("location")!).pathname).toBe("/chat");
+    expect(response.headers.get("x-middleware-next")).toBeNull();
+  });
+
+  it("serializes concurrent refreshes without fanning one rotated credential pair to both responses", async () => {
     let oldMeCalls = 0;
     let refreshCalls = 0;
     let releaseRefresh: ((response: Response) => void) | undefined;
@@ -161,6 +187,9 @@ describe("authoritative workspace proxy guard", () => {
         refreshCalls += 1;
         return refreshResponse;
       }
+      if (url.endsWith("/api/v1/auth/refresh/status")) {
+        return new Response(null, { status: 204 });
+      }
       throw new Error(`Unexpected backend request: ${url}`);
     });
 
@@ -175,18 +204,17 @@ describe("authoritative workspace proxy guard", () => {
 
     expect(oldMeCalls).toBe(2);
     expect(refreshCalls).toBe(1);
-    // Both requests re-check the authoritative principal, but the one-time
-    // refresh-token rotation itself is shared across Proxy and BFF callers.
     expect(fetchMock).toHaveBeenCalledTimes(5);
-    for (const response of [first, second]) {
-      expect(response.headers.get("x-middleware-next")).toBe("1");
-      expect(setCookieHeader(response)).toContain(
-        "kb_access=replacement-access-token",
-      );
-      expect(setCookieHeader(response)).toContain(
-        "kb_refresh=replacement-refresh-token",
-      );
-    }
+    expect([first.status, second.status].sort()).toEqual([200, 502]);
+    const successful = first.status === 200 ? first : second;
+    const rejected = first.status === 502 ? first : second;
+    expect(successful.headers.get("x-middleware-next")).toBe("1");
+    expect(setCookieHeader(successful)).toContain("kb_access=replacement-access-token");
+    expect(setCookieHeader(successful)).toContain("kb_refresh=replacement-refresh-token");
+    expect(setCookieHeader(rejected)).toBe("");
+    // Refresh persistence must never clear a newer logout fence. Only a fresh
+    // successful login is allowed to reset that generation barrier.
+    expect(setCookieHeader(successful)).not.toContain("kb_session_fence=;");
   });
 
   it("fails closed without clearing a potentially valid session when the backend is unavailable", async () => {

@@ -1,0 +1,9 @@
+# Reviewed false positives pinned to immutable historical fingerprints.
+# These entries cover test idempotency labels, test-only HMAC fixtures, and
+# source code that validates PEM boundary markers. New findings still fail.
+6c7e16425b4ffa082cdd9e16d7e3a4846d1d5ae4:tests/test_integration_api.py:generic-api-key:1000
+6c7e16425b4ffa082cdd9e16d7e3a4846d1d5ae4:scripts/acceptance.py:generic-api-key:967
+6c7e16425b4ffa082cdd9e16d7e3a4846d1d5ae4:web/e2e/support/evidence-reporter.ts:private-key:518
+f18b0a4a8127371b52419337ce0e44898afafb47:web/tests/bff-route.test.ts:generic-api-key:18
+1104331428f268a55aba958b00821d39ff41a334:web/tests/client-ip-signing.test.ts:generic-api-key:8
+c064096d7186a862c481704826e9de5c76e266df:tests/test_integration_api.py:generic-api-key:754

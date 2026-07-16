@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "policy_id": "heyi-functional-acceptance-v1",
+  "manifest_standard": "docs/FUNCTIONAL_ACCEPTANCE_STANDARD.zh-CN.md",
+  "required_requirement_ids": [
+    "FUNC-AUTH-001", "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001",
+    "FUNC-KB-ACL-001", "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001",
+    "FUNC-APIKEY-001", "FUNC-AUDIT-001", "FUNC-UXSTATE-001", "FUNC-HEALTH-001",
+    "FUNC-FORMAT-001", "FUNC-OFFLINE-001"
+  ],
+  "required_external_evidence_ids": ["EXT-BROWSER-E2E-001", "EXT-LINUX-HOST-001"],
+  "internal_gate_bindings": [
+    {
+      "gate_id": "TOKEN-GOV-P0-001",
+      "evidence_kind": "postgres-acceptance",
+      "test_discovery": "KB_TEST_POSTGRES_URL|KB_TEST_MIGRATION_POSTGRES_URL",
+      "required_checks": [
+        "real_migrations", "budget_concurrency", "idempotency_single_winner",
+        "malware_scan_lease", "rbac_acl_revocation_concurrency", "acl_cas_concurrency",
+        "rbac_mutation_lock_order", "role_policy_cas_concurrency",
+        "bootstrap_rbac_cas_linearization", "manual_entry_storage_quota_concurrency",
+        "refresh_token_rotation", "audit_append_only_runtime_role", "isolated_migration_0011",
+        "chat_idempotency_concurrency", "chat_outcome_unknown_fail_closed",
+        "chat_replay_lineage_upgrade", "knowledge_content_revision_trigger",
+        "credential_family_idempotency_upgrade", "rag_retrieval_quality",
+        "user_retirement_linearization", "last_superuser_linearization",
+        "api_key_retirement_linearization"
+      ]
+    }
+  ],
+  "runners": {
+    "backend-functional": {
+      "framework": "pytest",
+      "minimum_passed_tests": 434,
+      "covers": [
+        "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-KB-ACL-001",
+        "FUNC-FILE-001", "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001",
+        "FUNC-AUDIT-001", "FUNC-HEALTH-001", "FUNC-FORMAT-001", "FUNC-OFFLINE-001"
+      ],
+      "required_test_nodes": [
+        "tests/test_integration_api.py::test_admin_role_user_and_refresh_workflow",
+        "tests/test_user_role_cas.py",
+        "tests/test_user_password_reset.py",
+        "tests/test_admin_list_pagination.py",
+        "tests/test_role_delete.py",
+        "tests/test_role_catalog_pagination.py",
+        "tests/test_integration_api.py::test_single_upload_approval_and_download_workflow",
+        "tests/test_integration_api.py::test_malware_scan_failures_remain_quarantined_and_inaccessible",
+        "tests/test_integration_api.py::test_file_approval_follows_latest_okf_job_state",
+        "tests/test_integration_api.py::test_multipart_upload_signs_batches_and_completes",
+        "tests/test_integration_api.py::test_readiness_uses_database_and_redis",
+        "tests/test_integration_api.py::test_knowledge_base_chat_demo_and_acl_boundaries",
+        "tests/test_integration_api.py::test_revoked_knowledge_grant_removes_file_and_upload_access",
+        "tests/test_integration_api.py::test_knowledge_grant_cas_rejects_stale_writes_without_side_effects",
+        "tests/test_knowledge_grant_cas.py",
+        "tests/test_integration_api.py::test_scoped_api_key_lifecycle_and_public_endpoints",
+        "tests/test_chat_idempotency.py",
+        "tests/test_integration_api.py::test_non_superuser_cannot_issue_api_key_for_another_account",
+        "tests/test_integration_api.py::test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed",
+        "tests/test_integration_api.py::test_chat_generation_requires_kb_opt_in_and_reports_selected_model",
+        "tests/test_integration_api.py::test_non_superuser_cannot_list_issue_or_revoke_another_users_api_key",
+        "tests/test_integration_api.py::test_atomic_role_policy_replaces_both_halves_or_neither",
+        "tests/test_integration_api.py::test_all_role_policy_mutations_keep_identical_snapshots_side_effect_free",
+        "tests/test_role_policy.py", "tests/test_domain_access.py", "tests/test_domain_quota.py",
+        "tests/test_role_quota_routes.py",
+        "tests/test_integration_api.py::test_manual_entry_storage_quota_charges_utf8_growth_without_shrink_refund",
+        "tests/test_integration_api.py::test_manual_entry_storage_charge_rolls_back_with_failed_entry_transaction",
+        "tests/test_integration_api.py::test_unlimited_manual_entry_quota_still_obeys_platform_hard_cap",
+        "tests/test_okf_conversion.py", "tests/test_chat_answer_review.py", "tests/test_chat_presentation.py",
+        "tests/test_audit_logs_api.py", "tests/test_audit_result_persistence.py",
+        "tests/test_api_contract.py::test_liveness_endpoint_does_not_require_dependencies",
+        "tests/test_api_contract.py::test_readiness_rejects_database_schema_drift",
+        "tests/test_api_contract.py::test_openapi_requires_bounded_log_safe_chat_idempotency_keys",
+        "tests/test_host_preflight.py", "tests/test_offline_compose.py", "tests/test_document_parser.py",
+        "tests/test_document_parser_preflight.py", "tests/test_okf_document_pipeline.py",
+        "tests/test_api_key_catalog_pagination.py",
+        "tests/test_supply_chain_gate.py",
+        "tests/test_user_retirement.py",
+        "tests/test_user_retirement_migration.py",
+        "tests/test_user_activity_locking.py",
+        "tests/test_legacy_offline_adoption.py",
+        "tests/test_offline_adoption_transaction.py",
+        "tests/test_offline_crash_recovery.py",
+        "tests/test_offline_pre_migration_abort.py",
+        "tests/test_legacy_adoption_document_contract.py",
+        "tests/test_linux_host_evidence_collector.py"
+      ]
+    },
+    "frontend-functional": {
+      "framework": "vitest",
+      "minimum_passed_tests": 182,
+      "covers": [
+        "FUNC-AUTH-001", "FUNC-ACCOUNT-001", "FUNC-RBAC-001", "FUNC-LIMIT-001", "FUNC-FILE-001",
+        "FUNC-CHAT-001", "FUNC-MODEL-001", "FUNC-APIKEY-001", "FUNC-AUDIT-001",
+        "FUNC-UXSTATE-001"
+      ],
+      "required_test_nodes": [
+        "tests/access-routing.test.ts", "tests/login-route.test.ts", "tests/workspace-guard.test.ts",
+        "tests/role-policy.test.ts", "tests/user-role-assignment.test.ts",
+        "tests/user-password-reset.test.ts", "tests/role-administration.test.ts",
+        "tests/admin-list-pagination-contract.test.ts", "tests/role-catalog.test.ts",
+        "tests/knowledge-grant-assignment.test.ts", "tests/chat-contract.test.ts",
+        "tests/chat-sources.test.ts",
+        "tests/chat-data-table.test.ts", "tests/model-settings.test.ts", "tests/api-usage-examples.test.ts",
+        "tests/error-reporting.test.ts", "tests/access-provider.test.ts", "tests/chat-service-status.test.ts",
+        "tests/file-knowledge-status.test.ts",
+        "tests/user-retirement.test.ts",
+        "tests/audit-log-console.test.ts",
+        "tests/file-approval.test.ts"
+      ]
+    }
+  },
+  "external_collectors": {
+    "EXT-BROWSER-E2E-001": {"collector_id": "heyi-browser-e2e", "key_id": "browser-e2e-ed25519"},
+    "EXT-LINUX-HOST-001": {"collector_id": "heyi-linux-host", "key_id": "linux-host-ed25519"}
+  },
+  "external_test_collections": {
+    "EXT-BROWSER-E2E-001": {
+      "expected_collected_tests": 26,
+      "required_projects": ["enterprise-desktop", "enterprise-mobile"],
+      "required_test_titles": [
+        "@enterprise preflight 真实前端、API 与故障控制面必须可达",
+        "@enterprise TLS validates trusted identity and short-lived certificate renewal architecture",
+        "@enterprise unified login routes accounts by effective role",
+        "@enterprise account lifecycle rejects duplicates and revokes active access",
+        "@enterprise password reset enforces scope and revokes old credentials and sessions",
+        "@enterprise role administration edits and deletes safely under references and concurrency",
+        "@enterprise knowledge grants are visible then fail closed immediately after revocation",
+        "@enterprise all nine document formats complete scan, OKF, approval, retrieval and cited chat",
+        "@enterprise chat renders citations, no-answer, audited rejection and sourced table",
+        "@enterprise configured model switches and provider failure degrades safely",
+        "@enterprise API key enforces knowledge scope, rate limit and revocation",
+        "@enterprise audit query, pagination, CSV export and permission revocation fail closed",
+        "@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly"
+      ]
+    }
+  }
+}

@@ -97,3 +97,48 @@ async def test_chinese_contact_query_ranks_specific_contact_content_and_focuses_
         assert all(hit.entry_id != platform_entry.id for hit in hits)
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_weak_two_character_overlap_does_not_fabricate_an_answer() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    async with factory() as session:
+        user = User(email="no-answer-search@example.com", password_hash="hash")
+        session.add(user)
+        await session.flush()
+        knowledge_base = KnowledgeBase(owner_id=user.id, name="合成检索资料")
+        session.add(knowledge_base)
+        await session.flush()
+        session.add(
+            KnowledgeEntry(
+                knowledge_base_id=knowledge_base.id,
+                entry_type="SyntheticEvaluation",
+                title="珊瑚车间包装作业",
+                content="珊瑚车间只记录显示模组包装流程。",
+                publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+            )
+        )
+        await session.commit()
+
+        hits = await search_knowledge_entries(
+            session,
+            knowledge_base.id,
+            query="深海珊瑚邮局的潜水邮票面值是多少？",
+            limit=5,
+        )
+        exact_hits = await search_knowledge_entries(
+            session,
+            knowledge_base.id,
+            query="珊瑚",
+            limit=5,
+        )
+
+        assert hits == []
+        assert len(exact_hits) == 1
+        assert exact_hits[0].title == "珊瑚车间包装作业"
+
+    await engine.dispose()

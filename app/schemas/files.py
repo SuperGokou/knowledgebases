@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.db.models import FileStatus, OkfConversionStatus, UploadSessionStatus
+from app.db.models import (
+    FileStatus,
+    KnowledgeIngestionStatus,
+    MalwareScanStatus,
+    OkfConversionStatus,
+    UploadSessionStatus,
+)
 
 
 class UploadInitiateRequest(BaseModel):
@@ -93,10 +99,23 @@ class FileRead(BaseModel):
     checksum_algorithm: str | None
     checksum_value: str | None
     status: FileStatus
+    knowledge_status: KnowledgeIngestionStatus
+    knowledge_error_code: str | None
+    malware_scan_status: MalwareScanStatus
+    malware_signature: str | None
+    malware_scan_error_code: str | None
+    malware_scan_started_at: datetime | None
+    malware_scanned_at: datetime | None
+    searchable: bool = False
     custom_metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
     available_at: datetime | None
+
+    @model_validator(mode="after")
+    def derive_searchable_state(self) -> Self:
+        self.searchable = self.knowledge_status is KnowledgeIngestionStatus.INDEXED
+        return self
 
 
 class DownloadGrant(BaseModel):

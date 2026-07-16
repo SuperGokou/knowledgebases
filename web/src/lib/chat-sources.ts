@@ -11,12 +11,17 @@ const reasonDescriptions: Record<ChatSourceStatus["reason"], string> = {
   provider_unconfigured: "模型服务尚未配置，回答来自本地检索。",
   provider_configuration_error: "模型配置暂不可用，回答已回退到本地检索。",
   provider_unavailable: "模型服务暂不可用，回答已回退到本地检索。",
+  usage_governance_unavailable: "模型价格或预算配置不完整，回答已安全回退到本地检索。",
+  usage_budget_exceeded: "当前 Token 或成本预算已达上限，回答已安全回退到本地检索。",
+  usage_metering_unavailable: "模型未返回可核验的 Token 用量，回答已安全回退到本地检索。",
+  duplicate_request: "系统已识别到重复请求，本次回答已回退到本地检索。",
   missing_model_citations: "模型未提供有效引用，回答已回退到可验证的检索结果。",
   invalid_model_citations: "模型引用未通过校验，回答已回退到可验证的检索结果。",
   invalid_model_response: "模型回答格式未通过校验，已改用可验证的检索结果。",
   answer_review_rejected: "回答内容未通过语义审核，已改用可验证的检索结果。",
   answer_review_unavailable: "回答审核服务不可用，已按安全策略改用检索结果。",
   answer_review_invalid: "回答审核结果无效，已按安全策略改用检索结果。",
+  independent_reviewer_unavailable: "未配置独立的第二模型审核服务，回答已安全回退到本地检索。",
   no_matching_content: "当前知识库未检索到可引用内容。",
 };
 

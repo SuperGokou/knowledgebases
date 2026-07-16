@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -35,6 +38,20 @@ class StoredObject:
     version_id: str | None
     checksum_sha256: str | None
     content_type: str | None
+
+
+def checksum_sha256_base64_to_hex(value: str | None) -> str | None:
+    """Normalize an S3 ChecksumSHA256 value to the canonical database hex form."""
+
+    if value is None:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) != 32:
+        return None
+    return decoded.hex()
 
 
 class StorageService:
@@ -82,6 +99,7 @@ class StorageService:
                 "ContentType": content_type,
                 "ContentLength": expected_size_bytes,
                 "Metadata": metadata,
+                "IfNoneMatch": "*",
             }
             if expected_checksum_sha256_base64 is not None:
                 params["ChecksumSHA256"] = expected_checksum_sha256_base64
@@ -95,6 +113,7 @@ class StorageService:
                 "Content-Type": content_type,
                 "Content-Length": str(expected_size_bytes),
                 "x-amz-meta-upload-session-id": upload_session_id,
+                "If-None-Match": "*",
             }
             if expected_checksum_sha256_base64 is not None:
                 required_headers["x-amz-checksum-sha256"] = expected_checksum_sha256_base64
@@ -223,6 +242,27 @@ class StorageService:
             Key=key,
         )
 
+    async def seal_single_upload(self, *, key: str, upload_session_id: str) -> None:
+        """Revoke a create-only PUT capability by occupying its immutable key.
+
+        Single-part URLs sign ``If-None-Match: *``. Once this tombstone is
+        present, S3 and compatible stores must reject every replay instead of
+        recreating an object that is no longer tracked by an active session.
+        """
+
+        await asyncio.to_thread(
+            self._client.put_object,
+            Bucket=self._settings.s3_bucket,
+            Key=key,
+            Body=b"",
+            ContentLength=0,
+            ContentType="application/x-kb-upload-tombstone",
+            Metadata={
+                "upload-session-id": upload_session_id,
+                "upload-capability-state": "sealed",
+            },
+        )
+
     async def read_bytes(self, *, key: str, max_bytes: int) -> bytes:
         """Read a bounded object for text extraction without unbounded memory use."""
 
@@ -243,7 +283,30 @@ class StorageService:
             raise ValueError("object exceeds conversion input limit")
         return data
 
-    async def promote(self, *, source_key: str, destination_key: str) -> StoredObject:
+    async def iter_chunks(self, *, key: str, chunk_size: int) -> AsyncIterator[bytes]:
+        """Yield an object in bounded chunks and always release the HTTP body."""
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        response = await asyncio.to_thread(
+            self._client.get_object,
+            Bucket=self._settings.s3_bucket,
+            Key=key,
+        )
+        body = response["Body"]
+        try:
+            while chunk := await asyncio.to_thread(body.read, chunk_size):
+                yield bytes(chunk)
+        finally:
+            await asyncio.to_thread(body.close)
+
+    async def promote(
+        self,
+        *,
+        source_key: str,
+        destination_key: str,
+        upload_session_id: str,
+    ) -> StoredObject:
         """Copy a verified staging object to a key never exposed by a write URL."""
         await asyncio.to_thread(
             self._client.copy_object,
@@ -253,7 +316,10 @@ class StorageService:
             MetadataDirective="COPY",
         )
         promoted = await self.head(key=destination_key)
-        await self.delete(key=source_key)
+        await self.seal_single_upload(
+            key=source_key,
+            upload_session_id=upload_session_id,
+        )
         return promoted
 
     def presign_download(self, *, key: str, filename: str) -> str:
