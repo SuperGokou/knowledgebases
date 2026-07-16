@@ -755,7 +755,7 @@ def build_profile(
         AcceptanceGate(
             "CODE-P0-001",
             "P0",
-            ("uv", "run", "ruff", "check", "."),
+            (sys.executable, "-m", "ruff", "check", "."),
             str(repository),
             120,
         ),
@@ -786,7 +786,7 @@ def build_profile(
         AcceptanceGate(
             "TYPE-P1-001",
             "P1",
-            ("uv", "run", "mypy", "app", "scripts"),
+            (sys.executable, "-m", "mypy", "app", "scripts"),
             str(repository),
             180,
         ),
@@ -794,8 +794,8 @@ def build_profile(
             "BACKEND-P0-001",
             "P0",
             (
-                "uv",
-                "run",
+                sys.executable,
+                "-m",
                 "pytest",
                 "--cov=app",
                 "--cov-report=term-missing",

@@ -667,7 +667,11 @@ def evaluate_contract(
 def _execute(
     command: Sequence[str], cwd: Path, timeout_seconds: int
 ) -> subprocess.CompletedProcess[str]:
-    executable = shutil.which(command[0]) or command[0]
+    executable = (
+        sys.executable
+        if tuple(command[:2]) in {("python", "-m"), ("python3", "-m")}
+        else shutil.which(command[0]) or command[0]
+    )
     return subprocess.run(  # noqa: S603
         [executable, *command[1:]],
         cwd=cwd,

@@ -161,6 +161,34 @@ def test_repository_manifest_is_complete_and_source_contract_passes() -> None:
     } <= {item.requirement_id for item in report.requirements}
 
 
+def test_repository_backend_runner_uses_the_bound_python_environment() -> None:
+    manifest = load_manifest(MANIFEST)
+    backend = next(
+        item
+        for item in manifest["test_commands"]
+        if item["id"] == "backend-functional"  # type: ignore[index]
+    )
+
+    assert backend["command"][:3] == ["python", "-m", "pytest"]
+
+
+def test_python_runner_resolves_to_the_acceptance_interpreter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args[0]
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    functional_acceptance._execute(("python", "-m", "pytest"), REPOSITORY, 30)
+
+    assert captured["args"] == [functional_acceptance.sys.executable, "-m", "pytest"]
+
+
 def test_repository_policy_digest_is_stable_and_manifest_cannot_drop_required_id() -> None:
     manifest = load_manifest(MANIFEST)
     manifest["requirements"] = [

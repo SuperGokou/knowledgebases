@@ -697,6 +697,26 @@ def test_local_profile_contains_required_deterministic_gates() -> None:
     assert "maintenance" in offline_gate.command
 
 
+def test_python_quality_gates_use_the_bound_acceptance_interpreter() -> None:
+    by_id = {gate.gate_id: gate for gate in build_profile("ci")}
+
+    assert by_id["CODE-P0-001"].command[:3] == (
+        acceptance_module.sys.executable,
+        "-m",
+        "ruff",
+    )
+    assert by_id["TYPE-P1-001"].command[:3] == (
+        acceptance_module.sys.executable,
+        "-m",
+        "mypy",
+    )
+    assert by_id["BACKEND-P0-001"].command[:3] == (
+        acceptance_module.sys.executable,
+        "-m",
+        "pytest",
+    )
+
+
 def test_final_profile_rejects_the_deprecated_single_environment_file() -> None:
     gates = build_profile(
         "final",

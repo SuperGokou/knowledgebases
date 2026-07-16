@@ -257,7 +257,7 @@
       "id": "backend-functional",
       "cwd": ".",
       "command": [
-        "uv", "run", "pytest", "-rA",
+        "python", "-m", "pytest", "-rA",
         "tests/test_integration_api.py::test_admin_role_user_and_refresh_workflow",
         "tests/test_user_role_cas.py",
         "tests/test_user_password_reset.py",
