@@ -422,7 +422,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.41,<3" },
     { name = "types-defusedxml", marker = "extra == 'dev'", specifier = ">=0.7,<1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.35,<1" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0,<1" },
 ]
 provides-extras = ["dev"]
 
