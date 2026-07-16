@@ -16,6 +16,7 @@ import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 ADOPTION_SCRIPT = REPOSITORY / "deploy/tencent/adopt-offline.sh"
+OFFLINE_COMMON_SCRIPT = REPOSITORY / "deploy/tencent/offline-operation-common.sh"
 
 
 def _source() -> str:
@@ -442,8 +443,14 @@ archive_legacy_receipts
 def test_completion_publish_survives_sigkill_matrix(tmp_path: Path) -> None:
     shell = _linux_root_shell()
     source = _source()
+    common_source = OFFLINE_COMMON_SCRIPT.read_text(encoding="utf-8")
+    trust_gate_start = source.index("validate_adoption_evidence_trust_root() {")
+    trust_gate_end = source.index("\n}\n", trust_gate_start) + 3
+    trust_gate = source[trust_gate_start:trust_gate_end]
     helpers = "\n".join(
         (
+            _shell_function(common_source, "offline_clear_inherited_environment"),
+            trust_gate,
             _shell_function(source, "validate_exact_incomplete_staging_file"),
             _shell_function(source, "discard_exact_incomplete_staging_file"),
         )
@@ -503,6 +510,38 @@ def test_completion_publish_survives_sigkill_matrix(tmp_path: Path) -> None:
         text=True,
     )
     digest = "e" * 64
+    trust_validation_log = tmp_path / "trust-validation.log"
+    trusted_validator = tmp_path / "trusted-evidence-validator.py"
+    trusted_validator.write_text(
+        f"""from __future__ import annotations
+
+import os
+import pathlib
+import sys
+
+expected = [
+    "validate-evidence-trust-root",
+    "--challenge-context-sha256",
+    "{digest}",
+]
+if sys.argv[1:] != expected:
+    raise SystemExit(64)
+marker = pathlib.Path({trust_validation_log.as_posix()!r})
+descriptor = os.open(
+    marker,
+    os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
+    0o600,
+)
+try:
+    os.write(descriptor, (sys.argv[3] + "\\n").encode("ascii"))
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+""",
+        encoding="utf-8",
+    )
+    trusted_validator.chmod(0o400)
+    expected_trust_validations = 0
 
     for cut, (statement, after) in cuts.items():
         scenario = tmp_path / cut
@@ -545,9 +584,25 @@ validate_pending_adoption_completion_state() {{ :; }}
 validate_host_isolation_evidence() {{ [ -s "$1" ]; }}
 validate_adoption_completion_payload() {{ [ -s "$1" ] && [ -s "$2" ]; }}
 validate_adoption_completion_directory() {{ [ -d "$1" ]; }}
-validate_protected_file() {{ [ -f "$2" ] && [ ! -L "$2" ]; }}
+validate_protected_file() {{
+  [ -f "$2" ] && [ ! -L "$2" ] || exit 65
+  [ "$(stat -c %u -- "$2")" -eq 0 ] || exit 65
+  [ "$(stat -c %h -- "$2")" -eq 1 ] || exit 65
+  protected_mode=$(stat -c %a -- "$2") || exit 66
+  case " $3 " in
+    *" $protected_mode "*) ;;
+    *) exit 65 ;;
+  esac
+  protected_bytes=$(stat -c %s -- "$2") || exit 66
+  [ "$protected_bytes" -gt 0 ] && [ "$protected_bytes" -le "$4" ] || exit 65
+}}
 {helpers}
 {function}
+OFFLINE_LOCK_TOKEN=offline-adoption-fault-matrix
+OFFLINE_SYSTEM_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+OFFLINE_TMPDIR=/tmp
+OFFLINE_HOME=/root
+OFFLINE_DOCKER_CONFIG=/root/.docker
 OFFLINE_STATE_DIRECTORY={_quote(state)}
 adoption_transaction_dir={_quote(transaction_dir)}
 contract_sha256={digest}
@@ -563,6 +618,7 @@ legacy_archive_manifest_digest={digest}
 host_final_output={_quote(host_output)}
 evidence_signing_key={_quote(private_key)}
 evidence_public_key={_quote(public_key)}
+trusted_abort_helper={_quote(trusted_validator)}
 transaction_committed=false
 publish_completion_receipt
 """
@@ -570,6 +626,11 @@ publish_completion_receipt
         _kill_at_barrier(shell, build_harness(instrumented), marker, cut)
         resumed = _run_shell(shell, build_harness(base_function))
         assert resumed.returncode == 0, resumed.stderr
+        expected_trust_validations += 2
+        assert (
+            trust_validation_log.read_text(encoding="utf-8").splitlines()
+            == [digest] * expected_trust_validations
+        )
         completion = transaction_dir / "completion"
         assert transaction_dir.joinpath(".completion.pending").exists() is False
         assert {item.name for item in completion.iterdir()} == {

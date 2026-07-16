@@ -1449,7 +1449,8 @@ def build_profile(
             "P0",
             (
                 sys.executable,
-                str(repository / "scripts/functional_acceptance.py"),
+                "-m",
+                "scripts.functional_acceptance",
                 "--run-tests",
                 "--json",
                 *(
@@ -1960,7 +1961,8 @@ def build_profile(
             "P0",
             (
                 sys.executable,
-                str(repository / "scripts/postgres_acceptance.py"),
+                "-m",
+                "scripts.postgres_acceptance",
                 "--image",
                 "postgres:17.5-bookworm",
                 *_child_evidence_cli_arguments(
@@ -2143,7 +2145,8 @@ def build_profile(
         "P0",
         (
             sys.executable,
-            str(repository / "scripts/linux_host_evidence_collector.py"),
+            "-m",
+            "scripts.linux_host_evidence_collector",
             "--repository",
             str(repository),
             "--run-id",
@@ -2191,7 +2194,8 @@ def build_profile(
         "P0",
         (
             sys.executable,
-            str(repository / "scripts/functional_acceptance.py"),
+            "-m",
+            "scripts.functional_acceptance",
             "--profile",
             "runtime-functional",
             "--run-tests",
@@ -2251,7 +2255,8 @@ def build_profile(
         "P0",
         (
             sys.executable,
-            str(repository / "scripts/backend_acceptance.py"),
+            "-m",
+            "scripts.backend_acceptance",
             "--postgres-evidence",
             "artifacts/acceptance/evidence/postgres.json",
             *_child_evidence_cli_arguments(

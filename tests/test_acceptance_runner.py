@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sysconfig
 import textwrap
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -280,6 +281,116 @@ def test_functional_gate_passes_only_the_bound_node_path_and_digest() -> None:
         "--node-executable-require-root-owner",
     )
     assert not gate.environment
+
+
+@pytest.mark.parametrize("profile", ("local", "ci", "final"))
+def test_functional_gate_uses_the_repository_module_entrypoint(profile: str) -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+
+    gate = next(item for item in build_profile(profile) if item.gate_id == "FUNCTIONAL-P0-001")
+
+    assert gate.command[1:3] == ("-m", "scripts.functional_acceptance")
+    assert gate.cwd == str(repository)
+    assert not any(argument.endswith("functional_acceptance.py") for argument in gate.command)
+
+
+@pytest.mark.parametrize(
+    ("profile", "gate_id", "module"),
+    (
+        ("ci", "FUNCTIONAL-P0-001", "scripts.functional_acceptance"),
+        ("final", "TOKEN-GOV-P0-001", "scripts.postgres_acceptance"),
+        (
+            "final",
+            "LINUX-HOST-EVIDENCE-P0-001",
+            "scripts.linux_host_evidence_collector",
+        ),
+        ("final", "BACKEND-P0-001", "scripts.backend_acceptance"),
+    ),
+)
+def test_package_gate_module_entrypoint_starts_in_sanitized_environment(
+    profile: str,
+    gate_id: str,
+    module: str,
+) -> None:
+    gate = next(item for item in build_profile(profile) if item.gate_id == gate_id)
+    environment = acceptance_module.sanitized_test_environment()
+
+    completed = subprocess.run(
+        (*gate.command[:3], "--help"),
+        cwd=gate.cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "PYTHONPATH" not in environment
+    assert "PYTHONHOME" not in environment
+    assert gate.command[1:3] == ("-m", module)
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+
+
+@pytest.mark.parametrize("profile", ("local", "ci", "final"))
+def test_repository_python_child_gates_require_reviewed_entrypoints(profile: str) -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    scripts_root = (repository / "scripts").resolve()
+    reviewed_direct_entrypoints = {
+        (scripts_root / "acceptance.py").resolve(),
+        (scripts_root / "supply_chain_gate.py").resolve(),
+    }
+
+    for gate in build_profile(profile):
+        if len(gate.command) < 2 or gate.command[0] != acceptance_module.sys.executable:
+            continue
+        candidate = Path(gate.command[1])
+        if candidate.suffix != ".py":
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(scripts_root):
+            continue
+        assert resolved in reviewed_direct_entrypoints, (
+            f"{gate.gate_id} must use '-m scripts.<module>' or receive an explicit bootstrap review"
+        )
+
+
+@pytest.mark.parametrize("script_name", ("acceptance.py", "supply_chain_gate.py"))
+def test_reviewed_direct_entrypoints_start_isolated_from_the_repository_cwd(
+    script_name: str,
+    tmp_path: Path,
+) -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    environment = acceptance_module.sanitized_test_environment()
+    purelib = sysconfig.get_path("purelib")
+    assert purelib
+    launcher = (
+        "import runpy,sys;"
+        "script=sys.argv[1];"
+        "sys.path.append(sys.argv[2]);"
+        "sys.argv=[script,'--help'];"
+        "runpy.run_path(script,run_name='__main__')"
+    )
+
+    completed = subprocess.run(
+        (
+            acceptance_module.sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            launcher,
+            str(repository / "scripts" / script_name),
+            purelib,
+        ),
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "PYTHONPATH" not in environment
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
 
 
 def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> None:
@@ -1178,6 +1289,7 @@ def test_command_capture_uses_explicit_fault_tolerant_utf8(
         captured.update(kwargs)
         return subprocess.CompletedProcess(args=["tool"], returncode=0, stdout="ok", stderr="")
 
+    monkeypatch.setattr(acceptance_module, "_root_protected_executable", lambda command: command)
     monkeypatch.setattr(subprocess, "run", fake_run)
     gate = AcceptanceGate("CODE-P0-001", "P0", ("tool",), ".", 10)
 
@@ -1306,7 +1418,7 @@ def test_final_profile_adds_executable_target_evidence_gates() -> None:
 
     backend_gate = by_id["BACKEND-P0-001"]
     assert backend_gate.blocked_exit_codes == (2,)
-    assert Path(backend_gate.command[1]).name == "backend_acceptance.py"
+    assert backend_gate.command[1:3] == ("-m", "scripts.backend_acceptance")
     assert backend_gate.command[-2:] == (
         "--postgres-evidence",
         "artifacts/acceptance/evidence/postgres.json",
@@ -1359,7 +1471,7 @@ def test_final_profile_adds_executable_target_evidence_gates() -> None:
     assert token_gate.severity == "P0"
     assert token_gate.blocked_reason is None
     assert token_gate.blocked_exit_codes == (2,)
-    assert Path(token_gate.command[1]).name == "postgres_acceptance.py"
+    assert token_gate.command[1:3] == ("-m", "scripts.postgres_acceptance")
     assert token_gate.command[-2:] == (
         "--image",
         "postgres:17.5-bookworm",
@@ -1492,6 +1604,7 @@ def test_final_runtime_functional_is_last_consumer_of_one_deployment_identity(
 
     linux_gate = by_id["LINUX-HOST-EVIDENCE-P0-001"]
     assert linux_gate.blocked_reason is None
+    assert linux_gate.command[1:3] == ("-m", "scripts.linux_host_evidence_collector")
     assert linux_gate.command[linux_gate.command.index("--release-id") + 1] == identity.git_head
     assert linux_gate.command[linux_gate.command.index("--offline-contract-sha256") + 1] == (
         "d" * 64

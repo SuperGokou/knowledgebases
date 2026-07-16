@@ -1395,7 +1395,7 @@ def test_enterprise_acceptance_profile_runs_functional_source_gate() -> None:
     by_id = {gate.gate_id: gate for gate in build_profile("local")}
 
     gate = by_id["FUNCTIONAL-P0-001"]
-    assert Path(gate.command[1]).name == "functional_acceptance.py"
+    assert gate.command[1:3] == ("-m", "scripts.functional_acceptance")
     assert gate.command[-2:] == ("--run-tests", "--json")
 
 
