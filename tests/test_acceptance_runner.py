@@ -315,6 +315,9 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     assert (
         'test "$uv_source" = \\\n            /opt/hostedtoolcache/uv/0.11.15/x86_64/uv' in pin_block
     )
+    assert 'uv_version="$("$uv_source" --version)"' in pin_block
+    assert '"uv 0.11.15" | "uv 0.11.15 "*' in pin_block
+    assert 'test "$("$uv_source" --version)" = "uv 0.11.15"' not in pin_block
     assert (
         'test "$npm_cli" = \\\n'
         "            /opt/hostedtoolcache/node/24.18.0/x64/lib/node_modules/"

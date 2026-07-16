@@ -291,7 +291,14 @@ jobs:
           test -x "$uv_source"
           test -f "$npm_cli"
           test "$("$node_source" --version)" = "v24.18.0"
-          test "$("$uv_source" --version)" = "uv 0.11.15"
+          uv_version="$("$uv_source" --version)"
+          case "$uv_version" in
+            "uv 0.11.15" | "uv 0.11.15 "*) ;;
+            *)
+              echo "Refusing unexpected uv version: $uv_version" >&2
+              exit 1
+              ;;
+          esac
           test "$("$node_source" "$npm_cli" --version)" = "11.16.0"
           npm_package_root="${npm_cli%/bin/npm-cli.js}"
           sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
