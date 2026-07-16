@@ -518,9 +518,23 @@ def build_pytest_execution_command(command: Sequence[str], junit_path: Path) -> 
     return (*command, *_pytest_safety_arguments(), f"--junitxml={junit_path}")
 
 
+def _normalize_pytest_node_path(node_id: str) -> str:
+    """Normalize only the filesystem portion of a pytest node ID.
+
+    Parameter IDs may legitimately contain escaped backslashes such as ``\\n``,
+    ``\\u`` and ``\\x``.  Treating the complete node ID as a path corrupts those
+    identities and makes collection evidence disagree with pytest's JUnit output.
+    """
+    path, separator, remainder = node_id.partition(".py::")
+    if not separator:
+        return node_id
+    normalized_path = path.replace("\\", "/")
+    return f"{normalized_path}{separator}{remainder}"
+
+
 def parse_pytest_collection(output: str) -> tuple[str, ...]:
     nodes = tuple(
-        line.strip().replace("\\", "/")
+        _normalize_pytest_node_path(line.strip())
         for line in output.splitlines()
         if ".py::" in line and line.lstrip().startswith(("tests/", "tests\\"))
     )
@@ -533,7 +547,7 @@ def parse_pytest_collection(output: str) -> tuple[str, ...]:
 
 
 def _junit_key_for_node(node_id: str) -> tuple[str, str]:
-    parts = node_id.replace("\\", "/").split("::")
+    parts = _normalize_pytest_node_path(node_id).split("::")
     if len(parts) < 2 or not parts[0].endswith(".py"):
         raise AcceptanceGateError(f"invalid pytest node id: {node_id}")
     module = parts[0][:-3].replace("/", ".")
@@ -560,7 +574,7 @@ def parse_pytest_junit(report_path: Path, expected_nodes: Sequence[str]) -> Pyte
     except (SyntaxError, DefusedXmlException) as exc:
         raise AcceptanceGateError("pytest JUnit artifact is malformed") from exc
 
-    expected = tuple(node.replace("\\", "/") for node in expected_nodes)
+    expected = tuple(_normalize_pytest_node_path(node) for node in expected_nodes)
     if not expected or len(expected) != len(set(expected)):
         raise AcceptanceGateError("expected pytest nodes are empty or duplicated")
     key_to_node: dict[tuple[str, str], str] = {}

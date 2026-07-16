@@ -180,6 +180,11 @@ async def test_explicit_non_billable_retry_uses_a_new_attempt_key_and_can_succee
         )
         await session.refresh(job)
         assert job.status is OkfConversionStatus.RETRY_WAIT
+        first_attempt_usage = await session.scalar(select(LlmUsageRecord))
+        assert first_attempt_usage is not None
+        assert first_attempt_usage.status is LlmUsageStatus.RELEASED
+        first_attempt_usage_id = first_attempt_usage.id
+        first_attempt_idempotency_hash = first_attempt_usage.idempotency_hash
         job.next_attempt_at = None
         await session.commit()
 
@@ -195,16 +200,17 @@ async def test_explicit_non_billable_retry_uses_a_new_attempt_key_and_can_succee
         )
         await session.refresh(job)
         assert job.status.value == OkfConversionStatus.SUCCEEDED.value
-        usages = list(
+        retry_usages = list(
             (
-                await session.scalars(select(LlmUsageRecord).order_by(LlmUsageRecord.created_at))
+                await session.scalars(
+                    select(LlmUsageRecord).where(LlmUsageRecord.id != first_attempt_usage_id)
+                )
             ).all()
         )
-        assert [usage.status for usage in usages] == [
-            LlmUsageStatus.RELEASED,
-            LlmUsageStatus.SETTLED,
-        ]
-        assert len({usage.idempotency_hash for usage in usages}) == 2
+        assert len(retry_usages) == 1
+        retry_usage = retry_usages[0]
+        assert retry_usage.status is LlmUsageStatus.SETTLED
+        assert retry_usage.idempotency_hash != first_attempt_idempotency_hash
         assert client.calls == 2
     await engine.dispose()
 

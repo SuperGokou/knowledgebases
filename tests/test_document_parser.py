@@ -17,14 +17,17 @@ from app.services.document_parser import (
 
 LIMITS = ParseLimits(max_source_bytes=1_000_000, max_output_chars=100_000)
 CONTENT_TYPES = b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
+_FIXTURE_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 def _archive(files: dict[str, bytes], *, compression: int = zipfile.ZIP_DEFLATED) -> bytes:
     target = io.BytesIO()
     with zipfile.ZipFile(target, "w", compression=compression) as archive:
-        archive.writestr("[Content_Types].xml", CONTENT_TYPES)
+        content_types = zipfile.ZipInfo("[Content_Types].xml", _FIXTURE_ZIP_TIMESTAMP)
+        archive.writestr(content_types, CONTENT_TYPES, compress_type=compression)
         for name, data in files.items():
-            archive.writestr(name, data)
+            member = zipfile.ZipInfo(name, _FIXTURE_ZIP_TIMESTAMP)
+            archive.writestr(member, data, compress_type=compression)
     return target.getvalue()
 
 

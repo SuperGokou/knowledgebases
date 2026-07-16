@@ -144,6 +144,34 @@ def test_collection_and_junit_require_the_exact_same_nodes(tmp_path: Path) -> No
     assert evidence.node_ids == ("tests/test_example.py::test_one",)
 
 
+def test_collection_preserves_escaped_parameter_identity_across_path_styles(
+    tmp_path: Path,
+) -> None:
+    parameter_name = r"test_payload[line\n\u4e2d\x00]"
+    collection = parse_pytest_collection(
+        "\n".join(
+            (
+                rf"tests\test_example.py::{parameter_name}",
+                "1 test collected in 0.01s",
+            )
+        )
+    )
+    report = tmp_path / "escaped-parameters.xml"
+    report.write_text(
+        '<testsuites><testsuite><testcase classname="tests.test_example" '
+        f'name="{parameter_name}" /></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+
+    evidence = parse_pytest_junit(report, collection)
+
+    assert collection == (f"tests/test_example.py::{parameter_name}",)
+    assert evidence.is_success is True
+    assert evidence.node_ids == collection
+    assert evidence.deselected == 0
+    assert evidence.unexpected == 0
+
+
 @pytest.mark.parametrize(
     ("child", "field"),
     (
