@@ -81,6 +81,34 @@ def test_production_rejects_weak_or_oversized_bootstrap_admin_password(
         production_settings(bootstrap_admin_password=password)
 
 
+@pytest.mark.parametrize("password", ["", " \t\r\n"])
+def test_production_upgrade_treats_blank_bootstrap_admin_password_as_absent(
+    password: str,
+) -> None:
+    settings = production_settings(bootstrap_admin_password=password)
+
+    assert settings.bootstrap_admin_password is None
+
+
+def test_production_upgrade_rejects_nonempty_weak_bootstrap_password_without_echoing_it() -> None:
+    password = "nonemptybutweakpassword"
+
+    with pytest.raises(ValidationError, match="KB_BOOTSTRAP_ADMIN_PASSWORD") as captured:
+        production_settings(bootstrap_admin_password=password)
+
+    assert password not in str(captured.value)
+
+
+def test_production_upgrade_preserves_a_strong_bootstrap_password_as_a_secret() -> None:
+    password = "Strong-upgrade-password-123!"
+
+    settings = production_settings(bootstrap_admin_password=password)
+
+    assert settings.bootstrap_admin_password is not None
+    assert settings.bootstrap_admin_password.get_secret_value() == password
+    assert password not in str(settings.bootstrap_admin_password)
+
+
 def test_production_rejects_debug_and_plain_http_object_urls() -> None:
     with pytest.raises(ValidationError):
         production_settings(debug=True)

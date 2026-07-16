@@ -395,6 +395,14 @@ class Settings(BaseSettings):
     def normalize_environment(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
 
+    @field_validator("bootstrap_admin_password", mode="before")
+    @classmethod
+    def normalize_blank_bootstrap_admin_password(cls, value: object) -> object:
+        raw_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if isinstance(raw_value, str) and not raw_value.strip():
+            return None
+        return value
+
     @model_validator(mode="after")
     def reject_development_secrets_in_production(self) -> Settings:
         if self.legacy_external_llm_enabled is not None:
