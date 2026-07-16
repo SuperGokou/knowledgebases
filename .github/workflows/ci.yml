@@ -244,6 +244,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
+      ACCEPTANCE_GIT_SHA: ${{ github.sha }}
       CI: "true"
       KB_ENVIRONMENT: test
       NEXT_TELEMETRY_DISABLED: "1"
@@ -253,6 +254,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -264,8 +266,7 @@ jobs:
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: "0.11.15"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          enable-cache: false
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -314,10 +315,89 @@ jobs:
           sudo ln -sfn /usr/local/lib/heyi-acceptance/npm/bin/npm-cli.js \
             /usr/local/sbin/npm
 
+      - name: Create exact acceptance source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          acceptance_source=/usr/local/lib/heyi-acceptance/source
+          [[ "$ACCEPTANCE_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          runner_head="$(/usr/bin/git rev-parse HEAD)"
+          test "$runner_head" = "$ACCEPTANCE_GIT_SHA"
+          test -d "$GITHUB_WORKSPACE/.git"
+          test ! -e "$GITHUB_WORKSPACE/.git/objects/info/alternates"
+          /usr/bin/git diff --exit-code -- .
+          /usr/bin/git diff --cached --exit-code -- .
+          runner_status="$(
+            /usr/bin/git status --porcelain=v1 --untracked-files=all
+          )"
+          test -z "$runner_status"
+          runner_index_listing="$(/usr/bin/git ls-files -v)"
+          hidden_index_flags="$(
+            LC_ALL=C awk '/^[a-zS]/ { print }' <<<"$runner_index_listing"
+          )"
+          if test -n "$hidden_index_flags"; then
+            echo "Refusing runner checkout with hidden Git index flags" >&2
+            exit 1
+          fi
+          test ! -e "$acceptance_source"
+          root_git() {
+            sudo -H /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              /usr/bin/git -c core.hooksPath=/dev/null "$@"
+          }
+          root_git -c safe.directory="$GITHUB_WORKSPACE" clone \
+            --no-local \
+            --no-hardlinks \
+            --no-checkout \
+            "$GITHUB_WORKSPACE" \
+            "$acceptance_source"
+          root_git -C "$acceptance_source" checkout --detach "$ACCEPTANCE_GIT_SHA"
+          root_git -C "$acceptance_source" reset --hard "$ACCEPTANCE_GIT_SHA"
+          root_git -C "$acceptance_source" clean -ffdx
+          test -d "$acceptance_source/web"
+          test ! -L "$acceptance_source/web"
+          test ! -e "$acceptance_source/web/node_modules"
+          test ! -L "$acceptance_source/web/node_modules"
+          preinstall_link_list="$(
+            mktemp "${RUNNER_TEMP:?}/acceptance-preinstall-links.XXXXXX"
+          )"
+          cleanup_preinstall_link_list() {
+            rm -f -- "$preinstall_link_list"
+          }
+          trap cleanup_preinstall_link_list EXIT
+          sudo find "$acceptance_source" -type l -print0 |
+            /usr/bin/tee "$preinstall_link_list" >/dev/null
+          while IFS= read -r -d '' link_path; do
+            if ! resolved_path="$(sudo readlink -e -- "$link_path")"; then
+              echo "Refusing dangling pre-install symlink: $link_path" >&2
+              exit 1
+            fi
+            case "$resolved_path" in
+              "$acceptance_source" | "$acceptance_source"/*) ;;
+              *)
+                echo "Refusing external pre-install symlink: $link_path" >&2
+                exit 1
+                ;;
+            esac
+          done <"$preinstall_link_list"
+          cleanup_preinstall_link_list
+          trap - EXIT
+          root_git -C "$acceptance_source" remote remove origin
+          root_git -C "$acceptance_source" fsck --full --strict
+          snapshot_head="$(root_git -C "$acceptance_source" rev-parse HEAD)"
+          test "$snapshot_head" = "$ACCEPTANCE_GIT_SHA"
+          test ! -e "$acceptance_source/.git/objects/info/alternates"
+          sudo chown -hR root:root "$acceptance_source"
+          sudo chmod -R go-w "$acceptance_source"
+
       - name: Install root-protected acceptance runtime
         shell: bash
         run: |
           set -euo pipefail
+          cd /usr/local/lib/heyi-acceptance/source
           python_source="$(readlink -f -- "$(command -v python)")"
           test "$python_source" = \
             /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12
@@ -346,7 +426,7 @@ jobs:
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            "$python_runtime" -I - <<'PY'
+            "$python_runtime" -I -S - <<'PY'
           from pathlib import Path
           import sys
 
@@ -379,11 +459,13 @@ jobs:
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            "$python_runtime" -I -m venv --copies \
+            "$python_runtime" -I -S -m venv --copies --without-pip \
             /usr/local/lib/heyi-acceptance/venv
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            UV_NO_PROGRESS=1 \
+            UV_PYTHON="$python_runtime" \
             UV_PROJECT_ENVIRONMENT=/usr/local/lib/heyi-acceptance/venv \
             /usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev \
             --no-build --no-install-project
@@ -393,18 +475,63 @@ jobs:
             sudo install -o root -g root -m 0755 "$python_runtime" "$python_staged"
             sudo mv -fT -- "$python_staged" "$python_target"
           done
-          sudo chown -R root:root /usr/local/lib/heyi-acceptance
+          sudo chown -hR root:root /usr/local/lib/heyi-acceptance
           sudo chmod -R go-w /usr/local/lib/heyi-acceptance
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/local/lib/heyi-acceptance/venv/bin/python -c \
-            'import sys; from pathlib import Path; from scripts.acceptance import _root_protected_executable; expected = Path("/usr/local/lib/heyi-acceptance/python").resolve(); assert Path(sys.base_prefix).resolve() == expected; config = (Path(sys.prefix) / "pyvenv.cfg").read_text(encoding="utf-8"); assert "/opt/hostedtoolcache" not in config; _root_protected_executable((sys.executable,)); print("root-protected Python runtime: PASS")'
-          sudo -H /usr/bin/env -i \
-            HOME=/root \
-            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/local/lib/heyi-acceptance/venv/bin/python -c \
-            'import shutil; from scripts.acceptance import _root_protected_executable; _root_protected_executable((shutil.which("npm") or "",)); print("root-protected npm: PASS")'
+            "$python_runtime" -I -S - <<'PY'
+          from pathlib import Path
+          import stat
+
+          def assert_root_protected_executable(path_text: str) -> Path:
+              path = Path(path_text)
+              link_metadata = path.lstat()
+              assert link_metadata.st_uid == 0
+              if not stat.S_ISLNK(link_metadata.st_mode):
+                  assert not link_metadata.st_mode & 0o022
+              for parent in (path.parent, *path.parent.parents):
+                  metadata = parent.stat()
+                  assert metadata.st_uid == 0
+                  assert not metadata.st_mode & 0o022
+              resolved = path.resolve(strict=True)
+              metadata = resolved.stat()
+              assert stat.S_ISREG(metadata.st_mode)
+              for item in (resolved, *resolved.parents):
+                  metadata = item.stat()
+                  assert metadata.st_uid == 0
+                  assert not metadata.st_mode & 0o022
+              return resolved
+
+          python_executable = assert_root_protected_executable(
+              "/usr/local/lib/heyi-acceptance/venv/bin/python"
+          )
+          npm_executable = assert_root_protected_executable("/usr/local/sbin/npm")
+          config_path = Path(
+              "/usr/local/lib/heyi-acceptance/venv/pyvenv.cfg"
+          ).resolve(strict=True)
+          config = config_path.read_text(encoding="utf-8")
+          assert "/opt/hostedtoolcache" not in config
+          settings = {
+              key.strip(): value.strip()
+              for line in config.splitlines()
+              if "=" in line
+              for key, value in (line.split("=", maxsplit=1),)
+          }
+          expected_home = Path(
+              "/usr/local/lib/heyi-acceptance/python/bin"
+          ).resolve(strict=True)
+          expected_executable = Path(
+              "/usr/local/lib/heyi-acceptance/python/bin/python3.12"
+          ).resolve(strict=True)
+          assert Path(settings["home"]).resolve(strict=True) == expected_home
+          assert (
+              Path(settings["executable"]).resolve(strict=True)
+              == expected_executable
+          )
+          print(f"root-protected Python runtime: PASS ({python_executable})")
+          print(f"root-protected npm: PASS ({npm_executable})")
+          PY
 
       - name: Install document parser sandbox tools
         run: |
@@ -412,54 +539,153 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             bubblewrap libreoffice-nogui poppler-utils procps
 
-      - name: Install locked dependencies
+      - name: Install locked frontend dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+          acceptance_source=/usr/local/lib/heyi-acceptance/source
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          assert_git_root_protected() {
+            local non_root_git_paths
+            local symlink_git_paths
+            local writable_git_paths
+            test -d "$acceptance_source/.git"
+            test ! -L "$acceptance_source/.git"
+            non_root_git_paths="$(
+              sudo find "$acceptance_source/.git" ! -user root -print -quit
+            )"
+            test -z "$non_root_git_paths"
+            writable_git_paths="$(
+              sudo find "$acceptance_source/.git" \
+                ! -type l -perm /022 -print -quit
+            )"
+            test -z "$writable_git_paths"
+            symlink_git_paths="$(
+              sudo find "$acceptance_source/.git" -type l -print -quit
+            )"
+            test -z "$symlink_git_paths"
+          }
+          assert_git_root_protected
+          sudo chown -hR "$runner_uid:$runner_gid" "$acceptance_source/web"
           PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/local/sbin/npm ci --prefix web --ignore-scripts --no-audit --no-fund
+            /usr/local/sbin/npm ci \
+            --prefix "$acceptance_source/web" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund
+          assert_git_root_protected
 
       - name: Seal acceptance source snapshot
         shell: bash
         run: |
           set -euo pipefail
           acceptance_source=/usr/local/lib/heyi-acceptance/source
-          checked_out_sha="$(/usr/bin/git rev-parse HEAD)"
-          /usr/bin/git diff --exit-code -- .
-          /usr/bin/git diff --cached --exit-code -- .
-          test -z "$(/usr/bin/git status --porcelain=v1 --untracked-files=no)"
-          test ! -e "$acceptance_source"
-          sudo cp -a -- "$GITHUB_WORKSPACE" "$acceptance_source"
-          sudo chown -R root:root "$acceptance_source"
+          test -d "$acceptance_source"
+          test ! -L "$acceptance_source"
+          sudo chown -hR root:root "$acceptance_source"
           sudo chmod -R go-w "$acceptance_source"
           test -d "$acceptance_source/.git"
+          test ! -L "$acceptance_source/.git"
           test ! -e "$acceptance_source/.git/objects/info/alternates"
+          root_git() {
+            sudo -H /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              /usr/bin/git -c core.hooksPath=/dev/null "$@"
+          }
+          root_git -C "$acceptance_source" fsck --full --strict
+          sealed_sha="$(
+            root_git -C "$acceptance_source" rev-parse HEAD
+          )"
+          test "$sealed_sha" = "$ACCEPTANCE_GIT_SHA"
+          root_git -C "$acceptance_source" diff --exit-code -- .
+          root_git -C "$acceptance_source" diff --cached --exit-code -- .
+          sealed_status="$(
+            root_git -C "$acceptance_source" \
+              status --porcelain=v1 --untracked-files=all
+          )"
+          test -z "$sealed_status"
+          sealed_index_listing="$(
+            root_git -C "$acceptance_source" ls-files -v
+          )"
+          hidden_index_flags="$(
+            LC_ALL=C awk '/^[a-zS]/ { print }' <<<"$sealed_index_listing"
+          )"
+          if test -n "$hidden_index_flags"; then
+            echo "Refusing sealed source with hidden Git index flags" >&2
+            exit 1
+          fi
+          ignored_path_list=
+          seal_link_list=
+          cleanup_seal_lists() {
+            if test -n "$ignored_path_list"; then
+              rm -f -- "$ignored_path_list"
+            fi
+            if test -n "$seal_link_list"; then
+              rm -f -- "$seal_link_list"
+            fi
+          }
+          trap cleanup_seal_lists EXIT
+          ignored_path_list="$(
+            mktemp "${RUNNER_TEMP:?}/acceptance-ignored-paths.XXXXXX"
+          )"
+          seal_link_list="$(
+            mktemp "${RUNNER_TEMP:?}/acceptance-seal-links.XXXXXX"
+          )"
+          root_git -C "$acceptance_source" \
+            ls-files -z --others --ignored --exclude-standard \
+            >"$ignored_path_list"
+          while IFS= read -r -d '' ignored_path; do
+            case "$ignored_path" in
+              web/node_modules/*) ;;
+              *)
+                echo "Refusing unexpected ignored acceptance file: $ignored_path" >&2
+                exit 1
+                ;;
+            esac
+          done <"$ignored_path_list"
+          non_root_paths="$(
+            sudo find "$acceptance_source" ! -user root -print -quit
+          )"
+          test -z "$non_root_paths"
+          writable_paths="$(
+            sudo find "$acceptance_source" ! -type l -perm /022 -print -quit
+          )"
+          test -z "$writable_paths"
+          sudo find "$acceptance_source" -type l -print0 |
+            /usr/bin/tee "$seal_link_list" >/dev/null
           while IFS= read -r -d '' link_path; do
-            resolved_path="$(sudo readlink -f -- "$link_path")"
+            if ! resolved_path="$(sudo readlink -e -- "$link_path")"; then
+              echo "Refusing dangling acceptance symlink: $link_path" >&2
+              exit 1
+            fi
             case "$resolved_path" in
-              "$acceptance_source"/*) ;;
+              "$acceptance_source" | "$acceptance_source"/*) ;;
               *)
                 echo "Refusing external acceptance symlink: $link_path" >&2
                 exit 1
                 ;;
             esac
-          done < <(sudo find "$acceptance_source" -type l -print0)
-          sealed_sha="$(
-            sudo -H /usr/bin/env -i \
-              HOME=/root \
-              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-              /usr/bin/git -C "$acceptance_source" rev-parse HEAD
-          )"
-          test "$sealed_sha" = "$checked_out_sha"
+          done <"$seal_link_list"
+          cleanup_seal_lists
+          trap - EXIT
           sudo -H /usr/bin/env -i \
             HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/bin/git -C "$acceptance_source" diff --exit-code -- .
-          test -z "$(
-            sudo -H /usr/bin/env -i \
-              HOME=/root \
-              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-              /usr/bin/git -C "$acceptance_source" \
-              status --porcelain=v1 --untracked-files=no
-          )"
+            /usr/local/lib/heyi-acceptance/python/bin/python3.12 \
+            -I -S - <<'PY'
+          from pathlib import Path
+
+          source = Path("/usr/local/lib/heyi-acceptance/source").resolve(strict=True)
+          for item in (source, *source.parents):
+              metadata = item.stat()
+              assert metadata.st_uid == 0
+              assert not metadata.st_mode & 0o022
+          print("root-protected acceptance source ancestors: PASS")
+          PY
 
       - name: Run enterprise acceptance profile
         shell: bash

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import hashlib
 import json
 import platform
+import re
 import shutil
 import subprocess
+import textwrap
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -284,14 +287,17 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
     pin_step = "- name: Pin trusted Node executable"
+    snapshot_step = "- name: Create exact acceptance source snapshot"
     runtime_step = "- name: Install root-protected acceptance runtime"
-    dependency_step = "- name: Install locked dependencies"
+    dependency_step = "- name: Install locked frontend dependencies"
     seal_step = "- name: Seal acceptance source snapshot"
 
+    assert "ACCEPTANCE_GIT_SHA: ${{ github.sha }}" in acceptance_job
     assert 'python-version: "3.12.13"' in acceptance_job
     assert 'node-version: "24.18.0"' in acceptance_job
     assert 'version: "0.11.15"' in acceptance_job
     assert pin_step in acceptance_job
+    assert snapshot_step in acceptance_job
     assert runtime_step in acceptance_job
     assert dependency_step in acceptance_job
     assert seal_step in acceptance_job
@@ -304,9 +310,21 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     )
     assert "npm root --global" not in acceptance_job
 
+    checkout_block = acceptance_job.split("      - name: Check out repository\n", maxsplit=1)[
+        1
+    ].split("      - name: Set up Python\n", maxsplit=1)[0]
+    assert "fetch-depth: 0" in checkout_block
+    assert "persist-credentials: false" in checkout_block
+
+    setup_uv_block = acceptance_job.split("      - name: Set up uv\n", maxsplit=1)[1].split(
+        "      - name: Set up Node.js\n", maxsplit=1
+    )[0]
+    assert "enable-cache: false" in setup_uv_block
+    assert "cache-dependency-glob" not in setup_uv_block
+
     pin_block = acceptance_job.split("      - name: Pin trusted Node executable\n", maxsplit=1)[
         1
-    ].split("      - name: Install root-protected acceptance runtime\n", maxsplit=1)[0]
+    ].split("      - name: Create exact acceptance source snapshot\n", maxsplit=1)[0]
     assert 'node_source="$(readlink -f -- "$(command -v node)")"' in pin_block
     assert 'uv_source="$(readlink -f -- "$(command -v uv)")"' in pin_block
     assert 'npm_cli="$(readlink -f -- "$(command -v npm)")"' in pin_block
@@ -332,16 +350,18 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     setup_uv_index = acceptance_job.index("- name: Set up uv")
     setup_node_index = acceptance_job.index("- name: Set up Node.js")
     pin_index = acceptance_job.index(pin_step)
+    snapshot_index = acceptance_job.index(snapshot_step)
     runtime_index = acceptance_job.index(runtime_step)
     dependency_index = acceptance_job.index(dependency_step)
     seal_index = acceptance_job.index(seal_step)
-    npm_ci_index = acceptance_job.index("npm ci --prefix web")
+    npm_ci_index = acceptance_job.index("/usr/local/sbin/npm ci")
 
     assert (
         setup_python_index
         < setup_uv_index
         < setup_node_index
         < pin_index
+        < snapshot_index
         < runtime_index
         < dependency_index
         < npm_ci_index
@@ -351,6 +371,72 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     assert runtime_index < parser_index < dependency_index
     assert seal_index < acceptance_job.index("- name: Run enterprise acceptance profile")
     assert "--node-executable /usr/local/lib/heyi-acceptance/node" in acceptance_job
+
+
+def test_enterprise_acceptance_workflow_builds_exact_root_owned_source_snapshot() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+    snapshot_step = acceptance_job.split(
+        "      - name: Create exact acceptance source snapshot\n", maxsplit=1
+    )[1].split("      - name: Install root-protected acceptance runtime\n", maxsplit=1)[0]
+
+    assert '[[ "$ACCEPTANCE_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]' in snapshot_step
+    assert 'runner_head="$(/usr/bin/git rev-parse HEAD)"' in snapshot_step
+    assert 'test "$runner_head" = "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert 'test ! -e "$GITHUB_WORKSPACE/.git/objects/info/alternates"' in snapshot_step
+    assert "status --porcelain=v1 --untracked-files=all" in snapshot_step
+    assert "runner_status=" in snapshot_step
+    assert 'test -z "$runner_status"' in snapshot_step
+    assert 'runner_index_listing="$(/usr/bin/git ls-files -v)"' in snapshot_step
+    assert "awk '/^[a-zS]/ { print }'" in snapshot_step
+    assert "|| true" not in snapshot_step
+    assert 'if test -n "$hidden_index_flags"; then' in snapshot_step
+    assert re.search(
+        r"root_git\(\)\s*\{\s*sudo -H /usr/bin/env -i",
+        snapshot_step,
+        flags=re.DOTALL,
+    )
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in snapshot_step
+    assert "GIT_CONFIG_NOSYSTEM=1" in snapshot_step
+    assert 'safe.directory="$GITHUB_WORKSPACE"' in snapshot_step
+    normalized_snapshot = re.sub(r"\s+", " ", snapshot_step.replace("\\\n", " "))
+    assert re.search(
+        r'root_git -c safe\.directory="\$GITHUB_WORKSPACE" clone '
+        r"--no-local --no-hardlinks --no-checkout "
+        r'"\$GITHUB_WORKSPACE" "\$acceptance_source"',
+        normalized_snapshot,
+    )
+    assert 'checkout --detach "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert 'reset --hard "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert "clean -ffdx" in snapshot_step
+    assert 'test -d "$acceptance_source/web"' in snapshot_step
+    assert 'test ! -L "$acceptance_source/web"' in snapshot_step
+    assert 'test ! -e "$acceptance_source/web/node_modules"' in snapshot_step
+    assert 'test ! -L "$acceptance_source/web/node_modules"' in snapshot_step
+    assert 'sudo find "$acceptance_source" -type l -print0' in snapshot_step
+    assert '/usr/bin/tee "$preinstall_link_list" >/dev/null' in snapshot_step
+    assert 'done <"$preinstall_link_list"' in snapshot_step
+    assert "< <(" not in snapshot_step
+    assert 'sudo readlink -e -- "$link_path"' in snapshot_step
+    assert '"$acceptance_source" | "$acceptance_source"/*) ;;' in snapshot_step
+    assert re.search(
+        r"Refusing dangling pre-install symlink:[^\n]*\n\s+exit 1",
+        snapshot_step,
+    )
+    assert re.search(
+        r"Refusing external pre-install symlink:[^\n]*\n\s+exit 1",
+        snapshot_step,
+    )
+    assert "remote remove origin" in snapshot_step
+    assert "fsck --full --strict" in snapshot_step
+    assert 'snapshot_head="$(root_git -C "$acceptance_source" rev-parse HEAD)"' in snapshot_step
+    assert 'test "$snapshot_head" = "$ACCEPTANCE_GIT_SHA"' in snapshot_step
+    assert 'sudo chown -hR root:root "$acceptance_source"' in snapshot_step
+    assert 'sudo chmod -R go-w "$acceptance_source"' in snapshot_step
+    assert not re.search(r"(?m)(?:^|\s)(?:/[^\s]+/)?cp(?:\s|$)", snapshot_step)
+    assert "--shared" not in snapshot_step
+    assert "--reference" not in snapshot_step
 
 
 def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
@@ -365,14 +451,15 @@ def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
     assert "/usr/local/sbin/node" in acceptance_job
     runtime_step = acceptance_job.split(
         "      - name: Install root-protected acceptance runtime\n", maxsplit=1
-    )[1].split("      - name: Install locked dependencies\n", maxsplit=1)[0]
+    )[1].split("      - name: Install document parser sandbox tools\n", maxsplit=1)[0]
+    assert "cd /usr/local/lib/heyi-acceptance/source" in runtime_step
     assert 'python_source="$(readlink -f -- "$(command -v python)")"' in runtime_step
     assert (
         'test "$python_source" = \\\n'
         "            /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12" in runtime_step
     )
     assert (
-        '"$python_runtime" -I -m venv --copies \\\n'
+        '"$python_runtime" -I -S -m venv --copies --without-pip \\\n'
         "            /usr/local/lib/heyi-acceptance/venv" in runtime_step
     )
     assert 'python_prefix="${python_source%/bin/python3.12}"' in runtime_step
@@ -388,40 +475,167 @@ def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
     assert 'assert all(not entry.endswith(" (deleted)")' in runtime_step
     assert "path.is_relative_to(trusted_hosted_prefix)" in runtime_step
     assert "item.stat().st_uid == 0" in runtime_step
+    assert runtime_step.count("\"$python_runtime\" -I -S - <<'PY'") >= 2
     assert "--no-build --no-install-project" in runtime_step
+    assert 'UV_PYTHON="$python_runtime"' in runtime_step
     assert "for python_name in python python3 python3.12; do" in runtime_step
     assert 'python_staged="${python_target}.acceptance"' in runtime_step
     assert 'sudo install -o root -g root -m 0755 "$python_runtime" "$python_staged"' in runtime_step
     assert 'sudo mv -fT -- "$python_staged" "$python_target"' in runtime_step
-    assert "sudo chown -R root:root /usr/local/lib/heyi-acceptance" in runtime_step
+    assert "sudo chown -hR root:root /usr/local/lib/heyi-acceptance" in runtime_step
     assert "sudo chmod -R go-w /usr/local/lib/heyi-acceptance" in runtime_step
     assert 'assert "/opt/hostedtoolcache" not in config' in runtime_step
-    assert 'print("root-protected Python runtime: PASS")' in runtime_step
-    assert 'print("root-protected npm: PASS")' in runtime_step
+    assert "resolve(strict=True)" in runtime_step
+    assert "stat.S_ISREG" in runtime_step
+    assert "st_uid == 0" in runtime_step
+    assert "st_mode & 0o022" in runtime_step
+    assert "pyvenv.cfg" in runtime_step
+    assert 'settings["home"]' in runtime_step
+    assert 'settings["executable"]' in runtime_step
+    assert "root-protected Python runtime: PASS" in runtime_step
+    assert "root-protected npm: PASS" in runtime_step
+    shell_only_runtime = re.sub(
+        r"<<'PY'\n.*?\n\s+PY",
+        "<<'PY'\nPY",
+        runtime_step,
+        flags=re.DOTALL,
+    )
+    assert "/usr/local/lib/heyi-acceptance/venv/bin/python" not in shell_only_runtime
+    assert not re.search(
+        r"(?m)^\s*(?:sudo[^\n]*\s+)?"
+        r"/usr/local/lib/heyi-acceptance/venv/bin/python(?:\s|$)",
+        shell_only_runtime,
+    )
+    isolated_bodies = re.findall(
+        r'"\$python_runtime" -I -S - <<\'PY\'\n(.*?)\n\s+PY',
+        runtime_step,
+        flags=re.DOTALL,
+    )
+    assert len(isolated_bodies) == 2
+    allowed_import_roots = {"pathlib", "stat", "sys"}
+    for body in isolated_bodies:
+        tree = ast.parse(textwrap.dedent(body))
+        imported_roots = {
+            alias.name.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        imported_roots.update(
+            node.module.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        )
+        assert imported_roots <= allowed_import_roots
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"__import__", "compile", "eval", "exec"}
+            for node in ast.walk(tree)
+        )
+        assert not any(
+            isinstance(node, ast.ImportFrom) and (node.level > 0 or node.module is None)
+            for node in ast.walk(tree)
+        )
     assert "/opt/heyi-acceptance" not in runtime_step
 
+
+def test_enterprise_acceptance_workflow_seals_the_exact_source_after_npm_install() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
     dependency_step = acceptance_job.split(
-        "      - name: Install locked dependencies\n", maxsplit=1
+        "      - name: Install locked frontend dependencies\n", maxsplit=1
     )[1].split("      - name: Seal acceptance source snapshot\n", maxsplit=1)[0]
     assert "uv sync" not in dependency_step
+    assert 'sudo chown -hR "$runner_uid:$runner_gid" "$acceptance_source/web"' in dependency_step
+    assert 'sudo chown -hR "$runner_uid:$runner_gid" "$acceptance_source"' not in dependency_step
+    assert "assert_git_root_protected()" in dependency_step
+    assert 'find "$acceptance_source/.git" ! -user root -print -quit' in dependency_step
     assert (
-        "/usr/local/sbin/npm ci --prefix web --ignore-scripts --no-audit --no-fund"
-        in dependency_step
+        'find "$acceptance_source/.git" \\\n'
+        "                ! -type l -perm /022 -print -quit" in dependency_step
     )
+    assert 'find "$acceptance_source/.git" -type l -print -quit' in dependency_step
+    assert 'test -z "$non_root_git_paths"' in dependency_step
+    assert 'test -z "$writable_git_paths"' in dependency_step
+    assert 'test -z "$symlink_git_paths"' in dependency_step
+    git_protection_calls = [
+        match.start()
+        for match in re.finditer(
+            r"(?m)^\s+assert_git_root_protected\s*$",
+            dependency_step,
+        )
+    ]
+    assert len(git_protection_calls) == 2
+    assert all(
+        ".git" not in line for line in dependency_step.splitlines() if re.search(r"\bchown\b", line)
+    )
+    normalized_dependency = re.sub(r"\s+", " ", dependency_step.replace("\\\n", " "))
+    npm_contract = (
+        '/usr/local/sbin/npm ci --prefix "$acceptance_source/web" '
+        "--ignore-scripts --no-audit --no-fund"
+    )
+    assert npm_contract in normalized_dependency
+    assert (
+        git_protection_calls[0]
+        < dependency_step.index("/usr/local/sbin/npm ci")
+        < git_protection_calls[1]
+    )
+    assert "npm ci --prefix web" not in dependency_step
 
     seal_step = acceptance_job.split("      - name: Seal acceptance source snapshot\n", maxsplit=1)[
         1
     ].split("      - name: Run enterprise acceptance profile\n", maxsplit=1)[0]
-    assert "/usr/bin/git diff --exit-code -- ." in seal_step
-    assert "status --porcelain=v1 --untracked-files=no" in seal_step
-    assert 'sudo cp -a -- "$GITHUB_WORKSPACE" "$acceptance_source"' in seal_step
-    assert 'sudo chown -R root:root "$acceptance_source"' in seal_step
+    assert 'sudo chown -hR root:root "$acceptance_source"' in seal_step
     assert 'sudo chmod -R go-w "$acceptance_source"' in seal_step
     assert 'test -d "$acceptance_source/.git"' in seal_step
     assert 'test ! -e "$acceptance_source/.git/objects/info/alternates"' in seal_step
+    assert re.search(
+        r"root_git\(\)\s*\{\s*sudo -H /usr/bin/env -i",
+        seal_step,
+        flags=re.DOTALL,
+    )
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in seal_step
+    assert "GIT_CONFIG_NOSYSTEM=1" in seal_step
+    assert "fsck --full --strict" in seal_step
+    assert 'test "$sealed_sha" = "$ACCEPTANCE_GIT_SHA"' in seal_step
+    assert "diff --exit-code -- ." in seal_step
+    assert "diff --cached --exit-code -- ." in seal_step
+    assert "status --porcelain=v1 --untracked-files=all" in seal_step
+    assert 'test -z "$sealed_status"' in seal_step
+    assert "sealed_index_listing=" in seal_step
+    assert "awk '/^[a-zS]/ { print }'" in seal_step
+    assert "|| true" not in seal_step
+    assert 'if test -n "$hidden_index_flags"; then' in seal_step
+    assert "ls-files -z --others --ignored --exclude-standard" in seal_step
+    assert '>"$ignored_path_list"' in seal_step
+    assert 'done <"$ignored_path_list"' in seal_step
+    assert "web/node_modules/*" in seal_step
+    assert 'find "$acceptance_source" ! -user root -print -quit' in seal_step
+    assert 'find "$acceptance_source" ! -type l -perm /022 -print -quit' in seal_step
+    assert 'test -z "$non_root_paths"' in seal_step
+    assert 'test -z "$writable_paths"' in seal_step
     assert 'sudo find "$acceptance_source" -type l -print0' in seal_step
-    assert "Refusing external acceptance symlink" in seal_step
-    assert '/usr/bin/git -C "$acceptance_source" rev-parse HEAD' in seal_step
+    assert '/usr/bin/tee "$seal_link_list" >/dev/null' in seal_step
+    assert 'done <"$seal_link_list"' in seal_step
+    assert "< <(" not in seal_step
+    assert 'sudo readlink -e -- "$link_path"' in seal_step
+    assert '"$acceptance_source" | "$acceptance_source"/*) ;;' in seal_step
+    assert re.search(
+        r"Refusing dangling acceptance symlink:[^\n]*\n\s+exit 1",
+        seal_step,
+    )
+    assert re.search(
+        r"Refusing external acceptance symlink:[^\n]*\n\s+exit 1",
+        seal_step,
+    )
+    assert "resolve(strict=True)" in seal_step
+    assert "metadata.st_uid == 0" in seal_step
+    assert "metadata.st_mode & 0o022" in seal_step
+    assert "root-protected acceptance source ancestors: PASS" in seal_step
+    assert not re.search(r"(?m)(?:^|\s)(?:/[^\s]+/)?cp(?:\s|$)", seal_step)
+    assert "checked_out_sha" not in seal_step
 
     run_step = acceptance_job.split(
         "      - name: Run enterprise acceptance profile\n", maxsplit=1
