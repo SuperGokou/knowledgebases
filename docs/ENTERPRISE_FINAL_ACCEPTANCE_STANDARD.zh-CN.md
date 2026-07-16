@@ -99,22 +99,29 @@ sudo -H bash <<'ROOT'
 set -euo pipefail
 umask 077
 
-RELEASE='/srv/heyi-knowledgebases-offline/releases/REPLACE_WITH_CONTENT_SHA'
+SOURCE_CHECKOUT='/srv/heyi-knowledgebases-offline/acceptance-source/REPLACE_WITH_40_CHAR_GIT_SHA'
+BUNDLE_ROOT='/srv/heyi-knowledgebases-offline/artifacts/REPLACE_WITH_RELEASE_ID/offline-registry-bundle'
 RUNTIME_ENV='/srv/heyi-knowledgebases-offline/shared/runtime.env'
-RELEASE_ENV="$RELEASE/release.env"
+RELEASE_ENV="$BUNDLE_ROOT/release.env"
 EVIDENCE_ROOT='/srv/heyi-knowledgebases-offline/evidence'
 TRUST_ROOT='/etc/heyi-acceptance'
-RELEASE_ID='REPLACE_WITH_IMMUTABLE_RELEASE_ID'
+RELEASE_ID='REPLACE_WITH_40_CHAR_GIT_SHA'
 NODE_EXECUTABLE='/usr/local/lib/heyi-acceptance/node'
+DEPLOYMENT_BASE_URL='https://knowledge.example.internal'
+BROWSER_EVIDENCE="$SOURCE_CHECKOUT/artifacts/acceptance/functional/browser-e2e.json"
+LINUX_HOST_EVIDENCE="$SOURCE_CHECKOUT/artifacts/acceptance/functional/linux-host.json"
 
-test -d "$RELEASE/.git" || test -f "$RELEASE/.git"
-test "$RELEASE_ID" != 'REPLACE_WITH_IMMUTABLE_RELEASE_ID'
-cd -- "$RELEASE"
+test -d "$SOURCE_CHECKOUT/.git" || test -f "$SOURCE_CHECKOUT/.git"
+test -f "$RELEASE_ENV"
+test -f "$RELEASE_ENV.images"
+test "$RELEASE_ID" != 'REPLACE_WITH_40_CHAR_GIT_SHA'
+cd -- "$SOURCE_CHECKOUT"
 
 install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
 install -o root -g root -m 0755 "$(command -v node)" "$NODE_EXECUTABLE"
+install -d -o root -g root -m 0750 "$(dirname "$BROWSER_EVIDENCE")"
 
-PYTHONPATH="$RELEASE" /usr/bin/python3 scripts/acceptance.py \
+PYTHONPATH="$SOURCE_CHECKOUT" /usr/bin/python3 scripts/acceptance.py \
   --profile final \
   --host-disk-path /srv \
   --host-io-evidence "$EVIDENCE_ROOT/host-io.json" \
@@ -122,11 +129,14 @@ PYTHONPATH="$RELEASE" /usr/bin/python3 scripts/acceptance.py \
   --offline-runtime-env-file "$RUNTIME_ENV" \
   --offline-release-env-file "$RELEASE_ENV" \
   --offline-runtime-evidence "$EVIDENCE_ROOT/offline-runtime/offline-runtime-evidence.json" \
-  --e2e-evidence "$EVIDENCE_ROOT/browser-e2e.json" \
+  --e2e-evidence "$BROWSER_EVIDENCE" \
+  --linux-host-evidence "$LINUX_HOST_EVIDENCE" \
   --functional-trust-store "$TRUST_ROOT/functional-trust.json" \
   --functional-challenge-store /var/lib/heyi-acceptance/challenges \
   --e2e-signing-key-path "$TRUST_ROOT/browser-e2e-ed25519.key" \
   --e2e-signing-key-id browser-e2e-ed25519 \
+  --linux-host-signing-key-path "$TRUST_ROOT/linux-host-ed25519.key" \
+  --deployment-base-url "$DEPLOYMENT_BASE_URL" \
   --malware-evidence "$EVIDENCE_ROOT/malware.json" \
   --security-scan-evidence "$EVIDENCE_ROOT/security-scan.json" \
   --release-id "$RELEASE_ID" \
@@ -139,11 +149,11 @@ PYTHONPATH="$RELEASE" /usr/bin/python3 scripts/acceptance.py \
   --supply-chain-attestation "$TRUST_ROOT/release-rights-attestation.json" \
   --supply-chain-artifact-root "$EVIDENCE_ROOT/supply-chain" \
   --node-executable "$NODE_EXECUTABLE" \
-  --report-dir "$RELEASE/artifacts/acceptance/final"
+  --report-dir "$EVIDENCE_ROOT/reports/final"
 ROOT
 ```
 
-上面是 `final` Profile 的唯一完整入口示例；只需替换发布目录名和与容量/灾备签名信封一致的 `RELEASE_ID`。镜像清单不单独传参，验收器只从 `"$RELEASE_ENV.images"` 派生；若为兼容调用显式提供 `--offline-image-manifest`，其值也必须逐字等于该路径。`--supply-chain-attestation` 中的发布身份必须绑定当前 Git HEAD，而 `--release-id` 必须同时匹配容量与灾备证据中的不可变发布令牌。
+上面是 `final` Profile 的唯一完整入口示例。`SOURCE_CHECKOUT` 必须是与目标 40 位 Git SHA 绑定的干净源码检出，只用于运行验收器；`BUNDLE_ROOT` 必须是同一发布身份的已验签、只读运输 bundle，`RELEASE_ENV` 固定来自该 bundle。二者都不是 `/releases/<contract-sha256>` 的运行时物化目录；物化目录没有 `.git`、`runtime.env` 或 `release.env`。替换占位符时，`RELEASE_ID` 必须逐字等于源码 Git HEAD，且该 SHA、bundle 的 `RELEASE_ID`/`RELEASE_GIT_SHA`、供应链权利声明以及容量/灾备签名信封必须属于同一候选发布。镜像清单不单独传参，验收器只从 `"$RELEASE_ENV.images"` 派生；若为兼容调用显式提供 `--offline-image-manifest`，其值也必须逐字等于该路径。`DEPLOYMENT_BASE_URL` 必须是本次被测部署的规范 HTTPS origin；浏览器和 Linux 主机证据必须分别写入源码检出内固定的 `artifacts/acceptance/functional/browser-e2e.json` 与 `linux-host.json`，两份签名证据的发布 SHA、canonical contract 摘要、镜像清单摘要、URL 与主机身份必须完全一致。最终 JSON 只保存 canonical contract 与镜像清单的 SHA-256，不保存环境或清单正文；报告自身的规范 SHA-256 仍需由仓库外的签名发布包封装后才能作为正式交付证据。
 
 `final` Profile 必须在目标 Linux 主机执行，并把 `HOST-P0-001` 作为 P0。脚本只读取操作系统、架构、CPU、内存和指定路径所在文件系统，不读取 `.env`、IP 或凭据。Windows 或非目标环境返回 `blocked` 和退出码 2；目标 Linux 不符合规格返回退出码 1；通过返回 0。存在任何 P0 `failed/blocked` 时最终 verdict 必须为 `FAIL`。
 
@@ -151,7 +161,7 @@ ROOT
 
 `E2E-P0-001` 固定运行 enterprise Profile，必须运行 24 项企业桌面/移动业务检查（每个项目 12 项，包含严格 TLS 身份与有效期验证）以及桌面、移动各 1 项失败关闭预检，共 26 个测试实例；默认 4 项 Smoke 不能满足终验。Playwright 退出 0 后仍必须通过 `scripts.functional_acceptance` 对唯一 `EXT-BROWSER-E2E-001` 执行正式 `ed25519-challenge-v1` 验签并原子消费一次性 challenge；只有两步都成功才可通过。缺拓扑、缺证据、SHA-only、自签名、签名/指纹/工件不匹配或 challenge 重放均为 `blocked`，普通业务断言失败为 `failed`。签名私钥路径、固定 key id 和选中的 browser challenge 文件只通过显式子进程环境 `KB_E2E_SIGNING_KEY_PATH`、`KB_E2E_SIGNING_KEY_ID`、`KB_E2E_CHALLENGE_PATH` 交给 reporter，不读取项目 `.env`、不输出私钥内容。
 
-`--functional-trust-store` 必须是仓库外 root 所有的 `0400/0600` 非符号链接普通文件；`--functional-challenge-store` 必须是仓库外 root 所有的 `0700` 非符号链接目录，内部 challenge 为 `0400/0600` 普通文件；`--e2e-signing-key-path` 同样必须是仓库外 root 所有的受保护普通文件。`HOST-P0-001` 和 `STORAGE-WATERMARK-P0-001` 分别以模块入口消费显式的 `--host-io-evidence` 与 `--storage-chain-evidence`。`OFFLINE-P0-001` 必须先以 root 执行 `preflight-offline.sh`，`OFFLINE-IMAGES-P0-001` 再执行 `verify-offline-images.sh verify`；`OFFLINE-RUNTIME-P0-001` 独立验签 `--offline-runtime-evidence` 中的断网冷启动、业务闭环、持久化和网络恢复证据。只完成 RepoDigest、Compose 渲染或单元测试 fake runner 不能通过离线终验。`FORMAT-P0-001` 必须在内容寻址 API 镜像内执行 `python -m app.document_parser_preflight --require-all`；缺少 PDF/旧版 Office 工具或隔离沙箱时返回码 2 并记为 `blocked`。
+`--functional-trust-store` 必须是仓库外 root 所有的 `0400/0600` 非符号链接普通文件；`--functional-challenge-store` 必须是仓库外 root 所有的 `0700` 非符号链接目录，内部 challenge 为 `0400/0600` 普通文件；`--e2e-signing-key-path` 与 `--linux-host-signing-key-path` 同样必须是仓库外 root 所有的受保护普通文件。`LINUX-HOST-EVIDENCE-P0-001` 必须先采集并签署实际运行容器、发布回执、Compose origin、TLS 链、证书续期/重载和缓存替换证据；之后 `E2E-P0-001` 才能采集浏览器证据，最后 `FUNCTIONAL-P0-001` 对两份证据执行严格部署身份交叉绑定。任一证据缺失、旧部署混绑、字段不一致或 challenge 重放均为 `blocked/FAIL`。`HOST-P0-001` 和 `STORAGE-WATERMARK-P0-001` 分别以模块入口消费显式的 `--host-io-evidence` 与 `--storage-chain-evidence`。`OFFLINE-P0-001` 必须先以 root 执行 `preflight-offline.sh`，`OFFLINE-IMAGES-P0-001` 再执行 `verify-offline-images.sh verify`；`OFFLINE-RUNTIME-P0-001` 独立验签 `--offline-runtime-evidence` 中的断网冷启动、业务闭环、持久化和网络恢复证据。只完成 RepoDigest、Compose 渲染或单元测试 fake runner 不能通过离线终验。`FORMAT-P0-001` 必须在内容寻址 API 镜像内执行 `python -m app.document_parser_preflight --require-all`；缺少 PDF/旧版 Office 工具或隔离沙箱时返回码 2 并记为 `blocked`。
 
 `--node-executable` 必须指向仓库外的绝对规范路径。`final`/`ci` 会要求该 Node 普通文件及全部祖先目录由 root 所有、不可被组或其他用户写入，并拒绝符号链接；验收器在净化子进程环境前计算可执行文件 SHA-256，再把规范路径和摘要传给功能验收器，并在实际启动 Node 前复核文件身份与摘要。绑定缺失、路径不可信或运行期间被替换时，`FUNCTIONAL-P0-001` 必须 `blocked`。
 

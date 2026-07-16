@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
@@ -45,6 +46,8 @@ from scripts.acceptance_gate import (  # noqa: E402 - direct script bootstrap ab
     atomic_write_text,
     bind_trusted_executable,
     bind_trusted_executable_path,
+    discover_postgres_test_files,
+    parse_pytest_junit,
     sanitized_test_environment,
     start_gate_identity,
 )
@@ -94,7 +97,10 @@ _BROWSER_E2E_TOPOLOGY_ENVIRONMENT = frozenset(
         "KB_E2E_JOB_TIMEOUT_MS",
         "KB_E2E_MULTIPART_BYTES",
         "KB_E2E_OBJECTS_ORIGIN",
+        "KB_E2E_OFFLINE_CONTRACT_SHA256",
+        "KB_E2E_IMAGE_MANIFEST_SHA256",
         "KB_E2E_PUBLIC_API_ORIGIN",
+        "KB_E2E_RELEASE_ID",
         "KB_E2E_SEEDED_KNOWLEDGE_BASE_ID",
         "KB_E2E_SUITE_TIMEOUT_MS",
         "KB_E2E_TEST_TIMEOUT_MS",
@@ -145,6 +151,7 @@ _OPERATIONAL_EVIDENCE_CONTRACTS: dict[OperationalEvidenceKind, dict[str, object]
                 "restore_drill_report",
                 "database_integrity",
                 "object_integrity",
+                "control_plane_integrity",
                 "functional_smoke",
             }
         ),
@@ -184,6 +191,8 @@ class AcceptanceResult:
     status: GateStatus
     duration_seconds: float
     summary: str
+    child_evidence_kind: ChildEvidenceKind | None = None
+    child_evidence_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +339,23 @@ def _child_evidence_cli_arguments(
     )
 
 
-def calculate_verdict(results: Sequence[AcceptanceResult]) -> Verdict:
+def _gate_set_verified(
+    results: Sequence[AcceptanceResult],
+    *,
+    required_gate_ids: Sequence[str],
+) -> bool:
+    required = tuple(required_gate_ids)
+    observed = tuple(item.gate_id for item in results)
+    return bool(required) and len(required) == len(set(required)) and observed == required
+
+
+def calculate_verdict(
+    results: Sequence[AcceptanceResult],
+    *,
+    required_gate_ids: Sequence[str],
+) -> Verdict:
+    if not _gate_set_verified(results, required_gate_ids=required_gate_ids):
+        return "FAIL"
     if any(item.severity == "P0" and item.status != "passed" for item in results):
         return "FAIL"
     if any(item.severity == "P1" and item.status != "passed" for item in results):
@@ -590,38 +615,630 @@ def _read_bounded_regular_file(path: Path, *, maximum_bytes: int) -> bytes | Non
     return payload
 
 
+_CHILD_PYTEST_KEYS = frozenset(
+    {
+        "path",
+        "sha256",
+        "bytes",
+        "collected",
+        "executed",
+        "passed",
+        "failed",
+        "errors",
+        "skipped",
+        "xfailed",
+        "xpassed",
+        "deselected",
+        "unexpected",
+        "node_ids",
+        "missing_node_ids",
+        "unexpected_node_ids",
+        "test_files",
+    }
+)
+_FUNCTIONAL_RESULT_KEYS = frozenset(
+    {
+        "command_id",
+        "status",
+        "passed_tests",
+        "summary",
+        "machine_artifact",
+        "machine_artifact_sha256",
+        "result_hash",
+        "verified_nodes",
+    }
+)
+_FUNCTIONAL_LEDGER_KEYS = frozenset(
+    {
+        "schema_version",
+        "policy_sha256",
+        "command_id",
+        "framework",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+        "exit_code",
+        "environment",
+        "target",
+        "raw_result",
+        "passed_tests",
+        "skipped_tests",
+        "machine_execution",
+        "required_nodes",
+        "result_hash",
+    }
+)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _child_artifact(
+    path: Path,
+    *,
+    root: Path,
+    maximum_bytes: int,
+) -> tuple[Path, bytes] | None:
+    try:
+        root = root.resolve(strict=True)
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if _path_has_symlink(root, path):
+        return None
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    payload = _read_bounded_regular_file(resolved, maximum_bytes=maximum_bytes)
+    if payload is None:
+        return None
+    return resolved, payload
+
+
+def _validate_pytest_child_evidence(
+    value: object,
+    *,
+    evidence_path: Path,
+    minimum_collected: int,
+    expected_test_files: Sequence[str] | None = None,
+) -> tuple[str, ...] | None:
+    if not isinstance(value, dict) or set(value) != _CHILD_PYTEST_KEYS:
+        return None
+    raw_path = value.get("path")
+    node_ids = value.get("node_ids")
+    if (
+        not isinstance(raw_path, str)
+        or not isinstance(node_ids, list)
+        or not node_ids
+        or not all(isinstance(node, str) and node for node in node_ids)
+        or len(node_ids) != len(set(node_ids))
+    ):
+        return None
+    relative = Path(raw_path)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) != 2
+        or relative.parts[0] != "raw"
+        or relative.suffix != ".xml"
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        return None
+    artifact = _child_artifact(
+        evidence_path.parent / relative,
+        root=evidence_path.parent,
+        maximum_bytes=100 * 1024 * 1024,
+    )
+    if artifact is None:
+        return None
+    artifact_path, _payload = artifact
+    try:
+        parsed = parse_pytest_junit(artifact_path, cast(list[str], node_ids))
+    except (AcceptanceGateError, OSError, ValueError):
+        return None
+    expected = parsed.as_dict(path=relative.as_posix())
+    test_files = expected.get("test_files")
+    if (
+        value != expected
+        or not parsed.is_success
+        or parsed.collected < minimum_collected
+        or (expected_test_files is not None and test_files != list(expected_test_files))
+    ):
+        return None
+    return parsed.node_ids
+
+
+def _validate_postgres_child_document(
+    document: Mapping[str, object],
+    *,
+    repository: Path,
+    evidence_path: Path,
+    identity: GateIdentity,
+) -> bool:
+    if set(document) != {
+        "schema_version",
+        "kind",
+        "started_at",
+        "finished_at",
+        "image_id",
+        "target",
+        "status",
+        "policy_status",
+        "checks",
+        "pytest",
+    }:
+        return False
+    image_id = document.get("image_id")
+    if (
+        not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+        or not isinstance(document.get("started_at"), str)
+        or not isinstance(document.get("finished_at"), str)
+    ):
+        return False
+    expected_files = discover_postgres_test_files(repository)
+    node_ids = _validate_pytest_child_evidence(
+        document.get("pytest"),
+        evidence_path=evidence_path,
+        minimum_collected=1,
+        expected_test_files=expected_files,
+    )
+    if node_ids is None:
+        return False
+    try:
+        from scripts.backend_acceptance import postgres_evidence_closes_mapping
+
+        return postgres_evidence_closes_mapping(
+            document,
+            repository=repository,
+            evidence_path=evidence_path,
+            identity=identity,
+            expected_nodes=node_ids,
+        )
+    except (AcceptanceGateError, ImportError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _functional_test_contracts(
+    manifest: Mapping[str, object],
+) -> dict[str, Mapping[str, object]] | None:
+    raw_commands = manifest.get("test_commands")
+    if not isinstance(raw_commands, list) or not raw_commands:
+        return None
+    contracts: dict[str, Mapping[str, object]] = {}
+    for value in raw_commands:
+        if not isinstance(value, dict):
+            return None
+        command_id = value.get("id")
+        if not isinstance(command_id, str) or not command_id or command_id in contracts:
+            return None
+        contracts[command_id] = cast(Mapping[str, object], value)
+    return contracts
+
+
+def _functional_artifact_path(
+    raw_path: object,
+    *,
+    identity: GateIdentity,
+    command_id: str,
+) -> tuple[Path, bytes] | None:
+    if not isinstance(raw_path, str):
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute() or path.name != f"{command_id}.acceptance.json":
+        return None
+    root = (
+        Path(tempfile.gettempdir())
+        / "heyi-functional-acceptance"
+        / identity.content_fingerprint
+        / identity.run_nonce
+    )
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return None
+    if len(relative.parts) != 2:
+        return None
+    return _child_artifact(path, root=root, maximum_bytes=2 * 1024 * 1024)
+
+
+def _validate_functional_test_result(
+    value: object,
+    *,
+    contract: Mapping[str, object],
+    repository: Path,
+    identity: GateIdentity,
+    policy_sha256: str,
+) -> bool:
+    if not isinstance(value, dict) or set(value) != _FUNCTIONAL_RESULT_KEYS:
+        return False
+    command_id = contract.get("id")
+    framework = contract.get("framework")
+    minimum = contract.get("minimum_passed_tests")
+    required_nodes = contract.get("required_test_nodes")
+    cwd_value = contract.get("cwd")
+    if (
+        not isinstance(command_id, str)
+        or framework not in {"pytest", "vitest"}
+        or type(minimum) is not int
+        or minimum <= 0
+        or not isinstance(required_nodes, list)
+        or not required_nodes
+        or not all(isinstance(node, str) and node for node in required_nodes)
+        or not isinstance(cwd_value, str)
+    ):
+        return False
+    passed_tests = value.get("passed_tests")
+    verified_nodes = value.get("verified_nodes")
+    artifact_sha256 = value.get("machine_artifact_sha256")
+    result_hash = value.get("result_hash")
+    if (
+        value.get("command_id") != command_id
+        or value.get("status") != "passed"
+        or type(passed_tests) is not int
+        or passed_tests < minimum
+        or type(verified_nodes) is not int
+        or verified_nodes != len(required_nodes)
+        or value.get("summary") != f"{passed_tests} tests passed"
+        or not isinstance(artifact_sha256, str)
+        or _SHA256.fullmatch(artifact_sha256) is None
+        or not isinstance(result_hash, str)
+        or _SHA256.fullmatch(result_hash) is None
+    ):
+        return False
+    artifact = _functional_artifact_path(
+        value.get("machine_artifact"),
+        identity=identity,
+        command_id=command_id,
+    )
+    if artifact is None:
+        return False
+    artifact_path, artifact_payload = artifact
+    if hashlib.sha256(artifact_payload).hexdigest() != artifact_sha256:
+        return False
+    try:
+        ledger = _strict_json_object(artifact_payload, label="functional child ledger")
+    except ValueError:
+        return False
+    if set(ledger) != _FUNCTIONAL_LEDGER_KEYS:
+        return False
+    unsigned_ledger = dict(ledger)
+    unsigned_ledger.pop("result_hash", None)
+    expected_result_hash = hashlib.sha256(
+        json.dumps(unsigned_ledger, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    environment = ledger.get("environment")
+    raw_result = ledger.get("raw_result")
+    machine_execution = ledger.get("machine_execution")
+    required_results = ledger.get("required_nodes")
+    if (
+        ledger.get("schema_version") != 2
+        or ledger.get("policy_sha256") != policy_sha256
+        or ledger.get("command_id") != command_id
+        or ledger.get("framework") != framework
+        or ledger.get("target") != identity.target()
+        or ledger.get("exit_code") != 0
+        or ledger.get("passed_tests") != passed_tests
+        or ledger.get("skipped_tests") != 0
+        or ledger.get("result_hash") != result_hash
+        or result_hash != expected_result_hash
+        or type(ledger.get("duration_ms")) is not int
+        or cast(int, ledger.get("duration_ms")) < 0
+        or not isinstance(ledger.get("started_at"), str)
+        or not isinstance(ledger.get("finished_at"), str)
+        or not isinstance(environment, dict)
+        or set(environment) != {"system", "release", "machine", "python", "dependency_lock_sha256"}
+        or not isinstance(environment.get("dependency_lock_sha256"), str)
+        or _SHA256.fullmatch(cast(str, environment.get("dependency_lock_sha256"))) is None
+        or not isinstance(raw_result, dict)
+        or set(raw_result) != {"path", "sha256", "bytes"}
+        or not isinstance(machine_execution, dict)
+        or not isinstance(required_results, list)
+    ):
+        return False
+    raw_path_value = raw_result.get("path")
+    raw_sha256 = raw_result.get("sha256")
+    raw_bytes = raw_result.get("bytes")
+    if (
+        not isinstance(raw_path_value, str)
+        or not isinstance(raw_sha256, str)
+        or _SHA256.fullmatch(raw_sha256) is None
+        or type(raw_bytes) is not int
+        or raw_bytes <= 0
+    ):
+        return False
+    raw_path = Path(raw_path_value)
+    if not raw_path.is_absolute() or raw_path.parent != artifact_path.parent:
+        return False
+    raw_artifact = _child_artifact(
+        raw_path,
+        root=artifact_path.parent,
+        maximum_bytes=100 * 1024 * 1024,
+    )
+    if raw_artifact is None:
+        return False
+    resolved_raw_path, raw_payload = raw_artifact
+    if len(raw_payload) != raw_bytes or hashlib.sha256(raw_payload).hexdigest() != raw_sha256:
+        return False
+    try:
+        from scripts.functional_acceptance import (
+            _node_statuses_from_pytest,
+            _node_statuses_from_vitest,
+            _vitest_machine_evidence,
+        )
+
+        cwd = (repository / cwd_value).resolve(strict=True)
+        cwd.relative_to(repository)
+        if framework == "pytest":
+            node_ids = machine_execution.get("node_ids")
+            if not isinstance(node_ids, list):
+                return False
+            parsed = parse_pytest_junit(resolved_raw_path, cast(list[str], node_ids))
+            expected_machine_execution = parsed.as_dict(path=str(resolved_raw_path))
+            node_results, actual_passed, actual_skipped = _node_statuses_from_pytest(
+                resolved_raw_path, cast(list[str], required_nodes)
+            )
+            successful = parsed.is_success
+        else:
+            node_ids = machine_execution.get("node_ids")
+            if not isinstance(node_ids, list):
+                return False
+            vitest = _vitest_machine_evidence(resolved_raw_path, cwd, cast(list[str], node_ids))
+            expected_machine_execution = vitest.as_dict()
+            node_results, actual_passed, actual_skipped = _node_statuses_from_vitest(
+                resolved_raw_path, cast(list[str], required_nodes)
+            )
+            successful = vitest.is_success
+    except (
+        AcceptanceGateError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+    return bool(
+        successful
+        and machine_execution == expected_machine_execution
+        and required_results == node_results
+        and all(
+            isinstance(item, dict)
+            and item.get("status") == "passed"
+            and item.get("failed") == 0
+            and item.get("skipped") == 0
+            and type(item.get("cases")) is int
+            and cast(int, item.get("cases")) > 0
+            for item in required_results
+        )
+        and actual_passed == passed_tests
+        and actual_skipped == 0
+    )
+
+
+def _validate_functional_child_document(
+    document: Mapping[str, object],
+    *,
+    repository: Path,
+    identity: GateIdentity,
+) -> bool:
+    if set(document) != {
+        "schema_version",
+        "profile",
+        "source_verdict",
+        "runtime_functional_verdict",
+        "verdict",
+        "contract",
+        "test_commands",
+        "external_evidence",
+        "kind",
+        "target",
+        "status",
+        "policy_status",
+    }:
+        return False
+    try:
+        from scripts.functional_acceptance import evaluate_contract, load_manifest
+
+        manifest = load_manifest(repository / "docs/functional_acceptance_manifest.json")
+        expected_contract = asdict(evaluate_contract(repository, manifest))
+    except (ImportError, OSError, RuntimeError, UnicodeError, ValueError):
+        return False
+    if document.get("contract") != expected_contract:
+        return False
+    policy_sha256 = expected_contract.get("policy_sha256")
+    contracts = _functional_test_contracts(manifest)
+    results = document.get("test_commands")
+    external = document.get("external_evidence")
+    profile = document.get("profile")
+    if (
+        profile not in {"source", "runtime-functional"}
+        or document.get("source_verdict") != "PASS"
+        or document.get("verdict") != "PASS"
+        or document.get("runtime_functional_verdict") not in {"PASS", "BLOCKED"}
+        or not isinstance(policy_sha256, str)
+        or _SHA256.fullmatch(policy_sha256) is None
+        or contracts is None
+        or not isinstance(results, list)
+        or len(results) != len(contracts)
+        or not isinstance(external, dict)
+        or set(external) != {"verdict", "results"}
+    ):
+        return False
+    indexed_results: dict[str, object] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            return False
+        command_id = result.get("command_id")
+        if not isinstance(command_id, str) or command_id in indexed_results:
+            return False
+        indexed_results[command_id] = result
+    if set(indexed_results) != set(contracts):
+        return False
+    if not all(
+        _validate_functional_test_result(
+            indexed_results[command_id],
+            contract=contract,
+            repository=repository,
+            identity=identity,
+            policy_sha256=policy_sha256,
+        )
+        for command_id, contract in contracts.items()
+    ):
+        return False
+    external_results = external.get("results")
+    if not isinstance(external_results, list):
+        return False
+    expected_external = manifest.get("external_evidence")
+    if not isinstance(expected_external, list):
+        return False
+    expected_ids = [item.get("id") for item in expected_external if isinstance(item, dict)]
+    observed_ids: list[object] = []
+    observed_statuses: list[object] = []
+    for result in external_results:
+        if not isinstance(result, dict) or set(result) != {"evidence_id", "status", "summary"}:
+            return False
+        observed_ids.append(result.get("evidence_id"))
+        observed_statuses.append(result.get("status"))
+    external_verdict = external.get("verdict")
+    evidence_consistent = bool(
+        observed_ids == expected_ids
+        and all(status in {"passed", "blocked"} for status in observed_statuses)
+        and (
+            external_verdict == "PASS"
+            and all(status == "passed" for status in observed_statuses)
+            and document.get("runtime_functional_verdict") == "PASS"
+            or external_verdict == "BLOCKED"
+            and any(status == "blocked" for status in observed_statuses)
+            and document.get("runtime_functional_verdict") == "BLOCKED"
+        )
+    )
+    return bool(
+        evidence_consistent
+        and (
+            profile == "source"
+            or (
+                external_verdict == "PASS"
+                and document.get("runtime_functional_verdict") == "PASS"
+                and all(status == "passed" for status in observed_statuses)
+            )
+        )
+    )
+
+
+def _backend_minimum_tests(repository: Path) -> int | None:
+    try:
+        document = _strict_json_object(
+            (repository / "docs/functional_acceptance_manifest.json").read_bytes(),
+            label="functional acceptance manifest",
+        )
+    except (OSError, ValueError):
+        return None
+    contracts = _functional_test_contracts(document)
+    if contracts is None:
+        return None
+    backend = contracts.get("backend-functional")
+    minimum = backend.get("minimum_passed_tests") if backend is not None else None
+    return minimum if type(minimum) is int and minimum > 0 else None
+
+
+def _validate_backend_child_document(
+    document: Mapping[str, object],
+    *,
+    repository: Path,
+    evidence_path: Path,
+) -> bool:
+    if set(document) != {
+        "schema_version",
+        "kind",
+        "status",
+        "policy_status",
+        "started_at",
+        "finished_at",
+        "target",
+        "checks",
+        "pytest",
+        "postgres_skip_closure",
+    }:
+        return False
+    minimum = _backend_minimum_tests(repository)
+    if (
+        minimum is None
+        or not isinstance(document.get("started_at"), str)
+        or not isinstance(document.get("finished_at"), str)
+        or document.get("checks") != {"coverage_minimum_percent": 80}
+    ):
+        return False
+    node_ids = _validate_pytest_child_evidence(
+        document.get("pytest"),
+        evidence_path=evidence_path,
+        minimum_collected=minimum,
+    )
+    closure = document.get("postgres_skip_closure")
+    if (
+        node_ids is None
+        or not isinstance(closure, dict)
+        or set(closure)
+        != {
+            "gate_id",
+            "evidence_kind",
+            "evidence_file_name",
+            "evidence_sha256",
+            "mapped_test_files",
+        }
+    ):
+        return False
+    mapped = list(discover_postgres_test_files(repository))
+    pytest_evidence = cast(Mapping[str, object], document["pytest"])
+    test_files = pytest_evidence.get("test_files")
+    postgres_path = repository / _MACHINE_EVIDENCE_PATHS["postgres-acceptance"]
+    postgres_payload = _read_bounded_regular_file(postgres_path, maximum_bytes=1024 * 1024)
+    postgres_sha256 = closure.get("evidence_sha256")
+    return bool(
+        closure.get("gate_id") == "TOKEN-GOV-P0-001"
+        and closure.get("evidence_kind") == "postgres-acceptance"
+        and closure.get("evidence_file_name") == postgres_path.name
+        and isinstance(postgres_sha256, str)
+        and _SHA256.fullmatch(postgres_sha256) is not None
+        and postgres_payload is not None
+        and hashlib.sha256(postgres_payload).hexdigest() == postgres_sha256
+        and closure.get("mapped_test_files") == mapped
+        and isinstance(test_files, list)
+        and bool(test_files)
+        and all(isinstance(path, str) and path not in mapped for path in test_files)
+    )
+
+
 def verify_bound_child_evidence(
     gate: AcceptanceGate,
     *,
     repository: Path,
     identity: GateIdentity,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None]:
     """Verify a machine child result against the exact top-level acceptance target."""
     kind = gate.child_evidence_kind
     raw_path = gate.child_evidence_path
     failure = "machine child evidence is missing, unsafe, or does not match this acceptance run"
     if kind is None or raw_path is None:
-        return False, failure
+        return False, failure, None
     expected_path = _MACHINE_EVIDENCE_PATHS.get(kind)
     if raw_path != expected_path:
-        return False, failure
+        return False, failure, None
     repository = repository.resolve()
     candidate = repository / raw_path
     try:
         candidate.relative_to(repository)
     except ValueError:
-        return False, failure
+        return False, failure, None
     if _path_has_symlink(repository, candidate):
-        return False, failure
+        return False, failure, None
     payload = _read_bounded_regular_file(candidate, maximum_bytes=1024 * 1024)
     if payload is None:
-        return False, failure
+        return False, failure, None
     try:
-        document = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False, failure
-    if not isinstance(document, dict):
-        return False, failure
+        document = _strict_json_object(payload, label=f"{kind} child evidence")
+    except ValueError:
+        return False, failure, None
     if (
         type(document.get("schema_version")) is not int
         or document.get("schema_version") != 2
@@ -630,12 +1247,35 @@ def verify_bound_child_evidence(
         or document.get("policy_status") != "passed"
         or document.get("target") != identity.target()
     ):
-        return False, failure
-    if kind == "functional-acceptance" and (
-        document.get("verdict") != "PASS" or document.get("source_verdict") != "PASS"
-    ):
-        return False, failure
-    return True, f"{kind} evidence verified for the exact acceptance target"
+        return False, failure, None
+    valid = (
+        _validate_functional_child_document(
+            document,
+            repository=repository,
+            identity=identity,
+        )
+        if kind == "functional-acceptance"
+        else _validate_postgres_child_document(
+            document,
+            repository=repository,
+            evidence_path=candidate,
+            identity=identity,
+        )
+        if kind == "postgres-acceptance"
+        else _validate_backend_child_document(
+            document,
+            repository=repository,
+            evidence_path=candidate,
+        )
+    )
+    if not valid:
+        return False, failure, None
+    evidence_sha256 = hashlib.sha256(payload).hexdigest()
+    return (
+        True,
+        f"kind={kind} sha256={evidence_sha256} verified for the exact acceptance target",
+        evidence_sha256,
+    )
 
 
 def _identity_failure(stage: str, started: float) -> AcceptanceResult:
@@ -687,7 +1327,7 @@ def run_gates_bound_to_identity(
             gate.child_evidence_path is not None or gate.child_evidence_kind is not None
         )
         if result.status == "passed" and has_child_contract:
-            accepted, summary = verify_bound_child_evidence(
+            accepted, summary, child_evidence_sha256 = verify_bound_child_evidence(
                 gate,
                 repository=repository,
                 identity=identity,
@@ -700,7 +1340,12 @@ def run_gates_bound_to_identity(
                 return results
             if not verify(f"after {gate.gate_id} child evidence verification"):
                 return results
-            result = replace(result, summary=summary)
+            result = replace(
+                result,
+                summary=summary,
+                child_evidence_kind=gate.child_evidence_kind,
+                child_evidence_sha256=child_evidence_sha256,
+            )
         results.append(result)
         if on_result is not None:
             on_result(result)
@@ -716,6 +1361,34 @@ def _browser_e2e_exit_code(outcome: CommandOutcome, *, evidence_verified: bool) 
     return 0 if evidence_verified else 2
 
 
+def _deployment_identity(
+    *,
+    identity: GateIdentity | None,
+    offline_contract_sha256: str | None,
+    offline_image_manifest_sha256: str | None,
+    base_url: str | None,
+) -> tuple[dict[str, str] | None, str | None]:
+    if (
+        identity is None
+        or offline_contract_sha256 is None
+        or offline_image_manifest_sha256 is None
+        or base_url is None
+    ):
+        return None, "complete immutable deployment identity is unavailable"
+    try:
+        from scripts.functional_acceptance import build_deployment_identity
+
+        deployment = build_deployment_identity(
+            git_head=identity.git_head,
+            offline_contract_sha256=offline_contract_sha256,
+            image_manifest_sha256=offline_image_manifest_sha256,
+            base_url=base_url,
+        )
+    except (ImportError, RuntimeError, ValueError):
+        return None, "immutable deployment identity is invalid"
+    return deployment, None
+
+
 def build_profile(
     profile: Profile,
     *,
@@ -729,13 +1402,17 @@ def build_profile(
     offline_image_manifest_path: str | None = None,
     offline_contract_dir: str | None = None,
     offline_contract_sha256: str | None = None,
+    offline_image_manifest_sha256: str | None = None,
     offline_contract_blocker: str | None = None,
     offline_runtime_evidence_path: str | None = None,
     e2e_evidence_path: str | None = None,
+    linux_host_evidence_path: str | None = None,
     functional_trust_store_path: str | None = None,
     functional_challenge_store_path: str | None = None,
     e2e_signing_key_path: str | None = None,
     e2e_signing_key_id: str | None = None,
+    linux_host_signing_key_path: str | None = None,
+    deployment_base_url: str | None = None,
     malware_evidence_path: str | None = None,
     security_scan_evidence_path: str | None = None,
     release_id: str | None = None,
@@ -959,7 +1636,40 @@ def build_profile(
     offline_runtime_blocker = missing_target_path(
         offline_runtime_evidence_path, "--offline-runtime-evidence"
     )
-    e2e_evidence_blocker = missing_target_path(e2e_evidence_path, "--e2e-evidence")
+    browser_evidence_destination = (
+        repository / "artifacts/acceptance/functional/browser-e2e.json"
+    ).resolve(strict=False)
+    linux_evidence_destination = (
+        repository / "artifacts/acceptance/functional/linux-host.json"
+    ).resolve(strict=False)
+    e2e_evidence_blocker = (
+        None
+        if e2e_evidence_path is not None and Path(e2e_evidence_path).is_absolute()
+        else "--e2e-evidence must be an explicit absolute path on the target Linux host"
+    )
+    if (
+        e2e_evidence_blocker is None
+        and e2e_evidence_path is not None
+        and Path(e2e_evidence_path).resolve(strict=False) != browser_evidence_destination
+    ):
+        e2e_evidence_blocker = (
+            "--e2e-evidence must be the runtime-functional manifest destination "
+            "artifacts/acceptance/functional/browser-e2e.json"
+        )
+    linux_host_evidence_blocker = (
+        None
+        if linux_host_evidence_path is not None and Path(linux_host_evidence_path).is_absolute()
+        else "--linux-host-evidence must be an explicit absolute path on the target Linux host"
+    )
+    if (
+        linux_host_evidence_blocker is None
+        and linux_host_evidence_path is not None
+        and Path(linux_host_evidence_path).resolve(strict=False) != linux_evidence_destination
+    ):
+        linux_host_evidence_blocker = (
+            "--linux-host-evidence must be the runtime-functional manifest destination "
+            "artifacts/acceptance/functional/linux-host.json"
+        )
     trust_store_blocker = missing_target_path(
         functional_trust_store_path, "--functional-trust-store"
     )
@@ -967,6 +1677,9 @@ def build_profile(
         functional_challenge_store_path, "--functional-challenge-store"
     )
     signing_key_blocker = missing_target_path(e2e_signing_key_path, "--e2e-signing-key-path")
+    linux_signing_key_blocker = missing_target_path(
+        linux_host_signing_key_path, "--linux-host-signing-key-path"
+    )
     signing_key_id_blocker = (
         None
         if e2e_signing_key_id == "browser-e2e-ed25519"
@@ -978,8 +1691,13 @@ def build_profile(
     )
     release_id_blocker = (
         None
-        if release_id is not None and _OPERATIONAL_RELEASE_ID.fullmatch(release_id) is not None
-        else "--release-id must be an explicit 1-80 character immutable release token"
+        if (
+            release_id is not None
+            and _OPERATIONAL_RELEASE_ID.fullmatch(release_id) is not None
+            and acceptance_identity is not None
+            and release_id == acceptance_identity.git_head
+        )
+        else ("--release-id must exactly equal the immutable acceptance Git HEAD for this release")
     )
     capacity_evidence_blocker = missing_target_path(capacity_evidence_path, "--capacity-evidence")
     capacity_signature_blocker = missing_target_path(
@@ -1010,6 +1728,53 @@ def build_profile(
         if acceptance_identity is not None
         else "supply-chain release acceptance requires an immutable acceptance identity"
     )
+    deployment, deployment_blocker = _deployment_identity(
+        identity=acceptance_identity,
+        offline_contract_sha256=offline_contract_sha256,
+        offline_image_manifest_sha256=offline_image_manifest_sha256,
+        base_url=deployment_base_url,
+    )
+    if release_id_blocker is not None:
+        deployment_blocker = release_id_blocker
+    browser_run_id = (
+        f"acceptance-browser-{acceptance_identity.run_nonce}"
+        if acceptance_identity is not None
+        else ""
+    )
+    linux_run_id = (
+        f"acceptance-linux-{acceptance_identity.run_nonce}"
+        if acceptance_identity is not None
+        else ""
+    )
+    linux_challenge_path: Path | None = None
+    if (
+        deployment is not None
+        and acceptance_identity is not None
+        and functional_trust_store_path is not None
+        and functional_challenge_store_path is not None
+    ):
+        try:
+            from scripts.functional_acceptance import external_evidence_target
+
+            linux_target = external_evidence_target(
+                acceptance_identity,
+                run_id=linux_run_id,
+                deployment=deployment,
+            )
+            linux_challenge_path = _external_challenge_path(
+                repository,
+                Path(functional_trust_store_path),
+                Path(functional_challenge_store_path),
+                evidence_id="EXT-LINUX-HOST-001",
+                expected_target=linux_target,
+            )
+        except (ImportError, RuntimeError, ValueError):
+            linux_challenge_path = None
+    linux_challenge_blocker = (
+        None
+        if linux_challenge_path is not None
+        else "one exact deployment-bound Linux host challenge is required"
+    )
 
     final_gates = (
         AcceptanceGate(
@@ -1027,12 +1792,13 @@ def build_profile(
                 "--artifact-root",
                 supply_chain_artifact_root or "",
                 "--expected-release-id",
-                acceptance_identity.git_head if acceptance_identity is not None else "",
+                release_id or "",
             ),
             str(repository),
             120,
             blocked_reason=(
-                supply_chain_attestation_blocker
+                release_id_blocker
+                or supply_chain_attestation_blocker
                 or supply_chain_artifact_root_blocker
                 or supply_chain_identity_blocker
             ),
@@ -1086,6 +1852,7 @@ def build_profile(
                 or challenge_store_blocker
                 or signing_key_blocker
                 or signing_key_id_blocker
+                or deployment_blocker
             ),
             blocked_exit_codes=(2,),
             required_regular_files=(
@@ -1093,7 +1860,11 @@ def build_profile(
                 if functional_trust_store_path and e2e_signing_key_path
                 else ()
             ),
-            environment=_browser_gate_environment(acceptance_identity),
+            environment=_browser_gate_environment(
+                acceptance_identity,
+                deployment=deployment,
+                run_id=browser_run_id,
+            ),
         ),
         AcceptanceGate(
             "STORAGE-WATERMARK-P0-001",
@@ -1367,6 +2138,114 @@ def build_profile(
             (offline_runtime_evidence_path,) if offline_runtime_evidence_path else ()
         ),
     )
+    linux_host_evidence_gate = AcceptanceGate(
+        "LINUX-HOST-EVIDENCE-P0-001",
+        "P0",
+        (
+            sys.executable,
+            str(repository / "scripts/linux_host_evidence_collector.py"),
+            "--repository",
+            str(repository),
+            "--run-id",
+            linux_run_id,
+            "--release-id",
+            acceptance_identity.git_head if acceptance_identity is not None else "",
+            "--offline-contract-sha256",
+            offline_contract_sha256 or "",
+            "--image-manifest-sha256",
+            offline_image_manifest_sha256 or "",
+            "--base-url",
+            deployment["base_url"] if deployment is not None else "",
+            "--signing-key",
+            linux_host_signing_key_path or "",
+            "--challenge",
+            str(linux_challenge_path) if linux_challenge_path is not None else "",
+            "--disk-path",
+            host_disk_path,
+        ),
+        str(repository),
+        900,
+        blocked_reason=(
+            linux_host_evidence_blocker
+            or trust_store_blocker
+            or challenge_store_blocker
+            or linux_signing_key_blocker
+            or deployment_blocker
+            or linux_challenge_blocker
+        ),
+        blocked_exit_codes=(2,),
+        required_regular_files=(
+            (
+                functional_trust_store_path,
+                linux_host_signing_key_path,
+                str(linux_challenge_path),
+            )
+            if functional_trust_store_path
+            and linux_host_signing_key_path
+            and linux_challenge_path is not None
+            else ()
+        ),
+    )
+    runtime_functional_gate = AcceptanceGate(
+        "FUNCTIONAL-P0-001",
+        "P0",
+        (
+            sys.executable,
+            str(repository / "scripts/functional_acceptance.py"),
+            "--profile",
+            "runtime-functional",
+            "--run-tests",
+            "--trust-store",
+            functional_trust_store_path or "",
+            "--challenge-store",
+            functional_challenge_store_path or "",
+            "--json",
+            *(
+                (
+                    "--node-executable",
+                    functional_node_binding.path,
+                    "--node-executable-sha256",
+                    functional_node_binding.sha256,
+                    *(
+                        ("--node-executable-require-root-owner",)
+                        if functional_node_binding.require_root_owner
+                        else ()
+                    ),
+                )
+                if functional_node_binding is not None
+                else ()
+            ),
+            *_child_evidence_cli_arguments(
+                acceptance_identity,
+                "functional-acceptance",
+            ),
+        ),
+        str(repository),
+        900,
+        blocked_reason=(
+            functional_node_blocker
+            or trust_store_blocker
+            or challenge_store_blocker
+            or e2e_evidence_blocker
+            or linux_host_evidence_blocker
+            or deployment_blocker
+        ),
+        required_regular_files=(
+            (
+                functional_trust_store_path,
+                e2e_evidence_path,
+                linux_host_evidence_path,
+            )
+            if functional_trust_store_path and e2e_evidence_path and linux_host_evidence_path
+            else ()
+        ),
+        child_evidence_path=(
+            _MACHINE_EVIDENCE_PATHS["functional-acceptance"]
+            if acceptance_identity is not None
+            else None
+        ),
+        child_evidence_kind=("functional-acceptance" if acceptance_identity is not None else None),
+    )
     target_backend_gate = AcceptanceGate(
         "BACKEND-P0-001",
         "P0",
@@ -1400,13 +2279,14 @@ def build_profile(
     )
     token_gate = next(gate for gate in final_gates if gate.gate_id == "TOKEN-GOV-P0-001")
     supply_chain_gate = next(gate for gate in final_gates if gate.gate_id == "SUPPLY-CHAIN-P0-001")
+    browser_e2e_gate = next(gate for gate in final_gates if gate.gate_id == "E2E-P0-001")
     final_base_without_backend = tuple(
-        gate for gate in final_base if gate.gate_id != "BACKEND-P0-001"
+        gate for gate in final_base if gate.gate_id not in {"BACKEND-P0-001", "FUNCTIONAL-P0-001"}
     )
     remaining_final_gates = tuple(
         gate
         for gate in final_gates
-        if gate.gate_id not in {"SUPPLY-CHAIN-P0-001", "TOKEN-GOV-P0-001"}
+        if gate.gate_id not in {"SUPPLY-CHAIN-P0-001", "TOKEN-GOV-P0-001", "E2E-P0-001"}
     )
     final_base_with_supply_chain = tuple(
         candidate
@@ -1417,6 +2297,9 @@ def build_profile(
         *final_base_with_supply_chain,
         target_offline_images_gate,
         target_offline_runtime_gate,
+        linux_host_evidence_gate,
+        browser_e2e_gate,
+        runtime_functional_gate,
         token_gate,
         target_backend_gate,
         *remaining_final_gates,
@@ -1728,7 +2611,7 @@ def verify_browser_e2e_evidence(
         expected_run_id=expected_run_id,
         trust_context=trust_context,
     ):
-        return True, "signed browser E2E evidence verified and challenge consumed"
+        return True, "signed browser E2E evidence verified for later runtime-functional consumption"
     return False, failure
 
 
@@ -1751,7 +2634,7 @@ def _verify_browser_e2e_document(
         and attestation.get("key_id") == expected_key_id
         and isinstance(target, dict)
         and target.get("run_id") == expected_run_id
-        and set(target) == {"git_head", "content_fingerprint", "run_id"}
+        and set(target) == {"git_head", "content_fingerprint", "run_id", "deployment"}
     ):
         return False
     try:
@@ -1783,19 +2666,20 @@ def _verify_browser_e2e_document(
             document,
             policy=policy,
             trust_context=cast(ExternalTrustContext, trust_context),
+            consume_challenge=False,
         )
     except (ContractError, OSError, RuntimeError, UnicodeError, ValueError):
         return False
     return accepted
 
 
-def _browser_challenge_path(
+def _external_challenge_path(
     repository: Path,
     trust_store: Path,
     challenge_store: Path,
     *,
-    expected_identity: GateIdentity,
-    expected_run_id: str,
+    evidence_id: str,
+    expected_target: Mapping[str, object],
 ) -> Path | None:
     try:
         from scripts.functional_acceptance import (
@@ -1809,19 +2693,42 @@ def _browser_challenge_path(
     challenge_ids = [
         challenge_id
         for challenge_id, value in context.challenges.items()
-        if value.get("evidence_id") == "EXT-BROWSER-E2E-001"
+        if value.get("evidence_id") == evidence_id
         and value.get("status") == "issued"
-        and value.get("target")
-        == {
-            "git_head": expected_identity.git_head,
-            "content_fingerprint": expected_identity.content_fingerprint,
-            "run_id": expected_run_id,
-        }
+        and value.get("target") == dict(expected_target)
         and challenge_id in context.challenge_paths
     ]
     if len(challenge_ids) != 1:
         return None
     return context.challenge_paths[challenge_ids[0]]
+
+
+def _browser_challenge_path(
+    repository: Path,
+    trust_store: Path,
+    challenge_store: Path,
+    *,
+    expected_identity: GateIdentity,
+    expected_run_id: str,
+    expected_deployment: Mapping[str, object],
+) -> Path | None:
+    try:
+        from scripts.functional_acceptance import external_evidence_target
+
+        expected_target = external_evidence_target(
+            expected_identity,
+            run_id=expected_run_id,
+            deployment=expected_deployment,
+        )
+    except (ImportError, RuntimeError, ValueError):
+        return None
+    return _external_challenge_path(
+        repository,
+        trust_store,
+        challenge_store,
+        evidence_id="EXT-BROWSER-E2E-001",
+        expected_target=expected_target,
+    )
 
 
 def _browser_collection_contract(repository: Path) -> BrowserCollectionContract:
@@ -1903,14 +2810,28 @@ def verify_browser_e2e_collection(
     return True, f"browser E2E collection verified exactly ({expected} test instances)"
 
 
-def _browser_gate_environment(identity: GateIdentity | None) -> tuple[tuple[str, str], ...]:
+def _browser_gate_environment(
+    identity: GateIdentity | None,
+    *,
+    deployment: Mapping[str, str] | None = None,
+    run_id: str | None = None,
+) -> tuple[tuple[str, str], ...]:
     values = {
         name: value
         for name in sorted(_BROWSER_E2E_TOPOLOGY_ENVIRONMENT)
         if (value := os.environ.get(name)) is not None
     }
     if identity is not None:
-        values["KB_E2E_RUN_ID"] = f"acceptance-{identity.run_nonce}"
+        values["KB_E2E_RUN_ID"] = run_id or f"acceptance-browser-{identity.run_nonce}"
+    if deployment is not None:
+        values.update(
+            {
+                "KB_E2E_RELEASE_ID": deployment["release_id"],
+                "KB_E2E_OFFLINE_CONTRACT_SHA256": deployment["offline_contract_sha256"],
+                "KB_E2E_IMAGE_MANIFEST_SHA256": deployment["image_manifest_sha256"],
+                "KB_E2E_BASE_URL": deployment["base_url"],
+            }
+        )
     return tuple(sorted(values.items()))
 
 
@@ -1945,8 +2866,18 @@ def run_browser_e2e(
         return 2, failure
     else:
         return 2, failure
-    run_id = f"acceptance-{identity.run_nonce}"
+    run_id = f"acceptance-browser-{identity.run_nonce}"
     if _BROWSER_RUN_ID_PATTERN.fullmatch(run_id) is None:
+        return 2, failure
+    if os.environ.get("KB_E2E_RELEASE_ID") != identity.git_head:
+        return 2, failure
+    deployment, deployment_blocker = _deployment_identity(
+        identity=identity,
+        offline_contract_sha256=os.environ.get("KB_E2E_OFFLINE_CONTRACT_SHA256"),
+        offline_image_manifest_sha256=os.environ.get("KB_E2E_IMAGE_MANIFEST_SHA256"),
+        base_url=os.environ.get("KB_E2E_BASE_URL"),
+    )
+    if deployment is None or deployment_blocker is not None:
         return 2, failure
     try:
         collection_contract = _browser_collection_contract(repository)
@@ -1958,6 +2889,7 @@ def run_browser_e2e(
         challenge_store,
         expected_identity=identity,
         expected_run_id=run_id,
+        expected_deployment=deployment,
     )
     if challenge_path is None:
         return 2, failure
@@ -1974,6 +2906,10 @@ def run_browser_e2e(
             "KB_E2E_SIGNING_KEY_ID": signing_key_id,
             "KB_E2E_CHALLENGE_PATH": str(challenge_path),
             "KB_E2E_RUN_ID": run_id,
+            "KB_E2E_RELEASE_ID": deployment["release_id"],
+            "KB_E2E_OFFLINE_CONTRACT_SHA256": deployment["offline_contract_sha256"],
+            "KB_E2E_IMAGE_MANIFEST_SHA256": deployment["image_manifest_sha256"],
+            "KB_E2E_BASE_URL": deployment["base_url"],
         }
     )
     try:
@@ -2675,6 +3611,207 @@ def _validate_disaster_recovery_evidence(
     ):
         raise ValueError("restored object hash evidence is incomplete")
 
+    control_plane = _exact_object(
+        artifacts["control_plane_integrity"],
+        label="restored control-plane integrity",
+        keys=frozenset(
+            {
+                "schema_version",
+                "kind",
+                "status",
+                "restore_started_in_maintenance_hold",
+                "chat_safety_hold_materialized_before_runtime",
+                "restore_hold_sentinel_sha256",
+                "api_started_before_reconciliation",
+                "edge_exposed_before_reconciliation",
+                "missing_control_state_fail_closed",
+                "recovery_selection",
+                "reconciliation_completed_at",
+                "hold_cleared_at",
+                "business_services_started_at",
+                "source_contract_sha256",
+                "source_release_sha256",
+                "source_release_manifest_sha256",
+                "source_contract_bindings",
+                "source_manifest_sha256",
+                "restored_manifest_sha256",
+                "records",
+            }
+        ),
+    )
+    reconciliation_completed_at = _utc_timestamp(
+        control_plane.get("reconciliation_completed_at"),
+        label="control_plane.reconciliation_completed_at",
+    )
+    hold_cleared_at = _utc_timestamp(
+        control_plane.get("hold_cleared_at"),
+        label="control_plane.hold_cleared_at",
+    )
+    business_started_at = _utc_timestamp(
+        control_plane.get("business_services_started_at"),
+        label="control_plane.business_services_started_at",
+    )
+    source_contract_sha256 = control_plane.get("source_contract_sha256")
+    source_release_sha256 = control_plane.get("source_release_sha256")
+    source_release_manifest_sha256 = control_plane.get("source_release_manifest_sha256")
+    raw_source_bindings = _exact_object(
+        control_plane.get("source_contract_bindings"),
+        label="source contract bindings",
+        keys=frozenset(
+            {
+                "active_release",
+                "source_installed_receipt",
+                "active_contract_manifest",
+                "registry_import_receipt",
+            }
+        ),
+    )
+    binding_keys = frozenset(
+        {
+            "contract_sha256",
+            "release_sha256",
+            "manifest_sha256",
+        }
+    )
+    source_bindings = {
+        record_id: _exact_object(
+            raw_source_bindings[record_id],
+            label=f"source contract binding {record_id}",
+            keys=binding_keys,
+        )
+        for record_id in raw_source_bindings
+    }
+    if not (
+        isinstance(source_contract_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_contract_sha256) is not None
+        and isinstance(source_release_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_release_sha256) is not None
+        and isinstance(source_release_manifest_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_release_manifest_sha256) is not None
+        and all(
+            binding.get("contract_sha256") == source_contract_sha256
+            and binding.get("release_sha256") == source_release_sha256
+            and binding.get("manifest_sha256") == source_release_manifest_sha256
+            for binding in source_bindings.values()
+        )
+    ):
+        raise ValueError("restored control-plane source contract bindings differ")
+    source_manifest_sha256 = control_plane.get("source_manifest_sha256")
+    restored_manifest_sha256 = control_plane.get("restored_manifest_sha256")
+    hold_sentinel_sha256 = control_plane.get("restore_hold_sentinel_sha256")
+    raw_control_records = control_plane.get("records")
+    if not isinstance(raw_control_records, list):
+        raise ValueError("restored control-state inventory is missing")
+    expected_control_paths = {
+        "chat_safety_sentinel": re.compile(r"data/chat-safety/poison\.json\Z"),
+        "chat_safety_clear_pending": re.compile(r"state/chat-safety-clear-pending\.json\Z"),
+        "cutover_intent": re.compile(r"state/cutover-intent\.json\Z"),
+        "install_in_progress": re.compile(r"state/install-in-progress\.json\Z"),
+        "active_release": re.compile(r"state/active-release\.json\Z"),
+        "source_installed_receipt": re.compile(r"state/installed-[0-9a-f]{64}\.json\Z"),
+        "highest_release": re.compile(r"state/highest-release\.json\Z"),
+        "registry_import_receipt": re.compile(r"state/registry-import-[0-9a-f]{64}\.json\Z"),
+        "active_contract_manifest": re.compile(r"contracts/[0-9a-f]{64}/files\.sha256\Z"),
+        "recovery_state_helper": re.compile(r"recovery/offline-recovery-state\.py\Z"),
+        "recovery_dispatcher": re.compile(r"recovery/offline-recovery-dispatcher\.sh\Z"),
+    }
+    optional_absent = {
+        "chat_safety_sentinel",
+        "chat_safety_clear_pending",
+        "cutover_intent",
+        "install_in_progress",
+    }
+    observed_control_records: set[str] = set()
+    indexed_control_records: dict[str, dict[str, object]] = {}
+    for raw_record in raw_control_records:
+        record = _exact_object(
+            raw_record,
+            label="restored control-state record",
+            keys=frozenset(
+                {
+                    "id",
+                    "path",
+                    "source_state",
+                    "restored_state",
+                    "source_sha256",
+                    "restored_sha256",
+                }
+            ),
+        )
+        record_id = record.get("id")
+        record_path = record.get("path")
+        source_state = record.get("source_state")
+        restored_state = record.get("restored_state")
+        source_digest = record.get("source_sha256")
+        restored_digest = record.get("restored_sha256")
+        if (
+            not isinstance(record_id, str)
+            or record_id not in expected_control_paths
+            or record_id in observed_control_records
+            or not isinstance(record_path, str)
+            or expected_control_paths[record_id].fullmatch(record_path) is None
+            or source_state not in {"present", "absent"}
+            or restored_state != source_state
+        ):
+            raise ValueError("restored control-state record identity differs")
+        if source_state == "present":
+            if not (
+                isinstance(source_digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", source_digest) is not None
+                and isinstance(restored_digest, str)
+                and secrets.compare_digest(source_digest, restored_digest)
+            ):
+                raise ValueError("restored control-state digest differs")
+        elif (
+            record_id not in optional_absent
+            or source_digest is not None
+            or restored_digest is not None
+        ):
+            raise ValueError("mandatory control state is absent after restore")
+        observed_control_records.add(record_id)
+        indexed_control_records[record_id] = record
+    if observed_control_records != set(expected_control_paths):
+        raise ValueError("restored control-state inventory is incomplete")
+    if (
+        indexed_control_records["source_installed_receipt"]["path"]
+        != f"state/installed-{source_contract_sha256}.json"
+        or indexed_control_records["active_contract_manifest"]["path"]
+        != f"contracts/{source_contract_sha256}/files.sha256"
+        or indexed_control_records["registry_import_receipt"]["path"]
+        != f"state/registry-import-{source_release_manifest_sha256}.json"
+        or indexed_control_records["active_contract_manifest"]["source_sha256"]
+        != source_contract_sha256
+        or indexed_control_records["active_contract_manifest"]["restored_sha256"]
+        != source_contract_sha256
+    ):
+        raise ValueError("restored control-state source contract path binding differs")
+    if not (
+        control_plane.get("schema_version") == 1
+        and control_plane.get("kind") == "enterprise-restored-control-plane-integrity"
+        and control_plane.get("status") == "passed"
+        and control_plane.get("restore_started_in_maintenance_hold") is True
+        and control_plane.get("chat_safety_hold_materialized_before_runtime") is True
+        and isinstance(hold_sentinel_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", hold_sentinel_sha256) is not None
+        and control_plane.get("api_started_before_reconciliation") is False
+        and control_plane.get("edge_exposed_before_reconciliation") is False
+        and control_plane.get("missing_control_state_fail_closed") is True
+        and control_plane.get("recovery_selection") == "active"
+        and started_at
+        <= reconciliation_completed_at
+        < hold_cleared_at
+        < business_started_at
+        <= completed_at
+        and isinstance(source_manifest_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256) is not None
+        and isinstance(restored_manifest_sha256, str)
+        and secrets.compare_digest(
+            source_manifest_sha256,
+            restored_manifest_sha256,
+        )
+    ):
+        raise ValueError("restored control-plane fail-closed evidence is incomplete")
+
     smoke = _exact_object(
         artifacts["functional_smoke"],
         label="restored functional smoke",
@@ -2813,7 +3950,11 @@ def verify_signed_operational_evidence(
         return False, failure
     if kind == "capacity":
         return True, "signed control-plane plus non-stub real-model capacity evidence verified"
-    return True, "signed full-restore RPO/RTO and data-integrity evidence verified"
+    return (
+        True,
+        "signed full-restore RPO/RTO, data-integrity, and fail-closed "
+        "control-plane evidence verified",
+    )
 
 
 def verify_offline_runtime_evidence(
@@ -2946,6 +4087,38 @@ def verify_offline_runtime_evidence(
     return True, "offline runtime target evidence verified"
 
 
+def _release_binding_verified(
+    release_binding: Mapping[str, str] | None,
+    *,
+    acceptance_identity: GateIdentity | None,
+) -> bool:
+    if release_binding is None or acceptance_identity is None:
+        return False
+    if set(release_binding) != {
+        "release_id",
+        "offline_contract_sha256",
+        "offline_image_manifest_sha256",
+    }:
+        return False
+    return bool(
+        release_binding.get("release_id") == acceptance_identity.git_head
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            release_binding.get("offline_contract_sha256", ""),
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            release_binding.get("offline_image_manifest_sha256", ""),
+        )
+    )
+
+
+def _invalidate_report_outputs(report_dir: Path) -> None:
+    for name in ("acceptance.json", "acceptance.md"):
+        with suppress(FileNotFoundError):
+            (report_dir / name).unlink()
+
+
 def write_reports(
     results: Sequence[AcceptanceResult],
     *,
@@ -2954,40 +4127,58 @@ def write_reports(
     revision: str,
     repository: Path,
     acceptance_identity: GateIdentity | None = None,
+    required_gate_ids: Sequence[str],
+    release_binding: Mapping[str, str] | None = None,
+    worktree_evidence: WorktreeEvidence | None = None,
 ) -> tuple[Path, Path]:
     safe_results = [replace(item, summary=redact_output(item.summary)) for item in results]
-    verdict = calculate_verdict(safe_results)
-    try:
-        worktree = collect_worktree_evidence(repository)
-    except (OSError, RuntimeError, UnicodeError):
-        empty_hash = hashlib.sha256(b"").hexdigest()
-        worktree = WorktreeEvidence(
-            git_head=revision if re.fullmatch(r"[0-9a-f]{40,64}", revision) else "unknown",
-            dirty=True,
-            status_counts={
-                "total": -1,
-                "staged": -1,
-                "unstaged": -1,
-                "untracked": -1,
-                "conflicts": -1,
-            },
-            tracked_diff_sha256=empty_hash,
-            untracked_manifest_sha256=empty_hash,
-            content_fingerprint=empty_hash,
-        )
+    gate_set_verified = _gate_set_verified(
+        safe_results,
+        required_gate_ids=required_gate_ids,
+    )
+    verdict = calculate_verdict(
+        safe_results,
+        required_gate_ids=required_gate_ids,
+    )
+    worktree = worktree_evidence
+    if worktree is None:
+        try:
+            worktree = collect_worktree_evidence(repository)
+        except (OSError, RuntimeError, UnicodeError):
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            worktree = WorktreeEvidence(
+                git_head=revision if re.fullmatch(r"[0-9a-f]{40,64}", revision) else "unknown",
+                dirty=True,
+                status_counts={
+                    "total": -1,
+                    "staged": -1,
+                    "unstaged": -1,
+                    "untracked": -1,
+                    "conflicts": -1,
+                },
+                tracked_diff_sha256=empty_hash,
+                untracked_manifest_sha256=empty_hash,
+                content_fingerprint=empty_hash,
+            )
     identity_verified = bool(
         acceptance_identity is not None
         and worktree.git_head == acceptance_identity.git_head
         and worktree.content_fingerprint == acceptance_identity.content_fingerprint
     )
-    if profile == "final" and (worktree.dirty or not identity_verified):
+    release_verified = _release_binding_verified(
+        release_binding,
+        acceptance_identity=acceptance_identity,
+    )
+    if profile == "final" and (
+        worktree.dirty or not identity_verified or not gate_set_verified or not release_verified
+    ):
         verdict = "FAIL"
     generated_at = datetime.now(UTC).isoformat()
     evidence_class = (
         "final_signoff_candidate" if profile == "final" else "development_smoke_not_for_signoff"
     )
-    payload = {
-        "schema_version": 2,
+    payload: dict[str, object] = {
+        "schema_version": 3,
         "generated_at": generated_at,
         "profile": profile,
         "evidence_class": evidence_class,
@@ -2995,13 +4186,17 @@ def write_reports(
         "target": acceptance_identity.target() if acceptance_identity is not None else None,
         "identity_verified": identity_verified,
         "worktree": asdict(worktree),
+        "required_gate_ids": list(required_gate_ids),
+        "gate_set_verified": gate_set_verified,
+        "release_binding": dict(release_binding) if release_binding is not None else None,
+        "release_binding_verified": release_verified,
+        "publication_status": "complete",
         "verdict": verdict,
         "results": [asdict(item) for item in safe_results],
     }
+    report_sha256 = _canonical_digest(payload)
     json_path = report_dir / "acceptance.json"
     markdown_path = report_dir / "acceptance.md"
-    _atomic_write(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
     rows = [
         "# Enterprise Acceptance Evidence",
         "",
@@ -3015,6 +4210,7 @@ def write_reports(
         f"- Generated: `{generated_at}`",
         f"- Revision: `{worktree.git_head}`",
         f"- Profile: `{profile}`",
+        "- Publication status: `complete`",
         f"- Worktree dirty: `{str(worktree.dirty).lower()}`",
         f"- Tracked diff SHA-256: `{worktree.tracked_diff_sha256}`",
         f"- Untracked manifest SHA-256: `{worktree.untracked_manifest_sha256}`",
@@ -3025,6 +4221,27 @@ def write_reports(
             else "- Acceptance run nonce: `unavailable`"
         ),
         f"- Identity verified: `{str(identity_verified).lower()}`",
+        f"- Gate set verified: `{str(gate_set_verified).lower()}`",
+        f"- Release binding verified: `{str(release_verified).lower()}`",
+        (
+            f"- Release ID: `{release_binding.get('release_id', 'invalid')}`"
+            if release_binding is not None
+            else "- Release ID: `not applicable`"
+        ),
+        (
+            f"- Offline contract SHA-256: "
+            f"`{release_binding.get('offline_contract_sha256', 'invalid')}`"
+            if release_binding is not None
+            else "- Offline contract SHA-256: `not applicable`"
+        ),
+        (
+            f"- Offline image manifest SHA-256: "
+            f"`{release_binding.get('offline_image_manifest_sha256', 'invalid')}`"
+            if release_binding is not None
+            else "- Offline image manifest SHA-256: `not applicable`"
+        ),
+        f"- Report canonical SHA-256: `{report_sha256}`",
+        "- Report signature: `unsigned; external signed release bundle required`",
         f"- Verdict: **{verdict}**",
         "",
         "| Gate | Severity | Status | Duration | Summary |",
@@ -3036,8 +4253,70 @@ def write_reports(
             f"| `{item.gate_id}` | {item.severity} | {item.status} | "
             f"{item.duration_seconds:.2f}s | {summary} |"
         )
-    _atomic_write(markdown_path, "\n".join(rows) + "\n")
+    markdown_content = "\n".join(rows) + "\n"
+    markdown_sha256 = hashlib.sha256(markdown_content.encode("utf-8")).hexdigest()
+    payload["report_integrity"] = {
+        "algorithm": "sha256",
+        "coverage": "canonical-json-without-report_integrity",
+        "report_sha256": report_sha256,
+        "markdown_sha256": markdown_sha256,
+        "signature_status": "unsigned",
+        "signature_boundary": "external signed release bundle required for final delivery",
+    }
+    preparing_payload = dict(payload)
+    preparing_payload.pop("report_integrity")
+    preparing_payload["publication_status"] = "preparing"
+    preparing_payload["verdict"] = "FAIL"
+    preparing_payload["report_integrity"] = {
+        "algorithm": "sha256",
+        "coverage": "canonical-json-without-report_integrity",
+        "report_sha256": _canonical_digest(preparing_payload),
+        "markdown_sha256": markdown_sha256,
+        "signature_status": "unsigned",
+        "signature_boundary": "publication incomplete; report is not signable",
+    }
+    try:
+        _invalidate_report_outputs(report_dir)
+        _atomic_write(
+            json_path,
+            json.dumps(preparing_payload, ensure_ascii=False, indent=2) + "\n",
+        )
+        _atomic_write(markdown_path, markdown_content)
+        _atomic_write(json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    except (OSError, RuntimeError, UnicodeError):
+        _invalidate_report_outputs(report_dir)
+        raise
     return json_path, markdown_path
+
+
+def _publish_reports_fail_closed(
+    results: Sequence[AcceptanceResult],
+    *,
+    report_dir: Path,
+    profile: str,
+    revision: str,
+    repository: Path,
+    acceptance_identity: GateIdentity | None,
+    required_gate_ids: Sequence[str],
+    release_binding: Mapping[str, str] | None,
+    worktree_evidence: WorktreeEvidence | None = None,
+) -> tuple[Path, Path] | None:
+    try:
+        return write_reports(
+            results,
+            report_dir=report_dir,
+            profile=profile,
+            revision=revision,
+            repository=repository,
+            acceptance_identity=acceptance_identity,
+            required_gate_ids=required_gate_ids,
+            release_binding=release_binding,
+            worktree_evidence=worktree_evidence,
+        )
+    except (OSError, RuntimeError, UnicodeError):
+        with suppress(OSError):
+            _invalidate_report_outputs(report_dir)
+        return None
 
 
 def _revision(repository: Path) -> str:
@@ -3096,6 +4375,14 @@ def _create_offline_contract(
     if re.fullmatch(r"[0-9a-f]{64}", contract_sha256) is None:
         raise RuntimeError("contract creation returned an invalid SHA-256")
     return contract_dir, contract_sha256
+
+
+def _offline_image_manifest_digest(contract_dir: str) -> str:
+    manifest = Path(contract_dir) / "release.env.images"
+    payload = _read_bounded_regular_file(manifest, maximum_bytes=65_536)
+    if payload is None:
+        raise RuntimeError("canonical offline image manifest is unavailable or unsafe")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _remove_offline_contract(
@@ -3194,6 +4481,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Absolute target-host output path for enterprise Playwright evidence",
     )
     parser.add_argument(
+        "--linux-host-evidence",
+        help=(
+            "Absolute target-host output path for signed Linux host evidence; "
+            "must be the runtime-functional manifest destination"
+        ),
+    )
+    parser.add_argument(
         "--functional-trust-store",
         type=Path,
         help="Root-owned public-key trust store outside the repository",
@@ -3213,6 +4507,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Explicit browser evidence signing key identifier",
     )
     parser.add_argument(
+        "--linux-host-signing-key-path",
+        type=Path,
+        help="Root-owned Linux host evidence signing private key outside the repository",
+    )
+    parser.add_argument(
+        "--deployment-base-url",
+        help="Canonical HTTPS origin of the exact deployment under final acceptance",
+    )
+    parser.add_argument(
         "--malware-evidence",
         help="Formal target-host malware-chain evidence document",
     )
@@ -3222,7 +4525,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--release-id",
-        help="Immutable deployment release token shared by capacity and recovery evidence",
+        help=(
+            "Immutable deployment release identity; final acceptance requires it to equal "
+            "the acceptance Git HEAD across all operational evidence"
+        ),
     )
     parser.add_argument(
         "--capacity-evidence",
@@ -3501,6 +4807,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2 if identity.dirty else 0
 
     try:
+        _invalidate_report_outputs(arguments.report_dir)
+    except OSError:
+        print("verdict=FAIL")
+        print("report_error=existing acceptance report could not be invalidated")
+        return 1
+
+    try:
         initial_worktree, acceptance_identity = initialize_acceptance_identity(repository)
     except (AcceptanceGateError, OSError, RuntimeError, UnicodeError):
         print(json.dumps({"status": "blocked", "reason": "acceptance identity unavailable"}))
@@ -3513,18 +4826,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             duration_seconds=0.0,
             summary="final acceptance requires a clean worktree before any gate is executed",
         )
-        json_path, markdown_path = write_reports(
+        reports = _publish_reports_fail_closed(
             [dirty_result],
             report_dir=arguments.report_dir,
             profile=arguments.profile,
             revision=acceptance_identity.git_head,
             repository=repository,
             acceptance_identity=acceptance_identity,
+            required_gate_ids=(),
+            release_binding=None,
+            worktree_evidence=initial_worktree,
         )
         print(f"{dirty_result.gate_id}: failed (0.00s)")
         print("verdict=FAIL")
-        print(f"json_report={json_path}")
-        print(f"markdown_report={markdown_path}")
+        if reports is not None:
+            json_path, markdown_path = reports
+            print(f"json_report={json_path}")
+            print(f"markdown_report={markdown_path}")
+        else:
+            print("report_error=acceptance report publication failed")
         print(f"acceptance_run_nonce={acceptance_identity.run_nonce}")
         return 1
 
@@ -3540,23 +4860,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 duration_seconds=0.0,
                 summary="exclusive root deployment lock is unavailable",
             )
-            json_path, markdown_path = write_reports(
+            reports = _publish_reports_fail_closed(
                 [lock_result],
                 report_dir=arguments.report_dir,
                 profile=arguments.profile,
                 revision=acceptance_identity.git_head,
                 repository=repository,
                 acceptance_identity=acceptance_identity,
+                required_gate_ids=(),
+                release_binding=None,
+                worktree_evidence=initial_worktree,
             )
             print(f"{lock_result.gate_id}: blocked (0.00s)")
             print("verdict=FAIL")
-            print(f"json_report={json_path}")
-            print(f"markdown_report={markdown_path}")
+            if reports is not None:
+                json_path, markdown_path = reports
+                print(f"json_report={json_path}")
+                print(f"markdown_report={markdown_path}")
+            else:
+                print("report_error=acceptance report publication failed")
             print(f"acceptance_run_nonce={acceptance_identity.run_nonce}")
             return 1
 
     offline_contract_dir: str | None = None
     offline_contract_sha256: str | None = None
+    offline_image_manifest_sha256: str | None = None
     offline_contract_blocker: str | None = None
     if arguments.profile == "final":
         expected_manifest = (
@@ -3582,6 +4910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     runtime_env_file=arguments.offline_runtime_env_file,
                     release_env_file=arguments.offline_release_env_file,
                 )
+                offline_image_manifest_sha256 = _offline_image_manifest_digest(offline_contract_dir)
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 offline_contract_blocker = f"canonical offline contract unavailable: {exc}"
 
@@ -3596,9 +4925,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         offline_image_manifest_path=arguments.offline_image_manifest,
         offline_contract_dir=offline_contract_dir,
         offline_contract_sha256=offline_contract_sha256,
+        offline_image_manifest_sha256=offline_image_manifest_sha256,
         offline_contract_blocker=offline_contract_blocker,
         offline_runtime_evidence_path=arguments.offline_runtime_evidence,
         e2e_evidence_path=arguments.e2e_evidence,
+        linux_host_evidence_path=arguments.linux_host_evidence,
         functional_trust_store_path=(
             str(arguments.functional_trust_store)
             if arguments.functional_trust_store is not None
@@ -3615,6 +4946,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             else None
         ),
         e2e_signing_key_id=arguments.e2e_signing_key_id,
+        linux_host_signing_key_path=(
+            str(arguments.linux_host_signing_key_path)
+            if arguments.linux_host_signing_key_path is not None
+            else None
+        ),
+        deployment_base_url=(arguments.deployment_base_url or os.environ.get("KB_E2E_BASE_URL")),
         malware_evidence_path=arguments.malware_evidence,
         security_scan_evidence_path=arguments.security_scan_evidence,
         release_id=arguments.release_id,
@@ -3631,6 +4968,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         functional_node_binding=functional_node_binding,
         functional_node_blocker=functional_node_blocker,
         acceptance_identity=acceptance_identity,
+    )
+    required_gate_ids = tuple(gate.gate_id for gate in gates)
+    release_binding = (
+        {
+            "release_id": arguments.release_id or "",
+            "offline_contract_sha256": offline_contract_sha256 or "",
+            "offline_image_manifest_sha256": offline_image_manifest_sha256 or "",
+        }
+        if arguments.profile == "final"
+        else None
     )
     results: list[AcceptanceResult] = []
     contract_cleanup_succeeded = True
@@ -3693,44 +5040,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (AcceptanceGateError, OSError, RuntimeError, UnicodeError):
         record_identity_failure("after offline contract cleanup")
 
-    json_path, markdown_path = write_reports(
-        results,
-        report_dir=arguments.report_dir,
-        profile=arguments.profile,
-        revision=acceptance_identity.git_head,
-        repository=repository,
-        acceptance_identity=acceptance_identity,
-    )
-    try:
-        assert_gate_identity(
-            repository,
-            acceptance_identity,
-            collector=identity_collector,
-            stage="after report publication",
-        )
-    except (AcceptanceGateError, OSError, RuntimeError, UnicodeError):
-        record_identity_failure("after report publication")
-        json_path, markdown_path = write_reports(
-            results,
-            report_dir=arguments.report_dir,
-            profile=arguments.profile,
-            revision=acceptance_identity.git_head,
-            repository=repository,
-            acceptance_identity=acceptance_identity,
-        )
-
-    try:
-        worktree = collect_worktree_evidence(repository)
-    except (OSError, RuntimeError, UnicodeError):
-        worktree = None
-    verdict = calculate_verdict(results)
-    if arguments.profile == "final" and (
-        worktree is None
-        or worktree.dirty
-        or worktree.git_head != acceptance_identity.git_head
-        or worktree.content_fingerprint != acceptance_identity.content_fingerprint
-    ):
-        verdict = "FAIL"
     if deployment_lock_fd is not None:
         try:
             release_offline_acceptance_lock(deployment_lock_fd)
@@ -3743,15 +5052,91 @@ def main(argv: Sequence[str] | None = None) -> int:
                 summary="exclusive deployment lock could not be released safely",
             )
             results.append(lock_failure)
-            json_path, markdown_path = write_reports(
-                results,
-                report_dir=arguments.report_dir,
-                profile=arguments.profile,
-                revision=acceptance_identity.git_head,
-                repository=repository,
-                acceptance_identity=acceptance_identity,
-            )
-            verdict = "FAIL"
+            print(f"{lock_failure.gate_id}: failed (0.00s)")
+
+    worktree: WorktreeEvidence | None
+    try:
+        collected_worktree = collect_worktree_evidence(repository)
+    except (OSError, RuntimeError, UnicodeError):
+        worktree = None
+        record_identity_failure("before report publication")
+    else:
+        worktree = collected_worktree
+        if (
+            collected_worktree.dirty
+            or collected_worktree.git_head != acceptance_identity.git_head
+            or collected_worktree.content_fingerprint != acceptance_identity.content_fingerprint
+        ):
+            record_identity_failure("before report publication")
+
+    reports = _publish_reports_fail_closed(
+        results,
+        report_dir=arguments.report_dir,
+        profile=arguments.profile,
+        revision=acceptance_identity.git_head,
+        repository=repository,
+        acceptance_identity=acceptance_identity,
+        required_gate_ids=required_gate_ids,
+        release_binding=release_binding,
+        worktree_evidence=worktree,
+    )
+    if reports is None:
+        print("verdict=FAIL")
+        print("report_error=acceptance report publication failed")
+        print(f"acceptance_run_nonce={acceptance_identity.run_nonce}")
+        return 1
+    json_path, markdown_path = reports
+
+    published_worktree: WorktreeEvidence | None
+    try:
+        collected_published_worktree = collect_worktree_evidence(repository)
+    except (OSError, RuntimeError, UnicodeError):
+        published_worktree = None
+        record_identity_failure("after report publication")
+    else:
+        published_worktree = collected_published_worktree
+        if (
+            collected_published_worktree.dirty
+            or collected_published_worktree.git_head != acceptance_identity.git_head
+            or collected_published_worktree.content_fingerprint
+            != acceptance_identity.content_fingerprint
+        ):
+            record_identity_failure("after report publication")
+
+    if published_worktree is None or published_worktree != worktree:
+        reports = _publish_reports_fail_closed(
+            results,
+            report_dir=arguments.report_dir,
+            profile=arguments.profile,
+            revision=acceptance_identity.git_head,
+            repository=repository,
+            acceptance_identity=acceptance_identity,
+            required_gate_ids=required_gate_ids,
+            release_binding=release_binding,
+            worktree_evidence=published_worktree,
+        )
+        if reports is None:
+            print("verdict=FAIL")
+            print("report_error=acceptance report publication failed")
+            print(f"acceptance_run_nonce={acceptance_identity.run_nonce}")
+            return 1
+        json_path, markdown_path = reports
+
+    verdict = calculate_verdict(
+        results,
+        required_gate_ids=required_gate_ids,
+    )
+    if arguments.profile == "final" and (
+        published_worktree is None
+        or published_worktree.dirty
+        or published_worktree.git_head != acceptance_identity.git_head
+        or published_worktree.content_fingerprint != acceptance_identity.content_fingerprint
+        or not _release_binding_verified(
+            release_binding,
+            acceptance_identity=acceptance_identity,
+        )
+    ):
+        verdict = "FAIL"
     print(f"verdict={verdict}")
     print(f"json_report={json_path}")
     print(f"markdown_report={markdown_path}")

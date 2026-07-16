@@ -18,7 +18,45 @@ from typing import Any, Protocol, cast
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from app.services.chat_safety import (
+    CHAT_TERMINALIZATION_RESERVE_SECONDS,
+    current_chat_cleanup_deadline,
+    poison_chat_safety,
+)
+
 _LOGGER = logging.getLogger(__name__)
+LLM_CLEANUP_TIMEOUT_SECONDS = 5.0
+_SUPERVISED_LLM_CLEANUPS: set[asyncio.Task[Any]] = set()
+
+
+def llm_cleanup_backlog_size() -> int:
+    return sum(not task.done() for task in _SUPERVISED_LLM_CLEANUPS)
+
+
+def _observe_llm_cleanup(task: asyncio.Task[Any]) -> None:
+    _SUPERVISED_LLM_CLEANUPS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is not None:
+        poison_chat_safety(
+            reason="llm_cleanup_failed_after_request_deadline",
+            error_class=type(error).__name__,
+        )
+        _LOGGER.error(
+            "Supervised LLM cleanup terminated with an error",
+            extra={"error_class": type(error).__name__},
+        )
+
+
+def _supervise_llm_cleanup(task: asyncio.Task[Any]) -> None:
+    if task in _SUPERVISED_LLM_CLEANUPS:
+        return
+    _SUPERVISED_LLM_CLEANUPS.add(task)
+    task.add_done_callback(_observe_llm_cleanup)
 
 
 class OkfConceptDraft(BaseModel):
@@ -316,20 +354,75 @@ def _config_fingerprint(config: OpenAICompatibleConfig, endpoint: str) -> bytes:
     return digest.digest()
 
 
-async def _await_cleanup(task: asyncio.Task[None]) -> None:
-    """Finish cleanup under repeated cancellation, then restore cancellation."""
+async def _await_cleanup(
+    task: asyncio.Task[None],
+    *,
+    timeout_seconds: float = LLM_CLEANUP_TIMEOUT_SECONDS,
+    deadline: float | None = None,
+) -> None:
+    """Bound cleanup, preserve repeated caller cancellation, and supervise overruns."""
 
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("LLM cleanup timeout must be finite and positive")
+    if deadline is not None and not math.isfinite(deadline):
+        raise ValueError("LLM cleanup deadline must be finite")
     first_cancellation: asyncio.CancelledError | None = None
+    loop = asyncio.get_running_loop()
+    effective_deadline = loop.time() + timeout_seconds
+    shared_deadline = current_chat_cleanup_deadline()
+    if deadline is not None:
+        effective_deadline = min(effective_deadline, deadline)
+    if shared_deadline is not None:
+        effective_deadline = min(
+            effective_deadline,
+            shared_deadline - CHAT_TERMINALIZATION_RESERVE_SECONDS,
+        )
     while not task.done():
+        remaining = effective_deadline - loop.time()
+        if remaining <= 0:
+            break
         try:
-            await asyncio.shield(task)
+            completed, _ = await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError as error:
             if first_cancellation is None:
                 first_cancellation = error
-    # Surface a cleanup failure instead of silently claiming resources were closed.
-    task.result()
+            continue
+        if completed:
+            break
+    if not task.done():
+        _supervise_llm_cleanup(task)
+        poison_chat_safety(reason="llm_cleanup_exceeded_deadline")
+        _LOGGER.error(
+            "LLM cleanup exceeded its bounded deadline",
+            extra={"cleanup_timeout_seconds": timeout_seconds},
+        )
+        if first_cancellation is not None:
+            raise first_cancellation
+        raise TimeoutError("llm_cleanup_timeout")
+
+    cleanup_error: BaseException | None = None
+    try:
+        # Surface a cleanup failure instead of silently claiming resources were closed.
+        task.result()
+    except BaseException as error:
+        cleanup_error = error
+        poison_chat_safety(
+            reason="llm_cleanup_failed",
+            error_class=type(error).__name__,
+        )
+        _LOGGER.error(
+            "LLM cleanup failed",
+            extra={
+                "error_class": type(error).__name__,
+                "caller_cancelled": first_cancellation is not None,
+            },
+        )
     if first_cancellation is not None:
-        raise first_cancellation
+        raise first_cancellation from cleanup_error
+    if cleanup_error is not None:
+        if isinstance(cleanup_error, asyncio.CancelledError):
+            raise RuntimeError("llm_cleanup_cancelled") from cleanup_error
+        raise cleanup_error
 
 
 class LlmClientPool:
@@ -431,7 +524,11 @@ class LlmClientPool:
             # Flip admission synchronously before scheduling the drain task.
             self._closing = True
             self._close_task = asyncio.create_task(self._close_all())
-        await _await_cleanup(self._close_task)
+        await _await_cleanup(
+            self._close_task,
+            timeout_seconds=self._policy.shutdown_drain_timeout_seconds
+            + LLM_CLEANUP_TIMEOUT_SECONDS,
+        )
 
     async def _release(self, generation: _PoolGeneration) -> None:
         close_generation = False

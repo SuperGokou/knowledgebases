@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hmac
 import logging
 import signal
 from dataclasses import dataclass
@@ -36,7 +38,7 @@ from app.services.malware_scanner import (
 )
 from app.services.okf_conversion import enqueue_okf_conversion, process_okf_conversion_batch
 from app.services.quota import QuotaService
-from app.services.storage import StorageService
+from app.services.storage import StorageService, checksum_sha256_base64_to_hex
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +52,22 @@ def _single_final_object_key(staging_key: str) -> str:
     if not staging_key.startswith("staging/"):
         return staging_key
     return f"objects/{staging_key.removeprefix('staging/')}"
+
+
+def _declared_checksum_sha256_base64(file: File) -> tuple[str | None, bool]:
+    """Return the declared SHA-256 in S3 form and whether its DB representation is valid."""
+
+    if file.checksum_algorithm is None and file.checksum_value is None:
+        return None, True
+    if file.checksum_algorithm != "SHA256" or file.checksum_value is None:
+        return None, False
+    try:
+        checksum = bytes.fromhex(file.checksum_value)
+    except ValueError:
+        return None, False
+    if len(checksum) != 32:
+        return None, False
+    return base64.b64encode(checksum).decode("ascii"), True
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +256,8 @@ async def cleanup_expired_uploads(
         object_key: str
         storage_upload_id: str | None
         expected_size_bytes: int
+        expected_checksum_sha256: str | None
+        checksum_constraint_valid: bool
 
     async def claim_next() -> Claim | None:
         now = datetime.now(UTC)
@@ -275,6 +295,7 @@ async def cleanup_expired_uploads(
             await session.rollback()
             return None
         upload, file = row
+        expected_checksum, checksum_constraint_valid = _declared_checksum_sha256_base64(file)
         original_status = upload.status
         if original_status is UploadSessionStatus.INITIATED:
             # Make completion fail closed before releasing the row lock.
@@ -289,6 +310,8 @@ async def cleanup_expired_uploads(
             object_key=file.object_key,
             storage_upload_id=upload.storage_upload_id,
             expected_size_bytes=upload.expected_size_bytes,
+            expected_checksum_sha256=expected_checksum,
+            checksum_constraint_valid=checksum_constraint_valid,
         )
         await session.commit()
         return claim
@@ -300,6 +323,8 @@ async def cleanup_expired_uploads(
         if claim is None:
             break
         processed += 1
+        finalization_rejection_action: str | None = None
+        finalization_rejection_details: dict[str, object] | None = None
         if claim.original_status is UploadSessionStatus.FINALIZING:
             published_key = claim.object_key
             if claim.mode == UploadMode.SINGLE.value:
@@ -307,7 +332,22 @@ async def cleanup_expired_uploads(
                 stored = await storage.try_head(key=final_key)
                 if stored is None:
                     stored = await storage.try_head(key=claim.object_key)
-                    if stored is not None and stored.size_bytes == claim.expected_size_bytes:
+                    staging_matches_claim = (
+                        stored is not None
+                        and stored.size_bytes == claim.expected_size_bytes
+                        and claim.checksum_constraint_valid
+                        and (
+                            claim.expected_checksum_sha256 is None
+                            or (
+                                stored.checksum_sha256 is not None
+                                and hmac.compare_digest(
+                                    stored.checksum_sha256,
+                                    claim.expected_checksum_sha256,
+                                )
+                            )
+                        )
+                    )
+                    if staging_matches_claim:
                         stored = await storage.promote(
                             source_key=claim.object_key,
                             destination_key=final_key,
@@ -316,7 +356,31 @@ async def cleanup_expired_uploads(
                 published_key = final_key
             else:
                 stored = await storage.try_head(key=claim.object_key)
-            if stored is not None and stored.size_bytes == claim.expected_size_bytes:
+            if stored is not None and stored.size_bytes != claim.expected_size_bytes:
+                finalization_rejection_action = "upload.rejected_size_mismatch"
+                finalization_rejection_details = {
+                    "expected": claim.expected_size_bytes,
+                    "actual": stored.size_bytes,
+                }
+            elif stored is not None and (
+                not claim.checksum_constraint_valid
+                or (
+                    claim.expected_checksum_sha256 is not None
+                    and (
+                        stored.checksum_sha256 is None
+                        or not hmac.compare_digest(
+                            stored.checksum_sha256,
+                            claim.expected_checksum_sha256,
+                        )
+                    )
+                )
+            ):
+                finalization_rejection_action = "upload.rejected_checksum_mismatch"
+            if (
+                stored is not None
+                and finalization_rejection_action is None
+                and stored.size_bytes == claim.expected_size_bytes
+            ):
                 row = (
                     await session.execute(
                         select(UploadSession, File)
@@ -347,9 +411,10 @@ async def cleanup_expired_uploads(
                 file.size_bytes = stored.size_bytes
                 file.status = FileStatus.QUARANTINED
                 file.malware_scan_status = MalwareScanStatus.PENDING
-                if stored.checksum_sha256:
+                stored_checksum_hex = checksum_sha256_base64_to_hex(stored.checksum_sha256)
+                if stored_checksum_hex is not None and file.checksum_value is None:
                     file.checksum_algorithm = "SHA256"
-                    file.checksum_value = stored.checksum_sha256
+                    file.checksum_value = stored_checksum_hex
                 add_audit_event(
                     session,
                     actor_id=None,
@@ -400,20 +465,39 @@ async def cleanup_expired_uploads(
             claim.original_status is UploadSessionStatus.ABORTED
             or upload.status is UploadSessionStatus.ABORTED
         )
+        finalization_failed = (
+            claim.original_status is UploadSessionStatus.FINALIZING
+            and finalization_rejection_action is not None
+        )
         await quota.release_upload_reservations(
             session,
             upload_session_id=claim.upload_id,
-            status=ReservationStatus.RELEASED if aborted else ReservationStatus.EXPIRED,
+            status=(
+                ReservationStatus.RELEASED
+                if aborted or finalization_failed
+                else ReservationStatus.EXPIRED
+            ),
         )
-        upload.status = UploadSessionStatus.ABORTED if aborted else UploadSessionStatus.EXPIRED
+        upload.status = (
+            UploadSessionStatus.ABORTED
+            if aborted
+            else (
+                UploadSessionStatus.FAILED if finalization_failed else UploadSessionStatus.EXPIRED
+            )
+        )
         file.status = FileStatus.FAILED
         add_audit_event(
             session,
             actor_id=None,
-            action="upload.abort_reconciled" if aborted else "upload.expired",
-            result=AuditResult.SUCCESS,
+            action=(
+                "upload.abort_reconciled"
+                if aborted
+                else finalization_rejection_action or "upload.expired"
+            ),
+            result=AuditResult.DENIED if finalization_failed else AuditResult.SUCCESS,
             resource_type="file",
             resource_id=str(file.id),
+            details=finalization_rejection_details,
         )
         await session.commit()
     return processed

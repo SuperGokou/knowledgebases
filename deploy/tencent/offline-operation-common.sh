@@ -40,6 +40,58 @@ offline_fail() {
   exit "$code"
 }
 
+offline_require_no_chat_safety_poison() {
+  prefix=$1
+  clear_pending=$OFFLINE_STATE_DIRECTORY/chat-safety-clear-pending.json
+  clear_pending_status=$(python3 -I - "$clear_pending" <<'PY'
+import pathlib
+import stat
+import sys
+
+path=pathlib.Path(sys.argv[1])
+try:
+    info=path.lstat()
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(1)
+if (
+    stat.S_ISLNK(info.st_mode)
+    or not stat.S_ISREG(info.st_mode)
+    or info.st_uid != 0
+    or info.st_nlink != 1
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or not 0 < info.st_size <= 65536
+):
+    raise SystemExit(1)
+print("present")
+PY
+  ) || offline_fail "$prefix" "chat safety clear-pending state is invalid" 65
+  case "$clear_pending_status" in
+    absent) ;;
+    present)
+      offline_fail "$prefix" \
+        "chat safety clear transaction is pending; mutation remains blocked" 70
+      ;;
+    *) offline_fail "$prefix" "chat safety clear-pending status is malformed" 65 ;;
+  esac
+  sentinel=$OFFLINE_PERSISTENT_ROOT/data/chat-safety/poison.json
+  sentinel_status=$(python3 -I \
+    "$OFFLINE_RELEASE_ROOT/deploy/tencent/chat-safety-sentinel.py" status \
+    "$sentinel" --expected-uid 10001 --expected-gid 10001) || \
+    offline_fail "$prefix" "persistent chat safety sentinel state is invalid" 65
+  case "$sentinel_status" in
+    absent) return 0 ;;
+    "present "[0-9a-f][0-9a-f]*) digest=${sentinel_status#present } ;;
+    *) offline_fail "$prefix" "persistent chat safety status is malformed" 65 ;;
+  esac
+  printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$' || \
+    offline_fail "$prefix" "persistent chat safety digest is malformed" 65
+  offline_fail "$prefix" \
+    "chat safety reconciliation is required before mutation; sentinel_sha256=$digest" 70
+}
+
 offline_require_root() {
   prefix=$1
   if [ "$(id -u)" -ne 0 ]; then
@@ -184,6 +236,8 @@ release/deploy/tencent/Caddyfile.llm-egress
 release/deploy/tencent/offline-recovery-state.py
 release/deploy/tencent/offline-recovery-dispatcher.sh
 release/deploy/tencent/reconcile-offline.sh
+release/deploy/tencent/chat-safety-sentinel.py
+release/deploy/tencent/clear-chat-safety-poison.sh
 release/deploy/tencent/heyi-kb-offline-reconcile.service
 release/deploy/tencent/heyi-kb-offline-reconcile.timer
 release/deploy/tencent/offline-operation-common.sh
@@ -212,6 +266,7 @@ release/docker/minio/cleanup-multipart.sh
 release/docker/clamav/clamd.conf
 release/docker/clamav/preflight-database.sh
 release/scripts/legacy_offline_adoption.py
+release/scripts/offline_ca_restore_drill.py
 release/scripts/host_isolation_guard.py
 EOF
 }

@@ -24,9 +24,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "aiosqlite>=0.21,<1",
-    "httpx2>=2.5,<3",
-    "mypy>=1.16,<2",
+  "aiosqlite>=0.21,<1",
+  "bandit==1.9.4",
+  "httpx2>=2.5,<3",
+  "mypy>=1.16,<2",
+  "packaging>=26,<27",
+  "pip-audit==2.10.1",
   "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.0,<2",
   "pytest-cov>=6.2,<8",

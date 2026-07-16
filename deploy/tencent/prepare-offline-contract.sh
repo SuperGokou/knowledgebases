@@ -22,7 +22,13 @@ offline_clear_inherited_environment
 
 contract_dir=$(mktemp -d "$OFFLINE_CONTRACT_ROOT/contract.XXXXXXXXXX")
 chmod 0700 "$contract_dir"
+contract_paths=
+expected_inventory=
+actual_inventory=
 cleanup_contract() {
+  [ -z "$contract_paths" ] || rm -f -- "$contract_paths"
+  [ -z "$expected_inventory" ] || rm -f -- "$expected_inventory"
+  [ -z "$actual_inventory" ] || rm -f -- "$actual_inventory"
   rm -rf -- "$contract_dir"
 }
 trap cleanup_contract EXIT
@@ -104,65 +110,105 @@ copy_stable_file() {
 }
 
 copy_release_asset() {
-  relative_path=$1
-  source_path=$script_dir/../..//$relative_path
-  canonical_source=$(realpath -e -- "$source_path" 2>/dev/null || true)
-  destination=$contract_dir/release/$relative_path
-  copy_stable_file "$relative_path" "$canonical_source" "$destination" "400 444 500 544 555 600 644 700 744 755" 1048576
+  contract_path=$1
+  source_relative=${contract_path#release/}
+  source_path=$repository_root/$source_relative
+  destination=$contract_dir/$contract_path
+  copy_stable_file "$contract_path" "$source_path" "$destination" \
+    "400 444 500 544 555 600 644 700 744 755" 1048576
 }
+
+repository_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
+contract_paths=$(mktemp "$OFFLINE_TMPDIR/contract-source-paths.XXXXXXXXXX") || \
+  offline_fail contract "cannot create the canonical contract inventory" 66
+chmod 0600 "$contract_paths"
+offline_contract_files > "$contract_paths" || \
+  offline_fail contract "cannot enumerate the canonical contract" 66
+
+entry_count=$(wc -l < "$contract_paths" | tr -d '[:space:]')
+unique_count=$(LC_ALL=C sort -u "$contract_paths" | wc -l | tr -d '[:space:]')
+if [ -z "$entry_count" ] || [ "$entry_count" -ne "$unique_count" ]; then
+  offline_fail contract "canonical contract contains an empty or duplicate inventory" 65
+fi
 
 copy_stable_file runtime.env "$runtime_source" "$contract_dir/runtime.env" "400 600" 65536
 copy_stable_file release.env "$release_source" "$contract_dir/release.env" "400 444" 16384
 copy_stable_file release.env.images "$manifest_source" \
   "$contract_dir/release.env.images" "400 444" 65536
 
-for release_asset in \
-  deploy/tencent/compose.offline.yml \
-  deploy/tencent/Caddyfile.offline \
-  deploy/tencent/Caddyfile.maintenance \
-  deploy/tencent/Caddyfile.llm-egress \
-  deploy/tencent/offline-recovery-state.py \
-  deploy/tencent/offline-recovery-dispatcher.sh \
-  deploy/tencent/reconcile-offline.sh \
-  deploy/tencent/heyi-kb-offline-reconcile.service \
-  deploy/tencent/heyi-kb-offline-reconcile.timer \
-  deploy/tencent/offline-operation-common.sh \
-  deploy/tencent/prepare-offline-contract.sh \
-  deploy/tencent/preflight-offline.sh \
-  deploy/tencent/preflight-maintenance-offline.sh \
-  deploy/tencent/verify-offline-images.sh \
-  deploy/tencent/enter-maintenance-offline.sh \
-  deploy/tencent/install-offline.sh \
-  deploy/tencent/offline-pre-migration-abort.py \
-  deploy/tencent/deploy-offline.sh \
-  deploy/tencent/adopt-offline.sh \
-  deploy/tencent/create-offline-contract.sh \
-  deploy/tencent/remove-offline-contract.sh \
-  deploy/tencent/rollback-offline.sh \
-  deploy/tencent/import-offline-registry-bundle.sh \
-  deploy/tencent/verify-maintenance-endpoint.py \
-  deploy/tencent/verify-upgrade-backup.py \
-  deploy/tencent/run-migration-with-lock.py \
-  deploy/tencent/verify-offline-network-cidrs.py \
-  deploy/tencent/verify-offline-project-inventory.py \
-  deploy/tencent/validate-offline-environment.py \
-  docker/postgres/init-runtime-role.sh \
-  docker/minio/init.sh \
-  docker/minio/cleanup-multipart.sh \
-  docker/clamav/clamd.conf \
-  docker/clamav/preflight-database.sh \
-  scripts/legacy_offline_adoption.py \
-  scripts/host_isolation_guard.py; do
-  copy_release_asset "$release_asset"
-done
+runtime_entries=0
+release_entries=0
+manifest_entries=0
+release_asset_entries=0
+while IFS= read -r relative_path; do
+  if ! printf '%s\n' "$relative_path" | \
+    grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$'; then
+    offline_fail contract "canonical contract contains an unsafe path" 65
+  fi
+  case "/$relative_path/" in
+    *//*|*/../*|*/./*)
+      offline_fail contract "canonical contract contains a non-canonical path" 65
+      ;;
+  esac
+  case "$relative_path" in
+    runtime.env)
+      runtime_entries=$((runtime_entries + 1))
+      ;;
+    release.env)
+      release_entries=$((release_entries + 1))
+      ;;
+    release.env.images)
+      manifest_entries=$((manifest_entries + 1))
+      ;;
+    release/*)
+      source_relative=${relative_path#release/}
+      [ -n "$source_relative" ] || \
+        offline_fail contract "canonical release asset path is empty" 65
+      copy_release_asset "$relative_path"
+      release_asset_entries=$((release_asset_entries + 1))
+      ;;
+    *)
+      offline_fail contract "canonical contract contains an unsupported path" 65
+      ;;
+  esac
+done < "$contract_paths"
+
+if [ "$runtime_entries" -ne 1 ] || [ "$release_entries" -ne 1 ] || \
+  [ "$manifest_entries" -ne 1 ] || [ "$release_asset_entries" -le 0 ] || \
+  [ "$entry_count" -ne $((release_asset_entries + 3)) ]; then
+  offline_fail contract "canonical contract has an invalid environment or release boundary" 65
+fi
+
+unsafe_object=$(find "$contract_dir" -mindepth 1 \
+  ! -type d ! -type f -print -quit) || \
+  offline_fail contract "cannot inspect the contract snapshot object types" 66
+if [ -n "$unsafe_object" ]; then
+  offline_fail contract "contract snapshot contains an unsafe filesystem object" 65
+fi
+expected_inventory=$(mktemp "$OFFLINE_TMPDIR/contract-expected.XXXXXXXXXX") || \
+  offline_fail contract "cannot create the expected contract inventory" 66
+actual_inventory=$(mktemp "$OFFLINE_TMPDIR/contract-actual.XXXXXXXXXX") || \
+  offline_fail contract "cannot create the actual contract inventory" 66
+chmod 0600 "$expected_inventory" "$actual_inventory"
+LC_ALL=C sort "$contract_paths" > "$expected_inventory" || \
+  offline_fail contract "cannot sort the expected contract inventory" 66
+find "$contract_dir" -type f -printf '%P\n' | LC_ALL=C sort > "$actual_inventory" || \
+  offline_fail contract "cannot enumerate the contract snapshot" 66
+if ! cmp -s "$expected_inventory" "$actual_inventory"; then
+  offline_fail contract "contract snapshot inventory differs from the canonical contract" 65
+fi
+rm -f -- "$expected_inventory" "$actual_inventory"
+expected_inventory=
+actual_inventory=
 
 metadata=$contract_dir/files.sha256
 : > "$metadata"
-offline_contract_files | while IFS= read -r relative_path; do
-  [ -n "$relative_path" ] || continue
+while IFS= read -r relative_path; do
   digest=$(sha256sum "$contract_dir/$relative_path" | awk '{print $1}') || exit 66
   printf '%s  %s\n' "$digest" "$relative_path" >> "$metadata"
-done
+done < "$contract_paths"
+rm -f -- "$contract_paths"
+contract_paths=
 chmod 0400 "$metadata"
 contract_digest=$(sha256sum "$metadata" | awk '{print $1}') || exit 66
 printf '%s\n' "$contract_digest" > "$contract_dir/contract.sha256"

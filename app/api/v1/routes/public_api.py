@@ -4,7 +4,9 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.chat_deadline import require_chat_request_deadlines
 from app.api.dependencies import DatabaseSession, require_api_key_permission
 from app.api.errors import ApiError
 from app.api.idempotency import require_chat_idempotency_key
@@ -22,9 +24,10 @@ from app.services.chat_timeout import run_chat_with_budget
 from app.services.knowledge_bases import require_knowledge_base_access, search_knowledge_entries
 
 router = APIRouter()
+chat_router = APIRouter()
 
 
-@router.post("/chat/query", response_model=ChatQueryResponse)
+@chat_router.post("/chat/query", response_model=ChatQueryResponse)
 async def query_chat_with_api_key(
     request: Request,
     payload: ChatQueryRequest,
@@ -33,6 +36,7 @@ async def query_chat_with_api_key(
     settings: Annotated[Settings, Depends(get_settings)],
     idempotency_key: Annotated[str, Depends(require_chat_idempotency_key)],
 ) -> ChatQueryResponse:
+    deadlines = require_chat_request_deadlines(request)
     _require_key_knowledge_scope(key_access, payload.knowledge_base_id)
     # Re-authorize before any replay so key/user/role revocation remains immediate.
     await require_knowledge_base_access(
@@ -40,33 +44,46 @@ async def query_chat_with_api_key(
         key_access.access,
         payload.knowledge_base_id,
     )
-    return await run_chat_with_budget(
-        lambda: execute_chat_query_idempotently(
-            session,
-            settings,
-            principal=ChatIdempotencyPrincipal.for_api_key(key_access.api_key.credential_family_id),
-            idempotency_key=idempotency_key,
-            request=payload,
-            authorize=lambda ledger_session: authorize_api_key_chat_snapshot(
-                ledger_session,
-                api_key_id=key_access.api_key.id,
-                credential_family_id=key_access.api_key.credential_family_id,
-                user_id=key_access.api_key.user_id,
-                knowledge_base_id=payload.knowledge_base_id,
-            ),
-            operation=lambda: answer_knowledge_query(
-                session,
+    bind = session.bind
+    if bind is None:
+        raise RuntimeError("chat request session has no database bind")
+    await session.commit()
+
+    async def execute_with_owned_session() -> ChatQueryResponse:
+        async with AsyncSession(bind=bind, expire_on_commit=False) as operation_session:
+            return await execute_chat_query_idempotently(
+                operation_session,
                 settings,
-                key_access.access,
-                knowledge_base_id=payload.knowledge_base_id,
-                message=payload.message,
-                limit=payload.limit,
+                principal=ChatIdempotencyPrincipal.for_api_key(
+                    key_access.api_key.credential_family_id
+                ),
                 idempotency_key=idempotency_key,
-                api_key_id=key_access.api_key.id,
-                api_key_credential_family_id=key_access.api_key.credential_family_id,
-            ),
-        ),
+                request=payload,
+                authorize=lambda ledger_session: authorize_api_key_chat_snapshot(
+                    ledger_session,
+                    api_key_id=key_access.api_key.id,
+                    credential_family_id=key_access.api_key.credential_family_id,
+                    user_id=key_access.api_key.user_id,
+                    knowledge_base_id=payload.knowledge_base_id,
+                ),
+                operation=lambda: answer_knowledge_query(
+                    operation_session,
+                    settings,
+                    key_access.access,
+                    knowledge_base_id=payload.knowledge_base_id,
+                    message=payload.message,
+                    limit=payload.limit,
+                    idempotency_key=idempotency_key,
+                    api_key_id=key_access.api_key.id,
+                    api_key_credential_family_id=key_access.api_key.credential_family_id,
+                ),
+            )
+
+    return await run_chat_with_budget(
+        execute_with_owned_session,
         is_disconnected=request.is_disconnected,
+        operation_deadline=deadlines.operation_deadline,
+        cleanup_deadline=deadlines.cleanup_deadline,
     )
 
 
@@ -100,3 +117,6 @@ def _require_key_knowledge_scope(key_access: ApiKeyAccess, knowledge_base_id: UU
             code="knowledge_base_not_found",
             message="Knowledge base not found",
         )
+
+
+router.include_router(chat_router)

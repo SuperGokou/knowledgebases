@@ -23,17 +23,15 @@ def _source(path: Path) -> str:
 def _shell_function(source: str, name: str) -> str:
     start = source.index(f"{name}() {{")
     following = re.search(r"\n[A-Za-z_][A-Za-z0-9_]*\(\) \{\n", source[start + 1 :])
-    end = (
-        source.index(f"\n{name}\n", start)
-        if following is None
-        else start + 1 + following.start()
-    )
+    end = source.index(f"\n{name}\n", start) if following is None else start + 1 + following.start()
     return source[start:end].rstrip() + "\n"
 
 
 def test_adoption_entrypoint_is_part_of_the_signed_materialized_contract() -> None:
     common = _source(COMMON_SCRIPT)
     contract = _source(CONTRACT_SCRIPT)
+    canonical_listing = common.split("cat <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+    canonical_entries = canonical_listing.splitlines()
 
     for path in (
         "deploy/tencent/adopt-offline.sh",
@@ -41,8 +39,14 @@ def test_adoption_entrypoint_is_part_of_the_signed_materialized_contract() -> No
         "scripts/legacy_offline_adoption.py",
         "scripts/host_isolation_guard.py",
     ):
-        assert f"release/{path}" in common
-        assert path in contract
+        assert f"release/{path}" in canonical_entries
+    assert len(canonical_entries) == len(set(canonical_entries))
+    assert contract.count("offline_contract_files") == 1
+    assert 'offline_contract_files > "$contract_paths"' in contract
+    assert 'copy_release_asset "$relative_path"' in contract
+    assert "for release_asset in" not in contract
+    assert "contract snapshot inventory differs from the canonical contract" in contract
+    assert "find \"$contract_dir\" -type f -printf '%P\\n'" in contract
 
 
 def test_adoption_transaction_has_one_inherited_project_lock() -> None:
@@ -52,6 +56,92 @@ def test_adoption_transaction_has_one_inherited_project_lock() -> None:
     assert "offline_acquire_lock adoption" in source
     assert "KB_OFFLINE_LOCK_HELD=$OFFLINE_LOCK_TOKEN" in _source(COMMON_SCRIPT)
     assert 'exec sh "$materialized_entry"' in source
+
+
+def test_production_adoption_pins_an_independent_evidence_trust_root() -> None:
+    source = _source(ADOPTION_SCRIPT)
+    argument_parser = source.split('while [ "$#" -gt 0 ]; do', 1)[1].split(
+        'case "$confirmed_plan_sha256"', 1
+    )[0]
+
+    assert (
+        "trusted_adoption_evidence_public_key=/etc/heyi-adoption/trusted-evidence-public.pem"
+    ) in source
+    assert (
+        "trusted_adoption_evidence_signing_key=/run/heyi-adoption-signing/evidence-signing.key"
+    ) in source
+    assert "evidence_public_key=$trusted_adoption_evidence_public_key" in source
+    assert "evidence_signing_key=$trusted_adoption_evidence_signing_key" in source
+    assert "--evidence-public-key" not in argument_parser
+    assert "--evidence-signing-key" not in argument_parser
+    assert "validate_adoption_evidence_trust_root" in source
+    assert (
+        'validate-evidence-trust-root \\\n    --challenge-context-sha256 "$confirmed_plan_sha256"'
+    ) in source
+    assert "adoption-evidence-key-pair.challenge" not in source
+    assert "adoption-evidence-key-pair.sig" not in source
+
+
+def test_production_adoption_rejects_an_operator_selected_key_pair(
+    tmp_path: Path,
+) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("POSIX sh is unavailable")
+    attacker_public = tmp_path / "attacker.pub"
+    attacker_private = tmp_path / "attacker.key"
+    attacker_public.write_text("attacker public key\n", encoding="utf-8")
+    attacker_private.write_text("attacker private key\n", encoding="utf-8")
+
+    rejected = subprocess.run(
+        [
+            shell,
+            str(ADOPTION_SCRIPT),
+            "--evidence-public-key",
+            str(attacker_public),
+            "--evidence-signing-key",
+            str(attacker_private),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert rejected.returncode == 64
+    assert "usage: adopt-offline.sh" in rejected.stderr
+
+
+def test_adoption_trust_attacks_have_zero_downstream_mutations() -> None:
+    source = _source(ADOPTION_SCRIPT)
+    entry_gate = "\nvalidate_adoption_evidence_trust_root\noffline_acquire_lock adoption\n"
+    assert entry_gate in source
+    gate_position = source.index(entry_gate)
+
+    mutation_boundaries = (
+        "offline_acquire_lock adoption",
+        'prepare-offline-contract.sh" \\\n    "$runtime_source" "$release_source"',
+        "offline_materialize_release adoption",
+        'mktemp -d "$OFFLINE_TMPDIR/adoption.',
+        "capture_reconcile_baseline",
+        "verify_backup_evidence_for_transaction_state",
+        "docker ps",
+        "systemctl",
+        "retire_legacy",
+        "write_adoption_journal",
+    )
+    reached_before_gate = [
+        token for token in mutation_boundaries if source.index(token) < gate_position
+    ]
+
+    assert reached_before_gate == []
+    validator = source.split("validate_adoption_evidence_trust_root() {", 1)[1].split(
+        "\n}\n\n# The signer", 1
+    )[0]
+    assert "validate-evidence-trust-root" in validator
+    assert "--challenge-context-sha256" in validator
+    assert "mktemp" not in validator
+    assert ">" not in validator.replace(">/dev/null", "")
 
 
 def test_predictive_gates_run_before_exact_legacy_retirement() -> None:
@@ -320,6 +410,7 @@ verify_backup_evidence_for_transaction_state
 
 def test_durable_resume_has_no_wall_clock_expiry_but_rehashes_every_artifact() -> None:
     source = _source(ADOPTION_SCRIPT)
+    verifier = (ADOPTION_SCRIPT.parent / "verify-upgrade-backup.py").read_text(encoding="utf-8")
     durable = source.split("verify_durable_backup_evidence() {", 1)[1].split(
         "\nverify_fresh_backup_evidence() {", 1
     )[0]
@@ -329,15 +420,17 @@ def test_durable_resume_has_no_wall_clock_expiry_but_rehashes_every_artifact() -
     )[0]
 
     assert "datetime.now" not in durable
-    assert "module._artifact(document, field)" in durable
-    assert 'module._timestamp(drill.get("tested_at")' in durable
-    assert "issued < expires <= issued + timedelta(hours=24)" in durable
-    assert (
-        "issued - timedelta(days=30) <= tested <= issued + timedelta(minutes=5)"
-        in durable
-    )
-    assert "openssl dgst -sha256 -verify" in durable
-    assert '"database_backup", "object_manifest", "restore_evidence"' in durable
+    assert '"$trusted_backup_verifier"' in durable
+    assert "--durable-resume" in durable
+    assert "--durable-resume" not in fresh
+    assert "openssl dgst -sha256 -verify" not in durable
+    assert "for field in" not in durable
+    assert '_artifact(document, "database_backup")' in verifier
+    assert '_artifact(document, "object_manifest")' in verifier
+    assert '_artifact(document, "restore_evidence")' in verifier
+    assert "issued_at < expires_at <= issued_at + timedelta(hours=24)" in verifier
+    assert "issued_at - timedelta(days=30)" in verifier
+    assert "_fixed_release_authorization_binding()" in verifier
     assert "trusted_backup_verifier" in fresh
     assert predictive.index("discover_adoption_resume_state") < predictive.index(
         "verify_backup_evidence_for_transaction_state"
@@ -407,6 +500,8 @@ def test_target_install_and_abort_are_bound_to_the_adoption_transaction() -> Non
         "--confirm-restore-boundary PRE_MIGRATION_ONLY",
     ):
         assert argument in abort
+    assert "--evidence-public-key" not in abort
+    assert "--evidence-signing-key" not in abort
     assert "verify_abort_receipt" in abort
 
 
@@ -457,9 +552,9 @@ def test_abort_receipt_is_signed_and_independently_rechecked() -> None:
 
 def test_completion_requires_the_journal_bound_install_state_v2() -> None:
     source = _source(ADOPTION_SCRIPT)
-    install_validation = source.split(
-        "validate_journal_bound_install_document() {", 1
-    )[1].split("\nvalidate_target_active_release() {", 1)[0]
+    install_validation = source.split("validate_journal_bound_install_document() {", 1)[1].split(
+        "\nvalidate_target_active_release() {", 1
+    )[0]
     active_validation = source.split("validate_target_active_release() {", 1)[1].split(
         "\nvalidate_resumable_target_runtime_resources() {", 1
     )[0]
@@ -469,9 +564,7 @@ def test_completion_requires_the_journal_bound_install_state_v2() -> None:
     publish = source.split("publish_completion_receipt() {", 1)[1].split(
         "\nenter_forward_fix_maintenance() {", 1
     )[0]
-    completion = "\n".join(
-        (install_validation, active_validation, completion_payload, publish)
-    )
+    completion = "\n".join((install_validation, active_validation, completion_payload, publish))
 
     for token in (
         'document.get("schema_version") == 2',
@@ -507,7 +600,7 @@ def test_resume_classification_preserves_new_transaction_safety_gates() -> None:
         'report.get("status") != "PASS"',
         'report.get("change_count") != 0',
         'report.get("changes") != []',
-        'observed_projection != reference_projection',
+        "observed_projection != reference_projection",
     ):
         assert token in host_validation
     assert "completion and target abort states coexist" in classifier

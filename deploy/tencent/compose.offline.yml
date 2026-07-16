@@ -23,6 +23,8 @@ x-api-environment: &api-environment
   KB_CHAT_IDEMPOTENCY_RESPONSE_MAX_BYTES: "131072"
   KB_CHAT_IDEMPOTENCY_CLEANUP_BATCH_SIZE: "1000"
   KB_CHAT_IDEMPOTENCY_CLEANUP_MAX_BATCHES: "5"
+  KB_CHAT_MAX_ACTIVE_REQUESTS: "8"
+  KB_CHAT_SAFETY_STATE_PATH: /var/lib/kb-chat-safety/poison.json
   KB_CHAT_REPLAY_ENCRYPTION_KEYS: ${KB_CHAT_REPLAY_ENCRYPTION_KEYS:?required}
   KB_CHAT_REPLAY_ACTIVE_KEY_VERSION: ${KB_CHAT_REPLAY_ACTIVE_KEY_VERSION:?required}
   KB_REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379/0
@@ -411,6 +413,9 @@ services:
         source: ${KB_DATA_ROOT:?required}/capacity-probe
         target: /var/lib/kb-capacity
         read_only: true
+      - type: bind
+        source: ${KB_DATA_ROOT:?required}/chat-safety
+        target: /var/lib/kb-chat-safety
     depends_on:
       postgres:
         condition: service_healthy

@@ -9,7 +9,7 @@
 | Source contract | 路由、源码、配置、文档和活动自动化测试逐项对应 | 14 项证据完整；声明的后端/前端测试全通过；关键命令无 skip | 不可 |
 | Runtime-functional | 真实浏览器完整业务链与通用 Linux 目标机离线运行 | Source contract 与本次自动化命令通过，且两个外部证据文档全部通过 | 不可；仅代表功能运行层通过 |
 
-现有 Playwright 企业档案已定义 8 项业务检查，并分别绑定桌面与移动项目，另有 2 项失败关闭预检；只有 collection 或源码存在不等于真实业务链已通过。目标“其他云 Linux 8C16G300G”主机也未在本地会话中提供。因此缺少真实浏览器与目标机证据时，已实际运行自动化命令的 `source_verdict` 可以是 PASS，但 `runtime_functional_verdict` 必须是 BLOCKED。未使用 `--run-tests` 时，`source_verdict` 为 UNVERIFIED，不得显示 PASS。
+现有 Playwright 企业档案固定为两个项目，每个项目执行 12 个业务场景和 1 个失败关闭预检，共 26 个测试实例，并生成 16 个证据检查 ID；只有 collection 或源码存在不等于真实业务链已通过。目标“其他云 Linux 8C16G300G”主机也未在本地会话中提供。因此缺少真实浏览器与目标机证据时，已实际运行自动化命令的 `source_verdict` 可以是 PASS，但 `runtime_functional_verdict` 必须是 BLOCKED。未使用 `--run-tests` 时，`source_verdict` 为 UNVERIFIED，不得显示 PASS。
 
 本脚本不是企业交付终验器，也不覆盖容量、性能、容灾、安全扫描、供应链、真实 PostgreSQL 与恶意文件全链路等全部企业门禁。企业唯一正式 final 判定只能由 `scripts/acceptance.py --profile final` 产生；功能脚本不提供名为 `final` 的 profile 或 verdict 字段。
 

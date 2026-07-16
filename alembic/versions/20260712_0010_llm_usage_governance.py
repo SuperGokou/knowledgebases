@@ -216,12 +216,8 @@ def upgrade() -> None:
         sa.Column("reserved_output_tokens", sa.BigInteger(), nullable=False),
         sa.Column("reserved_token_count", sa.BigInteger(), nullable=False),
         sa.Column("reserved_cost_micro_usd", sa.BigInteger(), nullable=False),
-        sa.Column(
-            "input_price_micro_usd_per_million_tokens", sa.BigInteger(), nullable=False
-        ),
-        sa.Column(
-            "output_price_micro_usd_per_million_tokens", sa.BigInteger(), nullable=False
-        ),
+        sa.Column("input_price_micro_usd_per_million_tokens", sa.BigInteger(), nullable=False),
+        sa.Column("output_price_micro_usd_per_million_tokens", sa.BigInteger(), nullable=False),
         sa.Column("actual_input_tokens", sa.BigInteger(), nullable=True),
         sa.Column("actual_output_tokens", sa.BigInteger(), nullable=True),
         sa.Column("actual_token_count", sa.BigInteger(), nullable=True),

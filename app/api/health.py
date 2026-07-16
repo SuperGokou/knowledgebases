@@ -9,9 +9,14 @@ from fastapi import APIRouter, Depends
 from redis.asyncio import Redis
 from sqlalchemy import text
 
+from app.api.chat_deadline import chat_route_backlog_size
 from app.api.dependencies import DatabaseSession, redis_dependency
 from app.api.errors import ApiError
 from app.db.schema_version import assert_database_schema_current
+from app.services.chat_idempotency import chat_finalization_backlog_size
+from app.services.chat_safety import chat_safety_poisoned
+from app.services.chat_timeout import chat_cleanup_backlog_size
+from app.services.llm_provider import llm_cleanup_backlog_size
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -69,6 +74,23 @@ async def readiness(
     session: DatabaseSession,
     redis: Annotated[Redis, Depends(redis_dependency)],
 ) -> dict[str, str]:
+    if chat_safety_poisoned():
+        raise ApiError(
+            status_code=503,
+            code="chat_safety_poisoned",
+            message="Chat processing requires operator reconciliation and worker restart",
+        )
+    if (
+        chat_cleanup_backlog_size() > 0
+        or llm_cleanup_backlog_size() > 0
+        or chat_finalization_backlog_size() > 0
+        or chat_route_backlog_size() > 0
+    ):
+        raise ApiError(
+            status_code=503,
+            code="cleanup_in_progress",
+            message="A bounded background cleanup is still in progress",
+        )
     if not await readiness_probe.check(session, redis):
         raise ApiError(
             status_code=503,

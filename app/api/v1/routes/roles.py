@@ -60,9 +60,7 @@ async def _lock_and_refresh_role_admin(
 ) -> tuple[AccessContext, dict[UUID, Role]]:
     await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(
-        select(User)
-        .where(User.id == access.user.id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == access.user.id).execution_options(populate_existing=True)
     )
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")

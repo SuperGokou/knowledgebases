@@ -18,15 +18,32 @@ from scripts.functional_acceptance import _signature_payload
 from scripts.host_preflight import HostFacts
 
 
-def _target() -> dict[str, str]:
+def _deployment(
+    *,
+    git_head: str = "a" * 40,
+    contract_sha256: str = "c" * 64,
+    manifest_sha256: str = "d" * 64,
+    base_url: str = "https://kb.internal:8443",
+) -> dict[str, str]:
+    return {
+        "release_id": git_head,
+        "offline_contract_sha256": contract_sha256,
+        "image_manifest_sha256": manifest_sha256,
+        "base_url": base_url,
+        "host_identity": "kb.internal",
+    }
+
+
+def _target() -> dict[str, object]:
     return {
         "git_head": "a" * 40,
         "content_fingerprint": "b" * 64,
         "run_id": "linux-host-run-001",
+        "deployment": _deployment(),
     }
 
 
-def _challenge(target: dict[str, str], now: datetime) -> dict[str, object]:
+def _challenge(target: dict[str, object], now: datetime) -> dict[str, object]:
     return {
         "schema_version": 1,
         "challenge_id": "challenge-linux-host-001",
@@ -123,6 +140,43 @@ def test_complete_evidence_rejects_mismatched_challenge_target() -> None:
     assert captured.value.code == "evidence_challenge_target_mismatch"
 
 
+def test_complete_evidence_rejects_legacy_target_without_deployment_identity() -> None:
+    now = datetime.now(UTC)
+    legacy_target: dict[str, object] = {
+        "git_head": "a" * 40,
+        "content_fingerprint": "b" * 64,
+        "run_id": "linux-host-run-001",
+    }
+
+    with pytest.raises(collector.CollectorBlocked) as captured:
+        collector.build_complete_evidence(
+            legacy_target,
+            _artifact_records(),
+            Ed25519PrivateKey.generate(),
+            _challenge(legacy_target, now),
+            collected_at=now,
+        )
+
+    assert captured.value.code == "evidence_target_invalid"
+
+
+def test_complete_evidence_rejects_deployment_release_id_not_equal_to_target_head() -> None:
+    now = datetime.now(UTC)
+    target = _target()
+    target["deployment"] = _deployment(git_head="f" * 40)
+
+    with pytest.raises(collector.CollectorBlocked) as captured:
+        collector.build_complete_evidence(
+            target,
+            _artifact_records(),
+            Ed25519PrivateKey.generate(),
+            _challenge(target, now),
+            collected_at=now,
+        )
+
+    assert captured.value.code == "evidence_target_invalid"
+
+
 def test_complete_evidence_rejects_unsafe_or_empty_artifact() -> None:
     now = datetime.now(UTC)
     target = _target()
@@ -189,6 +243,107 @@ def test_challenge_claim_is_exclusive_and_directory_fsynced(tmp_path: Path) -> N
         assert claim.stat().st_mode & 0o777 in {0o400, 0o600}
     assert fsync_calls == [tmp_path]
     assert captured.value.code == "challenge_already_claimed"
+
+
+def test_active_release_receipt_rejects_git_head_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = {
+        "manifest_sha256": "d" * 64,
+        "release_sha256": "e" * 64,
+    }
+    receipt = {
+        "schema_version": 2,
+        "kind": "offline-registry-import",
+        "status": "verified",
+        "release_sequence": 1,
+        "release_id": "release-001",
+        "release_git_sha": "f" * 40,
+        "release_schema_head": "20260715_0021",
+        "release_sha256": active["release_sha256"],
+        "manifest_sha256": active["manifest_sha256"],
+        "release_assets_sha256": "1" * 64,
+        "checksum_set_sha256": "2" * 64,
+        "signature_sha256": "3" * 64,
+        "trusted_key_sha256": "4" * 64,
+    }
+    monkeypatch.setattr(collector, "_root_json", lambda _path: receipt)
+
+    with pytest.raises(collector.CollectorBlocked) as captured:
+        collector._validate_release_binding(active, "a" * 40)
+
+    assert captured.value.code == "active_release_target_mismatch"
+
+
+def _deployment_compose_config(origin: str) -> dict[str, object]:
+    return {
+        "services": {
+            "web": {"environment": {"KB_PUBLIC_ORIGIN": origin}},
+            "proxy": {
+                "environment": {"KB_OBJECTS_HTTPS_PORT": "9443"},
+                "volumes": [{"target": "/data", "source": "/srv/caddy-data"}],
+            },
+        }
+    }
+
+
+def test_active_deployment_binding_accepts_exact_contract_manifest_and_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        collector,
+        "_compose_origins",
+        lambda _config: (
+            "https://kb.internal:8443/",
+            "https://kb.internal:9443",
+            Path("/caddy/root.crt"),
+        ),
+    )
+    binding = collector._validate_deployment_binding(
+        {"contract_sha256": "c" * 64, "manifest_sha256": "d" * 64},
+        _deployment_compose_config("https://kb.internal:8443/"),
+        _target(),
+    )
+
+    assert binding == _deployment()
+
+
+@pytest.mark.parametrize(
+    ("contract_sha256", "manifest_sha256", "origin", "expected_code"),
+    [
+        ("e" * 64, "d" * 64, "https://kb.internal:8443", "deployment_contract_mismatch"),
+        ("c" * 64, "e" * 64, "https://kb.internal:8443", "deployment_manifest_mismatch"),
+        ("c" * 64, "d" * 64, "https://other.internal:8443", "deployment_base_url_mismatch"),
+    ],
+    ids=["contract", "manifest", "base-url"],
+)
+def test_active_deployment_binding_rejects_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    contract_sha256: str,
+    manifest_sha256: str,
+    origin: str,
+    expected_code: str,
+) -> None:
+    monkeypatch.setattr(
+        collector,
+        "_compose_origins",
+        lambda _config: (
+            origin,
+            "https://kb.internal:9443",
+            Path("/caddy/root.crt"),
+        ),
+    )
+    with pytest.raises(collector.CollectorBlocked) as captured:
+        collector._validate_deployment_binding(
+            {
+                "contract_sha256": contract_sha256,
+                "manifest_sha256": manifest_sha256,
+            },
+            _deployment_compose_config(origin),
+            _target(),
+        )
+
+    assert captured.value.code == expected_code
 
 
 @pytest.mark.parametrize(
@@ -511,6 +666,14 @@ def test_blocked_diagnostic_contains_only_enumerated_reason(
             str(tmp_path),
             "--run-id",
             "linux-host-run-001",
+            "--release-id",
+            "a" * 40,
+            "--offline-contract-sha256",
+            "c" * 64,
+            "--image-manifest-sha256",
+            "d" * 64,
+            "--base-url",
+            "https://kb.internal:8443",
             "--signing-key",
             str(tmp_path / secret),
             "--challenge",

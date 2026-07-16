@@ -56,6 +56,22 @@ export const REQUIRED_CHECKS = [
 ] as const;
 
 export const REQUIRED_PROJECTS = ["enterprise-desktop", "enterprise-mobile"] as const;
+export const REQUIRED_TEST_TITLES = [
+  "@enterprise preflight 真实前端、API 与故障控制面必须可达",
+  "@enterprise TLS validates trusted identity and short-lived certificate renewal architecture",
+  "@enterprise unified login routes accounts by effective role",
+  "@enterprise account lifecycle rejects duplicates and revokes active access",
+  "@enterprise password reset enforces scope and revokes old credentials and sessions",
+  "@enterprise role administration edits and deletes safely under references and concurrency",
+  "@enterprise knowledge grants are visible then fail closed immediately after revocation",
+  "@enterprise all nine document formats complete scan, OKF, approval, retrieval and cited chat",
+  "@enterprise chat renders citations, no-answer, audited rejection and sourced table",
+  "@enterprise configured model switches and provider failure degrades safely",
+  "@enterprise API key enforces knowledge scope, rate limit and revocation",
+  "@enterprise audit query, pagination, CSV export and permission revocation fail closed",
+  "@enterprise loading and 401/403/409/429/5xx/timeout states fail visibly",
+] as const;
+export const EXPECTED_COLLECTED_TESTS = 26;
 const REQUIRED_ATTACHMENTS = ["e2e-a11y", "e2e-observability", "e2e-screenshot"] as const;
 const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 
@@ -73,6 +89,30 @@ export type EvidenceTarget = {
   readonly git_head: string;
   readonly content_fingerprint: string;
   readonly run_id: string;
+  readonly deployment: DeploymentIdentity;
+};
+
+export type DeploymentIdentity = {
+  readonly release_id: string;
+  readonly offline_contract_sha256: string;
+  readonly image_manifest_sha256: string;
+  readonly base_url: string;
+  readonly host_identity: string;
+};
+
+export type EvidenceCollectionTest = {
+  readonly project: string;
+  readonly title: string;
+  readonly status: "passed";
+};
+
+export type EvidenceCollection = {
+  readonly collected: number;
+  readonly passed: number;
+  readonly failed: number;
+  readonly skipped: number;
+  readonly pending: number;
+  readonly tests: readonly EvidenceCollectionTest[];
 };
 
 export type EvidenceArtifact = {
@@ -107,6 +147,7 @@ export type CompleteEvidence = {
   readonly collected_at: string;
   readonly artifacts: readonly EvidenceArtifact[];
   readonly checks: Readonly<Record<CheckId, EvidenceCheck>>;
+  readonly collection: EvidenceCollection;
   readonly attestation: {
     readonly type: "ed25519-challenge-v1";
     readonly key_id: typeof EVIDENCE_KEY_ID;
@@ -129,6 +170,12 @@ type EvidenceRecord = {
   persistence_failed: boolean;
 };
 
+type TestExecutionRecord = {
+  readonly project: string;
+  readonly title: string;
+  readonly status: EvidenceStatus;
+};
+
 const SECRET_KEY =
   /(?:password|passwd|secret|token|api[-_ ]?key|authorization|cookie|credential|session)/i;
 const FULL_URL = /\bhttps?:\/\/[^\s"'<>]+/gi;
@@ -138,6 +185,7 @@ const SECRET_ASSIGNMENT =
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GIT_HEAD_PATTERN = /^[0-9a-f]{40,64}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
+const HOST_IDENTITY_PATTERN = /^[A-Za-z0-9.:-]{1,253}$/;
 
 function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -166,6 +214,144 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+export function normalizeDeploymentBaseUrl(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw !== raw.trim()) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    (parsed.pathname !== "" && parsed.pathname !== "/")
+  ) {
+    return null;
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/\.$/u, "");
+  if (!hostname || !HOST_IDENTITY_PATTERN.test(hostname.replace(/^\[|\]$/gu, ""))) return null;
+  const port = parsed.port === "443" ? "" : parsed.port;
+  return `https://${hostname}${port ? `:${port}` : ""}`;
+}
+
+function validatedDeploymentIdentity(
+  value: unknown,
+  expectedGitHead: string,
+): DeploymentIdentity | null {
+  if (!isRecord(value)) return null;
+  const expectedKeys = new Set([
+    "release_id",
+    "offline_contract_sha256",
+    "image_manifest_sha256",
+    "base_url",
+    "host_identity",
+  ]);
+  const normalizedBaseUrl = normalizeDeploymentBaseUrl(value.base_url);
+  const parsedHost =
+    normalizedBaseUrl === null
+      ? null
+      : new URL(normalizedBaseUrl).hostname.toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, "");
+  if (
+    Object.keys(value).length !== expectedKeys.size ||
+    Object.keys(value).some((key) => !expectedKeys.has(key)) ||
+    value.release_id !== expectedGitHead ||
+    typeof value.offline_contract_sha256 !== "string" ||
+    !SHA256_PATTERN.test(value.offline_contract_sha256) ||
+    typeof value.image_manifest_sha256 !== "string" ||
+    !SHA256_PATTERN.test(value.image_manifest_sha256) ||
+    normalizedBaseUrl === null ||
+    value.base_url !== normalizedBaseUrl ||
+    typeof value.host_identity !== "string" ||
+    !HOST_IDENTITY_PATTERN.test(value.host_identity) ||
+    value.host_identity !== parsedHost
+  ) {
+    return null;
+  }
+  return {
+    release_id: value.release_id,
+    offline_contract_sha256: value.offline_contract_sha256,
+    image_manifest_sha256: value.image_manifest_sha256,
+    base_url: normalizedBaseUrl,
+    host_identity: value.host_identity,
+  };
+}
+
+function deploymentIdentityFromEnv(
+  gitHead: string,
+  env: Readonly<Record<string, string | undefined>>,
+): DeploymentIdentity {
+  const baseUrl = normalizeDeploymentBaseUrl(env.KB_E2E_BASE_URL);
+  const hostIdentity =
+    baseUrl === null
+      ? ""
+      : new URL(baseUrl).hostname.toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, "");
+  const candidate = {
+    release_id: env.KB_E2E_RELEASE_ID?.trim() ?? "",
+    offline_contract_sha256: env.KB_E2E_OFFLINE_CONTRACT_SHA256?.trim() ?? "",
+    image_manifest_sha256: env.KB_E2E_IMAGE_MANIFEST_SHA256?.trim() ?? "",
+    base_url: baseUrl ?? "",
+    host_identity: hostIdentity,
+  };
+  const deployment = validatedDeploymentIdentity(candidate, gitHead);
+  if (deployment === null) {
+    throw new Error("browser evidence deployment identity is unavailable or invalid");
+  }
+  return deployment;
+}
+
+function validateEvidenceCollection(collection: EvidenceCollection): void {
+  const expectedKeys = new Set([
+    "collected",
+    "passed",
+    "failed",
+    "skipped",
+    "pending",
+    "tests",
+  ]);
+  const uniquePairs = new Set<string>();
+  const expectedPairs = new Set(
+    REQUIRED_PROJECTS.flatMap((project) =>
+      REQUIRED_TEST_TITLES.map((title) => `${project}\0${title}`),
+    ),
+  );
+  if (
+    Object.keys(collection).length !== expectedKeys.size ||
+    Object.keys(collection).some((key) => !expectedKeys.has(key)) ||
+    collection.collected !== EXPECTED_COLLECTED_TESTS ||
+    collection.passed !== EXPECTED_COLLECTED_TESTS ||
+    collection.failed !== 0 ||
+    collection.skipped !== 0 ||
+    collection.pending !== 0 ||
+    collection.tests.length !== EXPECTED_COLLECTED_TESTS
+  ) {
+    throw new Error("incomplete E2E test collection");
+  }
+  for (const record of collection.tests) {
+    const pair = `${record.project}\0${record.title}`;
+    if (
+      Object.keys(record).length !== 3 ||
+      !isRequiredProject(record.project) ||
+      !record.title ||
+      record.status !== "passed" ||
+      uniquePairs.has(pair)
+    ) {
+      throw new Error("invalid E2E test collection");
+    }
+    uniquePairs.add(pair);
+  }
+  if (
+    expectedPairs.size !== EXPECTED_COLLECTED_TESTS ||
+    uniquePairs.size !== expectedPairs.size ||
+    [...uniquePairs].some((pair) => !expectedPairs.has(pair))
+  ) {
+    throw new Error("E2E test collection does not match the exact trusted scenario matrix");
+  }
+}
+
 export function canonicalEvidenceDigest(
   evidence: Omit<CompleteEvidence, "attestation"> | CompleteEvidence,
 ): string {
@@ -178,6 +364,7 @@ export function canonicalEvidenceDigest(
     collected_at: evidence.collected_at,
     artifacts: evidence.artifacts,
     checks: evidence.checks,
+    collection: evidence.collection,
   };
   return sha256(stableJson(bound));
 }
@@ -247,8 +434,10 @@ export function parseEvidenceChallenge(
     value.target.git_head !== expectedTarget.git_head ||
     value.target.content_fingerprint !== expectedTarget.content_fingerprint ||
     value.target.run_id !== expectedTarget.run_id ||
+    stableJson(value.target.deployment) !== stableJson(expectedTarget.deployment) ||
+    validatedDeploymentIdentity(value.target.deployment, expectedTarget.git_head) === null ||
     !RUN_ID_PATTERN.test(expectedTarget.run_id) ||
-    Object.keys(value.target).length !== 3
+    Object.keys(value.target).length !== 4
   ) {
     throw new Error("invalid E2E signing challenge binding");
   }
@@ -307,6 +496,7 @@ export function buildCompleteEvidence(input: {
   readonly collectedAt: string;
   readonly artifacts: readonly EvidenceArtifact[];
   readonly checks: Readonly<Record<string, EvidenceCheck>>;
+  readonly collection: EvidenceCollection;
   readonly signing: {
     readonly privateKey: KeyObject;
     readonly challenge: EvidenceChallenge;
@@ -316,7 +506,8 @@ export function buildCompleteEvidence(input: {
     !GIT_HEAD_PATTERN.test(input.target.git_head) ||
     !SHA256_PATTERN.test(input.target.content_fingerprint) ||
     !RUN_ID_PATTERN.test(input.target.run_id) ||
-    Object.keys(input.target).length !== 3 ||
+    Object.keys(input.target).length !== 4 ||
+    validatedDeploymentIdentity(input.target.deployment, input.target.git_head) === null ||
     !Number.isFinite(Date.parse(input.collectedAt)) ||
     input.artifacts.length === 0
   ) {
@@ -358,6 +549,7 @@ export function buildCompleteEvidence(input: {
   if (referenced.size !== artifactIds.size) {
     throw new Error("unreferenced E2E evidence artifact");
   }
+  validateEvidenceCollection(input.collection);
 
   const unsigned = {
     schema_version: 2 as const,
@@ -368,6 +560,13 @@ export function buildCompleteEvidence(input: {
     collected_at: input.collectedAt,
     artifacts: [...input.artifacts].sort((left, right) => left.id.localeCompare(right.id)),
     checks,
+    collection: {
+      ...input.collection,
+      tests: [...input.collection.tests].sort(
+        (left, right) =>
+          left.project.localeCompare(right.project) || left.title.localeCompare(right.title),
+      ),
+    },
   };
   if (
     input.signing.privateKey.type !== "private" ||
@@ -465,6 +664,7 @@ export function collectWorktreeTarget(
     git_head: gitHead,
     content_fingerprint: sha256(`${gitHead}\0${trackedDiffHash}\0${untrackedHash}`),
     run_id: runId,
+    deployment: deploymentIdentityFromEnv(gitHead, env),
   };
 }
 
@@ -659,6 +859,7 @@ export default class EnterpriseEvidenceReporter implements Reporter {
   private readonly configuredProjects = new Set<string>();
   private readonly runStatuses: EvidenceStatus[] = [];
   private readonly reporterErrors: EvidenceStatus[] = [];
+  private readonly testExecutions = new Map<string, TestExecutionRecord>();
 
   constructor(options: ReporterOptions = {}) {
     this.outputFile = path.resolve(options.outputFile ?? defaultOutputFile());
@@ -684,6 +885,11 @@ export default class EnterpriseEvidenceReporter implements Reporter {
     this.runStatuses.push(status);
     const projectName = test.parent.project()?.name ?? "";
     if (!isRequiredProject(projectName)) return;
+    this.testExecutions.set(`${projectName}\0${test.id}`, {
+      project: projectName,
+      title: test.title,
+      status,
+    });
 
     const checks = test.annotations
       .filter((annotation) => annotation.type === "evidence-check")
@@ -745,11 +951,38 @@ export default class EnterpriseEvidenceReporter implements Reporter {
       this.runStatuses.includes("failed") ||
       result.status === "failed" ||
       result.status === "timedout";
+    const collectionRecords = [...this.testExecutions.values()].sort(
+      (left, right) =>
+        left.project.localeCompare(right.project) || left.title.localeCompare(right.title),
+    );
+    const collection: EvidenceCollection = {
+      collected: collectionRecords.length,
+      passed: collectionRecords.filter((record) => record.status === "passed").length,
+      failed: collectionRecords.filter((record) => record.status === "failed").length,
+      skipped: collectionRecords.filter((record) => record.status === "blocked").length,
+      pending: 0,
+      tests: collectionRecords
+        .filter((record): record is TestExecutionRecord & { readonly status: "passed" } =>
+          record.status === "passed"
+        )
+        .map((record) => ({
+          project: record.project,
+          title: record.title,
+          status: record.status,
+        })),
+    };
+    let collectionComplete = true;
+    try {
+      validateEvidenceCollection(collection);
+    } catch {
+      collectionComplete = false;
+    }
     const formalComplete =
       result.status === "passed" &&
       !explicitBlocked &&
       !executionFailed &&
-      checksComplete;
+      checksComplete &&
+      collectionComplete;
     const diagnosticFile = this.outputFile.replace(/\.json$/i, ".blocked.json");
 
     if (!formalComplete) {
@@ -761,6 +994,13 @@ export default class EnterpriseEvidenceReporter implements Reporter {
         collected_at: new Date().toISOString(),
         required_projects: REQUIRED_PROJECTS,
         required_checks: REQUIRED_CHECKS,
+        collection: {
+          collected: collection.collected,
+          passed: collection.passed,
+          failed: collection.failed,
+          skipped: collection.skipped,
+          pending: collection.pending,
+        },
         reason: explicitBlocked
           ? "E2E_BLOCKED: required enterprise topology or scenario evidence is unavailable"
           : "enterprise browser evidence is incomplete or failed",
@@ -806,6 +1046,7 @@ export default class EnterpriseEvidenceReporter implements Reporter {
         collectedAt: new Date().toISOString(),
         artifacts: uniqueArtifacts,
         checks: checks as Record<CheckId, EvidenceCheck>,
+        collection,
         signing,
       });
       await writeJsonAtomic(this.outputFile, evidence);

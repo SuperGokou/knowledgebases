@@ -5,10 +5,13 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
+
+import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 BUILDER = REPOSITORY / "scripts/build-offline-registry-bundle.ps1"
@@ -67,6 +70,78 @@ def test_builder_exposes_help_and_a_non_mutating_dry_run() -> None:
         assert mutating_operation not in dry_run_block
     assert "REGISTRY_UNPACKED_BYTES=MEASURED_DURING_FORMAL_BUILD" in dry_run_block
     assert "REGISTRY_UNPACKED_INODES=MEASURED_DURING_FORMAL_BUILD" in dry_run_block
+
+
+def test_builder_uses_canonical_release_sequence_and_safe_release_id_contracts() -> None:
+    script = builder_text()
+
+    assert "[string]$ReleaseSequence" in script
+    sequence_match = re.search(r"\$ReleaseSequence -notmatch '([^']+)'", script)
+    release_id_match = re.search(r"\$ReleaseId -notmatch '([^']+)'", script)
+    assert sequence_match is not None
+    assert release_id_match is not None
+    sequence_pattern = sequence_match.group(1)
+    release_id_pattern = release_id_match.group(1)
+
+    for value in ("1", "202607160001", "999999999999999999"):
+        assert re.fullmatch(sequence_pattern, value) is not None
+    for value in ("0", "0001", "08", "1000000000000000000"):
+        assert re.fullmatch(sequence_pattern, value) is None
+
+    for value in ("a", "2026.07.16", "release_1-test", "a" * 128):
+        assert re.fullmatch(release_id_pattern, value) is not None
+    for value in (".", "..", ".release", "release.", "release/id", "a" * 129):
+        assert re.fullmatch(release_id_pattern, value) is None
+
+
+@pytest.mark.parametrize(
+    ("sequence", "release_id", "expected_message"),
+    [
+        ("0001", "release-1", "canonical positive integer"),
+        ("08", "release-1", "canonical positive integer"),
+        ("1", ".", "release ID must be 1-128 characters"),
+        ("1", "..", "release ID must be 1-128 characters"),
+    ],
+)
+def test_builder_fails_before_tool_or_path_access_for_noncanonical_identity(
+    tmp_path: Path,
+    sequence: str,
+    release_id: str,
+    expected_message: str,
+) -> None:
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(BUILDER),
+            "-OutputDirectory",
+            str(tmp_path / "out"),
+            "-SigningPrivateKey",
+            str(tmp_path / "missing-signing-key.pem"),
+            "-ImageSbomScanner",
+            str(tmp_path / "missing-sbom-scanner.exe"),
+            "-ImageSbomScannerSha256",
+            "a" * 64,
+            "-ReleaseSequence",
+            sequence,
+            "-ReleaseId",
+            release_id,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert expected_message in completed.stderr
+    assert "required tool is unavailable" not in completed.stderr
 
 
 def test_builder_rejects_dirty_or_changing_git_state_and_uses_only_head() -> None:
@@ -429,6 +504,10 @@ def test_bundle_build_documentation_covers_verification_and_import_order() -> No
     assert documentation.index("docker load") < documentation.index(
         "import-offline-registry-bundle.sh"
     )
+    assert "RELEASE_GIT_SHA" in documentation
+    assert "/releases/<contract-sha256>" in documentation
+    assert "不包含 `runtime.env`、`release.env`、Registry 或 SBOM" in documentation
+    assert "`release/`、`registry/`、`sbom/`" in documentation
 
 
 def test_bundle_build_documentation_binds_the_approved_sbom_scanner_in_both_modes() -> None:

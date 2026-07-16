@@ -402,6 +402,16 @@ def test_contract_snapshot_has_one_derived_manifest_and_root_only_runtime() -> N
     common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
 
     assert "manifest_source=$release_source.images" in prepare
+    assert prepare.count("offline_contract_files") == 1
+    assert 'offline_contract_files > "$contract_paths"' in prepare
+    assert 'done < "$contract_paths"' in prepare
+    assert 'copy_release_asset "$relative_path"' in prepare
+    assert "for release_asset in" not in prepare
+    assert "canonical contract contains an unsafe path" in prepare
+    assert "canonical contract contains a non-canonical path" in prepare
+    assert "canonical contract contains an empty or duplicate inventory" in prepare
+    assert "contract snapshot inventory differs from the canonical contract" in prepare
+    assert "find \"$contract_dir\" -type f -printf '%P\\n'" in prepare
     assert "OFFLINE_CONTRACT_ROOT=$OFFLINE_RUNTIME_ROOT/contracts" in common
     assert "install -d -o root -g root -m 0700" in common
     assert "runtime.env\nrelease.env\nrelease.env.images" in common
@@ -583,19 +593,28 @@ def test_registry_import_uses_signed_loopback_bundle_not_classic_save_load() -> 
     assert 'docker rm -f "$registry_container_id"' in script
     assert 'for directory in ("registry", "release", "sbom")' in script
     assert "image SBOM evidence does not match the signed nine-image manifest" in script
-    assert 'len(images) != 9' in script
+    assert "len(images) != 9" in script
     assert '"https://knowledgebases.local/schemas/image-sbom-index-v1.schema.json"' in script
     assert "signed release asset inventory differs" in script
     assert "RELEASE_SEQUENCE" in script
     assert "signed release sequence is replayed or downgraded" in script
+    assert "AUDITED_NOOP exact signed release is already imported" in script
+    assert 'if [ "$release_sequence" -lt "$highest_release_sequence" ]; then' in script
+    assert 'if [ "$release_sequence" -eq "$highest_release_sequence" ]; then' in script
+    assert '! cmp -s "$highest_release_file" "$expected_highest"' in script
+    assert '! cmp -s "$receipt_file" "$expected_receipt"' in script
+    assert "verify_local_signed_images" in script
     assert "highest-release.json" in script
+    assert ("canonical_trusted_public_key=/etc/heyi-release/trusted-release-public.pem") in script
+    assert 'if [ "$trusted_public_key" != "$canonical_trusted_public_key" ]; then' in script
+    assert "trusted_key_sha256" in script
+    assert "predates the trusted-key binding; re-import is required" in script
     assert "release_assets_sha256" in script
-    assert '20260715_0021' in script
-    assert '20260714_0020' not in script
-    assert 'target_schema_head = sys.argv[2]' in script
+    assert "20260715_0021" in script
+    assert "20260714_0020" not in script
+    assert "target_schema_head = sys.argv[2]" in script
     assert (
-        "tuple(map(int, schema_match.groups())) "
-        "<= tuple(map(int, target_match.groups()))"
+        "tuple(map(int, schema_match.groups())) <= tuple(map(int, target_match.groups()))"
     ) in script
     docker_capacity_gate = script.index("docker_root=$(docker info")
     first_registry_pull = script.index('docker pull --platform linux/amd64 "$image"')
@@ -612,17 +631,19 @@ def test_registry_import_accepts_a_valid_previous_schema_head_but_rejects_downgr
 ) -> None:
     script = (DEPLOY / "import-offline-registry-bundle.sh").read_text(encoding="utf-8")
     program = script.split("highest_release_sequence=$(python3 -I -c '\n", 1)[1].split(
-        "\n' \"$highest_release_file\" \"$release_schema_head\")",
+        '\n\' "$highest_release_file" "$release_schema_head" "$trusted_key_digest")',
         1,
     )[0]
+    trusted_key_sha256 = "d" * 64
     state = {
-        "schema_version": 1,
+        "schema_version": 2,
         "release_sequence": 17,
         "release_id": "previous-release",
         "release_git_sha": "a" * 40,
         "release_schema_head": "20260714_0020",
         "manifest_sha256": "b" * 64,
         "release_assets_sha256": "c" * 64,
+        "trusted_key_sha256": trusted_key_sha256,
     }
     state_path = tmp_path / "highest-release.json"
 
@@ -633,7 +654,15 @@ def test_registry_import_accepts_a_valid_previous_schema_head_but_rejects_downgr
         state["release_schema_head"] = existing_head
         state_path.write_text(json.dumps(state), encoding="utf-8")
         return subprocess.run(
-            [sys.executable, "-I", "-c", program, str(state_path), target_head],
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                program,
+                str(state_path),
+                target_head,
+                trusted_key_sha256,
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -646,6 +675,47 @@ def test_registry_import_accepts_a_valid_previous_schema_head_but_rejects_downgr
     assert validate("20260715_0021").returncode == 0
     assert validate("20260716_0022").returncode != 0
     assert validate("not-a-schema-head").returncode != 0
+
+    state["release_sequence"] = True
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    boolean_sequence = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            str(state_path),
+            "20260715_0021",
+            trusted_key_sha256,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert boolean_sequence.returncode != 0
+
+    legacy_state = dict(state)
+    legacy_state["release_sequence"] = 17
+    legacy_state["schema_version"] = 1
+    legacy_state.pop("trusted_key_sha256")
+    state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+    legacy = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            program,
+            str(state_path),
+            "20260715_0021",
+            trusted_key_sha256,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert legacy.returncode != 0
 
 
 def test_every_hashed_release_asset_exists_and_is_copied_into_the_contract() -> None:
@@ -661,7 +731,14 @@ def test_every_hashed_release_asset_exists_and_is_copied_into_the_contract() -> 
     assert release_assets
     for relative_path in release_assets:
         assert (REPOSITORY / relative_path).is_file(), relative_path
-        assert relative_path in prepare, relative_path
+    assert "release/scripts/offline_ca_restore_drill.py" in contract_listing
+    assert "release/*)" in prepare
+    assert "source_relative=${relative_path#release/}" in prepare
+    assert 'copy_release_asset "$relative_path"' in prepare
+    assert "for release_asset in" not in prepare
+    assert 'copy_release_asset "deploy/' not in prepare
+    assert 'copy_release_asset "docker/' not in prepare
+    assert 'copy_release_asset "scripts/' not in prepare
 
 
 def test_deploy_wrapper_keeps_one_contract_and_flock_through_verified_cutover() -> None:
@@ -744,9 +821,7 @@ def test_deploy_wrapper_keeps_one_contract_and_flock_through_verified_cutover() 
 
 def test_install_wrapper_keeps_ports_closed_until_strict_business_cutover() -> None:
     script = (DEPLOY / "install-offline.sh").read_text(encoding="utf-8")
-    execution_marker = (
-        'verified_contract_sha256=$(offline_verify_contract install "$contract_dir")'
-    )
+    execution_marker = 'verified_contract_sha256=$(offline_verify_contract install "$contract_dir")'
     # The same verifier assignment also appears in the materialized-contract
     # setup path.  The last occurrence is the actual main execution boundary,
     # after all helper function definitions.
@@ -888,6 +963,10 @@ def test_registry_import_persists_a_release_bound_receipt_required_by_preflight(
     assert "registry-import-$manifest_digest.json" in importer
     assert "existing import receipt conflicts with this signature" in importer
     assert 'sync -f "$receipt_directory"' in importer
+    receipt_sync = importer.index('sync -f "$receipt_file"')
+    directory_barrier = importer.index('sync -f "$receipt_directory"', receipt_sync)
+    highest_commit = importer.index('mv -f -- "$temporary_highest"', directory_barrier)
+    assert receipt_sync < directory_barrier < highest_commit
     assert image_import_finished < cleanup_before_commit < receipt_commit
     assert "temporary registry resources could not be removed before receipt commit" in importer
     assert "signed registry import receipt is missing or unsafe" in preflight

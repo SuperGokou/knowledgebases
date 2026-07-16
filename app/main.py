@@ -10,17 +10,41 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp
 
+from app.api.chat_deadline import ChatIngressDeadlineMiddleware
 from app.api.errors import ApiError
 from app.api.health import router as health_router
 from app.api.middleware import RequestBodyLimitMiddleware, RequestContextMiddleware
 from app.api.v1.router import router as v1_router
 from app.core.config import get_settings
 from app.domain.errors import FilePolicyViolation, QuotaExceeded
+from app.services.chat_safety import (
+    complete_chat_safety_shutdown,
+    configure_chat_safety_state,
+)
 from app.services.llm_provider import close_shared_llm_clients
 
 logger = logging.getLogger("knowledge_base")
 settings = get_settings()
+
+
+class KnowledgeBaseFastAPI(FastAPI):
+    """Build the chat ingress fence outside Starlette's ServerErrorMiddleware."""
+
+    def build_middleware_stack(self) -> ASGIApp:
+        inner = super().build_middleware_stack()
+        return ChatIngressDeadlineMiddleware(
+            inner,
+            chat_paths=frozenset(
+                {
+                    f"{settings.api_prefix}/chat/query",
+                    f"{settings.api_prefix}/public/chat/query",
+                }
+            ),
+            max_active_requests=settings.chat_max_active_requests,
+            cors_origins=frozenset(settings.cors_origins),
+        )
 
 
 @asynccontextmanager
@@ -29,6 +53,7 @@ async def application_lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await close_shared_llm_clients()
+        complete_chat_safety_shutdown()
 
 
 def error_body(
@@ -63,7 +88,8 @@ def safe_validation_errors(error: RequestValidationError) -> list[dict[str, Any]
 
 
 def create_app() -> FastAPI:
-    application = FastAPI(
+    configure_chat_safety_state(settings.chat_safety_state_path)
+    application = KnowledgeBaseFastAPI(
         title=settings.app_name,
         version="0.1.0",
         debug=settings.debug,

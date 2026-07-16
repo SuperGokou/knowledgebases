@@ -67,7 +67,13 @@
 
 ### 3.3 当前调用路径的容量风险
 
-`UNVERIFIED`（容量）/ 已实现（代码）：一次对话先生成答案，再由独立审核客户端进行语义审核；两次调用仍串行执行。端到端超时链已统一为服务端 95 秒、BFF 105 秒、浏览器 115 秒，客户端取消会传播到活动操作。该设计消除了明显的下游早退窗口，但不能证明供应商在目标负载下能在预算内稳定完成两次调用。
+`UNVERIFIED`（容量）/ 已实现（代码）：一次对话先生成答案，再由独立审核客户端进行语义审核；两次调用仍串行执行。超时链固定为 FastAPI 95 秒、BFF 105 秒、浏览器 115 秒。FastAPI 使用位于 Starlette `ServerErrorMiddleware`、请求体限制、认证、限流、RBAC、知识库授权和业务端点**之外**的最外层 `ChatIngressDeadlineMiddleware`，在第一次读取请求体之前建立同一组单调绝对截止时间：85 秒为 operation fence，94 秒为 cleanup fence，95 秒为 response fence。前 85 秒覆盖收体与全部路由处理；第 85–94 秒只允许一次取消后的 LLM 连接释放、计费与幂等终态封闭；第 94–95 秒只允许发送已经完整缓冲、验证通过的唯一响应。前置数据库连接池等待、语句执行和异常处理都会消耗同一套预算，不会重新获得 85 秒。断连状态在业务任务的有界等待间隙顺序探测；客户端取消只向活动任务发送一次。LLM 清理还必须在 94 秒终态截止前预留 2 秒给独立数据库 terminalizer。
+
+`MODELLED`（容量）/ 已实现（代码）：隔离 Compose 固定 `KB_CHAT_MAX_ACTIVE_REQUESTS=8`。准入发生在读取请求体和取得数据库连接之前，不设等待队列；第 9 个并发聊天立即返回 `503 chat_capacity_exceeded` 与 `Retry-After: 1`。每个已准入请求的最终响应最多使用 4 MiB 进程内缓冲，并另受 64 条 ASGI message、64 个响应头和 64 KiB 响应头总量限制；因此仅响应正文缓冲的理论硬上界是 `8 × 4 MiB = 32 MiB`，尚未计入请求体、检索结果、模型客户端、Python 对象和连接池。该值是配置模型，不是并发性能证明。
+
+任何路由、LLM、业务任务、终态写入或真实响应发送超过绝对栅栏时，系统都会进入强引用监管并设置 sticky poison；隔离部署还会持久化 `/srv/heyi-knowledgebases-offline/data/chat-safety/poison.json`。readiness 与新聊天立即失败关闭，backlog 清零、API 重启、Docker 重启或主机重启都不会自动恢复。恢复器在任何 API 自动启动前检查唯一受控容器，任意非零退出码都会物化持久 hold；退出码 `78` 标识哨兵持久化失败，其他非零码标识 worker 异常退出。只有在全部相关写入者停止、幂等账本/供应商用量/审计证据完成对账后，才可使用选定不可变发布中的摘要绑定清除脚本恢复。
+
+清除事务在删除哨兵前先持久化 `chat-safety-clear-pending.json`。只要 pending 存在，即使哨兵已经删除，恢复器仍保持维护页；操作员只能用相同状态、摘要、contract、transaction 和相同证据续提，直至 `cleared` 审计落盘并以删除 pending 作为提交点。该设计消除了明显的下游早退窗口、late 200、断连监控死锁和“哨兵已删但审计未提交”的自动恢复窗口，但不能证明供应商在目标负载下能在预算内稳定完成两次调用。
 
 `UNVERIFIED`（容量）/ 已实现（代码）：Provider 传输使用每进程、按事件循环共享的有界 HTTP 连接池；凭据代际更新会退休旧客户端，应用生命周期结束时 drain/close，不再为每次回答创建并立即关闭连接池。单元回归不能替代真实长稳连接、DNS、TLS 与供应商限额测试。
 
@@ -113,6 +119,8 @@
 整改后的稳态容器 CPU 上限合计为 4.80 核，为 8 核主机保留 3.20 核；内存理论余量为 7,424 MiB（7.25 GiB）。该静态预算满足仓库 `OPS-P1-001` 的 CPU 门禁，并为操作系统、Docker 与同机其他应用留下明确硬上限空间；但保留空间还必须覆盖其他应用的实测峰值、备份与升级临时负载，不能仅凭静态配置判定共存通过，也不能容纳本地大模型推理。
 
 `UNVERIFIED`：硬限制之和不代表实际使用量。部署前后必须保留其他 Compose 项目的容器、端口、网络、卷与健康指纹，并通过 30 分钟稳态和 8–24 小时长稳测试证明 CPU 均值、内存、上下文切换、IO wait、磁盘延迟、OOM 行为和同机应用无回归。若宿主机与其他应用无法落入 3.20 vCPU / 7.25 GiB 保留预算，部署必须阻断。
+
+离线 API 镜像当前以 Dockerfile 的单条 Uvicorn 命令启动，未设置 `--workers`，因此每个 API 容器只有一个 worker。`KB_CHAT_MAX_ACTIVE_REQUESTS=8`、活动任务监管、响应缓冲和进程级 poison 都按这个单 worker 边界设计；在把 poison、准入计数和未决任务监管迁移为 PostgreSQL/Redis 共享状态并完成多进程故障注入前，禁止增加 Uvicorn worker 数或横向扩容 API 副本。单 worker 是当前安全限制，不是吞吐优化结论。
 
 ### 5.2 PostgreSQL
 
@@ -224,9 +232,12 @@
 3. 在全新一次性主机恢复到可登录、检索、下载，RTO 不超过 4 小时；
 4. 恢复后随机抽检至少 1,000 个对象，大小和 SHA-256 一致率 100%；
 5. Caddy CA、Compose 清单与密钥的受控恢复，密钥值不进入报告；
-6. 升级前迁移克隆演练，镜像使用不可变摘要，15 分钟内可回滚；
-7. PostgreSQL、MinIO、API 明确 `stop_grace_period`，强杀次数为 0；
-8. 每季度至少一次恢复演练，失败必须形成整改项和复测证据。
+6. 备份证据 schema v3 必须签名绑定 `operation_scope`；`legacy_adoption` 证明旧栈恢复与目标授权，`active_upgrade` 才同时要求 `control_state_archive` 与 `control_state_manifest`。active manifest 必须声明 `initial_mode=chat_safety_maintenance_hold`、先于运行时物化 hold、缺失状态失败关闭、对账前禁止业务启动；完整签名采集器与 source/target 交叉绑定交付前，生产入口保持 `active_upgrade` fail-closed；
+7. control-state manifest 恰好记录十一项：mandatory present 的 `active-release.json`、`installed-<source-contract-sha256>.json`、`highest-release.json`、精确 Registry 回执、contract `files.sha256`、恢复 state helper、恢复 dispatcher，以及明确 present/absent 的 `poison.json`、`chat-safety-clear-pending.json`、`cutover-intent.json`、`install-in-progress.json`；缺记录不等于 absent；
+8. 全新主机先只启动数据服务与维护页，源/恢复 manifest 摘要和十一项记录逐项一致；每项 present 记录的源端/恢复端 SHA-256 必须相同，hold 清除与业务边缘/API 启动严格晚于人工对账；
+9. 升级前迁移克隆演练，镜像使用不可变摘要，15 分钟内可回滚；
+10. PostgreSQL、MinIO、API 明确 `stop_grace_period`，强杀次数为 0；
+11. 每季度至少一次恢复演练，失败必须形成整改项和复测证据。
 
 ## 10. 交付证据清单
 

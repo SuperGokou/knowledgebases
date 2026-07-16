@@ -21,7 +21,7 @@ import re
 import stat
 import subprocess  # nosec B404
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NoReturn, cast
@@ -43,6 +43,11 @@ OWNER_MARKER = "heyi-kb-offline-owner-marker"
 SYSTEMD_ROOT = pathlib.Path("/etc/systemd/system")
 RECONCILE_SERVICE = "heyi-kb-offline-reconcile.service"
 RECONCILE_TIMER = "heyi-kb-offline-reconcile.timer"
+TRUSTED_EVIDENCE_PUBLIC_KEY = pathlib.Path("/etc/heyi-adoption/trusted-evidence-public.pem")
+TRUSTED_EVIDENCE_PUBLIC_KEY_SHA256 = pathlib.Path(
+    "/etc/heyi-adoption/trusted-evidence-public.sha256"
+)
+TRUSTED_EVIDENCE_SIGNING_KEY = pathlib.Path("/run/heyi-adoption-signing/evidence-signing.key")
 ALLOWED_PREFLIGHT_SERVICES = frozenset(
     {"api-preflight", "clamav-db-preflight", "llm-egress-preflight"}
 )
@@ -252,6 +257,31 @@ def _protected_directory(path: pathlib.Path, *, mode: int = 0o700) -> None:
         _fail(f"protected directory is unsafe: {path}")
 
 
+def _protected_trust_file(
+    path: pathlib.Path, *, modes: frozenset[int], maximum_bytes: int
+) -> bytes:
+    """Read fixed trust material only through root-owned, non-writable ancestors."""
+
+    current = path.parent
+    while True:
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise AbortError(f"protected trust ancestor is unavailable: {current}") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or current.is_symlink()
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or current.resolve(strict=True) != current
+        ):
+            _fail(f"protected trust ancestor is unsafe: {current}")
+        if current == current.parent:
+            break
+        current = current.parent
+    return _protected_file(path, modes=modes, maximum_bytes=maximum_bytes)
+
+
 def _fsync_directory(path: pathlib.Path) -> None:
     flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
     descriptor = os.open(path, flags)
@@ -432,44 +462,195 @@ class Runner:
         except json.JSONDecodeError as exc:
             raise AbortError("Docker returned malformed JSON", 69) from exc
 
+    def validate_evidence_key_pair(
+        self,
+        *,
+        signing_key: bytes,
+        public_key: bytes,
+        challenge: bytes,
+    ) -> None:
+        """Perform a real OpenSSL sign/verify challenge without filesystem artifacts."""
+
+        raw_memfd_create = getattr(os, "memfd_create", None)
+        if not callable(raw_memfd_create):
+            raise CleanupFailed("anonymous trust challenge storage is unavailable")
+        memfd_create = cast(Callable[[str, int], int], raw_memfd_create)
+        descriptors: list[int] = []
+
+        def anonymous_file(name: str, payload: bytes) -> int:
+            descriptor = memfd_create(name, int(getattr(os, "MFD_CLOEXEC", 0)))
+            descriptors.append(descriptor)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise CleanupFailed("anonymous trust challenge write made no progress")
+                view = view[written:]
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return descriptor
+
+        try:
+            signing_descriptor = anonymous_file("heyi-adoption-signing-key", signing_key)
+            public_descriptor = anonymous_file("heyi-adoption-public-key", public_key)
+            try:
+                signed = subprocess.run(  # nosec B603
+                    (
+                        "/usr/bin/openssl",
+                        "dgst",
+                        "-sha256",
+                        "-sign",
+                        f"/proc/self/fd/{signing_descriptor}",
+                    ),
+                    check=False,
+                    input=challenge,
+                    capture_output=True,
+                    env=self._environment,
+                    timeout=30,
+                    pass_fds=(signing_descriptor,),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise CleanupFailed("trusted key-pair challenge failed") from exc
+            if signed.returncode != 0 or not signed.stdout or len(signed.stdout) > 65_536:
+                _fail("ephemeral adoption signer could not sign the trust challenge")
+            signature_descriptor = anonymous_file(
+                "heyi-adoption-challenge-signature", signed.stdout
+            )
+            try:
+                verified = subprocess.run(  # nosec B603
+                    (
+                        "/usr/bin/openssl",
+                        "dgst",
+                        "-sha256",
+                        "-verify",
+                        f"/proc/self/fd/{public_descriptor}",
+                        "-signature",
+                        f"/proc/self/fd/{signature_descriptor}",
+                    ),
+                    check=False,
+                    input=challenge,
+                    capture_output=True,
+                    env=self._environment,
+                    timeout=30,
+                    pass_fds=(public_descriptor, signature_descriptor),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise CleanupFailed("trusted key-pair challenge failed") from exc
+            if verified.returncode != 0:
+                _fail(
+                    "ephemeral adoption signer does not match the independently trusted public key"
+                )
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+
+def _validate_evidence_trust_root(runner: Runner, *, contract: str) -> str:
+    """Validate the fixed evidence trust root before any abort-side mutation."""
+
+    public_key = _protected_trust_file(
+        TRUSTED_EVIDENCE_PUBLIC_KEY,
+        modes=frozenset({0o400, 0o444}),
+        maximum_bytes=65_536,
+    )
+    fingerprint = _protected_trust_file(
+        TRUSTED_EVIDENCE_PUBLIC_KEY_SHA256,
+        modes=frozenset({0o400, 0o444}),
+        maximum_bytes=128,
+    )
+    signing_key = _protected_trust_file(
+        TRUSTED_EVIDENCE_SIGNING_KEY,
+        modes=frozenset({0o400}),
+        maximum_bytes=65_536,
+    )
+    if re.fullmatch(rb"[0-9a-f]{64}\n", fingerprint) is None:
+        _fail("trusted adoption evidence key fingerprint is malformed")
+    expected_digest = fingerprint[:-1].decode("ascii")
+    actual_digest = _sha256(public_key)
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        _fail("trusted adoption evidence public key differs from its independent fingerprint")
+    challenge = (f"heyi-adoption-evidence-key-pair-v1\n{contract}\n{expected_digest}\n").encode(
+        "ascii"
+    )
+    runner.validate_evidence_key_pair(
+        signing_key=signing_key,
+        public_key=public_key,
+        challenge=challenge,
+    )
+    if (
+        not hmac.compare_digest(
+            public_key,
+            _protected_trust_file(
+                TRUSTED_EVIDENCE_PUBLIC_KEY,
+                modes=frozenset({0o400, 0o444}),
+                maximum_bytes=65_536,
+            ),
+        )
+        or not hmac.compare_digest(
+            fingerprint,
+            _protected_trust_file(
+                TRUSTED_EVIDENCE_PUBLIC_KEY_SHA256,
+                modes=frozenset({0o400, 0o444}),
+                maximum_bytes=128,
+            ),
+        )
+        or not hmac.compare_digest(
+            signing_key,
+            _protected_trust_file(
+                TRUSTED_EVIDENCE_SIGNING_KEY,
+                modes=frozenset({0o400}),
+                maximum_bytes=65_536,
+            ),
+        )
+    ):
+        _fail("trusted adoption evidence trust root changed during validation")
+    return actual_digest
+
 
 def _lines(output: str) -> list[str]:
     return [line for line in output.splitlines() if line]
 
 
-def _container_mounts_are_read_only(
+def _container_mounts_match_contract(
     service: str, mounts: object, release_root: pathlib.Path
 ) -> bool:
     if not isinstance(mounts, list):
         return False
-    allowed: dict[str, set[tuple[str, str]]] = {
-        "api-preflight": {(str(DATA_ROOT / "capacity-probe"), "/var/lib/kb-capacity")},
+    allowed: dict[str, dict[tuple[str, str], bool]] = {
+        "api-preflight": {
+            (str(DATA_ROOT / "capacity-probe"), "/var/lib/kb-capacity"): False,
+        },
         "clamav-db-preflight": {
-            (str(DATA_ROOT / "clamav-db"), "/var/lib/clamav"),
+            (str(DATA_ROOT / "clamav-db"), "/var/lib/clamav"): False,
             (
                 str(release_root / "docker/clamav/preflight-database.sh"),
                 "/opt/clamav/preflight-database.sh",
-            ),
+            ): False,
         },
         "llm-egress-preflight": {
             (
                 str(release_root / "deploy/tencent/Caddyfile.llm-egress"),
                 "/etc/caddy/Caddyfile",
-            )
+            ): False
         },
     }
+    expected = allowed.get(service)
+    if expected is None:
+        return False
     observed: set[tuple[str, str]] = set()
     for raw in mounts:
         if not isinstance(raw, dict):
             return False
-        if raw.get("Type") != "bind" or raw.get("RW") is not False:
+        if raw.get("Type") != "bind":
             return False
         source = raw.get("Source")
         destination = raw.get("Destination")
         if not isinstance(source, str) or not isinstance(destination, str):
             return False
-        observed.add((source, destination))
-    return observed == allowed[service]
+        binding = (source, destination)
+        if binding in observed or binding not in expected or raw.get("RW") is not expected[binding]:
+            return False
+        observed.add(binding)
+    return observed == set(expected)
 
 
 def _validated_preflight_containers(
@@ -549,7 +730,9 @@ def _validated_preflight_containers(
             or IMAGE_REFERENCE.fullmatch(cast(str, config.get("Image"))) is None
             or not isinstance(raw.get("Image"), str)
             or IMAGE_ID.fullmatch(cast(str, raw.get("Image"))) is None
-            or not _container_mounts_are_read_only(service, raw.get("Mounts"), mounted_release_root)
+            or not _container_mounts_match_contract(
+                service, raw.get("Mounts"), mounted_release_root
+            )
         ):
             raise BoundaryClosed("target preflight container binding differs")
         identifier = raw.get("Id")
@@ -1241,8 +1424,6 @@ def _dry_run_result(
 class AbortArguments:
     journal: pathlib.Path
     binding_key: pathlib.Path
-    signing_key: pathlib.Path
-    public_key: pathlib.Path
     host_baseline: pathlib.Path
     host_hmac_key: pathlib.Path
     execute: bool
@@ -1257,6 +1438,10 @@ class AbortArguments:
 def abort_pre_migration(arguments: AbortArguments, runner: Runner | None = None) -> dict[str, Any]:
     _require_root_linux()
     command_runner = runner or Runner()
+    materialized_contract = _self_bound_contract()
+    if arguments.contract != materialized_contract:
+        _fail("abort confirmation differs from the sealed materialized release")
+    _validate_evidence_trust_root(command_runner, contract=materialized_contract)
     if arguments.project != PROJECT or arguments.restore_boundary != RESTORE_BOUNDARY:
         _fail("exact project and PRE_MIGRATION_ONLY confirmations are required")
     journal = validate_journal(
@@ -1273,12 +1458,11 @@ def abort_pre_migration(arguments: AbortArguments, runner: Runner | None = None)
     transaction_dir = arguments.journal.parent
     pending = transaction_dir / ".target-pre-migration-abort.pending"
     final = transaction_dir / "target-pre-migration-abort"
-    _protected_file(arguments.public_key, modes=frozenset({0o400, 0o440, 0o444}))
     if final.exists() or final.is_symlink():
         if pending.exists() or pending.is_symlink():
             _fail("published and pending abort receipts both exist")
         published = _validate_published_receipt(
-            command_runner, final, journal, arguments.public_key
+            command_runner, final, journal, TRUSTED_EVIDENCE_PUBLIC_KEY
         )
         if arguments.execute:
             return published
@@ -1415,27 +1599,33 @@ def abort_pre_migration(arguments: AbortArguments, runner: Runner | None = None)
         "global_actions": [],
         "restore_boundary": RESTORE_BOUNDARY,
     }
-    _protected_file(arguments.signing_key, modes=frozenset({0o400, 0o600}))
     _publish_receipt(
         command_runner,
         pending=pending,
         final=final,
         receipt=receipt,
-        signing_key=arguments.signing_key,
-        public_key=arguments.public_key,
+        signing_key=TRUSTED_EVIDENCE_SIGNING_KEY,
+        public_key=TRUSTED_EVIDENCE_PUBLIC_KEY,
     )
-    return _validate_published_receipt(command_runner, final, journal, arguments.public_key)
+    return _validate_published_receipt(command_runner, final, journal, TRUSTED_EVIDENCE_PUBLIC_KEY)
 
 
-def _self_bound_dry_run_arguments(arguments: argparse.Namespace) -> AbortArguments:
-    """Derive non-mutating confirmations from the journal and sealed release."""
+def _self_bound_contract() -> str:
+    """Return the contract bound to this immutable, root-owned helper."""
 
     helper_path = pathlib.Path(__file__).resolve(strict=True)
     contract = _hex64(helper_path.parents[2].name, "materialized release contract")
     expected_helper = RELEASE_ROOT / contract / "deploy/tencent/offline-pre-migration-abort.py"
     if helper_path != expected_helper:
-        _fail("dry-run helper is outside the sealed materialized release")
+        _fail("abort helper is outside the sealed materialized release")
     _protected_file(helper_path, modes=frozenset({0o444}), maximum_bytes=2_097_152)
+    return contract
+
+
+def _self_bound_dry_run_arguments(arguments: argparse.Namespace) -> AbortArguments:
+    """Derive non-mutating confirmations from the journal and sealed release."""
+
+    contract = _self_bound_contract()
     transaction = _transaction(
         arguments.adoption_journal.parent.name, "adoption transaction directory"
     )
@@ -1448,8 +1638,6 @@ def _self_bound_dry_run_arguments(arguments: argparse.Namespace) -> AbortArgumen
     return AbortArguments(
         journal=arguments.adoption_journal,
         binding_key=arguments.adoption_binding_key,
-        signing_key=arguments.evidence_signing_key,
-        public_key=arguments.evidence_public_key,
         host_baseline=arguments.host_isolation_baseline,
         host_hmac_key=arguments.host_isolation_hmac_key,
         execute=False,
@@ -1462,11 +1650,9 @@ def _self_bound_dry_run_arguments(arguments: argparse.Namespace) -> AbortArgumen
     )
 
 
-def _add_abort_evidence_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_abort_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--adoption-journal", required=True, type=pathlib.Path)
     parser.add_argument("--adoption-binding-key", required=True, type=pathlib.Path)
-    parser.add_argument("--evidence-signing-key", required=True, type=pathlib.Path)
-    parser.add_argument("--evidence-public-key", required=True, type=pathlib.Path)
     parser.add_argument("--host-isolation-baseline", required=True, type=pathlib.Path)
     parser.add_argument("--host-isolation-hmac-key", required=True, type=pathlib.Path)
 
@@ -1480,10 +1666,12 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--adoption-transaction", required=True)
     validate.add_argument("--contract-sha256", required=True)
     validate.add_argument("--allow-pending-journal", action="store_true")
+    validate_trust = subparsers.add_parser("validate-evidence-trust-root")
+    validate_trust.add_argument("--challenge-context-sha256", default="")
     dry_run = subparsers.add_parser("abort-dry-run")
-    _add_abort_evidence_arguments(dry_run)
+    _add_abort_arguments(dry_run)
     abort = subparsers.add_parser("abort")
-    _add_abort_evidence_arguments(abort)
+    _add_abort_arguments(abort)
     abort.add_argument("--execute", action="store_true")
     abort.add_argument("--confirm-project", default="")
     abort.add_argument("--confirm-contract-sha256", default="")
@@ -1524,6 +1712,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
+    if arguments.command == "validate-evidence-trust-root":
+        _require_root_linux()
+        explicit_context = bool(arguments.challenge_context_sha256)
+        challenge_context = (
+            _hex64(arguments.challenge_context_sha256, "trust challenge context")
+            if explicit_context
+            else _self_bound_contract()
+        )
+        digest = _validate_evidence_trust_root(Runner(), contract=challenge_context)
+        identity = {
+            (
+                "challenge_context_sha256" if explicit_context else "contract_sha256"
+            ): challenge_context
+        }
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "verified",
+                    "public_key_sha256": digest,
+                    **identity,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
     if arguments.command == "abort-dry-run":
         result = abort_pre_migration(_self_bound_dry_run_arguments(arguments))
     else:
@@ -1531,8 +1746,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             AbortArguments(
                 journal=arguments.adoption_journal,
                 binding_key=arguments.adoption_binding_key,
-                signing_key=arguments.evidence_signing_key,
-                public_key=arguments.evidence_public_key,
                 host_baseline=arguments.host_isolation_baseline,
                 host_hmac_key=arguments.host_isolation_hmac_key,
                 execute=arguments.execute,

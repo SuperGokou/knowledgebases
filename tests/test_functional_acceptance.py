@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import scripts.functional_acceptance as functional_acceptance
-from scripts.acceptance import build_profile, collect_worktree_evidence
+from scripts.acceptance import WorktreeEvidence, build_profile, collect_worktree_evidence
 from scripts.acceptance_gate import TrustedExecutableBinding
 from scripts.functional_acceptance import (
     AcceptanceGateError,
@@ -119,6 +119,7 @@ def _canonical_evidence_digest(document: dict[str, object]) -> str:
             "collected_at",
             "artifacts",
             "checks",
+            "collection",
         )
     }
     return hashlib.sha256(
@@ -184,9 +185,37 @@ def _minimal_manifest() -> dict[str, object]:
                     "id": "heyi-browser-e2e",
                     "version": "1.0.0",
                 },
+                "collection": {
+                    "expected_collected_tests": 1,
+                    "required_projects": ["enterprise-desktop"],
+                    "required_test_titles": ["enterprise acceptance test"],
+                },
                 "max_age_seconds": 3600,
             }
         ],
+    }
+
+
+def _deployment(git_head: str) -> dict[str, str]:
+    return {
+        "release_id": git_head,
+        "offline_contract_sha256": "a" * 64,
+        "image_manifest_sha256": "b" * 64,
+        "base_url": "https://knowledge.example.invalid",
+        "host_identity": "knowledge.example.invalid",
+    }
+
+
+def _external_target(
+    identity: WorktreeEvidence,
+    run_id: str,
+) -> dict[str, object]:
+    git_head = identity.git_head
+    return {
+        "git_head": git_head,
+        "content_fingerprint": identity.content_fingerprint,
+        "run_id": run_id,
+        "deployment": _deployment(git_head),
     }
 
 
@@ -735,16 +764,13 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
     raw_path.write_bytes(raw_content)
     identity = collect_worktree_evidence(repository)
     run_id = "acceptance-functional-test-001"
+    target = _external_target(identity, run_id)
     document: dict[str, object] = {
         "schema_version": 2,
         "evidence_id": "EXT-BROWSER-E2E-001",
         "status": "complete",
         "collector": {"id": "heyi-browser-e2e", "version": "1.0.0"},
-        "target": {
-            "git_head": identity.git_head,
-            "content_fingerprint": identity.content_fingerprint,
-            "run_id": run_id,
-        },
+        "target": target,
         "collected_at": datetime.now(UTC).isoformat(),
         "artifacts": [
             {
@@ -759,6 +785,20 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
                 "status": "passed",
                 "artifact_ids": ["browser-result"],
             }
+        },
+        "collection": {
+            "collected": 1,
+            "passed": 1,
+            "failed": 0,
+            "skipped": 0,
+            "pending": 0,
+            "tests": [
+                {
+                    "project": "enterprise-desktop",
+                    "title": "enterprise acceptance test",
+                    "status": "passed",
+                }
+            ],
         },
     }
     private_key = Ed25519PrivateKey.generate()
@@ -781,11 +821,7 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
                 "status": "issued",
                 "evidence_id": "EXT-BROWSER-E2E-001",
                 "nonce": challenge_nonce,
-                "target": {
-                    "git_head": identity.git_head,
-                    "content_fingerprint": identity.content_fingerprint,
-                    "run_id": run_id,
-                },
+                "target": target,
                 "issued_at": datetime.now(UTC).isoformat(),
                 "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             }
@@ -824,11 +860,7 @@ def test_fresh_signed_challenged_external_evidence_passes_and_replay_blocks(
                 "status": "issued",
                 "evidence_id": "EXT-BROWSER-E2E-001",
                 "nonce": challenge_nonce,
-                "target": {
-                    "git_head": identity.git_head,
-                    "content_fingerprint": identity.content_fingerprint,
-                    "run_id": run_id,
-                },
+                "target": target,
                 "issued_at": datetime.now(UTC).isoformat(),
                 "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             }
@@ -855,6 +887,8 @@ def _generic_external_report(
     *,
     challenge_run_id: str,
     extra_target_field: bool = False,
+    omit_deployment: bool = False,
+    deployment_release_id: str | None = None,
 ) -> ExternalEvidenceReport:
     repository = tmp_path / "generic-repository"
     repository.mkdir(parents=True)
@@ -880,11 +914,13 @@ def _generic_external_report(
     raw_path.write_bytes(raw)
     identity = collect_worktree_evidence(repository)
     run_id = "linux-host-target-001"
-    target: dict[str, object] = {
-        "git_head": identity.git_head,
-        "content_fingerprint": identity.content_fingerprint,
-        "run_id": run_id,
-    }
+    target = _external_target(identity, run_id)
+    if omit_deployment:
+        target.pop("deployment")
+    elif deployment_release_id is not None:
+        deployment = dict(target["deployment"])  # type: ignore[arg-type]
+        deployment["release_id"] = deployment_release_id
+        target["deployment"] = deployment
     if extra_target_field:
         target["operator"] = "untrusted"
     document: dict[str, object] = {
@@ -948,11 +984,27 @@ def _generic_external_report(
                 "status": "issued",
                 "evidence_id": "EXT-LINUX-HOST-001",
                 "nonce": nonce,
-                "target": {
-                    "git_head": identity.git_head,
-                    "content_fingerprint": identity.content_fingerprint,
-                    "run_id": challenge_run_id,
-                },
+                "target": (
+                    {
+                        key: value
+                        for key, value in _external_target(identity, challenge_run_id).items()
+                        if key != "deployment"
+                    }
+                    if omit_deployment
+                    else {
+                        **_external_target(identity, challenge_run_id),
+                        **(
+                            {
+                                "deployment": {
+                                    **_deployment(identity.git_head),
+                                    "release_id": deployment_release_id,
+                                }
+                            }
+                            if deployment_release_id is not None
+                            else {}
+                        ),
+                    }
+                ),
                 "issued_at": datetime.now(UTC).isoformat(),
                 "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             }
@@ -983,10 +1035,279 @@ def test_all_external_evidence_requires_exact_run_bound_challenge_target(
         challenge_run_id="linux-host-target-001",
         extra_target_field=True,
     )
+    legacy_target = _generic_external_report(
+        tmp_path / "legacy-target",
+        challenge_run_id="linux-host-target-001",
+        omit_deployment=True,
+    )
+    stale_release = _generic_external_report(
+        tmp_path / "stale-release",
+        challenge_run_id="linux-host-target-001",
+        deployment_release_id="f" * 40,
+    )
 
     assert matching.verdict == "PASS"
     assert mismatched.verdict == "BLOCKED"
     assert extra_target.verdict == "BLOCKED"
+    assert legacy_target.verdict == "BLOCKED"
+    assert stale_release.verdict == "BLOCKED"
+
+
+def test_browser_collection_rejects_empty_or_partial_26_test_execution() -> None:
+    titles = [f"enterprise test {index:02d}" for index in range(13)]
+    contract = {
+        "collection": {
+            "expected_collected_tests": 26,
+            "required_projects": ["enterprise-desktop", "enterprise-mobile"],
+            "required_test_titles": titles,
+        }
+    }
+    policy = {
+        "external_test_collections": {
+            "EXT-BROWSER-E2E-001": contract["collection"],
+        }
+    }
+    empty = {
+        "evidence_id": "EXT-BROWSER-E2E-001",
+        "collection": {
+            "collected": 0,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "pending": 0,
+            "tests": [],
+        },
+    }
+    partial = {
+        **empty,
+        "collection": {
+            "collected": 25,
+            "passed": 25,
+            "failed": 0,
+            "skipped": 0,
+            "pending": 0,
+            "tests": [
+                {
+                    "project": project,
+                    "title": title,
+                    "status": "passed",
+                }
+                for project in ("enterprise-desktop", "enterprise-mobile")
+                for title in titles
+            ][:25],
+        },
+    }
+
+    assert not functional_acceptance._validate_browser_collection(
+        empty,
+        contract,
+        policy=policy,
+    )
+    assert not functional_acceptance._validate_browser_collection(
+        partial,
+        contract,
+        policy=policy,
+    )
+
+
+def _paired_deployment_report(
+    tmp_path: Path,
+    *,
+    omit_linux: bool = False,
+    linux_release_id: str | None = None,
+) -> tuple[ExternalEvidenceReport, ExternalTrustContext]:
+    repository = tmp_path / "paired-repository"
+    repository.mkdir(parents=True)
+    (repository / ".gitignore").write_text("artifacts/acceptance/\n", encoding="utf-8")
+    (repository / "application.txt").write_text("release candidate\n", encoding="utf-8")
+    for arguments in (
+        ("init", "-q"),
+        ("config", "user.email", "acceptance@example.invalid"),
+        ("config", "user.name", "Acceptance Test"),
+        ("add", ".gitignore", "application.txt"),
+        ("commit", "-q", "-m", "test fixture"),
+    ):
+        subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+    identity = collect_worktree_evidence(repository)
+    deployment = _deployment(identity.git_head)
+    linux_deployment = {
+        **deployment,
+        **({"release_id": linux_release_id} if linux_release_id is not None else {}),
+    }
+    evidence_dir = repository / "artifacts/acceptance/functional"
+    raw_dir = evidence_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    manifest: dict[str, object] = {
+        "external_evidence": [
+            {
+                "id": "EXT-BROWSER-E2E-001",
+                "path": "artifacts/acceptance/functional/browser-e2e.json",
+                "required_checks": ["login_role_routing"],
+                "collection": {
+                    "expected_collected_tests": 1,
+                    "required_projects": ["enterprise-desktop"],
+                    "required_test_titles": ["enterprise acceptance test"],
+                },
+                "evidence_schema_version": 2,
+                "collector": {"id": "heyi-browser-e2e", "version": "1.0.0"},
+                "max_age_seconds": 3600,
+            },
+            {
+                "id": "EXT-LINUX-HOST-001",
+                "path": "artifacts/acceptance/functional/linux-host.json",
+                "required_checks": ["linux_amd64"],
+                "evidence_schema_version": 2,
+                "collector": {"id": "heyi-linux-host", "version": "1.0.0"},
+                "max_age_seconds": 3600,
+            },
+        ]
+    }
+    public_keys: dict[tuple[str, str], bytes] = {}
+    challenges: dict[str, dict[str, object]] = {}
+    now = datetime.now(UTC)
+    for evidence_id, collector_id, filename, check_id, run_id, bound_deployment in (
+        (
+            "EXT-BROWSER-E2E-001",
+            "heyi-browser-e2e",
+            "browser-e2e.json",
+            "login_role_routing",
+            "paired-browser-run-001",
+            deployment,
+        ),
+        (
+            "EXT-LINUX-HOST-001",
+            "heyi-linux-host",
+            "linux-host.json",
+            "linux_amd64",
+            "paired-linux-run-001",
+            linux_deployment,
+        ),
+    ):
+        if omit_linux and evidence_id == "EXT-LINUX-HOST-001":
+            continue
+        raw = json.dumps({"evidence_id": evidence_id}).encode()
+        raw_name = f"{evidence_id.casefold()}.json"
+        (raw_dir / raw_name).write_bytes(raw)
+        target = {
+            "git_head": identity.git_head,
+            "content_fingerprint": identity.content_fingerprint,
+            "run_id": run_id,
+            "deployment": bound_deployment,
+        }
+        document: dict[str, object] = {
+            "schema_version": 2,
+            "evidence_id": evidence_id,
+            "status": "complete",
+            "collector": {"id": collector_id, "version": "1.0.0"},
+            "target": target,
+            "collected_at": now.isoformat(),
+            "artifacts": [
+                {
+                    "id": f"{evidence_id}-artifact",
+                    "path": f"raw/{raw_name}",
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "bytes": len(raw),
+                }
+            ],
+            "checks": {
+                check_id: {
+                    "status": "passed",
+                    "artifact_ids": [f"{evidence_id}-artifact"],
+                }
+            },
+        }
+        if evidence_id == "EXT-BROWSER-E2E-001":
+            document["collection"] = {
+                "collected": 1,
+                "passed": 1,
+                "failed": 0,
+                "skipped": 0,
+                "pending": 0,
+                "tests": [
+                    {
+                        "project": "enterprise-desktop",
+                        "title": "enterprise acceptance test",
+                        "status": "passed",
+                    }
+                ],
+            }
+        key_id = (
+            "browser-e2e-ed25519" if evidence_id == "EXT-BROWSER-E2E-001" else "linux-host-ed25519"
+        )
+        challenge_id = (
+            "challenge-paired-browser-001"
+            if evidence_id == "EXT-BROWSER-E2E-001"
+            else "challenge-paired-linux-001"
+        )
+        nonce = "n" * 48 if evidence_id == "EXT-BROWSER-E2E-001" else "l" * 48
+        private_key = Ed25519PrivateKey.generate()
+        public_keys[(collector_id, key_id)] = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        challenges[challenge_id] = {
+            "status": "issued",
+            "evidence_id": evidence_id,
+            "nonce": nonce,
+            "target": target,
+            "issued_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        }
+        document["attestation"] = {
+            "type": "ed25519-challenge-v1",
+            "key_id": key_id,
+            "challenge_id": challenge_id,
+            "challenge_nonce": nonce,
+            "signature": base64.b64encode(
+                private_key.sign(
+                    _signature_payload(
+                        document,
+                        key_id=key_id,
+                        challenge_id=challenge_id,
+                        challenge_nonce=nonce,
+                    )
+                )
+            ).decode(),
+        }
+        (evidence_dir / filename).write_text(json.dumps(document), encoding="utf-8")
+    context = ExternalTrustContext(
+        public_keys=public_keys,
+        challenges=challenges,
+        consumed_challenges=set(),
+    )
+    return (
+        evaluate_external_evidence(
+            repository,
+            manifest,
+            trust_context=context,
+            enforce_policy=False,
+        ),
+        context,
+    )
+
+
+def test_runtime_external_evidence_requires_one_measured_deployment(tmp_path: Path) -> None:
+    matching, matching_context = _paired_deployment_report(tmp_path / "matching")
+    mismatched, mismatched_context = _paired_deployment_report(
+        tmp_path / "mismatched",
+        linux_release_id="f" * 40,
+    )
+    missing, missing_context = _paired_deployment_report(
+        tmp_path / "missing",
+        omit_linux=True,
+    )
+
+    assert matching.verdict == "PASS"
+    assert len(matching_context.consumed_challenges) == 2
+    assert mismatched.verdict == "BLOCKED"
+    assert mismatched_context.consumed_challenges == set()
+    assert missing.verdict == "BLOCKED"
+    assert missing_context.consumed_challenges == set()
 
 
 def test_challenge_consume_is_noreplace_and_fsyncs_directory() -> None:

@@ -30,6 +30,8 @@ from app.db.models import (
     ReservationStatus,
     UploadSession,
     UploadSessionStatus,
+    User,
+    UserStatus,
 )
 from app.domain.errors import FilePolicyViolation
 from app.domain.files import UploadMode, plan_upload, validate_upload
@@ -45,18 +47,20 @@ from app.schemas.files import (
     UploadInitiateResponse,
     UploadSessionRead,
 )
-from app.services.access import AccessContext
+from app.services.access import AccessContext, AccessService
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
 from app.services.list_search import literal_contains_pattern
 from app.services.quota import QuotaService, QuotaSpec, daily_window_start, lifetime_window_start
-from app.services.storage import StorageService, StoredObject
+from app.services.rbac_mutation import acquire_rbac_authorization_lock
+from app.services.storage import StorageService, StoredObject, checksum_sha256_base64_to_hex
 from app.services.storage_capacity import (
     FilesystemCapacity,
     StoragePolicyViolation,
     assess_storage_capacity,
     effective_upload_limit,
 )
+from app.services.user_activity import ActivityLockMode, acquire_user_activity_locks
 
 router = APIRouter()
 
@@ -276,6 +280,49 @@ async def _record_finalization_rejection(
     )
     await session.commit()
     return True
+
+
+async def _reauthorize_upload_finalization(
+    session: DatabaseSession,
+    *,
+    user_id: UUID,
+    expected_token_version: int,
+) -> AccessContext:
+    """Refresh the actor after storage I/O and hold revocation locks through commit."""
+
+    await acquire_rbac_authorization_lock(session)
+    await acquire_user_activity_locks(
+        session,
+        {user_id: ActivityLockMode.SHARED},
+    )
+    user = await session.scalar(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if user is None or user.status is not UserStatus.ACTIVE or user.retired_at is not None:
+        raise ApiError(
+            status_code=401,
+            code="inactive_user",
+            message="The user is not active",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if user.token_version != expected_token_version:
+        raise ApiError(
+            status_code=401,
+            code="token_revoked",
+            message="The access token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    current = await AccessService().resolve(session, user)
+    if not current.allows("file:upload"):
+        raise ApiError(
+            status_code=403,
+            code="permission_denied",
+            message="Permission required: file:upload",
+        )
+    return current
 
 
 @router.get("", response_model=list[FileRead])
@@ -686,6 +733,8 @@ async def complete_upload(
     expected_size = upload.expected_size_bytes
     expected_checksum = _checksum_base64(file.checksum_value)
     storage_upload_id = upload.storage_upload_id
+    actor_id = access.user.id
+    expected_token_version = access.user.token_version
     parts: list[dict[str, object]] = []
     if mode == UploadMode.MULTIPART.value:
         numbers = sorted(item.part_number for item in payload.parts)
@@ -781,9 +830,14 @@ async def complete_upload(
             final_key=final_key,
             upload_session_id=upload_session_id,
         )
+        finalization_access = await _reauthorize_upload_finalization(
+            session,
+            user_id=actor_id,
+            expected_token_version=expected_token_version,
+        )
         recorded = await _record_finalization_rejection(
             session=session,
-            access=access,
+            access=finalization_access,
             upload_session_id=upload_session_id,
             request=request,
             action=cast(str, rejection_action),
@@ -801,12 +855,29 @@ async def complete_upload(
             message=cast(str, rejection_message),
         )
 
+    try:
+        finalization_access = await _reauthorize_upload_finalization(
+            session,
+            user_id=actor_id,
+            expected_token_version=expected_token_version,
+        )
+    except ApiError:
+        await session.rollback()
+        await _cleanup_completed_upload_objects(
+            storage,
+            mode=mode,
+            source_key=source_key,
+            final_key=final_key,
+            upload_session_id=upload_session_id,
+        )
+        raise
+
     # Re-read under lock with populate_existing. Objects retained across the
     # pre-S3 commit are not authoritative after abort/finalization races.
     upload, file = await _owned_upload(
         session,
         upload_session_id=upload_session_id,
-        user_id=access.user.id,
+        user_id=finalization_access.user.id,
         lock=True,
     )
     if upload.status is UploadSessionStatus.COMPLETED:
@@ -828,13 +899,27 @@ async def complete_upload(
             message=f"Upload became {concurrent_status.value} during finalization",
         )
     if file.knowledge_base_id is not None:
-        await require_knowledge_base_access(
-            session,
-            access,
-            file.knowledge_base_id,
-            minimum=KnowledgeBaseAccessLevel.EDITOR,
-            lock=True,
-        )
+        try:
+            await require_knowledge_base_access(
+                session,
+                finalization_access,
+                file.knowledge_base_id,
+                minimum=KnowledgeBaseAccessLevel.EDITOR,
+                lock=True,
+            )
+        except ApiError:
+            # The object cannot remain recoverable after a concurrent KB grant
+            # revocation. Otherwise maintenance could later publish content that
+            # the actor no longer had permission to finalize.
+            await session.rollback()
+            await _cleanup_completed_upload_objects(
+                storage,
+                mode=mode,
+                source_key=source_key,
+                final_key=final_key,
+                upload_session_id=upload_session_id,
+            )
+            raise
 
     file.object_key = final_key
     await QuotaService().consume_upload_reservations(session, upload_session_id=upload.id)
@@ -842,12 +927,13 @@ async def complete_upload(
     upload.completed_at = datetime.now(UTC)
     file.size_bytes = stored.size_bytes
     file.status = FileStatus.QUARANTINED
-    if stored.checksum_sha256 and file.checksum_value is None:
+    stored_checksum_hex = checksum_sha256_base64_to_hex(stored.checksum_sha256)
+    if stored_checksum_hex is not None and file.checksum_value is None:
         file.checksum_algorithm = "SHA256"
-        file.checksum_value = stored.checksum_sha256
+        file.checksum_value = stored_checksum_hex
     add_audit_event(
         session,
-        actor_id=access.user.id,
+        actor_id=finalization_access.user.id,
         action="upload.completed",
         result=AuditResult.SUCCESS,
         resource_type="file",

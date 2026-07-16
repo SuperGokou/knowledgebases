@@ -403,6 +403,139 @@ ORDER BY status;
 
 当前采用最保守的 fail-closed 异常策略：claim 建立后 operation 抛出的任何异常都会封闭为 `OUTCOME_UNKNOWN`，包括少数可以证明尚未外发的确定性错误。这可能牺牲可用性，但不会放宽为可能二次外发；运维不得手工改状态。将错误分类为“未开始/已知结果/未知结果”属于后续优化项，在完成故障注入验收前不能宣称已经解决。
 
+Claim、模型调用、`COMPLETED` 响应写入和异常终态封闭分别使用独立数据库会话，模型调用期间不持有幂等账本会话。operation 或最终响应落库阶段收到取消时，系统会先以独立 terminalizer 验证现有 `COMPLETED` / `OUTCOME_UNKNOWN` / `INVALIDATED`，仅对仍为 `PROCESSING` 的记录单调写入 `OUTCOME_UNKNOWN`，再恢复原始取消。若提交或回滚返回异常，会丢弃该会话并用新会话读回验证和幂等重试；无法在绝对清理截止时间内证明终态时，当前 worker 会设置不可通过 HTTP 清除的 sticky poison，使 readiness 和所有新聊天返回 503。隔离部署会同时写入主机持久哨兵；backlog 清零、API 重启、Docker 重启或主机重启都不会解除 poison。恢复必须执行下节的人工对账与摘要绑定清除流程。当前离线部署保持单 worker/容器；扩展多 worker 或多副本前必须将该安全栅栏迁移到 PostgreSQL 或 Redis 共享状态。
+
+离线请求从第一次读取请求体前开始使用同一组 85/94/95 秒绝对截止时间：前 85 秒覆盖收体、认证、限流、授权、检索和模型路由；85–94 秒只允许取消后的连接释放、供应商用量对账和独立 terminalizer 封闭；94–95 秒只允许发送已经完整缓冲并验证通过的唯一响应。`KB_CHAT_MAX_ACTIVE_REQUESTS=8` 在收体和取得数据库连接前执行无队列准入，第 9 个并发聊天返回 `503 chat_capacity_exceeded`；每个已准入响应最多缓冲 4 MiB。上述数值是单 worker 安全边界，不是 8 个并发请求均能在真实供应商下达标的容量证明。
+
+### 9.1 持久 Chat Safety Poison 哨兵与人工恢复
+
+隔离部署把 `KB_CHAT_SAFETY_STATE_PATH` 固定为容器内 `/var/lib/kb-chat-safety/poison.json`，对应主机 `/srv/heyi-knowledgebases-offline/data/chat-safety/poison.json`。目录必须为 UID/GID `10001:10001`、模式 `0700`；哨兵必须为同一属主、模式 `0600`、单硬链接的普通 JSON 文件。哨兵只保存创建时间、PID、失败原因和异常类型，不保存问题、知识正文、Token、密钥或模型响应。
+
+出现哨兵后，`heyi-kb-offline-reconcile.timer` 会在受保护的选定发布中验证其 SHA-256，停止 `api`、`proxy`、`maintenance`、`llm-egress`、`migrate` 和 `bootstrap` 等敏感写入者，只保留独立 `maintenance-page`。恢复器还会检查唯一、归属正确且已停止的 API 容器：**任意非零退出码**都会在允许创建新 API 之前物化为持久哨兵；退出码 `78` 记录为哨兵持久化失败，其他非零退出码记录为 API worker 异常退出。退出状态、容器归属、固定镜像引用或镜像 ID 无法证明时同样失败关闭。恢复器不得因 readiness 失败自动重启 API，也不得执行迁移、Bootstrap 或普通业务 `compose up`。
+
+`/srv/heyi-knowledgebases-offline/state/chat-safety-clear-pending.json` 是清除事务的持久 hold。其顶层只能包含 `schema_version`、`created_at`、`sentinel_sha256`、`evidence_sha256`、`contract_sha256`、`transaction_id`、`state_selection`、`state_operation` 八个键，并与当前恢复选择及归档证据逐项绑定。只要该文件存在，即使 `poison.json` 已经删除，恢复器仍必须保持维护页并禁止重启业务写入者；预检、首次安装和升级入口也必须拒绝继续。禁止手工删除、移动、覆盖、`chmod` 或编辑 `poison.json`、`chat-safety-clear-pending.json` 及其审计文件；任何元数据、摘要或 schema 不合法时，应保留现场并按安全事件升级，不能把它“修好后继续”。
+
+#### 恢复前置
+
+1. 先触发恢复器并确认维护页接管，全部敏感写入者已经停止：
+
+```bash
+sudo systemctl start heyi-kb-offline-reconcile.service
+sudo systemctl status --no-pager heyi-kb-offline-reconcile.service
+sudo docker ps \
+  --filter label=com.docker.compose.project=heyi-kb-offline \
+  --format 'table {{.ID}}\t{{.Label "com.docker.compose.service"}}\t{{.Status}}'
+```
+
+   结果必须只有受允许的数据服务和 `maintenance-page` 继续运行；`api`、`proxy`、`maintenance`、`llm-egress`、`migrate`、`bootstrap` 不得处于运行状态。未满足时不要继续。
+
+2. 读取恢复器选定的持久状态。存在有效 `cutover-intent.json` 时，选择为 `intent`，操作只能是 `install`、`deploy` 或 `maintenance`；否则选择已提交的 `active-release.json`，操作固定为 `none`。记录其中的 64 位 `contract_sha256` 与 32 位 `transaction_id`，并从该 contract 对应的不可变发布目录执行后续命令。不得由操作员自行把 `intent` 改成 `active`，也不得复用其他发布或事务的值。
+
+3. 从恢复日志中的 `sentinel_sha256=<64位小写摘要>` 记录预期摘要。若 `poison.json` 仍存在，可使用**当前选定的不可变发布**再次只读验证：
+
+```bash
+export SELECTED_CONTRACT_SHA256='<选定 intent 或 active 状态中的 64 位 contract_sha256>'
+export SELECTED_RELEASE="/srv/heyi-knowledgebases-offline/releases/${SELECTED_CONTRACT_SHA256}"
+export SENTINEL='/srv/heyi-knowledgebases-offline/data/chat-safety/poison.json'
+
+sudo python3 -I \
+  "$SELECTED_RELEASE/deploy/tencent/chat-safety-sentinel.py" verify \
+  "$SENTINEL" \
+  --expected-uid 10001 \
+  --expected-gid 10001
+```
+
+   保存命令输出的 64 位摘要。后续 `--expected-sha256` 必须逐字节使用同一值；摘要改变表示证据链已变化，必须停止并重新调查。若 `poison.json` 已不存在但 `chat-safety-clear-pending.json` 存在，说明清除事务已越过哨兵删除步骤；不要重新制造哨兵，必须使用恢复日志和原始变更记录中的同一摘要、同一证据文件续提。
+
+4. 人工完成三类对账：
+
+   - 聊天幂等账本：每条相关 claim 已归类为 `COMPLETED`、`OUTCOME_UNKNOWN` 或 `INVALIDATED`，不存在待处置的 `PROCESSING`；
+   - 供应商用量：按供应商请求记录、token/费用账本和变更窗口确认是否已外发、是否计费以及是否需要补记；
+   - 审计记录：核对请求 ID、主体、知识库、API Key 族、变更单和人工结论，不在证据中写入问题正文、提示词、模型输出或密钥。
+
+5. 在固定路径 `/srv/heyi-knowledgebases-offline/state/chat-safety-reconciliation.json` 创建严格证据。文件必须为 `root:root`、模式 `0600`、单硬链接普通文件，最大 64 KiB；顶层键必须且只能是下面 **14 个键**。`captured_at` 必须为带时区的 RFC3339 时间，不能早于执行前 24 小时，也不能晚于当前时间 5 分钟：
+
+```json
+{
+  "schema_version": 1,
+  "sentinel_sha256": "<与 verify 输出一致的 64 位小写 SHA-256>",
+  "captured_at": "<当前 RFC3339 UTC 时间，例如 2026-07-16T12:34:56Z>",
+  "operator_id": "ops@example.com",
+  "change_ticket": "CHG-20260716-001",
+  "processing_claims_reconciled": true,
+  "provider_usage_reconciled": true,
+  "audit_log_reviewed": true,
+  "provider_reconciliation_reference": "provider-report-20260716",
+  "audit_review_reference": "audit-review-20260716",
+  "state_selection": "<intent 或 active>",
+  "state_operation": "<install、deploy、maintenance 或 none>",
+  "contract_sha256": "<选定状态中的 64 位小写 contract SHA-256>",
+  "transaction_id": "<选定状态中的 32 位小写事务标识>"
+}
+```
+
+`state_selection`、`state_operation`、`contract_sha256` 与 `transaction_id` 必须与清除脚本执行时重新读取的选定状态完全一致：`active` 只能配 `none`，`intent` 只能配 `install`、`deploy` 或 `maintenance`。其余占位符必须替换为真实、非敏感引用。使用受控编辑器写入后执行：
+
+```bash
+sudo chown root:root \
+  /srv/heyi-knowledgebases-offline/state/chat-safety-reconciliation.json
+sudo chmod 0600 \
+  /srv/heyi-knowledgebases-offline/state/chat-safety-reconciliation.json
+```
+
+#### 摘要绑定清除
+
+只有选定发布、项目锁、固定证据路径、全部写入者已停止、14-key 证据 schema 合法、状态/contract/事务绑定一致、哨兵摘要未变且数据库中 `PROCESSING` 计数为 0 时，清除脚本才会继续。首次创建 pending 时证据不得超过 24 小时；续提既有 pending 时允许证据超过该墙钟窗口，但其字节摘要必须与 pending 已绑定的摘要完全一致：
+
+```bash
+export SELECTED_CONTRACT_SHA256='<选定 intent 或 active 状态中的 64 位 contract_sha256>'
+export SELECTED_RELEASE="/srv/heyi-knowledgebases-offline/releases/${SELECTED_CONTRACT_SHA256}"
+export EXPECTED_SENTINEL_SHA256='<verify 输出的 64 位小写 SHA-256>'
+export RECONCILIATION_EVIDENCE='/srv/heyi-knowledgebases-offline/state/chat-safety-reconciliation.json'
+
+sudo sh "$SELECTED_RELEASE/deploy/tencent/clear-chat-safety-poison.sh" \
+  --expected-sha256 "$EXPECTED_SENTINEL_SHA256" \
+  --evidence "$RECONCILIATION_EVIDENCE"
+```
+
+脚本先把证据按 SHA-256 归档为 root-only `0400` 文件，在 `/srv/heyi-knowledgebases-offline/state/chat-safety-audit/clear-events.jsonl` 追加并 `fsync` 一条 `authorized` 事件，再创建并 `fsync` `chat-safety-clear-pending.json`。随后它验证唯一 API 容器 witness 的项目、服务、所有者、栈、固定镜像和实际 image ID；非零退出 witness 会归档为 `worker-exit-<exit-code>-<container-id>.json` 的 root-only `0400` 证据并消费精确容器。选择 `active` 状态时，脚本还会消费既有的精确已停止 API 容器，并从选定发布的固定摘要镜像创建一个**不启动、ExitCode=0** 的 clean API handoff；只有其项目/服务/所有者/栈/镜像身份全部匹配，才允许继续。恢复器随后只能启动这个受控 handoff，不由清除脚本开放 proxy 或模型写入者。
+
+脚本最后按摘要、inode 和设备号清除精确哨兵、追加并同步 `cleared` 事件，并以删除且同步 `chat-safety-clear-pending.json` 作为事务提交点。
+
+若进程在 pending 创建后、提交点前崩溃，恢复器必须继续显示维护页。操作员完成现场核验后，使用**同一选定状态、同一 `--expected-sha256` 和字节完全相同的证据文件**重新运行同一命令；脚本会验证既有 pending 并从安全步骤继续，不要求重新制造哨兵或容器。改变证据、contract、transaction 或状态选择会被拒绝。该幂等续提只消除重复清除的副作用，不会跳过人工对账；任一步失败都必须保持维护状态，不得改用 `rm`、直接 `docker start` 或手工更新幂等表。
+
+#### 清除后恢复与验收
+
+清除成功后，由受保护恢复器重建业务边界；不要直接运行裸 Compose：
+
+```bash
+sudo systemctl start heyi-kb-offline-reconcile.service
+sudo systemctl status --no-pager heyi-kb-offline-reconcile.service
+```
+
+验收必须在同一变更窗口完成：
+
+```bash
+sudo test ! -e /srv/heyi-knowledgebases-offline/data/chat-safety/poison.json
+sudo test ! -e /srv/heyi-knowledgebases-offline/state/chat-safety-clear-pending.json
+
+curl --fail --cacert /etc/heyi/pki/root-ca.pem \
+  "https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/health/ready"
+
+curl --fail-with-body --cacert /etc/heyi/pki/root-ca.pem \
+  --request POST \
+  "https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/api/v1/public/chat/query" \
+  --header "X-API-Key: <受控测试 API Key>" \
+  --header "Idempotency-Key: post-reconcile-<唯一测试标识>" \
+  --header 'Content-Type: application/json' \
+  --data '{"knowledge_base_id":"<已授权知识库 UUID>","message":"恢复后来源校验","limit":3}'
+
+sudo tail -n 2 \
+  /srv/heyi-knowledgebases-offline/state/chat-safety-audit/clear-events.jsonl
+```
+
+同时确认 `maintenance-page` 已退出、`api`/`proxy`/`maintenance` 健康、readiness 不再返回 `chat_safety_poisoned`、pending 已提交删除、测试问答具有合法来源与审核状态，并保存 `clear-events.jsonl` 中由相同 sentinel/evidence/contract/transaction/state 字段关联的 `authorized`/`cleared` 事件、非零退出 witness 归档（如有）、健康检查结果和聊天响应摘要。重试可能留下多条同事务 `authorized` 尝试记录，但只能有一个最终提交后的业务恢复。若哨兵或 pending 重新出现、审计事件缺失或问答终态无法证明，应立即保持维护状态并重新对账。
+
 聊天幂等表不保存问题正文、明文 Key 或明文主体 ID；响应先有界 zlib 压缩，再以 AES-256-GCM 加密。数据库保存密钥版本、12 字节随机 nonce、密文和原始大小，外置密钥环由 `KB_CHAT_REPLAY_ENCRYPTION_KEYS` 与 `KB_CHAT_REPLAY_ACTIVE_KEY_VERSION` 配置。旧密钥必须至少保留到相关记录超过 TTL；提前移除、AAD/密文篡改或解密失败会安全转为 `OUTCOME_UNKNOWN` 并清除密文，不会再次调用模型。完整轮换流程见[聊天幂等回放加密运维](./CHAT_REPLAY_ENCRYPTION.zh-CN.md)。
 
 应用层 AEAD 不覆盖 PostgreSQL 其他元数据、对象文件、WAL、快照或备份。上述介质仍必须采用企业访问控制、静态加密、保留和销毁策略；若无法提供静态加密及恢复演练证据，敏感知识库部署必须判定为 `NO-GO`。SHA-256、压缩或 replay 字段加密都不能充当整库匿名化/加密证明。
@@ -443,11 +576,16 @@ docker compose --env-file .env.kb exec postgres psql -U knowledge -d knowledge -
 - PostgreSQL：定期 base backup + 连续 WAL 归档，满足明确 RPO/RTO；
 - 对象存储：版本化、跨故障域复制，合规场景评估 Object Lock；
 - 配置与密钥：可恢复但与数据备份隔离保管；
-- 审计日志：写入独立、受限、防篡改的长期存储。
+- 审计日志：写入独立、受限、防篡改的长期存储；
+- 离线恢复控制面：`data/chat-safety/`、`state/` 中的 active/intent/install/Registry/最高发布状态、`chat-safety-clear-pending.json`、chat-safety 审计归档，以及与其绑定的 `contracts/`、不可变 `releases/`、签名 bundle 和公开信任根。
+
+离线备份授权使用 schema v3，并必须签名携带调用方绑定的 `operation_scope`。旧栈接管固定使用 `legacy_adoption`，其证据证明旧数据、对象、CA、拓扑和目标发布授权，不得伪造尚不存在的 target active release、installed receipt 或 active contract；常规升级固定使用 `active_upgrade`，并额外要求相互绑定的 `control_state_archive` 与 `control_state_manifest`。内部 active profile 固定为十一项控制状态，其中 `source_installed_receipt` 必须存在，路径只能匹配 `state/installed-<source-contract-sha256>.json`，恢复端状态与 SHA-256 必须与源端完全一致。active manifest 的恢复策略固定为 `initial_mode=chat_safety_maintenance_hold`、`materialize_hold_before_runtime=true`、`missing_state_policy=fail_closed`、`allow_business_start_before_reconciliation=false`。在完整签名采集器以及 source/target 控制状态语义交叉绑定全部完成前，生产校验器仍显式拒绝 `active_upgrade`，不得用手工证据或 durable resume 绕过。
 
 Redis 限流窗口可丢失并重建，不应成为业务恢复事实源。Compose 的 Redis AOF 只是开发便利。
 
 只做备份不算完成：至少季度演练恢复 PostgreSQL 到指定时间，并抽样校验 file.object_key 对应对象、大小和状态。跨 PostgreSQL/S3 没有单一事务，需要记录恢复点并执行孤儿对账。
+
+灾备恢复必须默认进入维护态：先恢复并验证 PostgreSQL、MinIO、CA、签名发布和上述控制状态，只启动数据服务与独立 `maintenance-page`；`api`、`proxy`、`maintenance`、`llm-egress`、迁移和 Bootstrap 在恢复器完成选定状态、contract、容器清单、哨兵、pending 与审计链核验前必须保持停止。`poison.json` 或 `chat-safety-clear-pending.json` 存在时继续走 9.1 节；控制状态缺失、损坏、时间点不一致或无法证明“清洁”时，不得把“文件不存在”解释为安全，应保持维护态并升级为灾备/安全事件。升级备份证据不能替代这套全量灾备控制状态。
 
 ### 10.2 本地升级
 

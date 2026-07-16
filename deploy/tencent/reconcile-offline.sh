@@ -29,15 +29,15 @@ selection_json=$(python3 -I "$state_helper" select) || \
 selection_fields=$(printf '%s\n' "$selection_json" | python3 -I -c '
 import json,re,sys
 d=json.load(sys.stdin)
-values=(d.get("selection"),d.get("contract_sha256"),d.get("transaction_id"),d.get("compose_profile"),d.get("compose_config_sha256"),d.get("project_inventory_sha256", "-"),d.get("egress_proof_sha256", "-"),d.get("active_provider_snapshot", "none"))
-if values[0] not in {"intent","active"} or not re.fullmatch(r"[0-9a-f]{64}",str(values[1])) or not re.fullmatch(r"[0-9a-f]{32}",str(values[2])) or values[3] not in {"strict-offline","controlled-egress"} or not re.fullmatch(r"[0-9a-f]{64}",str(values[4])) or (values[0] == "active" and (not re.fullmatch(r"[0-9a-f]{64}",str(values[5])) or not re.fullmatch(r"[0-9a-f]{64}",str(values[6])) or (values[3] == "strict-offline" and values[7] != "none") or (values[3] == "controlled-egress" and values[7] not in {"deepseek","qwen","minimax"}))):
+values=(d.get("selection"),d.get("contract_sha256"),d.get("transaction_id"),d.get("compose_profile"),d.get("compose_config_sha256"),d.get("project_inventory_sha256", "-"),d.get("egress_proof_sha256", "-"),d.get("active_provider_snapshot", "none"),d.get("operation","none"))
+if values[0] not in {"intent","active"} or not re.fullmatch(r"[0-9a-f]{64}",str(values[1])) or not re.fullmatch(r"[0-9a-f]{32}",str(values[2])) or values[3] not in {"strict-offline","controlled-egress"} or not re.fullmatch(r"[0-9a-f]{64}",str(values[4])) or (values[0] == "active" and (values[8] != "none" or not re.fullmatch(r"[0-9a-f]{64}",str(values[5])) or not re.fullmatch(r"[0-9a-f]{64}",str(values[6])) or (values[3] == "strict-offline" and values[7] != "none") or (values[3] == "controlled-egress" and values[7] not in {"deepseek","qwen","minimax"}))) or (values[0] == "intent" and values[8] not in {"install","deploy","maintenance"}):
     raise SystemExit(1)
 print(*values)
 ') || offline_fail recovery "durable transaction fields are invalid" 65
-# The trusted parser validates all eight whitespace-free fields before printing them.
+# The trusted parser validates all nine whitespace-free fields before printing them.
 # shellcheck disable=SC2086
 set -- $selection_fields
-[ "$#" -eq 8 ] || offline_fail recovery "durable transaction fields are incomplete" 65
+[ "$#" -eq 9 ] || offline_fail recovery "durable transaction fields are incomplete" 65
 selection=$1
 selected_contract_sha256=$2
 transaction_id=$3
@@ -45,6 +45,7 @@ receipt_profile=$4
 receipt_compose_digest=$5
 receipt_inventory_digest=$6
 receipt_egress_proof_digest=$7
+state_operation=$9
 if [ "$selection" != "$expected_selection" ] || \
   [ "$selected_contract_sha256" != "$contract_sha256" ] || \
   [ "$transaction_id" != "$expected_transaction_id" ]; then
@@ -77,6 +78,46 @@ validate_exact_service() {
     [ "$observed_service" = "$expected_service" ] && \
     [ "$observed_owner" = jiangsu-heyi-knowledgebases ] && \
     [ "$observed_stack" = offline ]
+}
+
+chat_safety_sentinel=$OFFLINE_PERSISTENT_ROOT/data/chat-safety/poison.json
+chat_safety_clear_pending=$OFFLINE_STATE_DIRECTORY/chat-safety-clear-pending.json
+
+materialize_api_persistence_witness() {
+  api_ids=$(docker ps -aq --no-trunc \
+    --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \
+    --filter "label=com.docker.compose.service=api") || return 1
+  old_ifs=$IFS
+  IFS="$(printf '\n ')"
+  # shellcheck disable=SC2086
+  set -- $api_ids
+  IFS=$old_ifs
+  [ "$#" -le 1 ] || return 1
+  if [ "$#" -eq 0 ]; then
+    if [ "$selection" = active ]; then
+      python3 -I "$script_dir/chat-safety-sentinel.py" materialize \
+        "$chat_safety_sentinel" --expected-uid 10001 --expected-gid 10001 \
+        --reason api_worker_missing \
+        --error-class WorkerMissing >/dev/null || return 1
+    fi
+    return 0
+  fi
+  api_id=$1
+  validate_exact_service "$api_id" api || return 1
+  api_running=$(docker inspect --format '{{.State.Running}}' "$api_id") || return 1
+  api_exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$api_id") || return 1
+  case "$api_exit_code" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  case "$api_running" in true|false) ;; *) return 1 ;; esac
+  if [ "$api_running" = false ] && [ "$api_exit_code" -ne 0 ]; then
+    witness_reason=api_worker_abnormal_exit
+    [ "$api_exit_code" -eq 78 ] && witness_reason=chat_safety_persistence_failed
+    python3 -I "$script_dir/chat-safety-sentinel.py" materialize \
+      "$chat_safety_sentinel" --expected-uid 10001 --expected-gid 10001 \
+      --reason "$witness_reason" \
+      --error-class "WorkerExit$api_exit_code" >/dev/null || return 1
+  fi
 }
 
 stop_sensitive_services() {
@@ -183,6 +224,143 @@ cleanup_recovery() {
   fi
 }
 
+enter_chat_safety_hold_if_present() {
+  clear_pending_status=$(python3 -I - "$chat_safety_clear_pending" \
+    "$selection" "$state_operation" "$contract_sha256" "$transaction_id" <<'PY'
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path=pathlib.Path(sys.argv[1])
+expected={
+    "state_selection":sys.argv[2],
+    "state_operation":sys.argv[3],
+    "contract_sha256":sys.argv[4],
+    "transaction_id":sys.argv[5],
+}
+try:
+    before=path.lstat()
+except FileNotFoundError:
+    print("absent")
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(1)
+if (
+    stat.S_ISLNK(before.st_mode)
+    or not stat.S_ISREG(before.st_mode)
+    or before.st_uid != 0
+    or before.st_nlink != 1
+    or stat.S_IMODE(before.st_mode) != 0o600
+    or not 0 < before.st_size <= 65536
+):
+    raise SystemExit(1)
+flags=os.O_RDONLY
+if hasattr(os,"O_NOFOLLOW"):
+    flags|=os.O_NOFOLLOW
+fd=os.open(path,flags)
+try:
+    after=os.fstat(fd)
+    if (
+        after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_uid != 0
+        or after.st_nlink != 1
+        or stat.S_IMODE(after.st_mode) != 0o600
+        or after.st_size != before.st_size
+    ):
+        raise SystemExit(1)
+    raw=b""
+    while len(raw) <= 65536:
+        chunk=os.read(fd,min(8192,65537-len(raw)))
+        if not chunk:
+            break
+        raw+=chunk
+    if len(raw) != after.st_size or len(raw) > 65536:
+        raise SystemExit(1)
+finally:
+    os.close(fd)
+def unique(items):
+    result={}
+    for key,value in items:
+        if key in result:
+            raise ValueError(key)
+        result[key]=value
+    return result
+document=json.loads(
+    raw,
+    object_pairs_hook=unique,
+    parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+)
+required={
+    "schema_version","created_at","sentinel_sha256","evidence_sha256",*expected,
+}
+created=document.get("created_at")
+if (
+    not isinstance(document,dict)
+    or set(document) != required
+    or type(document.get("schema_version")) is not int
+    or document["schema_version"] != 1
+    or any(document.get(key) != value for key,value in expected.items())
+    or re.fullmatch(r"[0-9a-f]{64}",str(document.get("sentinel_sha256"))) is None
+    or re.fullmatch(r"[0-9a-f]{64}",str(document.get("evidence_sha256"))) is None
+    or not isinstance(created,str)
+):
+    raise SystemExit(1)
+parsed=dt.datetime.fromisoformat(created.replace("Z","+00:00"))
+if parsed.tzinfo is None:
+    raise SystemExit(1)
+print("present",document["sentinel_sha256"])
+PY
+  ) || offline_fail recovery "chat safety clear-pending state is invalid" 65
+  case "$clear_pending_status" in
+    absent) clear_pending_digest= ;;
+    "present "[0-9a-f][0-9a-f]*) clear_pending_digest=${clear_pending_status#present } ;;
+    *) offline_fail recovery "chat safety clear-pending status is malformed" 65 ;;
+  esac
+  if [ -n "$clear_pending_digest" ]; then
+    printf '%s\n' "$clear_pending_digest" | grep -Eq '^[0-9a-f]{64}$' || \
+      offline_fail recovery "chat safety clear-pending digest is malformed" 65
+  fi
+  chat_safety_status=$(python3 -I "$script_dir/chat-safety-sentinel.py" status \
+    "$chat_safety_sentinel" --expected-uid 10001 --expected-gid 10001) || \
+    offline_fail recovery "persistent chat safety sentinel state is invalid" 65
+  case "$chat_safety_status" in
+    absent) chat_safety_digest= ;;
+    "present "[0-9a-f][0-9a-f]*) chat_safety_digest=${chat_safety_status#present } ;;
+    *) offline_fail recovery "persistent chat safety status is malformed" 65 ;;
+  esac
+  if [ -z "$chat_safety_digest" ] && [ -z "$clear_pending_digest" ]; then
+    return 0
+  fi
+  if [ -n "$chat_safety_digest" ] && [ -n "$clear_pending_digest" ] && \
+    [ "$chat_safety_digest" != "$clear_pending_digest" ]; then
+    offline_fail recovery "poison sentinel and clear-pending digests differ" 65
+  fi
+  [ -n "$chat_safety_digest" ] || chat_safety_digest=$clear_pending_digest
+  printf '%s\n' "$chat_safety_digest" | grep -Eq '^[0-9a-f]{64}$' || \
+    offline_fail recovery "persistent chat safety digest is malformed" 65
+  # A durable poison is an explicit operator-reconciliation hold. Never
+  # restart API writers or the business proxy merely because readiness is
+  # failing: doing so would erase process-local evidence before ledger and
+  # provider-side usage have been reconciled.
+  stop_sensitive_services || \
+    offline_fail recovery "cannot isolate the poisoned chat deployment" 70
+  offline_compose recovery "$contract_dir" \
+    --profile maintenance up -d --pull never --no-build --no-deps \
+    --wait --wait-timeout 60 maintenance-page
+  python3 -I "$script_dir/verify-maintenance-endpoint.py" \
+    --compose-config-stdin < "$endpoint_config_file"
+  recovery_succeeded=true
+  cleanup_recovery
+  trap - EXIT HUP INT TERM
+  echo "recovery: chat safety reconciliation required; sentinel_sha256=$chat_safety_digest"
+  exit 0
+}
+
 handle_exit() {
   original_code=$1
   trap - EXIT HUP INT TERM
@@ -210,6 +388,11 @@ fi
 offline_compose recovery "$contract_dir" \
   --profile maintenance config --format json > "$endpoint_config_file"
 chmod 0400 "$endpoint_config_file"
+
+enter_chat_safety_hold_if_present
+materialize_api_persistence_witness || \
+  offline_fail recovery "cannot materialize the API persistence-failure safety hold" 73
+enter_chat_safety_hold_if_present
 
 if [ "$selection" = intent ]; then
   # The dispatcher already stopped every sensitive service.  Starting a
@@ -258,6 +441,10 @@ if (offline_verify_project_release_labels recovery "$contract_dir") \
   done
 fi
 if "$steady_contract_matches" && "$steady_business_ready"; then
+  enter_chat_safety_hold_if_present
+  materialize_api_persistence_witness || \
+    offline_fail recovery "cannot revalidate the healthy API safety witness" 73
+  enter_chat_safety_hold_if_present
   # A crash can occur after the active receipt commit point but before the
   # deploy worker removes its matching intent.  Once the exact release,
   # receipt digest and TLS readiness have all been revalidated, converge that
@@ -289,6 +476,13 @@ done
 # the watchdog runs repeatedly and must never churn PostgreSQL/Redis/MinIO.
 stop_sensitive_services || \
   offline_fail recovery "cannot isolate the active release before repair" 70
+# Recheck after quiescence and immediately before any Compose path can create a
+# replacement API. This closes the window where the old worker exits 78 during
+# steady-state probes or while it is being stopped.
+enter_chat_safety_hold_if_present
+materialize_api_persistence_witness || \
+  offline_fail recovery "cannot materialize the quiesced API safety hold" 73
+enter_chat_safety_hold_if_present
 
 maintenance_ids=$(docker ps -aq \
   --filter "label=com.docker.compose.project=$OFFLINE_PROJECT_NAME" \

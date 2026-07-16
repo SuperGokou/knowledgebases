@@ -14,6 +14,12 @@ from scripts.acceptance import build_profile, verify_signed_operational_evidence
 from scripts.acceptance_gate import GateIdentity
 
 RELEASE_ID = "2026.07.14-acceptance.1"
+CONTROL_PLANE_SCHEMA = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "schemas"
+    / "enterprise-restored-control-plane-integrity-v1.schema.json"
+)
 
 
 def _timestamp(value: datetime) -> str:
@@ -228,6 +234,121 @@ def _disaster_recovery_bundle(
         ).hexdigest(),
         "samples": samples,
     }
+    reconciliation_completed = completed - timedelta(minutes=10)
+    hold_cleared = completed - timedelta(minutes=9)
+    business_started = completed - timedelta(minutes=8)
+    source_contract_sha256 = "3" * 64
+    source_release_sha256 = "6" * 64
+    source_release_manifest_sha256 = "4" * 64
+    control_records = [
+        {
+            "id": "chat_safety_sentinel",
+            "path": "data/chat-safety/poison.json",
+            "source_state": "absent",
+            "restored_state": "absent",
+            "source_sha256": None,
+            "restored_sha256": None,
+        },
+        {
+            "id": "chat_safety_clear_pending",
+            "path": "state/chat-safety-clear-pending.json",
+            "source_state": "absent",
+            "restored_state": "absent",
+            "source_sha256": None,
+            "restored_sha256": None,
+        },
+        {
+            "id": "cutover_intent",
+            "path": "state/cutover-intent.json",
+            "source_state": "absent",
+            "restored_state": "absent",
+            "source_sha256": None,
+            "restored_sha256": None,
+        },
+        {
+            "id": "install_in_progress",
+            "path": "state/install-in-progress.json",
+            "source_state": "absent",
+            "restored_state": "absent",
+            "source_sha256": None,
+            "restored_sha256": None,
+        },
+    ]
+    for record_id, path in (
+        ("active_release", "state/active-release.json"),
+        (
+            "source_installed_receipt",
+            f"state/installed-{source_contract_sha256}.json",
+        ),
+        ("highest_release", "state/highest-release.json"),
+        (
+            "registry_import_receipt",
+            f"state/registry-import-{source_release_manifest_sha256}.json",
+        ),
+        (
+            "active_contract_manifest",
+            f"contracts/{source_contract_sha256}/files.sha256",
+        ),
+        ("recovery_state_helper", "recovery/offline-recovery-state.py"),
+        ("recovery_dispatcher", "recovery/offline-recovery-dispatcher.sh"),
+    ):
+        digest = (
+            source_contract_sha256
+            if record_id == "active_contract_manifest"
+            else hashlib.sha256(record_id.encode()).hexdigest()
+        )
+        control_records.append(
+            {
+                "id": record_id,
+                "path": path,
+                "source_state": "present",
+                "restored_state": "present",
+                "source_sha256": digest,
+                "restored_sha256": digest,
+            }
+        )
+    control_manifest_sha256 = hashlib.sha256(
+        json.dumps(
+            control_records,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    control_plane = {
+        "schema_version": 1,
+        "kind": "enterprise-restored-control-plane-integrity",
+        "status": "passed",
+        "restore_started_in_maintenance_hold": True,
+        "chat_safety_hold_materialized_before_runtime": True,
+        "restore_hold_sentinel_sha256": hashlib.sha256(b"dr-hold").hexdigest(),
+        "api_started_before_reconciliation": False,
+        "edge_exposed_before_reconciliation": False,
+        "missing_control_state_fail_closed": True,
+        "recovery_selection": "active",
+        "reconciliation_completed_at": _timestamp(reconciliation_completed),
+        "hold_cleared_at": _timestamp(hold_cleared),
+        "business_services_started_at": _timestamp(business_started),
+        "source_contract_sha256": source_contract_sha256,
+        "source_release_sha256": source_release_sha256,
+        "source_release_manifest_sha256": source_release_manifest_sha256,
+        "source_contract_bindings": {
+            record_id: {
+                "contract_sha256": source_contract_sha256,
+                "release_sha256": source_release_sha256,
+                "manifest_sha256": source_release_manifest_sha256,
+            }
+            for record_id in (
+                "active_release",
+                "source_installed_receipt",
+                "active_contract_manifest",
+                "registry_import_receipt",
+            )
+        },
+        "source_manifest_sha256": control_manifest_sha256,
+        "restored_manifest_sha256": control_manifest_sha256,
+        "records": control_records,
+    }
     smoke = {
         "schema_version": 1,
         "kind": "enterprise-restored-functional-smoke",
@@ -242,6 +363,7 @@ def _disaster_recovery_bundle(
         _artifact(root, "restore_drill_report", restore_drill),
         _artifact(root, "database_integrity", database),
         _artifact(root, "object_integrity", objects),
+        _artifact(root, "control_plane_integrity", control_plane),
         _artifact(root, "functional_smoke", smoke),
     ]
     return _write_signed_envelope(
@@ -270,6 +392,56 @@ def _rebind_and_resign(
     descriptor["bytes"] = len(payload)
     _write_json(evidence, document)
     signature.write_bytes(private_key.sign(evidence.read_bytes()))
+
+
+def test_control_plane_integrity_schema_requires_exactly_eleven_records() -> None:
+    schema = json.loads(CONTROL_PLANE_SCHEMA.read_text(encoding="utf-8"))
+    assert {
+        "source_contract_sha256",
+        "source_release_sha256",
+        "source_release_manifest_sha256",
+        "source_contract_bindings",
+    }.issubset(schema["required"])
+    assert set(schema["$defs"]["sourceContractBindings"]["required"]) == {
+        "active_release",
+        "source_installed_receipt",
+        "active_contract_manifest",
+        "registry_import_receipt",
+    }
+    records = schema["properties"]["records"]
+    assert records["minItems"] == 11
+    assert records["maxItems"] == 11
+    required_ids = {clause["contains"]["properties"]["id"]["const"] for clause in records["allOf"]}
+    assert required_ids == {
+        "chat_safety_sentinel",
+        "chat_safety_clear_pending",
+        "cutover_intent",
+        "install_in_progress",
+        "active_release",
+        "source_installed_receipt",
+        "highest_release",
+        "registry_import_receipt",
+        "active_contract_manifest",
+        "recovery_state_helper",
+        "recovery_dispatcher",
+    }
+    control_record = schema["$defs"]["controlRecord"]
+    installed_path_rule = next(
+        rule
+        for rule in control_record["allOf"]
+        if rule.get("if", {}).get("properties", {}).get("id", {}).get("const")
+        == "source_installed_receipt"
+    )
+    assert (
+        installed_path_rule["then"]["properties"]["path"]["pattern"]
+        == r"^state/installed-[0-9a-f]{64}\.json$"
+    )
+    mandatory_ids = next(
+        rule["if"]["properties"]["id"]["enum"]
+        for rule in control_record["allOf"]
+        if "enum" in rule.get("if", {}).get("properties", {}).get("id", {})
+    )
+    assert "source_installed_receipt" in mandatory_ids
 
 
 @pytest.fixture
@@ -377,6 +549,7 @@ def test_signed_disaster_recovery_evidence_enforces_rpo_rto_and_integrity(
         ("restore_drill_report", "rpo_seconds", 901),
         ("restore_drill_report", "simulation", True),
         ("object_integrity", "sampled_object_count", 999),
+        ("control_plane_integrity", "restore_started_in_maintenance_hold", False),
         ("functional_smoke", "search_passed", False),
     ],
 )
@@ -400,6 +573,272 @@ def test_disaster_recovery_evidence_fails_closed_on_policy_gaps(
         signature,
         private_key,
         artifact_id=artifact_id,
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+def test_disaster_recovery_evidence_rejects_missing_control_state_record(
+    tmp_path: Path,
+    identity: GateIdentity,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    document["records"] = [
+        record for record in document["records"] if record["id"] != "chat_safety_clear_pending"
+    ]
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+@pytest.mark.parametrize(
+    "record_id",
+    ("active_release", "source_installed_receipt"),
+)
+def test_disaster_recovery_evidence_rejects_absent_mandatory_control_state(
+    tmp_path: Path,
+    identity: GateIdentity,
+    record_id: str,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    mandatory = next(record for record in document["records"] if record["id"] == record_id)
+    mandatory["source_state"] = "absent"
+    mandatory["restored_state"] = "absent"
+    mandatory["source_sha256"] = None
+    mandatory["restored_sha256"] = None
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+def test_disaster_recovery_evidence_rejects_non_contract_installed_receipt_path(
+    tmp_path: Path,
+    identity: GateIdentity,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    installed = next(
+        record for record in document["records"] if record["id"] == "source_installed_receipt"
+    )
+    installed["path"] = "state/installed-current.json"
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+def test_disaster_recovery_evidence_rejects_a_different_well_formed_contract_path(
+    tmp_path: Path,
+    identity: GateIdentity,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    installed = next(
+        record for record in document["records"] if record["id"] == "source_installed_receipt"
+    )
+    installed["path"] = f"state/installed-{'f' * 64}.json"
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+@pytest.mark.parametrize(
+    ("binding_id", "field"),
+    (
+        ("active_release", "contract_sha256"),
+        ("source_installed_receipt", "contract_sha256"),
+        ("active_contract_manifest", "release_sha256"),
+        ("registry_import_receipt", "manifest_sha256"),
+    ),
+)
+def test_disaster_recovery_evidence_rejects_cross_contract_semantic_binding(
+    tmp_path: Path,
+    identity: GateIdentity,
+    binding_id: str,
+    field: str,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    document["source_contract_bindings"][binding_id][field] = "f" * 64
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+def test_disaster_recovery_evidence_rejects_contract_manifest_digest_not_equal_to_contract(
+    tmp_path: Path,
+    identity: GateIdentity,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    contract_record = next(
+        record for record in document["records"] if record["id"] == "active_contract_manifest"
+    )
+    contract_record["source_sha256"] = "f" * 64
+    contract_record["restored_sha256"] = "f" * 64
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
+    )
+
+    accepted, _ = verify_signed_operational_evidence(
+        "disaster-recovery",
+        evidence,
+        signature,
+        public_key,
+        identity=identity,
+        release_id=RELEASE_ID,
+        require_protected_files=False,
+        now=now,
+    )
+
+    assert accepted is False
+
+
+def test_disaster_recovery_evidence_rejects_restored_installed_receipt_digest_mismatch(
+    tmp_path: Path,
+    identity: GateIdentity,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    evidence, signature, public_key, private_key = _disaster_recovery_bundle(
+        tmp_path, identity, now=now
+    )
+    artifact = tmp_path / "artifacts/control_plane_integrity.json"
+    document = json.loads(artifact.read_text(encoding="utf-8"))
+    installed = next(
+        record for record in document["records"] if record["id"] == "source_installed_receipt"
+    )
+    installed["restored_sha256"] = "f" * 64
+    _write_json(artifact, document)
+    _rebind_and_resign(
+        evidence,
+        signature,
+        private_key,
+        artifact_id="control_plane_integrity",
     )
 
     accepted, _ = verify_signed_operational_evidence(
@@ -546,7 +985,7 @@ def test_final_profile_wires_explicit_capacity_and_dr_evidence(identity: GateIde
     gates = build_profile(
         "final",
         acceptance_identity=identity,
-        release_id=RELEASE_ID,
+        release_id=identity.git_head,
         capacity_evidence_path="/evidence/capacity.json",
         capacity_evidence_signature_path="/evidence/capacity.sig",
         capacity_evidence_public_key_path="/secure/operational.pub",
@@ -564,7 +1003,7 @@ def test_final_profile_wires_explicit_capacity_and_dr_evidence(identity: GateIde
         assert gate.blocked_reason is None
         assert gate.command
         assert gate.command[gate.command.index("--verify-operational-evidence") + 1] == kind
-        assert gate.command[gate.command.index("--release-id") + 1] == RELEASE_ID
+        assert gate.command[gate.command.index("--release-id") + 1] == identity.git_head
         assert gate.blocked_exit_codes == (2,)
         assert len(gate.required_regular_files) == 3
 
@@ -574,7 +1013,11 @@ def test_final_profile_keeps_missing_operational_evidence_as_no_go(
 ) -> None:
     by_id = {
         gate.gate_id: gate
-        for gate in build_profile("final", acceptance_identity=identity, release_id=RELEASE_ID)
+        for gate in build_profile(
+            "final",
+            acceptance_identity=identity,
+            release_id=identity.git_head,
+        )
     }
 
     for gate_id in ("CAPACITY-P0-001", "DR-P0-001"):

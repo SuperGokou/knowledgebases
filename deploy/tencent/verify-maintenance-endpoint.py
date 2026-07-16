@@ -135,9 +135,7 @@ def verify_maintenance_contract(document: dict[str, Any]) -> None:
         elif content_type != "text/html":
             raise ValueError(f"browser maintenance response is not HTML: {path}")
 
-    object_status, object_type, object_body = _request_status(
-        objects_origin, "/", context
-    )
+    object_status, object_type, object_body = _request_status(objects_origin, "/", context)
     if object_status != 503 or object_type != "application/json":
         raise ValueError("object-storage maintenance entry did not fail closed")
     if len(object_body) > _MAX_RESPONSE_BYTES:

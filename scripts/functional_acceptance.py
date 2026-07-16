@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
@@ -64,6 +65,7 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SEMVER_PATTERN = re.compile(r"\d+\.\d+\.\d+")
 _EXTERNAL_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,80}\Z")
 _CHALLENGE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
+_HOST_IDENTITY_PATTERN = re.compile(r"[A-Za-z0-9.:-]{1,253}\Z")
 _MAX_RAW_ARTIFACT_BYTES = 100 * 1024 * 1024
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
 _SUPPORTED_FRAMEWORK_PREFIXES: dict[str, tuple[tuple[str, ...], ...]] = {
@@ -174,6 +176,121 @@ class ExternalTrustContext:
 
 
 TestExecutor = Callable[[Sequence[str], Path, int], subprocess.CompletedProcess[str]]
+
+
+def normalize_deployment_base_url(raw: object) -> str | None:
+    if not isinstance(raw, str) or not raw or raw != raw.strip():
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return None
+    hostname = parsed.hostname.casefold().rstrip(".")
+    if not hostname or _HOST_IDENTITY_PATTERN.fullmatch(hostname) is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    suffix = "" if port in {None, 443} else f":{port}"
+    return f"https://{host}{suffix}"
+
+
+def build_deployment_identity(
+    *,
+    git_head: str,
+    offline_contract_sha256: str,
+    image_manifest_sha256: str,
+    base_url: str,
+) -> dict[str, str]:
+    normalized = normalize_deployment_base_url(base_url)
+    if (
+        re.fullmatch(r"[0-9a-f]{40,64}", git_head) is None
+        or _SHA256_PATTERN.fullmatch(offline_contract_sha256) is None
+        or _SHA256_PATTERN.fullmatch(image_manifest_sha256) is None
+        or normalized is None
+    ):
+        raise ContractError("deployment identity is invalid")
+    hostname = urllib.parse.urlsplit(normalized).hostname
+    if hostname is None:
+        raise ContractError("deployment host identity is invalid")
+    return {
+        "release_id": git_head,
+        "offline_contract_sha256": offline_contract_sha256,
+        "image_manifest_sha256": image_manifest_sha256,
+        "base_url": normalized,
+        "host_identity": hostname.casefold().rstrip("."),
+    }
+
+
+def external_evidence_target(
+    identity: GateIdentity,
+    *,
+    run_id: str,
+    deployment: Mapping[str, object],
+) -> dict[str, object]:
+    if _EXTERNAL_RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ContractError("external evidence run id is invalid")
+    normalized = _validated_deployment_identity(deployment, git_head=identity.git_head)
+    if normalized is None:
+        raise ContractError("external evidence deployment identity is invalid")
+    return {
+        "git_head": identity.git_head,
+        "content_fingerprint": identity.content_fingerprint,
+        "run_id": run_id,
+        "deployment": normalized,
+    }
+
+
+def _validated_deployment_identity(
+    value: object,
+    *,
+    git_head: str,
+) -> dict[str, str] | None:
+    deployment = _mapping(value)
+    if deployment is None or set(deployment) != {
+        "release_id",
+        "offline_contract_sha256",
+        "image_manifest_sha256",
+        "base_url",
+        "host_identity",
+    }:
+        return None
+    release_id = deployment.get("release_id")
+    offline_contract_sha256 = deployment.get("offline_contract_sha256")
+    image_manifest_sha256 = deployment.get("image_manifest_sha256")
+    base_url = normalize_deployment_base_url(deployment.get("base_url"))
+    host_identity = deployment.get("host_identity")
+    if (
+        release_id != git_head
+        or not isinstance(offline_contract_sha256, str)
+        or _SHA256_PATTERN.fullmatch(offline_contract_sha256) is None
+        or not isinstance(image_manifest_sha256, str)
+        or _SHA256_PATTERN.fullmatch(image_manifest_sha256) is None
+        or base_url is None
+        or not isinstance(host_identity, str)
+        or _HOST_IDENTITY_PATTERN.fullmatch(host_identity) is None
+        or host_identity != (urllib.parse.urlsplit(base_url).hostname or "").casefold().rstrip(".")
+    ):
+        return None
+    return {
+        "release_id": release_id,
+        "offline_contract_sha256": offline_contract_sha256,
+        "image_manifest_sha256": image_manifest_sha256,
+        "base_url": base_url,
+        "host_identity": host_identity,
+    }
 
 
 def _secure_root_file(path: Path) -> bool:
@@ -1274,6 +1391,7 @@ def _chain_digest(document: Mapping[str, object]) -> str:
             "collected_at",
             "artifacts",
             "checks",
+            "collection",
         )
     }
     encoded = json.dumps(
@@ -1345,6 +1463,63 @@ def _consume_challenge_once(challenge_path: Path) -> bool:
     return linked
 
 
+def _validate_browser_collection(
+    document: Mapping[str, object],
+    contract: Mapping[str, object],
+    *,
+    policy: Mapping[str, object] | None,
+) -> bool:
+    expected = _mapping(contract.get("collection"))
+    if policy is not None:
+        collections = _mapping(policy.get("external_test_collections"))
+        policy_expected = (
+            _mapping(collections.get("EXT-BROWSER-E2E-001")) if collections is not None else None
+        )
+        if expected is None or expected != policy_expected:
+            return False
+    if expected is None:
+        return False
+    expected_total = expected.get("expected_collected_tests")
+    required_projects = _string_list(expected.get("required_projects"))
+    required_titles = _string_list(expected.get("required_test_titles"))
+    collection = _mapping(document.get("collection"))
+    if (
+        not isinstance(expected_total, int)
+        or isinstance(expected_total, bool)
+        or expected_total <= 0
+        or required_projects is None
+        or required_titles is None
+        or expected_total != len(required_projects) * len(required_titles)
+        or collection is None
+        or set(collection) != {"collected", "passed", "failed", "skipped", "pending", "tests"}
+        or collection.get("collected") != expected_total
+        or collection.get("passed") != expected_total
+        or collection.get("failed") != 0
+        or collection.get("skipped") != 0
+        or collection.get("pending") != 0
+    ):
+        return False
+    tests = _object_list(collection.get("tests"))
+    if tests is None or len(tests) != expected_total:
+        return False
+    actual: set[tuple[str, str]] = set()
+    for test in tests:
+        project = test.get("project")
+        title = test.get("title")
+        if (
+            set(test) != {"project", "title", "status"}
+            or not isinstance(project, str)
+            or not isinstance(title, str)
+            or test.get("status") != "passed"
+        ):
+            return False
+        actual.add((project, title))
+    expected_pairs = {
+        (project, title) for project in required_projects for title in required_titles
+    }
+    return len(actual) == expected_total and actual == expected_pairs
+
+
 def _validate_external_provenance(
     repository: Path,
     evidence_path: Path,
@@ -1354,6 +1529,7 @@ def _validate_external_provenance(
     policy: Mapping[str, object] | None,
     trust_context: ExternalTrustContext | None,
     signature_payload_builder: Callable[..., bytes] = _signature_payload,
+    consume_challenge: bool = True,
 ) -> bool:
     expected_collector = _mapping(contract.get("collector"))
     collector = _mapping(document.get("collector"))
@@ -1392,13 +1568,28 @@ def _validate_external_provenance(
     except (OSError, RuntimeError, UnicodeError):
         return False
     target = _mapping(document.get("target"))
+    deployment_bound = document.get("evidence_id") in {
+        "EXT-BROWSER-E2E-001",
+        "EXT-LINUX-HOST-001",
+    }
+    deployment = (
+        _validated_deployment_identity(target.get("deployment"), git_head=identity.git_head)
+        if target is not None and deployment_bound
+        else None
+    )
+    expected_target_keys = (
+        {"git_head", "content_fingerprint", "run_id", "deployment"}
+        if deployment_bound
+        else {"git_head", "content_fingerprint", "run_id"}
+    )
     if (
         target is None
         or target.get("git_head") != identity.git_head
         or target.get("content_fingerprint") != identity.content_fingerprint
         or not isinstance(target.get("run_id"), str)
         or _EXTERNAL_RUN_ID_PATTERN.fullmatch(str(target.get("run_id"))) is None
-        or set(target) != {"git_head", "content_fingerprint", "run_id"}
+        or (deployment_bound and (deployment is None or target.get("deployment") != deployment))
+        or set(target) != expected_target_keys
     ):
         return False
 
@@ -1442,6 +1633,13 @@ def _validate_external_provenance(
             or not set(references).issubset(artifact_ids)
         ):
             return False
+
+    if document.get("evidence_id") == "EXT-BROWSER-E2E-001" and not _validate_browser_collection(
+        document,
+        contract,
+        policy=policy,
+    ):
+        return False
 
     if trust_context is None:
         return False
@@ -1517,9 +1715,10 @@ def _validate_external_provenance(
     except (ValueError, binascii.Error, InvalidSignature):
         return False
     challenge_path = trust_context.challenge_paths.get(challenge_id)
-    if challenge_path is not None and not _consume_challenge_once(challenge_path):
-        return False
-    trust_context.consumed_challenges.add(challenge_id)
+    if consume_challenge:
+        if challenge_path is not None and not _consume_challenge_once(challenge_path):
+            return False
+        trust_context.consumed_challenges.add(challenge_id)
     return True
 
 
@@ -1553,19 +1752,18 @@ def evaluate_external_evidence(
                 "manifest does not contain the exact required external evidence ids",
             )
             return ExternalEvidenceReport("BLOCKED", (result,))
-    results: list[ExternalEvidenceResult] = []
+    results_by_id: dict[str, ExternalEvidenceResult] = {}
+    loaded: dict[str, tuple[Mapping[str, object], Path, dict[str, object]]] = {}
     for entry in entries:
         evidence_id = entry.get("id")
         if not isinstance(evidence_id, str) or not evidence_id:
             evidence_id = "INVALID-EXTERNAL-EVIDENCE"
         path = _safe_path(repository, entry.get("path"), must_exist=True)
         if path is None or not path.is_file():
-            results.append(
-                ExternalEvidenceResult(
-                    evidence_id,
-                    "blocked",
-                    "required external evidence is not available",
-                )
+            results_by_id[evidence_id] = ExternalEvidenceResult(
+                evidence_id,
+                "blocked",
+                "required external evidence is not available",
             )
             continue
         try:
@@ -1573,19 +1771,57 @@ def evaluate_external_evidence(
                 raise ValueError
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            results.append(
-                ExternalEvidenceResult(evidence_id, "blocked", "external evidence is invalid")
+            results_by_id[evidence_id] = ExternalEvidenceResult(
+                evidence_id, "blocked", "external evidence is invalid"
             )
             continue
         if not isinstance(document, dict):
-            results.append(
-                ExternalEvidenceResult(
-                    evidence_id,
-                    "blocked",
-                    "external evidence contract is invalid",
-                )
+            results_by_id[evidence_id] = ExternalEvidenceResult(
+                evidence_id,
+                "blocked",
+                "external evidence contract is invalid",
             )
             continue
+        loaded[evidence_id] = (entry, path, document)
+
+    deployment_bound_ids = {"EXT-BROWSER-E2E-001", "EXT-LINUX-HOST-001"}
+    if deployment_bound_ids <= {str(entry.get("id")) for entry in entries}:
+        bound_documents = {
+            evidence_id: loaded.get(evidence_id) for evidence_id in deployment_bound_ids
+        }
+        deployments: dict[str, Mapping[str, object] | None] = {}
+        for evidence_id, record in bound_documents.items():
+            target = _mapping(record[2].get("target")) if record is not None else None
+            deployments[evidence_id] = (
+                _mapping(target.get("deployment")) if target is not None else None
+            )
+        if (
+            any(record is None for record in bound_documents.values())
+            or any(deployment is None for deployment in deployments.values())
+            or deployments["EXT-BROWSER-E2E-001"] != deployments["EXT-LINUX-HOST-001"]
+        ):
+            for evidence_id in deployment_bound_ids:
+                results_by_id[evidence_id] = ExternalEvidenceResult(
+                    evidence_id,
+                    "blocked",
+                    "browser and Linux evidence do not bind the same measured deployment",
+                )
+
+    for entry in entries:
+        evidence_id = entry.get("id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            evidence_id = "INVALID-EXTERNAL-EVIDENCE"
+        if evidence_id in results_by_id:
+            continue
+        record = loaded.get(evidence_id)
+        if record is None:
+            results_by_id[evidence_id] = ExternalEvidenceResult(
+                evidence_id,
+                "blocked",
+                "external evidence is unavailable",
+            )
+            continue
+        _loaded_entry, path, document = record
         if not _validate_external_provenance(
             repository.resolve(),
             path,
@@ -1594,21 +1830,25 @@ def evaluate_external_evidence(
             policy=policy,
             trust_context=trust_context,
         ):
-            results.append(
-                ExternalEvidenceResult(
-                    evidence_id,
-                    "blocked",
-                    "external evidence provenance is incomplete or invalid",
-                )
+            results_by_id[evidence_id] = ExternalEvidenceResult(
+                evidence_id,
+                "blocked",
+                "external evidence provenance is incomplete or invalid",
             )
             continue
-        results.append(
-            ExternalEvidenceResult(
-                evidence_id,
-                "passed",
-                "all external checks and provenance passed",
-            )
+        results_by_id[evidence_id] = ExternalEvidenceResult(
+            evidence_id,
+            "passed",
+            "all external checks and provenance passed",
         )
+    results = [
+        results_by_id[
+            str(entry.get("id"))
+            if isinstance(entry.get("id"), str) and entry.get("id")
+            else "INVALID-EXTERNAL-EVIDENCE"
+        ]
+        for entry in entries
+    ]
     blocked = any(item.status == "blocked" for item in results)
     return ExternalEvidenceReport("BLOCKED" if blocked else "PASS", tuple(results))
 

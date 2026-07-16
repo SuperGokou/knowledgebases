@@ -6,7 +6,7 @@ param(
     [string]$SigningPrivateKey,
     [string]$ImageSbomScanner,
     [string]$ImageSbomScannerSha256,
-    [long]$ReleaseSequence,
+    [string]$ReleaseSequence,
     [string]$ReleaseId,
     [string]$RegistryBootstrapSource = "docker.io/library/registry:2.8.3@sha256:46faa9a1ae6813194b53921a370f2f4f8c5e1aae228a89bceafef5847a6a3278"
 )
@@ -668,15 +668,15 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
 
 if (-not $OutputDirectory -or -not $SigningPrivateKey -or
     -not $ImageSbomScanner -or -not $ImageSbomScannerSha256 -or
-    $ReleaseSequence -le 0 -or -not $ReleaseId) {
+    -not $ReleaseSequence -or -not $ReleaseId) {
     Write-Error $Usage
     exit 64
 }
-if ($ReleaseSequence.ToString().Length -gt 18) {
-    Fail 'release sequence must be a positive integer with at most 18 digits'
+if ($ReleaseSequence -notmatch '^[1-9][0-9]{0,17}$') {
+    Fail 'release sequence must be a canonical positive integer with 1-18 digits and no leading zero'
 }
-if ($ReleaseId -notmatch '^[A-Za-z0-9._-]+$') {
-    Fail 'release ID may contain only letters, digits, dot, underscore and hyphen'
+if ($ReleaseId -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$') {
+    Fail 'release ID must be 1-128 characters, use only letters/digits/dot/underscore/hyphen, and start and end with a letter or digit'
 }
 if ($RegistryBootstrapSource -notmatch '^docker\.io/library/registry:2\.8\.3@sha256:[0-9a-f]{64}$') {
     Fail 'bootstrap Registry source must be the pinned registry:2.8.3 linux/amd64 manifest'

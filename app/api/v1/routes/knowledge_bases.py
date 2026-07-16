@@ -304,9 +304,7 @@ async def replace_role_grants(
     role_ids = {item.role_id for item in payload.grants}
     await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(
-        select(User)
-        .where(User.id == access.user.id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == access.user.id).execution_options(populate_existing=True)
     )
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")

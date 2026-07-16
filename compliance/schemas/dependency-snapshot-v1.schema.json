@@ -36,6 +36,7 @@
             ],
             "properties": {
               "ecosystem": { "enum": ["python", "web"] },
+              "marker_environment": { "$ref": "#/$defs/pythonMarkerEnvironment" },
               "path": { "$ref": "#/$defs/relativePath" },
               "sha256": { "$ref": "#/$defs/sha256" },
               "format": { "const": "CycloneDX" },
@@ -51,7 +52,17 @@
                   "version": { "type": "string", "minLength": 1 }
                 }
               }
-            }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "ecosystem": { "const": "python" } },
+                  "required": ["ecosystem"]
+                },
+                "then": { "required": ["marker_environment"] },
+                "else": { "not": { "required": ["marker_environment"] } }
+              }
+            ]
           }
         ]
       }
@@ -64,6 +75,36 @@
       "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
     },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "pythonMarkerEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation_name",
+        "implementation_version",
+        "os_name",
+        "platform_machine",
+        "platform_python_implementation",
+        "platform_release",
+        "platform_system",
+        "platform_version",
+        "python_full_version",
+        "python_version",
+        "sys_platform"
+      ],
+      "properties": {
+        "implementation_name": { "type": "string" },
+        "implementation_version": { "type": "string" },
+        "os_name": { "type": "string" },
+        "platform_machine": { "type": "string" },
+        "platform_python_implementation": { "type": "string" },
+        "platform_release": { "type": "string" },
+        "platform_system": { "type": "string" },
+        "platform_version": { "type": "string" },
+        "python_full_version": { "type": "string" },
+        "python_version": { "type": "string" },
+        "sys_platform": { "type": "string" }
+      }
+    },
     "boundFile": {
       "type": "object",
       "required": ["path", "sha256"],

@@ -31,11 +31,29 @@
     "target": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["git_head", "content_fingerprint"],
+      "required": ["git_head", "content_fingerprint", "run_id"],
       "properties": {
         "git_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
         "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"}
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"},
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "release_id",
+            "offline_contract_sha256",
+            "image_manifest_sha256",
+            "base_url",
+            "host_identity"
+          ],
+          "properties": {
+            "release_id": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+            "offline_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "image_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "base_url": {"type": "string", "pattern": "^https://[^/?#]+$"},
+            "host_identity": {"type": "string", "pattern": "^[A-Za-z0-9.:-]{1,253}$"}
+          }
+        }
       }
     },
     "collected_at": {"type": "string", "format": "date-time"},
@@ -71,6 +89,32 @@
         }
       }
     },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collected", "passed", "failed", "skipped", "pending", "tests"],
+      "properties": {
+        "collected": {"type": "integer", "minimum": 1},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "skipped": {"type": "integer", "minimum": 0},
+        "pending": {"type": "integer", "minimum": 0},
+        "tests": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["project", "title", "status"],
+            "properties": {
+              "project": {"type": "string", "minLength": 1},
+              "title": {"type": "string", "minLength": 1},
+              "status": {"const": "passed"}
+            }
+          }
+        }
+      }
+    },
     "attestation": {
       "type": "object",
       "additionalProperties": false,
@@ -87,7 +131,14 @@
   "allOf": [
     {
       "if": {"properties": {"evidence_id": {"const": "EXT-BROWSER-E2E-001"}}},
-      "then": {"properties": {"target": {"required": ["run_id"]}}}
+      "then": {
+        "required": ["collection"],
+        "properties": {"target": {"required": ["deployment"]}}
+      }
+    },
+    {
+      "if": {"properties": {"evidence_id": {"const": "EXT-LINUX-HOST-001"}}},
+      "then": {"properties": {"target": {"required": ["deployment"]}}}
     }
   ]
 }

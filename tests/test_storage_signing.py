@@ -5,12 +5,24 @@ import pytest
 
 from app.core.config import Settings
 from app.domain.files import UploadMode, UploadPlan
-from app.services.storage import StorageService
+from app.services.storage import StorageService, checksum_sha256_base64_to_hex
 
 
 def signed_headers(url: str) -> set[str]:
     values = parse_qs(urlparse(url).query)["X-Amz-SignedHeaders"][0]
     return set(values.split(";"))
+
+
+def test_s3_checksum_is_normalized_to_canonical_hex() -> None:
+    digest = bytes(range(32))
+    encoded = base64.b64encode(digest).decode("ascii")
+
+    assert checksum_sha256_base64_to_hex(encoded) == digest.hex()
+
+
+@pytest.mark.parametrize("value", [None, "", "not-base64", base64.b64encode(b"short").decode()])
+def test_invalid_s3_checksum_is_not_persisted(value: str | None) -> None:
+    assert checksum_sha256_base64_to_hex(value) is None
 
 
 @pytest.mark.asyncio
@@ -120,6 +132,7 @@ async def test_cos_virtual_addressing_places_bucket_in_hostname() -> None:
 async def test_isolated_storage_signs_the_internal_tls_proxy_origin() -> None:
     service = StorageService(
         Settings(
+            _env_file=None,
             environment="production",
             deployment_profile="isolated",
             jwt_secret="4f" * 32,
@@ -132,6 +145,7 @@ async def test_isolated_storage_signs_the_internal_tls_proxy_origin() -> None:
             s3_use_ssl=True,
             malware_scan_host="clamd",
             storage_capacity_probe_path="/var/lib/kb-capacity",
+            chat_safety_state_path="/var/lib/kb-chat-safety/poison.json",
             trusted_hosts=("knowledge.internal",),
             chat_replay_encryption_keys={1: base64.urlsafe_b64encode(b"s" * 32).decode("ascii")},
             chat_replay_active_key_version=1,

@@ -22,7 +22,7 @@
 |---|---|
 | 项目负责人 / 验收人 | [企业终验标准](./ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md) → [证据格式](./ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md) → [性能与容量模型](./PERFORMANCE_CAPACITY_MODEL.zh-CN.md) → 法律交付文档 |
 | 架构师 / 后端工程师 | [架构设计](./ARCHITECTURE.zh-CN.md) → [知识流水线](./KNOWLEDGE_PIPELINE.zh-CN.md) → [API 与模型管理](./API_AND_MODEL_MANAGEMENT.zh-CN.md) |
-| 平台运维 / SRE | [通用 Linux 离线部署](./TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md) → [运维手册](./OPERATIONS.zh-CN.md) → [内部 CA](./TLS_INTERNAL_CA_OPERATIONS.zh-CN.md) → [断网冷启动验收](./OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md) |
+| 平台运维 / SRE | [通用 Linux 离线部署](./TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md) → [离线发布信任链](./OFFLINE_RELEASE_TRUST_CHAIN.zh-CN.md) → [运维手册](./OPERATIONS.zh-CN.md) → [内部 CA](./TLS_INTERNAL_CA_OPERATIONS.zh-CN.md) → [断网冷启动验收](./OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md) |
 | 安全 / 合规 / 法务 | [威胁模型](./THREAT_MODEL.zh-CN.md) → [依赖许可证审计](./DEPENDENCY_LICENSE_AUDIT.zh-CN.md) → [资产来源](./ASSET_PROVENANCE.zh-CN.md) → [第三方声明](./THIRD-PARTY-NOTICES.md) |
 | QA / 浏览器验收 | [功能验收标准](./FUNCTIONAL_ACCEPTANCE_STANDARD.zh-CN.md) → [证据信任模型](./FUNCTIONAL_ACCEPTANCE_TRUST.zh-CN.md) → [浏览器套件](../web/e2e/README.md) |
 
@@ -41,11 +41,12 @@
 
 | 文档 | 用途 |
 |---|---|
-| [Linux 8C16G/300GB 离线企业部署](./TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md) | 供应商中立的离线安装、固定镜像、4 个 internal 网络、可选受控模型出口、升级与失败关闭回滚 |
+| [Linux 8C16G/300GB 离线企业部署](./TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md) | 供应商中立的离线首次安装与 legacy adoption、固定镜像、4 个 internal 网络、可选受控模型出口；常规升级当前 NO-GO / fail-closed |
 | [共享服务器部署基线](./TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md) | 同机多应用的端口、网络、资源和变更隔离；文件名为历史兼容路径 |
 | [运维手册](./OPERATIONS.zh-CN.md) | 启停、账号/角色操作、扫描审批、备份恢复、容量和故障排查 |
 | [内部 CA 与 TLS 运维](./TLS_INTERNAL_CA_OPERATIONS.zh-CN.md) | 私有 CA 安装、短生命周期叶证书续期、严格 SAN/有效期验收、证书轮换、客户端信任与禁止降级要求 |
 | [离线 Registry Bundle 构建](./OFFLINE_REGISTRY_BUNDLE_BUILD.zh-CN.md) | 回环 Registry、精确摘要、SBOM、签名与离线镜像运输 |
+| [离线发布信任链](./OFFLINE_RELEASE_TRUST_CHAIN.zh-CN.md) | 固定发布公钥、Registry 回执与最高序列、纳管 plan v4、备份授权和 durable resume 的失败关闭边界 |
 | [断网冷启动验收](./OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md) | 无 GitHub、Vercel、COS、公共 Registry/npm/PyPI 依赖的真实冷启动证据 |
 | [主机隔离守卫](./HOST_ISOLATION_GUARD.zh-CN.md) | 防止部署影响同机其他应用和越界修改宿主资源 |
 | [主机与存储验收](./HOST_STORAGE_ACCEPTANCE.zh-CN.md) | 8C16G/300GB、SSD、fio、水位与证据格式 |

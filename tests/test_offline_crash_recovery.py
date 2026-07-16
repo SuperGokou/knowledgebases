@@ -23,6 +23,8 @@ def _text(name: str) -> str:
 def test_recovery_assets_are_part_of_the_canonical_offline_contract() -> None:
     common = _text("offline-operation-common.sh")
     prepare = _text("prepare-offline-contract.sh")
+    canonical_listing = common.split("cat <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+    canonical_entries = canonical_listing.splitlines()
     assets = (
         "offline-recovery-state.py",
         "offline-recovery-dispatcher.sh",
@@ -31,9 +33,15 @@ def test_recovery_assets_are_part_of_the_canonical_offline_contract() -> None:
         "heyi-kb-offline-reconcile.timer",
     )
     for asset in assets:
-        assert f"release/deploy/tencent/{asset}" in common
-        assert f"deploy/tencent/{asset}" in prepare
+        assert f"release/deploy/tencent/{asset}" in canonical_entries
         assert (DEPLOY / asset).is_file()
+    assert len(canonical_entries) == len(set(canonical_entries))
+    assert prepare.count("offline_contract_files") == 1
+    assert 'offline_contract_files > "$contract_paths"' in prepare
+    assert 'copy_release_asset "$relative_path"' in prepare
+    assert "for release_asset in" not in prepare
+    assert "contract snapshot inventory differs from the canonical contract" in prepare
+    assert "find \"$contract_dir\" -type f -printf '%P\\n'" in prepare
 
 
 def test_cutover_receipt_is_the_only_business_recovery_authorization() -> None:
@@ -91,11 +99,23 @@ def test_uncommitted_dispatcher_stops_only_exact_project_writers_and_edge() -> N
         "io.heyi.knowledgebases.stack",
     ):
         assert label in dispatcher
-    assert dispatcher.index('if [ "$selection" = intent ]') < dispatcher.index('exec sh "$worker"')
+    assert dispatcher.index('if [ "$selection" = intent ]') < dispatcher.index('if sh "$worker"')
     assert "docker compose down" not in dispatcher
     assert "docker system prune" not in dispatcher
     assert "docker network rm" not in dispatcher
     assert "docker volume rm" not in dispatcher
+
+
+def test_dispatcher_never_reports_missing_recovery_state_as_healthy() -> None:
+    dispatcher = _text("offline-recovery-dispatcher.sh")
+    missing_state = dispatcher.split(
+        'if ! selection_json=$(python3 -I "$state_helper" select); then',
+        1,
+    )[1].split("\nfi", 1)[0]
+
+    assert "fail_closed_project" in missing_state
+    assert "exit 65" in missing_state
+    assert "exit 0" not in missing_state
 
 
 def test_reconciler_has_non_mutating_active_fast_path() -> None:

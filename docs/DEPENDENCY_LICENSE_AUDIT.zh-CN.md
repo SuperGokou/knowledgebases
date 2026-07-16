@@ -1,6 +1,6 @@
 # 依赖、许可证与 SBOM 审计
 
-> 审计日期：2026-07-12
+> 审计日期：2026-07-16
 >
 > 审计结论：**FAIL / 法务阻断**
 >
@@ -18,12 +18,18 @@
 
 | 输入 | SHA-256 |
 |---|---|
-| `web/package.json` | `4BCAF1307F305A42EE2ED01290946410635E1D5726F1EA3245C59DDF01161BBA` |
+| `web/package.json` | `721CC6CF67BA4D467E48E802023580C84F527E1D509837504655F294CC2897C1` |
 | `web/package-lock.json` | `3DCD055EEBCD015434DF5D053488A8B5B1F297B5A6E9193E528A466E3D17A34B` |
-| `pyproject.toml` | `13686ACA1BBC827EF30C456979518B88FAA990E6908DBF85E6E8781027E478E2` |
-| `uv.lock` | `8F4AB2455F848BCC077E36089DC5A738EA329AF314E3F63A6D24A6D449EAC488` |
+| `pyproject.toml` | `C0DD484200B2D89E6D788736C30C20B7A616C84A4D56A4ED515AF3F95BF24594` |
+| `uv.lock` | `64337849840D92B76DE9141EAEFE037421BBD947A101328EE310CD7935EF6059` |
 
 如果任一输入哈希改变，本报告的包数、许可证结论和 SBOM 哈希必须重新生成，不得沿用。
+
+Python 锁文件 SBOM 的 PEP 508 marker 目标固定为 Windows / CPython 3.12.13，
+并随依赖快照提交；门禁从项目根生产依赖出发，展开已请求 extras 后计算精确可达闭包，
+再与 SBOM 的 purl、名称和版本双向对账。Web 门禁按 npm lockfile v3 的生产语义保留
+`devOptional` 与跨平台 optional 包、排除纯开发包，并同样要求锁文件生产集合与 SBOM
+双向完全一致。Linux 最终交付仍以构建完成的镜像级 SBOM 为准。
 
 ## 工具与命令
 
@@ -69,10 +75,10 @@ uvx --from cyclonedx-bom==7.3.0 cyclonedx-py environment `
 
 | 产物 | 格式 | 组件 | 依赖节点 | SHA-256 |
 |---|---|---:|---:|---|
-| `artifacts/acceptance/sbom-web.cdx.json` | CycloneDX JSON 1.6 | 54 | 57 | `A90A51571435CA05986F976F9CAAADF2F5CF8F3435534D485272D7EFC0DEC5DF` |
+| `artifacts/acceptance/sbom-web.cdx.json` | CycloneDX JSON 1.6 | 56 | 57 | `8C90B3BB154FDD42558A9E1D36310A5D9AF2D6EE496D89E8989633C082F00F1D` |
 | `artifacts/acceptance/sbom-python.cdx.json` | CycloneDX JSON 1.6 | 52 | 53 | `6895E628CDE5244D3654749A9DC631C98E62139C92D928A034ABD84D164D97C9` |
 
-Web SBOM 按锁文件生成，包含 npm 用于跨平台分发的 optional 二进制组件；它的 54 个组件不等于 Windows 开发机或 Linux 运行镜像实际加载的包数。最终容器仍须对构建好的 Linux 镜像生成 image SBOM，并与本锁文件 SBOM 对账。
+Web SBOM 按锁文件生成，包含 npm 用于跨平台分发的 optional 二进制组件；它的 56 个组件不等于 Windows 开发机或 Linux 运行镜像实际加载的包数。最终容器仍须对构建好的 Linux 镜像生成 image SBOM，并与本锁文件 SBOM 对账。
 
 ## Web 生产依赖结果
 

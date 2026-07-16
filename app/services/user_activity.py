@@ -181,9 +181,7 @@ def _trusted_routes(application: Any) -> tuple[_TrustedRoute, ...]:
                     path_regex=path_regex,
                     param_convertors=param_convertors,
                     endpoint=endpoint,
-                    rbac_mutation=bool(
-                        getattr(endpoint, _RBAC_MUTATION_ATTRIBUTE, False) is True
-                    ),
+                    rbac_mutation=bool(getattr(endpoint, _RBAC_MUTATION_ATTRIBUTE, False) is True),
                 )
             )
 

@@ -15,14 +15,10 @@ _MIGRATION_LOCK_ID = 4_848_959_473_284_661_318
 async def _run_command(
     command: Sequence[str], interrupted: asyncio.Event, *, env: dict[str, str] | None = None
 ) -> int:
-    process = await asyncio.create_subprocess_exec(
-        *command, env=env, start_new_session=True
-    )
+    process = await asyncio.create_subprocess_exec(*command, env=env, start_new_session=True)
     completed = asyncio.create_task(process.wait())
     stopped = asyncio.create_task(interrupted.wait())
-    done, _pending = await asyncio.wait(
-        {completed, stopped}, return_when=asyncio.FIRST_COMPLETED
-    )
+    done, _pending = await asyncio.wait({completed, stopped}, return_when=asyncio.FIRST_COMPLETED)
     if completed in done:
         stopped.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -67,9 +63,7 @@ async def _main() -> int:
             print("migration-gate: another migration owns the database lock", file=sys.stderr)
             return 75
         bootstrap_environment = dict(os.environ)
-        bootstrap_database_url = bootstrap_environment.pop(
-            "KB_BOOTSTRAP_DATABASE_URL", ""
-        )
+        bootstrap_database_url = bootstrap_environment.pop("KB_BOOTSTRAP_DATABASE_URL", "")
         if bootstrap_database_url:
             bootstrap_environment["KB_DATABASE_URL"] = bootstrap_database_url
         commands: tuple[tuple[Sequence[str], dict[str, str] | None], ...] = (
@@ -91,9 +85,7 @@ async def _main() -> int:
         for command, command_environment in commands:
             if interrupted.is_set():
                 return 130
-            return_code = await _run_command(
-                command, interrupted, env=command_environment
-            )
+            return_code = await _run_command(command, interrupted, env=command_environment)
             if return_code != 0:
                 print(
                     f"migration-gate: command failed with status {return_code}",

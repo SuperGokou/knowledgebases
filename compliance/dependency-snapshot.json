@@ -4,11 +4,11 @@
   "inputs": [
     {
       "path": "pyproject.toml",
-      "sha256": "13686aca1bbc827ef30c456979518b88faa990e6908dbf85e6e8781027e478e2"
+      "sha256": "c0dd484200b2d89e6d788736c30c20b7a616c84a4d56a4ed515af3f95bf24594"
     },
     {
       "path": "uv.lock",
-      "sha256": "8f4ab2455f848bcc077e36089dc5a738ea329af314e3f63a6d24a6d449eac488"
+      "sha256": "64337849840d92b76de9141eaefe037421bbd947a101328ee310cd7935ef6059"
     },
     {
       "path": "web/package.json",
@@ -22,6 +22,19 @@
   "sboms": [
     {
       "ecosystem": "python",
+      "marker_environment": {
+        "implementation_name": "cpython",
+        "implementation_version": "3.12.13",
+        "os_name": "nt",
+        "platform_machine": "AMD64",
+        "platform_python_implementation": "CPython",
+        "platform_release": "",
+        "platform_system": "Windows",
+        "platform_version": "",
+        "python_full_version": "3.12.13",
+        "python_version": "3.12",
+        "sys_platform": "win32"
+      },
       "path": "artifacts/acceptance/sbom-python.cdx.json",
       "sha256": "6895e628cde5244d3654749a9dc631c98e62139c92d928a034abd84d164d97c9",
       "format": "CycloneDX",

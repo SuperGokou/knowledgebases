@@ -3,6 +3,7 @@ import {
   generateKeyPairSync,
   verify,
 } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -18,14 +19,21 @@ import {
   EVIDENCE_COLLECTOR,
   EVIDENCE_ID,
   EVIDENCE_KEY_ID,
+  EXPECTED_COLLECTED_TESTS,
   REQUIRED_CHECKS,
   REQUIRED_PROJECTS,
+  REQUIRED_TEST_TITLES,
   buildCompleteEvidence,
   canonicalEvidenceDigest,
+  collectWorktreeTarget,
+  normalizeDeploymentBaseUrl,
   parseEvidenceChallenge,
   protectedFileMetadataIsValid,
   signaturePayload,
+  type DeploymentIdentity,
   type EvidenceArtifact,
+  type EvidenceCollection,
+  type EvidenceTarget,
 } from "../e2e/support/evidence-reporter";
 import { resolvePlaywrightProfile } from "../e2e/support/playwright-profile";
 import {
@@ -84,6 +92,45 @@ function readFormalBrowserCollectionContracts(): readonly BrowserCollectionPolic
     throw new Error("formal browser collection contract is incomplete");
   }
   return [manifestContract, policyContract];
+}
+
+function deploymentIdentity(gitHead = "a".repeat(40)): DeploymentIdentity {
+  return {
+    release_id: gitHead,
+    offline_contract_sha256: "d".repeat(64),
+    image_manifest_sha256: "e".repeat(64),
+    base_url: "https://kb.invalid",
+    host_identity: "kb.invalid",
+  };
+}
+
+function passingBrowserCollection(): EvidenceCollection {
+  const [contract] = readFormalBrowserCollectionContracts();
+  if (!contract) throw new Error("formal browser collection contract is unavailable");
+  const tests = contract.required_projects.flatMap((project) =>
+    contract.required_test_titles.map((title) => ({
+      project,
+      title,
+      status: "passed" as const,
+    })),
+  );
+  return {
+    collected: tests.length,
+    passed: tests.length,
+    failed: 0,
+    skipped: 0,
+    pending: 0,
+    tests,
+  };
+}
+
+function evidenceTarget(gitHead = "a".repeat(40)): EvidenceTarget {
+  return {
+    git_head: gitHead,
+    content_fingerprint: "b".repeat(64),
+    run_id: "acceptance-run-20260714",
+    deployment: deploymentIdentity(gitHead),
+  };
 }
 
 describe("enterprise Playwright profile", () => {
@@ -318,10 +365,59 @@ describe("enterprise Playwright profile", () => {
     const reporterProjects = [...REQUIRED_PROJECTS];
 
     for (const contract of readFormalBrowserCollectionContracts()) {
-      expect(contract.expected_collected_tests).toBe(26);
+      expect(contract.expected_collected_tests).toBe(EXPECTED_COLLECTED_TESTS);
       expect(contract.required_projects).toEqual(runtimeProjects);
       expect(contract.required_projects).toEqual(reporterProjects);
+      expect(contract.required_test_titles).toEqual([...REQUIRED_TEST_TITLES]);
+      expect(contract.required_test_titles).toHaveLength(13);
+      expect(new Set(contract.required_test_titles).size).toBe(13);
+      expect(
+        contract.required_projects.length * contract.required_test_titles.length,
+      ).toBe(EXPECTED_COLLECTED_TESTS);
     }
+  });
+
+  test("normalizes and binds the enterprise deployment identity to the collected worktree", () => {
+    expect(normalizeDeploymentBaseUrl("HTTPS://KB.Invalid.:443/")).toBe(
+      "https://kb.invalid",
+    );
+    expect(normalizeDeploymentBaseUrl("https://kb.invalid:8443")).toBe(
+      "https://kb.invalid:8443",
+    );
+    expect(normalizeDeploymentBaseUrl("https://[2001:db8::1]:8443/")).toBe(
+      "https://[2001:db8::1]:8443",
+    );
+    for (const invalid of [
+      " http://kb.invalid",
+      "http://kb.invalid",
+      "https://user:password@kb.invalid",
+      "https://kb.invalid/path",
+      "https://kb.invalid?query=1",
+      "https://kb.invalid#fragment",
+    ]) {
+      expect(normalizeDeploymentBaseUrl(invalid)).toBeNull();
+    }
+
+    const gitHead = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    }).trim();
+    const target = collectWorktreeTarget(process.cwd(), {
+      KB_E2E_RUN_ID: "acceptance-run-20260714",
+      KB_E2E_RELEASE_ID: gitHead,
+      KB_E2E_OFFLINE_CONTRACT_SHA256: "d".repeat(64),
+      KB_E2E_IMAGE_MANIFEST_SHA256: "e".repeat(64),
+      KB_E2E_BASE_URL: "HTTPS://KB.Invalid.:443/",
+    });
+    expect(target.git_head).toBe(gitHead);
+    expect(target.content_fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(target.deployment).toEqual({
+      release_id: gitHead,
+      offline_contract_sha256: "d".repeat(64),
+      image_manifest_sha256: "e".repeat(64),
+      base_url: "https://kb.invalid",
+      host_identity: "kb.invalid",
+    });
   });
 
   test("rejects unknown profile names instead of silently running smoke", () => {
@@ -484,16 +580,14 @@ describe("enterprise evidence schema v2", () => {
         { status: "passed" as const, artifact_ids: [`artifact-${check}`] },
       ]),
     );
-    const target = {
-      git_head: "a".repeat(40),
-      content_fingerprint: "b".repeat(64),
-      run_id: "acceptance-run-20260714",
-    };
+    const target = evidenceTarget();
+    const collection = passingBrowserCollection();
     const evidence = buildCompleteEvidence({
       target,
       collectedAt: "2026-07-13T12:00:00.000Z",
       artifacts,
       checks,
+      collection,
       signing: {
         privateKey,
         challenge: {
@@ -514,6 +608,7 @@ describe("enterprise evidence schema v2", () => {
       "attestation",
       "checks",
       "collected_at",
+      "collection",
       "collector",
       "evidence_id",
       "schema_version",
@@ -526,10 +621,24 @@ describe("enterprise evidence schema v2", () => {
     expect(evidence.status).toBe("complete");
     expect(Object.keys(evidence.target).sort()).toEqual([
       "content_fingerprint",
+      "deployment",
       "git_head",
       "run_id",
     ]);
     expect(evidence.target.run_id).toBe("acceptance-run-20260714");
+    expect(evidence.target.deployment).toEqual(deploymentIdentity());
+    expect(evidence.collection).toEqual({
+      ...collection,
+      tests: [...collection.tests].sort(
+        (left, right) =>
+          left.project.localeCompare(right.project) || left.title.localeCompare(right.title),
+      ),
+    });
+    expect(evidence.collection.collected).toBe(EXPECTED_COLLECTED_TESTS);
+    expect(evidence.collection.passed).toBe(EXPECTED_COLLECTED_TESTS);
+    expect(evidence.collection.failed).toBe(0);
+    expect(evidence.collection.skipped).toBe(0);
+    expect(evidence.collection.pending).toBe(0);
     expect(Object.keys(evidence.checks).sort()).toEqual([...REQUIRED_CHECKS].sort());
     expect(evidence.attestation).toEqual({
       type: "ed25519-challenge-v1",
@@ -584,6 +693,48 @@ describe("enterprise evidence schema v2", () => {
         Buffer.from(evidence.attestation.signature, "base64"),
       ),
     ).toBe(false);
+    const wrongDeployment = {
+      ...evidence,
+      target: {
+        ...evidence.target,
+        deployment: {
+          ...evidence.target.deployment,
+          image_manifest_sha256: "f".repeat(64),
+        },
+      },
+    };
+    expect(
+      verify(
+        null,
+        signaturePayload(wrongDeployment, {
+          keyId: EVIDENCE_KEY_ID,
+          challengeId: evidence.attestation.challenge_id,
+          challengeNonce: evidence.attestation.challenge_nonce,
+        }),
+        publicKey,
+        Buffer.from(evidence.attestation.signature, "base64"),
+      ),
+    ).toBe(false);
+    const wrongCollection = {
+      ...evidence,
+      collection: {
+        ...evidence.collection,
+        passed: EXPECTED_COLLECTED_TESTS - 1,
+        failed: 1,
+      },
+    };
+    expect(
+      verify(
+        null,
+        signaturePayload(wrongCollection, {
+          keyId: EVIDENCE_KEY_ID,
+          challengeId: evidence.attestation.challenge_id,
+          challengeNonce: evidence.attestation.challenge_nonce,
+        }),
+        publicKey,
+        Buffer.from(evidence.attestation.signature, "base64"),
+      ),
+    ).toBe(false);
   });
 
   test("refuses incomplete, dangling, duplicated, or hash-invalid evidence", () => {
@@ -600,14 +751,11 @@ describe("enterprise evidence schema v2", () => {
       ]),
     );
     const { privateKey } = generateKeyPairSync("ed25519");
-    const target = {
-      git_head: "a".repeat(40),
-      content_fingerprint: "b".repeat(64),
-      run_id: "acceptance-run-20260714",
-    };
+    const target = evidenceTarget();
     const base = {
       target,
       collectedAt: "2026-07-13T12:00:00.000Z",
+      collection: passingBrowserCollection(),
       signing: {
         privateKey,
         challenge: {
@@ -622,12 +770,26 @@ describe("enterprise evidence schema v2", () => {
         },
       },
     };
+    const completeCollection = passingBrowserCollection();
 
     expect(() => buildCompleteEvidence({ ...base, artifacts: [], checks: completeChecks })).toThrow();
     expect(() =>
       buildCompleteEvidence({
         ...base,
         artifacts: [validArtifact, validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        collection: {
+          ...completeCollection,
+          passed: EXPECTED_COLLECTED_TESTS - 1,
+          pending: 1,
+          tests: completeCollection.tests.slice(0, -1),
+        },
+        artifacts: [validArtifact],
         checks: completeChecks,
       }),
     ).toThrow();
@@ -656,14 +818,110 @@ describe("enterprise evidence schema v2", () => {
         checks: completeChecks,
       }),
     ).toThrow();
+
+    const legacyTarget = {
+      git_head: target.git_head,
+      content_fingerprint: target.content_fingerprint,
+      run_id: target.run_id,
+    } as unknown as EvidenceTarget;
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        target: legacyTarget,
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        collection: {
+          collected: 0,
+          passed: 0,
+          failed: 0,
+          skipped: 0,
+          pending: 0,
+          tests: [],
+        },
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        collection: {
+          ...completeCollection,
+          collected: EXPECTED_COLLECTED_TESTS - 1,
+          passed: EXPECTED_COLLECTED_TESTS - 1,
+          tests: completeCollection.tests.slice(0, -1),
+        },
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        collection: {
+          ...completeCollection,
+          passed: EXPECTED_COLLECTED_TESTS - 1,
+          skipped: 1,
+          tests: completeCollection.tests.map((item, index) =>
+            index === 0 ? { ...item, status: "skipped" } : item,
+          ),
+        } as unknown as EvidenceCollection,
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        collection: {
+          ...completeCollection,
+          passed: EXPECTED_COLLECTED_TESTS - 1,
+          failed: 1,
+          tests: completeCollection.tests.map((item, index) =>
+            index === 0 ? { ...item, status: "failed" } : item,
+          ),
+        } as unknown as EvidenceCollection,
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    expect(() =>
+      buildCompleteEvidence({
+        ...base,
+        collection: {
+          ...completeCollection,
+          tests: completeCollection.tests.map((item, index) =>
+            index === 0 ? { ...item, title: "@enterprise unexpected substitute" } : item,
+          ),
+        },
+        artifacts: [validArtifact],
+        checks: completeChecks,
+      }),
+    ).toThrow();
+    for (const invalidDeployment of [
+      { ...target.deployment, release_id: "f".repeat(40) },
+      { ...target.deployment, base_url: "https://kb.invalid/" },
+      { ...target.deployment, offline_contract_sha256: "not-a-hash" },
+      { ...target.deployment, image_manifest_sha256: "not-a-hash" },
+    ]) {
+      expect(() =>
+        buildCompleteEvidence({
+          ...base,
+          target: { ...target, deployment: invalidDeployment },
+          artifacts: [validArtifact],
+          checks: completeChecks,
+        }),
+      ).toThrow();
+    }
   });
 
   test("validates one-time challenge scope, expiry and target binding", () => {
-    const target = {
-      git_head: "a".repeat(40),
-      content_fingerprint: "b".repeat(64),
-      run_id: "acceptance-run-20260714",
-    };
+    const target = evidenceTarget();
     const challenge = {
       schema_version: 1,
       challenge_id: "browser-challenge-20260713",
@@ -695,6 +953,49 @@ describe("enterprise evidence schema v2", () => {
       parseEvidenceChallenge(
         challenge,
         { ...target, run_id: "acceptance-run-20260715" },
+        new Date("2026-07-13T12:00:00.000Z"),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseEvidenceChallenge(
+        challenge,
+        {
+          ...target,
+          deployment: {
+            ...target.deployment,
+            image_manifest_sha256: "f".repeat(64),
+          },
+        },
+        new Date("2026-07-13T12:00:00.000Z"),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseEvidenceChallenge(
+        {
+          ...challenge,
+          target: {
+            ...target,
+            deployment: {
+              ...target.deployment,
+              offline_contract_sha256: "f".repeat(64),
+            },
+          },
+        },
+        target,
+        new Date("2026-07-13T12:00:00.000Z"),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseEvidenceChallenge(
+        {
+          ...challenge,
+          target: {
+            git_head: target.git_head,
+            content_fingerprint: target.content_fingerprint,
+            run_id: target.run_id,
+          },
+        },
+        target,
         new Date("2026-07-13T12:00:00.000Z"),
       ),
     ).toThrow();

@@ -414,9 +414,7 @@ async def test_retirement_atomically_transfers_owned_knowledge_bases(
         owners = set(
             (
                 await session.scalars(
-                    select(KnowledgeBase.owner_id).where(
-                        KnowledgeBase.id.in_(knowledge_base_ids)
-                    )
+                    select(KnowledgeBase.owner_id).where(KnowledgeBase.id.in_(knowledge_base_ids))
                 )
             ).all()
         )

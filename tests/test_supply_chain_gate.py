@@ -61,6 +61,59 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _rebind_snapshot_input(fixture: Path, relative_path: str) -> None:
+    snapshot_path = fixture / "compliance" / "dependency-snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    entry = next(item for item in snapshot["inputs"] if item["path"] == relative_path)
+    entry["sha256"] = _sha256(fixture / relative_path)
+    snapshot_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _remove_sbom_component_and_rebind(
+    fixture: Path,
+    *,
+    ecosystem: str,
+    component_name: str,
+) -> None:
+    sbom_path = fixture / "artifacts" / "acceptance" / f"sbom-{ecosystem}.cdx.json"
+    sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+    component = next(item for item in sbom["components"] if item["name"] == component_name)
+    component_reference = component["bom-ref"]
+    sbom["components"] = [
+        item for item in sbom["components"] if item["bom-ref"] != component_reference
+    ]
+    sbom["dependencies"] = [
+        {
+            **item,
+            "dependsOn": [
+                reference
+                for reference in item.get("dependsOn", [])
+                if reference != component_reference
+            ],
+        }
+        for item in sbom["dependencies"]
+        if item.get("ref") != component_reference
+    ]
+    sbom_path.write_text(
+        json.dumps(sbom, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    snapshot_path = fixture / "compliance" / "dependency-snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    entry = next(item for item in snapshot["sboms"] if item["ecosystem"] == ecosystem)
+    entry["component_count"] = len(sbom["components"])
+    entry["dependency_count"] = len(sbom["dependencies"])
+    entry["sha256"] = _sha256(sbom_path)
+    snapshot_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_bound_image_evidence(fixture: Path) -> Path:
     release_git_sha = "a" * 40
     manifest = fixture / "release.env.images"
@@ -332,6 +385,110 @@ def test_lock_file_drift_invalidates_the_bound_snapshot(tmp_path: Path) -> None:
 
     assert report["status"] == "FAIL"
     assert "LOCK_INPUT_HASH_MISMATCH" in _finding_codes(report)
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "component_name", "expected_code"),
+    [
+        ("python", "Mako", "PYTHON_SBOM_PRODUCTION_COMPONENT_MISSING"),
+        ("python", "hiredis", "PYTHON_SBOM_PRODUCTION_COMPONENT_MISSING"),
+        ("python", "tzdata", "PYTHON_SBOM_PRODUCTION_COMPONENT_MISSING"),
+        ("web", "scheduler", "WEB_SBOM_PRODUCTION_COMPONENT_MISSING"),
+        ("web", "sharp-linux-x64", "WEB_SBOM_PRODUCTION_COMPONENT_MISSING"),
+    ],
+)
+def test_transitive_production_component_cannot_be_omitted_from_a_rebound_sbom(
+    tmp_path: Path,
+    ecosystem: str,
+    component_name: str,
+    expected_code: str,
+) -> None:
+    fixture = _copy_gate_fixture(tmp_path)
+    _remove_sbom_component_and_rebind(
+        fixture,
+        ecosystem=ecosystem,
+        component_name=component_name,
+    )
+
+    report = run_gate(fixture, mode="inventory")
+
+    assert report["status"] == "FAIL"
+    assert expected_code in _finding_codes(report)
+
+
+def test_sbom_purl_must_match_the_declared_component_identity(tmp_path: Path) -> None:
+    fixture = _copy_gate_fixture(tmp_path)
+    sbom_path = fixture / "artifacts" / "acceptance" / "sbom-python.cdx.json"
+    sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+    component = next(item for item in sbom["components"] if item["name"] == "Mako")
+    component["purl"] = f"pkg:pypi/not-mako@{component['version']}"
+    sbom_path.write_text(
+        json.dumps(sbom, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    snapshot_path = fixture / "compliance" / "dependency-snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    entry = next(item for item in snapshot["sboms"] if item["ecosystem"] == "python")
+    entry["sha256"] = _sha256(sbom_path)
+    snapshot_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    report = run_gate(fixture, mode="inventory")
+
+    assert report["status"] == "FAIL"
+    assert "SBOM_COMPONENT_IDENTITY_INVALID" in _finding_codes(report)
+
+
+@pytest.mark.parametrize("section", ["inputs", "sboms"])
+def test_snapshot_cannot_omit_a_required_ecosystem_binding(
+    tmp_path: Path,
+    section: str,
+) -> None:
+    fixture = _copy_gate_fixture(tmp_path)
+    snapshot_path = fixture / "compliance" / "dependency-snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if section == "inputs":
+        snapshot["inputs"] = [
+            item for item in snapshot["inputs"] if item["path"] != "web/package-lock.json"
+        ]
+    else:
+        snapshot["sboms"] = [item for item in snapshot["sboms"] if item["ecosystem"] != "web"]
+    snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    with pytest.raises(GateConfigurationError, match="must bind"):
+        run_gate(fixture, mode="inventory")
+
+
+def test_unreachable_dev_only_lock_components_are_not_required_in_production_sboms(
+    tmp_path: Path,
+) -> None:
+    fixture = _copy_gate_fixture(tmp_path)
+    uv_lock = fixture / "uv.lock"
+    uv_lock.write_text(
+        uv_lock.read_text(encoding="utf-8")
+        + '\n[[package]]\nname = "acceptance-dev-only"\nversion = "1.0.0"\n'
+        + 'source = { registry = "https://pypi.org/simple" }\n',
+        encoding="utf-8",
+    )
+    _rebind_snapshot_input(fixture, "uv.lock")
+
+    web_lock_path = fixture / "web" / "package-lock.json"
+    web_lock = json.loads(web_lock_path.read_text(encoding="utf-8"))
+    web_lock["packages"]["node_modules/acceptance-dev-only"] = {
+        "version": "1.0.0",
+        "dev": True,
+    }
+    web_lock_path.write_text(
+        json.dumps(web_lock, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _rebind_snapshot_input(fixture, "web/package-lock.json")
+
+    report = run_gate(fixture, mode="inventory")
+
+    assert report["status"] == "PASS"
 
 
 def test_unregistered_binary_asset_fails_inventory(tmp_path: Path) -> None:

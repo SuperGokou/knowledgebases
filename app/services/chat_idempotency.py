@@ -9,6 +9,7 @@ import logging
 import os
 import zlib
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -18,20 +19,263 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+)
 
 from app.api.errors import ApiError
 from app.core.config import Settings
 from app.db.models import ChatIdempotencyRecord, ChatIdempotencyStatus
 from app.schemas.chat import ChatQueryRequest, ChatQueryResponse
 from app.services.chat_replay_authorization import ChatAuthorizationSnapshot
+from app.services.chat_safety import (
+    current_chat_cleanup_deadline,
+    poison_chat_safety,
+)
 
 _ENCODING = "aesgcm-zlib-json-v1"
 _AES_256_KEY_BYTES = 32
 _AES_GCM_NONCE_BYTES = 12
 _AES_GCM_TAG_BYTES = 16
+_CHAT_TERMINALIZATION_TIMEOUT_SECONDS = 5.0
 _LOGGER = logging.getLogger(__name__)
 AuthorizationCallback = Callable[[AsyncSession], Awaitable[ChatAuthorizationSnapshot]]
+
+
+class ChatTerminalizationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ChatTerminalizationAck:
+    record_id: UUID
+    status: ChatIdempotencyStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _ChatClaimDescriptor:
+    record_id: UUID
+    principal_hash: str
+    key_hash: str
+    request_hash: str
+
+
+_SUPERVISED_CHAT_FINALIZATIONS: set[asyncio.Task[ChatTerminalizationAck]] = set()
+
+
+def chat_finalization_backlog_size() -> int:
+    return sum(not task.done() for task in _SUPERVISED_CHAT_FINALIZATIONS)
+
+
+def _observe_supervised_finalization(
+    task: asyncio.Task[ChatTerminalizationAck],
+) -> None:
+    _SUPERVISED_CHAT_FINALIZATIONS.discard(task)
+    if task.cancelled():
+        poison_chat_safety(reason="chat_terminalization_cancelled_after_deadline")
+        return
+    try:
+        task.result()
+    except BaseException as error:
+        poison_chat_safety(
+            reason="chat_terminalization_failed_after_deadline",
+            error_class=type(error).__name__,
+        )
+        _LOGGER.critical(
+            "Supervised chat terminalization failed",
+            extra={"error_class": type(error).__name__},
+        )
+
+
+def _supervise_finalization(task: asyncio.Task[ChatTerminalizationAck]) -> None:
+    if task in _SUPERVISED_CHAT_FINALIZATIONS:
+        return
+    _SUPERVISED_CHAT_FINALIZATIONS.add(task)
+    task.add_done_callback(_observe_supervised_finalization)
+
+
+def _session_factory(session: AsyncSession) -> async_sessionmaker[AsyncSession]:
+    bind = session.bind
+    if bind is None:
+        raise RuntimeError("chat operation session has no database bind")
+    engine: AsyncEngine = bind.engine if isinstance(bind, AsyncConnection) else bind
+    return async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+def _matches_claim(
+    record: ChatIdempotencyRecord,
+    descriptor: _ChatClaimDescriptor,
+) -> bool:
+    return (
+        record.id == descriptor.record_id
+        and record.principal_hash == descriptor.principal_hash
+        and record.idempotency_key_hash == descriptor.key_hash
+        and record.request_hash == descriptor.request_hash
+    )
+
+
+def _terminal_ack(
+    record: ChatIdempotencyRecord,
+    descriptor: _ChatClaimDescriptor,
+) -> ChatTerminalizationAck | None:
+    if not _matches_claim(record, descriptor):
+        raise ChatTerminalizationError("chat idempotency claim identity changed")
+    if record.status in {
+        ChatIdempotencyStatus.COMPLETED,
+        ChatIdempotencyStatus.OUTCOME_UNKNOWN,
+        ChatIdempotencyStatus.INVALIDATED,
+    }:
+        return ChatTerminalizationAck(record_id=record.id, status=record.status)
+    if record.status is ChatIdempotencyStatus.PROCESSING:
+        return None
+    raise ChatTerminalizationError("chat idempotency claim has an invalid state")
+
+
+async def _verify_terminal_state(
+    factory: async_sessionmaker[AsyncSession],
+    descriptor: _ChatClaimDescriptor,
+) -> ChatTerminalizationAck | None:
+    async with factory() as verification:
+        record = await verification.scalar(
+            select(ChatIdempotencyRecord)
+            .where(ChatIdempotencyRecord.id == descriptor.record_id)
+            .execution_options(populate_existing=True)
+        )
+        if record is None:
+            raise ChatTerminalizationError("chat idempotency claim disappeared")
+        return _terminal_ack(record, descriptor)
+
+
+async def _transition_outcome_unknown_once(
+    factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    descriptor: _ChatClaimDescriptor,
+) -> ChatTerminalizationAck:
+    async with factory() as terminalization:
+        record = await terminalization.scalar(
+            select(ChatIdempotencyRecord)
+            .where(ChatIdempotencyRecord.id == descriptor.record_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if record is None:
+            raise ChatTerminalizationError("chat idempotency claim disappeared")
+        terminal = _terminal_ack(record, descriptor)
+        if terminal is not None:
+            await terminalization.rollback()
+            return terminal
+        now = datetime.now(UTC)
+        record.status = ChatIdempotencyStatus.OUTCOME_UNKNOWN
+        _clear_response(record)
+        record.completed_at = now
+        record.expires_at = now + timedelta(seconds=settings.chat_idempotency_ttl_seconds)
+        await terminalization.commit()
+    verified = await _verify_terminal_state(factory, descriptor)
+    if verified is None:
+        raise ChatTerminalizationError("chat idempotency claim did not become terminal")
+    return verified
+
+
+async def _reconcile_outcome_unknown(
+    factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    descriptor: _ChatClaimDescriptor,
+) -> ChatTerminalizationAck:
+    primary_error: BaseException | None = None
+    for _ in range(2):
+        try:
+            return await _transition_outcome_unknown_once(factory, settings, descriptor)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            if primary_error is None:
+                primary_error = error
+            try:
+                verified = await _verify_terminal_state(factory, descriptor)
+            except BaseException as verification_error:
+                if isinstance(verification_error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                _LOGGER.error(
+                    "Chat terminalization verification failed",
+                    extra={
+                        "record_id": str(descriptor.record_id),
+                        "error_class": type(error).__name__,
+                        "verification_error_class": type(verification_error).__name__,
+                    },
+                )
+                continue
+            if verified is not None:
+                return verified
+    raise ChatTerminalizationError(
+        "chat idempotency terminal state could not be proven"
+    ) from primary_error
+
+
+async def _await_terminalization(
+    task: asyncio.Task[ChatTerminalizationAck],
+    *,
+    descriptor: _ChatClaimDescriptor,
+) -> ChatTerminalizationAck:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _CHAT_TERMINALIZATION_TIMEOUT_SECONDS
+    shared_deadline = current_chat_cleanup_deadline()
+    if shared_deadline is not None:
+        deadline = min(deadline, shared_deadline)
+    first_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            completed, _ = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError as error:
+            if first_cancellation is None:
+                first_cancellation = error
+            continue
+        if completed:
+            break
+    if not task.done():
+        task.cancel()
+        _supervise_finalization(task)
+        poison_chat_safety(reason="chat_terminalization_exceeded_deadline")
+        _LOGGER.critical(
+            "Chat terminalization exceeded its absolute deadline",
+            extra={"record_id": str(descriptor.record_id)},
+        )
+        if first_cancellation is not None:
+            raise first_cancellation
+        raise ChatTerminalizationError("chat idempotency terminalization timed out")
+
+    terminalization_error: BaseException | None = None
+    acknowledgement: ChatTerminalizationAck | None = None
+    try:
+        acknowledgement = task.result()
+    except BaseException as error:
+        terminalization_error = error
+        poison_chat_safety(
+            reason="chat_terminalization_failed",
+            error_class=type(error).__name__,
+        )
+        _LOGGER.critical(
+            "Chat terminalization failed",
+            extra={
+                "record_id": str(descriptor.record_id),
+                "error_class": type(error).__name__,
+                "caller_cancelled": first_cancellation is not None,
+            },
+        )
+    if first_cancellation is not None:
+        raise first_cancellation from terminalization_error
+    if terminalization_error is not None:
+        raise ChatTerminalizationError(
+            "chat idempotency terminalization failed"
+        ) from terminalization_error
+    if acknowledgement is None:  # pragma: no cover - defensive task result contract.
+        raise ChatTerminalizationError("chat terminalization returned no acknowledgement")
+    return acknowledgement
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +493,14 @@ def _resource_changed_error() -> ApiError:
     )
 
 
+def _terminalization_unavailable_error() -> ApiError:
+    return ApiError(
+        status_code=503,
+        code="idempotency_terminalization_unavailable",
+        message="The chat outcome could not be durably finalized; processing is fail-closed",
+    )
+
+
 async def _claim_or_replay(
     session: AsyncSession,
     settings: Settings,
@@ -370,19 +622,18 @@ async def _store_completed_response(
     settings: Settings,
     keyring: _ChatReplayKeyring,
     *,
-    record_id: UUID,
-    request_hash: str,
+    descriptor: _ChatClaimDescriptor,
     response: ChatQueryResponse,
     authorize: AuthorizationCallback,
 ) -> None:
     snapshot = await authorize(session)
     record = await session.scalar(
         select(ChatIdempotencyRecord)
-        .where(ChatIdempotencyRecord.id == record_id)
+        .where(ChatIdempotencyRecord.id == descriptor.record_id)
         .execution_options(populate_existing=True)
         .with_for_update()
     )
-    if record is None or record.request_hash != request_hash:
+    if record is None or not _matches_claim(record, descriptor):
         raise RuntimeError("chat idempotency claim is no longer active")
     now = datetime.now(UTC)
     if record.status is ChatIdempotencyStatus.INVALIDATED:
@@ -419,40 +670,16 @@ async def _store_completed_response(
 
 
 async def _mark_outcome_unknown(
-    session: AsyncSession,
+    factory: async_sessionmaker[AsyncSession],
     settings: Settings,
     *,
-    record_id: UUID,
-    request_hash: str,
-) -> None:
-    try:
-        await session.rollback()
-        record = await session.scalar(
-            select(ChatIdempotencyRecord)
-            .where(ChatIdempotencyRecord.id == record_id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
-        if (
-            record is not None
-            and record.request_hash == request_hash
-            and record.status is ChatIdempotencyStatus.PROCESSING
-        ):
-            now = datetime.now(UTC)
-            record.status = ChatIdempotencyStatus.OUTCOME_UNKNOWN
-            _clear_response(record)
-            record.completed_at = now
-            record.expires_at = now + timedelta(seconds=settings.chat_idempotency_ttl_seconds)
-        await session.commit()
-    except Exception as persistence_error:
-        await session.rollback()
-        _LOGGER.error(
-            "Failed to persist an unknown chat idempotency outcome",
-            extra={
-                "record_id": str(record_id),
-                "error_class": type(persistence_error).__name__,
-            },
-        )
+    descriptor: _ChatClaimDescriptor,
+) -> ChatTerminalizationAck:
+    terminalization = asyncio.create_task(
+        _reconcile_outcome_unknown(factory, settings, descriptor),
+        name="chat-idempotency-terminalization",
+    )
+    return await _await_terminalization(terminalization, descriptor=descriptor)
 
 
 async def execute_chat_query_idempotently(
@@ -467,9 +694,7 @@ async def execute_chat_query_idempotently(
 ) -> ChatQueryResponse:
     """Execute one logical chat request once and durably replay only known final results."""
 
-    bind = session.bind
-    if bind is None:
-        raise RuntimeError("chat operation session has no database bind")
+    factory = _session_factory(session)
     # Resolve and validate the external keyring before creating a durable claim
     # or invoking retrieval/model code. Missing key material can never degrade to
     # a plaintext response or an execution whose outcome cannot be replayed.
@@ -479,88 +704,127 @@ async def execute_chat_query_idempotently(
     # preserves the already-resolved ORM identity (expire_on_commit=False) while
     # the ledger remains an entirely separate transaction boundary.
     await session.commit()
+    principal_hash = principal.fingerprint()
+    key_hash = _sha256(f"chat-idempotency-key-v1\0{idempotency_key}")
     request_hash = _request_hash(request)
-    async with AsyncSession(bind=bind, expire_on_commit=False) as ledger_session:
+    async with factory() as claim_session:
         record, replay = await _claim_or_replay(
-            ledger_session,
+            claim_session,
             settings,
             keyring,
-            principal_hash=principal.fingerprint(),
-            key_hash=_sha256(f"chat-idempotency-key-v1\0{idempotency_key}"),
+            principal_hash=principal_hash,
+            key_hash=key_hash,
             request_hash=request_hash,
             request_knowledge_base_id=request.knowledge_base_id,
             authorize=authorize,
         )
         if replay is not None:
             return replay
+        descriptor = _ChatClaimDescriptor(
+            record_id=record.id,
+            principal_hash=principal_hash,
+            key_hash=key_hash,
+            request_hash=request_hash,
+        )
 
+    try:
+        response = await operation()
+    except asyncio.CancelledError as original_cancellation:
+        with suppress(asyncio.CancelledError, ChatTerminalizationError):
+            await _mark_outcome_unknown(
+                factory,
+                settings,
+                descriptor=descriptor,
+            )
+        # The terminalizer itself records backlog/poison before preserving
+        # cancellation. Never replace the caller's 499/504 semantics.
+        raise original_cancellation
+    except Exception as operation_error:
         try:
-            response = await operation()
+            await _mark_outcome_unknown(
+                factory,
+                settings,
+                descriptor=descriptor,
+            )
         except asyncio.CancelledError:
-            await _mark_outcome_unknown(
-                ledger_session,
-                settings,
-                record_id=record.id,
-                request_hash=request_hash,
-            )
             raise
-        except Exception as operation_error:
-            await _mark_outcome_unknown(
-                ledger_session,
-                settings,
-                record_id=record.id,
-                request_hash=request_hash,
-            )
-            _LOGGER.warning(
-                "Chat request ended without a safely replayable outcome",
-                extra={
-                    "record_id": str(record.id),
-                    "error_class": type(operation_error).__name__,
-                },
-            )
-            if (
-                isinstance(operation_error, ApiError)
-                and operation_error.code == "idempotency_outcome_unknown"
-            ):
-                raise operation_error
-            raise _outcome_unknown_error() from None
+        except ChatTerminalizationError:
+            raise _terminalization_unavailable_error() from None
+        _LOGGER.warning(
+            "Chat request ended without a safely replayable outcome",
+            extra={
+                "record_id": str(descriptor.record_id),
+                "error_class": type(operation_error).__name__,
+            },
+        )
+        if (
+            isinstance(operation_error, ApiError)
+            and operation_error.code == "idempotency_outcome_unknown"
+        ):
+            raise operation_error
+        raise _outcome_unknown_error() from None
 
-        try:
+    try:
+        async with factory() as completion_session:
             await _store_completed_response(
-                ledger_session,
+                completion_session,
                 settings,
                 keyring,
-                record_id=record.id,
-                request_hash=request_hash,
+                descriptor=descriptor,
                 response=response,
                 authorize=authorize,
             )
-        except ApiError as finalization_error:
-            if finalization_error.code == "idempotency_resource_changed":
-                raise
+    except asyncio.CancelledError as original_cancellation:
+        with suppress(asyncio.CancelledError, ChatTerminalizationError):
             await _mark_outcome_unknown(
-                ledger_session,
+                factory,
                 settings,
-                record_id=record.id,
-                request_hash=request_hash,
+                descriptor=descriptor,
             )
+        raise original_cancellation
+    except ApiError as finalization_error:
+        if finalization_error.code == "idempotency_resource_changed":
             raise
-        except Exception as finalization_error:
-            await _mark_outcome_unknown(
-                ledger_session,
+        try:
+            acknowledgement = await _mark_outcome_unknown(
+                factory,
                 settings,
-                record_id=record.id,
-                request_hash=request_hash,
+                descriptor=descriptor,
             )
-            _LOGGER.error(
-                "Chat response could not be persisted for safe replay",
-                extra={
-                    "record_id": str(record.id),
-                    "error_class": type(finalization_error).__name__,
-                },
+        except asyncio.CancelledError:
+            raise
+        except ChatTerminalizationError:
+            raise _terminalization_unavailable_error() from None
+        if acknowledgement.status is ChatIdempotencyStatus.COMPLETED:
+            return response
+        if acknowledgement.status is ChatIdempotencyStatus.INVALIDATED:
+            raise _resource_changed_error() from finalization_error
+        raise _outcome_unknown_error() from finalization_error
+    except Exception as finalization_error:
+        try:
+            acknowledgement = await _mark_outcome_unknown(
+                factory,
+                settings,
+                descriptor=descriptor,
             )
-            raise _outcome_unknown_error() from None
-        return response
+        except asyncio.CancelledError:
+            raise
+        except ChatTerminalizationError:
+            raise _terminalization_unavailable_error() from None
+        _LOGGER.error(
+            "Chat response could not be persisted for safe replay",
+            extra={
+                "record_id": str(descriptor.record_id),
+                "error_class": type(finalization_error).__name__,
+                "verified_status": acknowledgement.status.value,
+            },
+        )
+        if acknowledgement.status is ChatIdempotencyStatus.COMPLETED:
+            return response
+        if acknowledgement.status is ChatIdempotencyStatus.INVALIDATED:
+            raise _resource_changed_error() from finalization_error
+        raise _outcome_unknown_error() from finalization_error
+    return response
 
 
 async def cleanup_chat_idempotency_records(

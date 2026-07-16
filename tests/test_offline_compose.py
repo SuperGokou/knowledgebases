@@ -351,6 +351,7 @@ def test_offline_preflight_api_is_secret_free_and_network_isolated() -> None:
         mount for mount in service["volumes"] if mount["target"] == "/var/lib/kb-capacity"
     )
     assert capacity_mount["read_only"] is True
+    assert all(mount["target"] != "/var/lib/kb-chat-safety" for mount in service["volumes"])
 
 
 def test_offline_resources_carry_the_explicit_stack_owner_labels() -> None:
@@ -799,6 +800,16 @@ def test_offline_api_has_read_only_capacity_probe_and_aligned_hard_upload_limit(
         "MaxFileSize": hard_limit,
     }
 
+    chat_safety_mount = next(
+        mount for mount in api["volumes"] if mount["target"] == "/var/lib/kb-chat-safety"
+    )
+    assert chat_safety_mount["source"].endswith("/chat-safety")
+    assert chat_safety_mount.get("read_only", False) is False
+    assert api["environment"]["KB_CHAT_SAFETY_STATE_PATH"] == (
+        "/var/lib/kb-chat-safety/poison.json"
+    )
+    assert api["environment"]["KB_CHAT_MAX_ACTIVE_REQUESTS"] == "8"
+
 
 def test_offline_preflight_requires_image_manifest_and_clamav_database_evidence() -> None:
     script = (REPOSITORY / "deploy/tencent/preflight-offline.sh").read_text(encoding="utf-8")
@@ -808,6 +819,13 @@ def test_offline_preflight_requires_image_manifest_and_clamav_database_evidence(
     assert 'verify-offline-images.sh" verify' in script
     assert "release.env.images" in common
     assert 'install -d -o root -g root -m 0755 "$KB_DATA_ROOT/capacity-probe"' in script
+    assert "chat_safety_directory=$KB_DATA_ROOT/chat-safety" in script
+    assert '[ -L "$chat_safety_directory" ]' in script
+    assert 'install -d -o 10001 -g 10001 -m 0700 "$chat_safety_directory"' in script
+    assert 'chat_safety_uid=$(stat -c %u -- "$chat_safety_directory")' in script
+    assert 'chat_safety_gid=$(stat -c %g -- "$chat_safety_directory")' in script
+    assert "offline_require_no_chat_safety_poison preflight" in script
+    assert script.index("chat_safety_directory=") < script.index("project_marker_volume=")
     assert "shutil.disk_usage(probe)" in script
     assert 'verify-offline-network-cidrs.py"' in script
     assert "172.30.240.0/24" in script
@@ -838,6 +856,22 @@ def test_offline_preflight_requires_image_manifest_and_clamav_database_evidence(
         "com.docker.compose.project.config_files",
     ):
         assert binding in clamav_blocks[0]
+
+
+def test_offline_mutation_boundaries_recheck_the_persistent_chat_safety_hold() -> None:
+    deploy = (REPOSITORY / "deploy/tencent/deploy-offline.sh").read_text(encoding="utf-8")
+    install = (REPOSITORY / "deploy/tencent/install-offline.sh").read_text(encoding="utf-8")
+
+    assert (
+        deploy.index("quiesce_owned_business_writers")
+        < deploy.index("offline_require_no_chat_safety_poison deploy")
+        < deploy.index("--profile ops run --pull never --rm migrate")
+    )
+    assert (
+        install.index('preflight-offline.sh"')
+        < install.index("offline_require_no_chat_safety_poison install")
+        < install.index("--profile ops run --pull never --rm migrate")
+    )
 
 
 def test_offline_image_and_preflight_require_the_complete_document_parser_toolchain() -> None:

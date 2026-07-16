@@ -89,7 +89,7 @@
 
 | 资源 | 地址 | 用途 |
 |---|---|---|
-| 局域网工作台 | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/login` | 企业内网登录、聊天与管理；默认正式交付入口 |
+| 局域网工作台 | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/login` | 企业内网登录、聊天与管理；完成安全、法律与目标机验收并获批后的正式入口 |
 | 局域网公共 API | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/api/v1/public/*` | 业务系统使用 `X-API-Key` 调用，不依赖浏览器 Cookie |
 | 局域网 OpenAPI | `https://<KB_PUBLIC_HOST>:<KB_HTTPS_PORT>/openapi.json` | 无公共 CDN 的原始契约；仅限 VPN/可信网段 |
 | Web 工作台 | [knowledgebases.vercel.app](https://knowledgebases.vercel.app) | 登录、聊天与后台管理入口 |
@@ -202,7 +202,7 @@ sequenceDiagram
 | 大文件上传 | 单 PUT、S3 Multipart、最多 10,000 分片、分批签名、并发上传和客户端断点续传 |
 | 并发安全 | PostgreSQL `used + reserved` 配额模型、行锁、唯一约束与幂等键 |
 | 对象安全 | 私有 Bucket、短期预签名 URL、精确 `Content-Length`、单 PUT SHA-256 强校验、staging/final key 隔离 |
-| 恢复与维护 | 上传状态机、`FINALIZING` 对账、过期会话与 reservation 清理、Vercel Cron |
+| 恢复与维护 | 上传状态机、`FINALIZING` 对账、过期会话与 reservation 清理、聊天持久失败关闭、可续提人工清除事务与 Vercel Cron |
 | 审计 | `/admin/audit` 权限化控制台、动作/主体/资源/结果/时间过滤、游标分页、8 字段脱敏投影与最多 5,000 行的安全 CSV 导出；离线运行时数据库角色仅可查询和追加审计 |
 | 部署 | Docker Compose 本地栈、Alembic、幂等 Bootstrap、Vercel Functions、S3-compatible 对象存储、其他云 Linux 离线单机 |
 
@@ -399,7 +399,13 @@ Content-Type: application/json
 
 `POST /api/v1/chat/query` 与 `POST /api/v1/public/chat/query` 必须携带 1–160 位、日志安全的 `Idempotency-Key`。同一次逻辑问答的网络重试复用同一个 Key；新问题必须生成新 Key。服务端不再使用请求 ID 静默替代幂等键。
 
-聊天幂等是 PostgreSQL 持久语义，不是仅校验请求头：同一主体、同一 Key、同一规范化请求会在 24 小时保留期内原样重放最终 `ChatQueryResponse`，不会再次检索、调用模型或计费；请求内容不同返回 `409 idempotency_conflict`，原请求仍在执行返回 `409 idempotency_in_progress`，执行结果无法安全确认返回 `409 idempotency_outcome_unknown`，知识库内容版本变化返回 `409 idempotency_resource_changed` 并清空旧响应。公开 API 以稳定 `credential_family_id` 隔离命名空间，原子轮换前后的 Key 可安全重放且不能绕过限流；审计与用量仍保留实际 Key ID。数据库只保存主体、Key 与请求的 SHA-256，以及默认最多 128 KiB（硬上限 512 KiB）的 AES-256-GCM 有界加密响应，不保存问题正文；密钥保存在数据库之外并支持版本轮换，篡改或缺失旧密钥时安全转为 `OUTCOME_UNKNOWN` 且不会再次调用模型。maintenance worker 以独立批次处理超时 claim 和过期终态，密钥生成与轮换步骤见 [聊天幂等回放加密运维](./docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)。
+聊天幂等是 PostgreSQL 持久语义，不是仅校验请求头：同一主体、同一 Key、同一规范化请求会在 24 小时保留期内原样重放最终 `ChatQueryResponse`，不会再次检索、调用模型或计费；请求内容不同返回 `409 idempotency_conflict`，原请求仍在执行返回 `409 idempotency_in_progress`，执行结果无法安全确认返回 `409 idempotency_outcome_unknown`，知识库内容版本变化返回 `409 idempotency_resource_changed` 并清空旧响应。公开 API 以稳定 `credential_family_id` 隔离命名空间，原子轮换前后的 Key 可安全重放且不能绕过限流；审计与用量仍保留实际 Key ID。数据库只保存主体、Key 与请求的 SHA-256，以及默认最多 128 KiB（硬上限 512 KiB）的 AES-256-GCM 有界加密响应，不保存问题正文；密钥保存在数据库之外并支持版本轮换，篡改或缺失旧密钥时安全转为 `OUTCOME_UNKNOWN` 且不会再次调用模型。Claim、模型调用、最终响应写入和异常终态封闭使用独立数据库会话；终态无法在绝对截止时间内证明时，当前单 worker 会进入 sticky fail-closed。隔离部署还会把该状态持久化到主机哨兵，重启 API 或 Docker 不会解除 503；只有在全部聊天/模型写入者已静默、幂等账本、供应商用量和审计记录完成对账后，才可使用摘要绑定且受审计的专用脚本清除。maintenance worker 以独立批次处理超时 claim 和过期终态，密钥生成与轮换步骤见[聊天幂等回放加密运维](./docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)，持久哨兵恢复流程见[聊天安全哨兵与人工恢复](./docs/OPERATIONS.zh-CN.md#91-持久-chat-safety-poison-哨兵与人工恢复)。
+
+> [!IMPORTANT]
+> 聊天最外层栅栏从读取请求体前开始计时：前 85 秒覆盖收体和完整路由处理，85–94 秒只允许取消后的连接释放、用量对账与幂等终态封闭，94–95 秒只允许发送已完整缓冲且验证通过的唯一响应。离线 API 固定为单 Uvicorn worker，`KB_CHAT_MAX_ACTIVE_REQUESTS=8`；第 9 个并发聊天在取数据库连接前立即返回 `503 chat_capacity_exceeded`，每个已准入响应最多缓冲 4 MiB。增加 worker 或 API 副本前，必须先把 poison、准入计数和活动任务监管迁移到 PostgreSQL/Redis 共享状态并完成多进程故障注入。
+
+> [!WARNING]
+> 恢复器把唯一、归属正确且已停止的 API 容器的**任意非零退出码**物化为持久 Chat Safety hold；退出码 `78` 表示哨兵持久化失败，其他非零码按 worker 异常退出处理。人工清除使用严格 14-key 对账证据，并先创建 `chat-safety-clear-pending.json`；若清除进程在哨兵删除后崩溃，pending 仍阻止业务重启。操作员只能用相同状态、摘要、contract、transaction 和字节完全相同的证据幂等续提，直到 `cleared` 审计已同步且 pending 作为最终提交点删除。
 
 > [!WARNING]
 > 聊天重放体先有界压缩，再以 AES-256-GCM 加密；数据库保存密钥版本、12 字节随机 nonce、密文和原始大小，密钥环位于数据库与备份之外。迁移 `20260714_0020` 不可逆：历史 `zlib-json-v1` 的 `COMPLETED` 记录会转为 `OUTCOME_UNKNOWN` 并清除正文。AEAD 仅保护重放字段，不能替代 PostgreSQL 数据卷、WAL、快照和备份的静态加密；缺少这些证据时敏感数据交付仍为 `NO-GO`。
@@ -452,7 +458,10 @@ npm run test:e2e  # 本地 smoke；正式企业档案见 web/e2e/README.md
 - 分支覆盖率门槛 `80%`；
 - Ruff 的 `E/F/I/B/UP/SIM` 规则；
 - mypy strict；
-- Python 3.12 锁定依赖。
+- Python 3.12 锁定依赖；
+- Gitleaks 全 Git 历史脱敏密钥扫描；
+- Bandit Medium/High、pip-audit 与 npm Moderate 依赖安全门禁；
+- ShellCheck 固定摘要工具与 PostgreSQL/Redis CI 镜像 digest；
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
 测试数量由最终冻结候选版本动态收集，不在代码仍变动时写死。pytest、PostgreSQL 集成测试、Vitest 与 Playwright 的“已收集”仅表示发现范围，不等于通过、覆盖率或目标机能力证明；Ruff、mypy、ESLint、TypeScript、production build、真实浏览器和目标 Linux 运行结论都必须来自绑定同一 Git 身份、内容指纹与目标环境的签名 Gate 产物。默认 `npm run test:e2e` 只是本地 smoke，企业档案、证据检查 ID 与正式执行方式以[浏览器企业验收套件](web/e2e/README.md)和[企业终验标准](docs/ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md)为准。
@@ -563,6 +572,8 @@ flowchart LR
 
 聊天幂等重放字段使用 AES-256-GCM，不代表 PostgreSQL、MinIO、WAL、快照、备份或整盘已经静态加密。宿主卷加密、密钥托管、备份恢复和销毁证明属于目标环境前置条件；缺少任一证据时，敏感数据正式交付保持 `NO-GO`。操作步骤与证据边界见[内网 TLS 与 Caddy 内部 CA 运维](docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)、[主机与存储验收](docs/HOST_STORAGE_ACCEPTANCE.zh-CN.md)和[聊天幂等回放加密运维](docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)。
 
+灾备恢复默认进入 Chat Safety 维护态，而不是直接启动业务。schema v3 签名备份证据必须包含调用方绑定的 `operation_scope`：旧栈接管只接受 `legacy_adoption`；常规升级只接受 `active_upgrade`，并额外要求相互绑定的 control-state archive/manifest。内部 active profile 已将 `state/installed-<source-contract-sha256>.json` 作为第十一项 mandatory-present 控制状态，并要求源端/恢复端 SHA-256 一致；但完整 active 签名采集器与 source/target 状态语义交叉绑定尚未交付，因此生产校验器仍显式禁用 `active_upgrade`，不得通过手写证据或 durable resume 绕过。新主机必须先物化维护 hold，恢复并核对控制状态、对账与审计链后才能启动 API/业务边缘；状态缺失或不一致一律保持 fail closed。
+
 ## 安全边界
 
 已经实现：
@@ -621,12 +632,14 @@ flowchart LR
 - [Vercel 部署手册](docs/VERCEL_DEPLOYMENT.zh-CN.md)：Supabase、Redis、腾讯 COS、Cron 与生产变量。
 - [其他云共享服务器应用部署基线（历史文件名）](docs/TENCENT_SHARED_HOST_DEPLOYMENT_BASELINE.zh-CN.md)：跨应用隔离、端口登记、国内构建、最小权限、上线检查与回滚。
 - [其他云 Linux 8C16G 离线部署（历史文件名）](docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)：本地 PostgreSQL、Redis、MinIO、镜像清单、格式门禁与目标机验收。
+- [离线发布信任链](docs/OFFLINE_RELEASE_TRUST_CHAIN.zh-CN.md)：固定发布公钥、最高发布序列、Registry 回执、纳管 plan v4 与备份恢复授权边界。
 - [离线运行时与断网冷启动验收](docs/OFFLINE_RUNTIME_ACCEPTANCE.zh-CN.md)：本地制品冷加载、断网闭环、socket 证据与失败关闭判定。
 - [文档解析能力与安全边界](docs/DOCUMENT_PARSER_SECURITY.zh-CN.md)：九类格式矩阵、来源定位、隔离工具和失败关闭语义。
 - [API 与模型管理](docs/API_AND_MODEL_MANAGEMENT.zh-CN.md)：API Key 生命周期、外部调用示例、模型切换与密钥安全。
 - [内网 TLS 与 Caddy 内部 CA 运维](docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)：根证书分发、严格 SAN 校验、短生命周期证书续期与换根边界。
 - [主机与存储验收](docs/HOST_STORAGE_ACCEPTANCE.zh-CN.md)：8C16G/300GB、SSD、fio、磁盘水位与目标机证据。
 - [性能与容量模型](docs/PERFORMANCE_CAPACITY_MODEL.zh-CN.md)：1,000 用户、每日 50 亿 token 与未来 10 TB 的建模和未验证边界。
+- [聊天安全哨兵与人工恢复](docs/OPERATIONS.zh-CN.md#91-持久-chat-safety-poison-哨兵与人工恢复)：持久失败关闭、人工对账证据、摘要绑定清除与恢复验收。
 - [功能验收标准](docs/FUNCTIONAL_ACCEPTANCE_STANDARD.zh-CN.md)与[证据信任模型](docs/FUNCTIONAL_ACCEPTANCE_TRUST.zh-CN.md)：业务闭环、签名 challenge 与重放防护。
 - [终验证据格式](docs/ACCEPTANCE_EVIDENCE_FORMAT.zh-CN.md)：目标主机、浏览器、离线运行、容量与灾备的机器可读证据。
 - [聊天幂等回放加密运维](docs/CHAT_REPLAY_ENCRYPTION.zh-CN.md)：AES-256-GCM 密钥环、轮换与整库加密边界。

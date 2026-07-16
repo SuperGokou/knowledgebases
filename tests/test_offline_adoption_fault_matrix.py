@@ -216,9 +216,7 @@ write_adoption_journal
             "binding_key": binding_key,
         }
 
-        _kill_at_barrier(
-            shell, build_harness(instrumented, **arguments), marker, cut
-        )
+        _kill_at_barrier(shell, build_harness(instrumented, **arguments), marker, cut)
         resumed = _run_shell(shell, build_harness(base_function, **arguments))
         assert resumed.returncode == 0, resumed.stderr
         journal = transaction_dir / "journal.json"
@@ -350,18 +348,12 @@ def test_archive_metadata_publish_survives_sigkill_matrix(tmp_path: Path) -> Non
         receipt.chmod(0o400)
         receipt_digest = hashlib.sha256(receipt.read_bytes()).hexdigest()
         inventory = scenario / "inventory.sha256"
-        inventory.write_text(
-            f"{receipt_digest}  {receipt.as_posix()}\n", encoding="utf-8"
-        )
+        inventory.write_text(f"{receipt_digest}  {receipt.as_posix()}\n", encoding="utf-8")
         planned_receipts = scenario / "planned-receipts.sha256"
-        planned_receipts.write_text(
-            f"{receipt_digest}  {receipt.name}\n", encoding="utf-8"
-        )
+        planned_receipts.write_text(f"{receipt_digest}  {receipt.name}\n", encoding="utf-8")
         planned_digest = hashlib.sha256(planned_receipts.read_bytes()).hexdigest()
         planned_manifest = scenario / "planned-manifest.sha256"
-        planned_manifest.write_text(
-            f"{planned_digest}  receipts.sha256\n", encoding="utf-8"
-        )
+        planned_manifest.write_text(f"{planned_digest}  receipts.sha256\n", encoding="utf-8")
         archive_root = state / "legacy-adoption/receipts"
         pending = archive_root / f".pending-{identity_digest}-{identity_digest}"
         final = archive_root / f"adopted-{identity_digest}-{identity_digest}"
@@ -560,7 +552,7 @@ OFFLINE_STATE_DIRECTORY={_quote(state)}
 adoption_transaction_dir={_quote(transaction_dir)}
 contract_sha256={digest}
 manifest_digest={digest}
-adoption_transaction_id={'f' * 32}
+adoption_transaction_id={"f" * 32}
 journal_sha256={digest}
 confirmed_plan_sha256={digest}
 retirement_digest={digest}
@@ -635,7 +627,7 @@ run_target_install() {{ : > {_quote(mutation_marker)}; }}
 {classifier}
 OFFLINE_STATE_DIRECTORY={_quote(state)}
 adoption_transaction_dir={_quote(transaction)}
-contract_sha256={'1' * 64}
+contract_sha256={"1" * 64}
 transaction_committed=false
 classify_journal_bound_target_state
 run_target_install
@@ -700,9 +692,7 @@ validate_pending_adoption_completion_state {_quote(pending)}
     assert after == before
     classifier = _shell_function(source, "classify_journal_bound_target_state")
     publish = _shell_function(source, "publish_completion_receipt")
-    pending_validator = _shell_function(
-        source, "validate_pending_adoption_completion_state"
-    )
+    pending_validator = _shell_function(source, "validate_pending_adoption_completion_state")
     assert "discard_exact_incomplete_staging_file" not in pending_validator
     assert "validate_pending_adoption_completion_state" in classifier
     assert "discard_exact_incomplete_staging_file" in publish
@@ -791,9 +781,7 @@ restore_archived_receipts
     live_receipt.chmod(0o400)
     live_digest = hashlib.sha256(live_receipt.read_bytes()).hexdigest()
     live_inventory = no_archive_case / "inventory"
-    live_inventory.write_text(
-        f"{live_digest}  {live_receipt.as_posix()}\n", encoding="utf-8"
-    )
+    live_inventory.write_text(f"{live_digest}  {live_receipt.as_posix()}\n", encoding="utf-8")
     no_archive = run_restore(
         state=live_state,
         inventory=live_inventory,
@@ -949,7 +937,7 @@ legacy_source_schema_head=20260714_0019
 target_schema_head=20260714_0020
 reconcile_baseline_file={_quote(baseline)}
 reconcile_after_abort_file={_quote(after)}
-abort_independent_host_output={_quote(tmp_path / 'current-host.json')}
+abort_independent_host_output={_quote(tmp_path / "current-host.json")}
 verify_terminal_abort_receipt
 reactivate_legacy
 """
@@ -1017,7 +1005,7 @@ archive_started=false
 transaction_terminal_aborted=false
 transaction_committed=false
 adoption_transaction_dir={_quote(transaction)}
-host_after_retire_output={_quote(tmp_path / 'host-after-retire.json')}
+host_after_retire_output={_quote(tmp_path / "host-after-retire.json")}
 run_adoption_orchestrator
 """
     completed = subprocess.run(
@@ -1065,8 +1053,8 @@ execute_requested=true
 resume_journal_present=true
 legacy_retired=false
 transaction_committed=false
-host_after_retire_output={_quote(tmp_path / 'host-after-retire.json')}
-host_final_output={_quote(tmp_path / 'host-final.json')}
+host_after_retire_output={_quote(tmp_path / "host-after-retire.json")}
+host_final_output={_quote(tmp_path / "host-final.json")}
 run_adoption_orchestrator
 """
     for _ in range(2):
@@ -1104,12 +1092,8 @@ def test_active_provider_drift_fails_before_install_mutation(tmp_path: Path) -> 
         "project_name": "heyi-kb-offline",
         "transaction_id": "9" * 32,
         "contract_sha256": contract_digest,
-        "runtime_sha256": hashlib.sha256(
-            (contract / "runtime.env").read_bytes()
-        ).hexdigest(),
-        "release_sha256": hashlib.sha256(
-            (contract / "release.env").read_bytes()
-        ).hexdigest(),
+        "runtime_sha256": hashlib.sha256((contract / "runtime.env").read_bytes()).hexdigest(),
+        "release_sha256": hashlib.sha256((contract / "release.env").read_bytes()).hexdigest(),
         "manifest_sha256": hashlib.sha256(
             (contract / "release.env.images").read_bytes()
         ).hexdigest(),

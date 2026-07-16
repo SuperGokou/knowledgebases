@@ -35,9 +35,7 @@ OWNER_LABEL = "io.heyi.knowledgebases.owner"
 STACK_LABEL = "io.heyi.knowledgebases.stack"
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
-_PINNED_LOOPBACK_IMAGE = re.compile(
-    r"^127\.0\.0\.1:5000/.+@sha256:[0-9a-f]{64}$"
-)
+_PINNED_LOOPBACK_IMAGE = re.compile(r"^127\.0\.0\.1:5000/.+@sha256:[0-9a-f]{64}$")
 _MATERIALIZED_COMPOSE = re.compile(
     r"^/srv/heyi-knowledgebases-offline/releases/[0-9a-f]{64}/"
     r"deploy/tencent/compose\.offline\.yml$"
@@ -84,8 +82,7 @@ NETWORK_SUBNETS = {
 SERVICE_RESTART_POLICIES = {
     service: (
         "unless-stopped"
-        if service
-        in {"clamd", "maintenance-page", "minio", "postgres", "redis"}
+        if service in {"clamd", "maintenance-page", "minio", "postgres", "redis"}
         else "no"
     )
     for service in SERVICE_NETWORKS
@@ -199,13 +196,8 @@ def _validate_compose_network(
         raise ValueError(f"Compose network {logical_network} has an unsafe Internal setting")
     if definition.get("enable_ipv6", False) is not False:
         raise ValueError(f"Compose network {logical_network} must disable IPv6")
-    labels = _object(
-        definition.get("labels"), f"Compose labels for network {logical_network}"
-    )
-    if (
-        labels.get(OWNER_LABEL) != EXPECTED_OWNER
-        or labels.get(STACK_LABEL) != EXPECTED_STACK
-    ):
+    labels = _object(definition.get("labels"), f"Compose labels for network {logical_network}")
+    if labels.get(OWNER_LABEL) != EXPECTED_OWNER or labels.get(STACK_LABEL) != EXPECTED_STACK:
         raise ValueError(f"Compose network {logical_network} lacks ownership labels")
     ipam = _object(definition.get("ipam"), f"Compose IPAM for {logical_network}")
     if ipam.get("driver", "default") != "default":
@@ -271,9 +263,7 @@ def _compose_port_bindings(
     for raw_port in raw_ports:
         port = _object(raw_port, f"Compose port for {service}")
         target = _integer(port.get("target"), f"Compose target port for {service}")
-        published = _string(
-            port.get("published"), f"Compose published port for {service}"
-        )
+        published = _string(port.get("published"), f"Compose published port for {service}")
         host_ip = _string(port.get("host_ip"), f"Compose host IP for {service}")
         if (
             not 1 <= target <= 65_535
@@ -331,9 +321,7 @@ def _runtime_mounts(container: dict[str, Any], service: str) -> frozenset[tuple[
         if mount.get("Type") != "bind":
             raise ValueError(f"{service} runtime must contain only bind mounts")
         source = _string(mount.get("Source"), f"runtime bind source for {service}")
-        destination = _string(
-            mount.get("Destination"), f"runtime bind destination for {service}"
-        )
+        destination = _string(mount.get("Destination"), f"runtime bind destination for {service}")
         read_write = _bool(mount.get("RW"), f"runtime bind RW for {service}")
         if mount.get("Propagation") != "rprivate":
             raise ValueError(f"{service} runtime bind mounts must use rprivate propagation")
@@ -375,9 +363,7 @@ def _validate_state(
     if service == "minio-init":
         exit_code = _integer(state.get("ExitCode"), "minio-init exit code")
         started = _parse_nonzero_timestamp(state.get("StartedAt"), "minio-init StartedAt")
-        finished = _parse_nonzero_timestamp(
-            state.get("FinishedAt"), "minio-init FinishedAt"
-        )
+        finished = _parse_nonzero_timestamp(state.get("FinishedAt"), "minio-init FinishedAt")
         if (
             status != "exited"
             or running
@@ -418,9 +404,7 @@ def _validate_restart_policy(
     if service_config.get("restart", "no") != expected_restart:
         raise ValueError(f"{service} differs from the fixed restart policy")
     host_config = _object(container.get("HostConfig"), f"host config for {service}")
-    restart_policy = _object(
-        host_config.get("RestartPolicy"), f"restart policy for {service}"
-    )
+    restart_policy = _object(host_config.get("RestartPolicy"), f"restart policy for {service}")
     if (
         restart_policy.get("Name") != expected_restart
         or restart_policy.get("MaximumRetryCount") != 0
@@ -434,9 +418,7 @@ def _validate_resource_limits(
     container: dict[str, Any],
 ) -> None:
     expected_memory, expected_nano_cpus, expected_pids = SERVICE_RESOURCE_LIMITS[service]
-    compose_memory = _decimal_bytes(
-        service_config.get("mem_limit"), f"memory limit for {service}"
-    )
+    compose_memory = _decimal_bytes(service_config.get("mem_limit"), f"memory limit for {service}")
     compose_pids = _integer(service_config.get("pids_limit"), f"PID limit for {service}")
     compose_cpus = service_config.get("cpus")
     if (
@@ -458,12 +440,8 @@ def _validate_resource_limits(
     observed_memory_swap = _integer(
         host_config.get("MemorySwap"), f"runtime memory+swap policy for {service}"
     )
-    observed_nano_cpus = _integer(
-        host_config.get("NanoCpus"), f"runtime CPU limit for {service}"
-    )
-    observed_pids = _integer(
-        host_config.get("PidsLimit"), f"runtime PID limit for {service}"
-    )
+    observed_nano_cpus = _integer(host_config.get("NanoCpus"), f"runtime CPU limit for {service}")
+    observed_pids = _integer(host_config.get("PidsLimit"), f"runtime PID limit for {service}")
     if (
         observed_memory != expected_memory
         or observed_memory_swap != 0
@@ -481,9 +459,7 @@ def _validate_port_bindings(
     host_config = _object(container.get("HostConfig"), f"host config for {service}")
     if host_config.get("PublishAllPorts") is not False:
         raise ValueError(f"{service} must disable automatic port publication")
-    raw_bindings = _object(
-        host_config.get("PortBindings"), f"runtime port bindings for {service}"
-    )
+    raw_bindings = _object(host_config.get("PortBindings"), f"runtime port bindings for {service}")
     if set(raw_bindings) != set(expected_bindings):
         raise ValueError(f"{service} runtime port bindings differ from Compose")
     for key, expected in expected_bindings.items():
@@ -532,9 +508,7 @@ def _validate_runtime_endpoint(
     normalized_name: str,
     container_id: str,
 ) -> tuple[str, str, str] | None:
-    network_id = _string(
-        endpoint.get("NetworkID"), f"network id for {service}/{logical_network}"
-    )
+    network_id = _string(endpoint.get("NetworkID"), f"network id for {service}/{logical_network}")
     if network_id != expected_network_id:
         raise ValueError(f"{service} network membership differs from inspected network")
     endpoint_id = _string(
@@ -573,9 +547,7 @@ def _validate_runtime_endpoint(
     if raw_dns_names is not None:
         dns_names = [
             _string(value, f"DNS name for {service}/{logical_network}")
-            for value in _list(
-                raw_dns_names, f"DNS names for {service}/{logical_network}"
-            )
+            for value in _list(raw_dns_names, f"DNS names for {service}/{logical_network}")
         ]
         if (
             service not in dns_names
@@ -828,9 +800,7 @@ def validate_inventory(
                 expected_ipv4,
                 expected_mac,
             ):
-                raise ValueError(
-                    f"{service}/{logical_network} reverse endpoint identity differs"
-                )
+                raise ValueError(f"{service}/{logical_network} reverse endpoint identity differs")
 
 
 def parse_compose_hashes(text: str) -> dict[str, str]:
@@ -876,9 +846,7 @@ def _read_protected(path: Path) -> str:
         ):
             raise InputError("inventory input must be a protected regular file")
         current_uid = getattr(os, "geteuid", lambda: observed.st_uid)()
-        if os.name == "posix" and (
-            observed.st_uid != current_uid or observed.st_mode & 0o077
-        ):
+        if os.name == "posix" and (observed.st_uid != current_uid or observed.st_mode & 0o077):
             raise InputError("inventory input must be a protected regular file")
         with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
             descriptor = -1
@@ -901,9 +869,7 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     parser = _Parser(add_help=True)
     parser.add_argument("--project-name", required=True)
     parser.add_argument("--profile", choices=("strict", "controlled-egress"), required=True)
-    parser.add_argument(
-        "--phase", choices=("install", "deploy", "recovery"), required=True
-    )
+    parser.add_argument("--phase", choices=("install", "deploy", "recovery"), required=True)
     parser.add_argument("--expected-config-file", required=True)
     parser.add_argument("--compose-config-json", type=Path, required=True)
     parser.add_argument("--compose-hashes", type=Path, required=True)

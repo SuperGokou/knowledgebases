@@ -125,9 +125,7 @@ async def _lock_authorized_user_target(
 
     await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(
-        select(User)
-        .where(User.id == access.user.id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == access.user.id).execution_options(populate_existing=True)
     )
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
@@ -138,9 +136,7 @@ async def _lock_authorized_user_target(
     # manager who may operate only below their own tier must not be able to hold
     # an exclusive lifecycle lock on a protected administrator.
     candidate = await session.scalar(
-        select(User)
-        .where(User.id == target_user_id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == target_user_id).execution_options(populate_existing=True)
     )
     if candidate is None:
         raise ApiError(status_code=404, code="user_not_found", message="User not found")
@@ -168,13 +164,7 @@ async def _lock_authorized_user_target(
         activity_locks,
     )
     locked_user_ids = {actor.id, target_user_id, *additional_activity_locks}
-    users = list(
-        (
-            await session.scalars(
-                locked_users_statement(locked_user_ids)
-            )
-        ).all()
-    )
+    users = list((await session.scalars(locked_users_statement(locked_user_ids))).all())
     users_by_id = {item.id: item for item in users}
     actor = users_by_id.get(actor.id)
     user = users_by_id.get(target_user_id)
@@ -384,9 +374,7 @@ async def create_user(
     password_hash = await hash_password(passwords, payload.password)
     await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(
-        select(User)
-        .where(User.id == access.user.id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == access.user.id).execution_options(populate_existing=True)
     )
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
@@ -621,10 +609,7 @@ async def retire_user(
                 code="replacement_owner_not_found",
                 message="Replacement owner not found",
             )
-        if (
-            replacement.status is not UserStatus.ACTIVE
-            or replacement.retired_at is not None
-        ):
+        if replacement.status is not UserStatus.ACTIVE or replacement.retired_at is not None:
             raise ApiError(
                 status_code=409,
                 code="replacement_owner_invalid",

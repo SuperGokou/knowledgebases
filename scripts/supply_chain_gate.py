@@ -11,11 +11,15 @@ import secrets
 import stat
 import sys
 import tomllib
+from collections import defaultdict, deque
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
+from urllib.parse import unquote
+
+from packaging.markers import InvalidMarker, Marker, UndefinedEnvironmentName
 
 Mode = Literal["inventory", "release"]
 
@@ -55,6 +59,30 @@ IMAGE_REFERENCE_PATTERN = re.compile(
 CHECKSUM_LINE_PATTERN = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._/-]+)$")
 IMAGE_SBOM_INDEX_SCHEMA = "https://knowledgebases.local/schemas/image-sbom-index-v1.schema.json"
 PLACEHOLDER_MARKERS = ("pending", "replace", "todo", "待补", "待签", "待填")
+PYTHON_MARKER_ENVIRONMENT_KEYS = frozenset(
+    {
+        "implementation_name",
+        "implementation_version",
+        "os_name",
+        "platform_machine",
+        "platform_python_implementation",
+        "platform_release",
+        "platform_system",
+        "platform_version",
+        "python_full_version",
+        "python_version",
+        "sys_platform",
+    }
+)
+REQUIRED_LOCK_INPUTS = frozenset(
+    {
+        "pyproject.toml",
+        "uv.lock",
+        "web/package.json",
+        "web/package-lock.json",
+    }
+)
+REQUIRED_SBOM_ECOSYSTEMS = frozenset({"python", "web"})
 
 
 @dataclass(frozen=True, order=True)
@@ -139,8 +167,53 @@ def _validate_configuration(
     policy: dict[str, Any],
     assets: dict[str, Any],
 ) -> None:
-    _require_list(snapshot.get("inputs"), "snapshot.inputs")
-    _require_list(snapshot.get("sboms"), "snapshot.sboms")
+    inputs = _require_list(snapshot.get("inputs"), "snapshot.inputs")
+    input_paths = [
+        _require_string(entry.get("path"), f"snapshot.inputs[{index}].path")
+        for index, entry in enumerate(inputs)
+        if isinstance(entry, dict)
+    ]
+    if len(input_paths) != len(inputs):
+        raise GateConfigurationError("snapshot.inputs must contain only objects")
+    for relative_path in input_paths:
+        posix_path = PurePosixPath(relative_path)
+        if posix_path.is_absolute() or ".." in posix_path.parts:
+            raise GateConfigurationError(f"unsafe relative path: {relative_path!r}")
+    if len(input_paths) != len(set(input_paths)) or set(input_paths) != REQUIRED_LOCK_INPUTS:
+        raise GateConfigurationError(
+            "snapshot.inputs must bind each required Python/Web manifest and lock file exactly once"
+        )
+
+    sboms = _require_list(snapshot.get("sboms"), "snapshot.sboms")
+    ecosystems = [
+        _require_string(entry.get("ecosystem"), f"snapshot.sboms[{index}].ecosystem")
+        for index, entry in enumerate(sboms)
+        if isinstance(entry, dict)
+    ]
+    if len(ecosystems) != len(sboms):
+        raise GateConfigurationError("snapshot.sboms must contain only objects")
+    if len(ecosystems) != len(set(ecosystems)) or set(ecosystems) != REQUIRED_SBOM_ECOSYSTEMS:
+        raise GateConfigurationError(
+            "snapshot.sboms must bind exactly one Python and one Web production SBOM"
+        )
+    sbom_paths = [
+        _require_string(entry.get("path"), f"snapshot.sboms[{index}].path")
+        for index, entry in enumerate(sboms)
+        if isinstance(entry, dict)
+    ]
+    if len(sbom_paths) != len(set(sbom_paths)):
+        raise GateConfigurationError("snapshot.sboms paths must be unique")
+    python_entry = next(entry for entry in sboms if entry.get("ecosystem") == "python")
+    marker_environment = python_entry.get("marker_environment")
+    if (
+        not isinstance(marker_environment, dict)
+        or set(marker_environment) != PYTHON_MARKER_ENVIRONMENT_KEYS
+        or not all(isinstance(value, str) for value in marker_environment.values())
+    ):
+        raise GateConfigurationError(
+            "the Python SBOM must declare a complete, host-independent marker_environment"
+        )
+
     policy_lists = (
         "allowed",
         "manual_review",
@@ -171,6 +244,101 @@ def _severity(mode: Mode) -> Severity:
 
 def _normalise_python_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _component_coordinates(
+    components: list[dict[str, Any]],
+    *,
+    ecosystem: Literal["python", "web"],
+    findings: list[Finding],
+    subject: str,
+) -> set[tuple[str, str]]:
+    coordinates: list[tuple[str, str]] = []
+    for component in components:
+        name = component.get("name")
+        version = component.get("version")
+        purl = component.get("purl")
+        group = component.get("group")
+        if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
+            findings.append(
+                Finding(
+                    "SBOM_COMPONENT_IDENTITY_INVALID",
+                    "error",
+                    subject,
+                    "Every component must declare a non-empty name and version.",
+                )
+            )
+            continue
+        if not isinstance(purl, str):
+            findings.append(
+                Finding(
+                    "SBOM_COMPONENT_IDENTITY_INVALID",
+                    "error",
+                    f"{name}@{version}",
+                    "Every component must declare a matching package URL.",
+                )
+            )
+            continue
+
+        base_purl = purl.split("#", maxsplit=1)[0].split("?", maxsplit=1)[0]
+        prefix = "pkg:pypi/" if ecosystem == "python" else "pkg:npm/"
+        package_and_version = base_purl.removeprefix(prefix)
+        if not base_purl.startswith(prefix) or "@" not in package_and_version:
+            findings.append(
+                Finding(
+                    "SBOM_COMPONENT_IDENTITY_INVALID",
+                    "error",
+                    f"{name}@{version}",
+                    f"Component purl is not a valid {ecosystem} package coordinate.",
+                )
+            )
+            continue
+        purl_name, purl_version = package_and_version.rsplit("@", maxsplit=1)
+        purl_name = unquote(purl_name)
+        purl_version = unquote(purl_version)
+        if ecosystem == "python":
+            component_name = _normalise_python_name(name)
+            coordinate_name = _normalise_python_name(purl_name)
+        else:
+            component_name = f"{group}/{name}" if isinstance(group, str) and group else name
+            coordinate_name = purl_name
+        if component_name != coordinate_name or version != purl_version:
+            findings.append(
+                Finding(
+                    "SBOM_COMPONENT_IDENTITY_INVALID",
+                    "error",
+                    f"{name}@{version}",
+                    "Component name/version and purl do not describe the same package.",
+                )
+            )
+            continue
+        coordinates.append((coordinate_name, version))
+
+    coordinate_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for coordinate in coordinates:
+        coordinate_counts[coordinate] += 1
+    for (name, version), count in sorted(coordinate_counts.items()):
+        if count > 1:
+            findings.append(
+                Finding(
+                    "SBOM_COMPONENT_COORDINATE_DUPLICATE",
+                    "error",
+                    f"{name}@{version}",
+                    "A package coordinate must occur exactly once in the SBOM.",
+                )
+            )
+    return set(coordinates)
+
+
+def _marker_matches(marker: Any, environment: dict[str, str], *, extra: str = "") -> bool:
+    if marker is None:
+        return True
+    if not isinstance(marker, str) or not marker.strip():
+        raise GateConfigurationError("uv.lock dependency markers must be non-empty strings")
+    try:
+        return Marker(marker).evaluate({**environment, "extra": extra})
+    except (InvalidMarker, KeyError, UndefinedEnvironmentName) as exc:
+        raise GateConfigurationError(f"cannot evaluate uv.lock marker {marker!r}: {exc}") from exc
 
 
 def _extract_licenses(component: dict[str, Any]) -> list[str]:
@@ -239,6 +407,7 @@ def _check_bound_file(
 
 def _check_python_lock_coverage(
     repo: Path,
+    entry: dict[str, Any],
     components: list[dict[str, Any]],
     findings: list[Finding],
 ) -> None:
@@ -251,19 +420,26 @@ def _check_python_lock_coverage(
         findings.append(Finding("PYTHON_LOCK_INVALID", "error", "uv.lock", str(exc)))
         return
 
-    packages = lock.get("package")
-    if not isinstance(packages, list):
+    raw_packages = lock.get("package")
+    if not isinstance(raw_packages, list):
         findings.append(
             Finding("PYTHON_LOCK_INVALID", "error", "uv.lock", "Missing package array.")
         )
         return
+    packages = [package for package in raw_packages if isinstance(package, dict)]
+    if len(packages) != len(raw_packages):
+        findings.append(
+            Finding(
+                "PYTHON_LOCK_INVALID",
+                "error",
+                "uv.lock",
+                "Every package record must be an object.",
+            )
+        )
+        return
     project_name = project.get("project", {}).get("name")
     project_version = project.get("project", {}).get("version")
-    roots = [
-        package
-        for package in packages
-        if isinstance(package, dict) and package.get("name") == project_name
-    ]
+    roots = [package for package in packages if package.get("name") == project_name]
     if len(roots) != 1 or roots[0].get("version") != project_version:
         findings.append(
             Finding(
@@ -275,41 +451,132 @@ def _check_python_lock_coverage(
         )
         return
 
-    locked = {
-        (_normalise_python_name(str(package["name"])), str(package["version"]))
-        for package in packages
-        if isinstance(package, dict)
-        and package.get("name") != project_name
-        and isinstance(package.get("name"), str)
-        and isinstance(package.get("version"), str)
-    }
-    sbom_coordinates = {
-        (_normalise_python_name(str(component.get("name", ""))), str(component.get("version", "")))
-        for component in components
-    }
-    for name, version in sorted(sbom_coordinates - locked):
+    raw_environment = entry.get("marker_environment")
+    if not isinstance(raw_environment, dict):
+        raise GateConfigurationError("Python SBOM marker_environment is missing")
+    marker_environment = {str(key): str(value) for key, value in raw_environment.items()}
+
+    packages_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for package in packages:
+        name = package.get("name")
+        version = package.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            findings.append(
+                Finding(
+                    "PYTHON_LOCK_INVALID",
+                    "error",
+                    "uv.lock",
+                    "Every package record must declare a string name and version.",
+                )
+            )
+            return
+        packages_by_name[_normalise_python_name(name)].append(package)
+
+    selected_extras: dict[tuple[str, str], set[str]] = {}
+    selected_packages: dict[tuple[str, str], dict[str, Any]] = {}
+    queue: deque[tuple[str, str]] = deque()
+
+    def dependency_extras(dependency: dict[str, Any]) -> set[str]:
+        raw_extras = dependency.get("extra", dependency.get("extras", []))
+        if isinstance(raw_extras, str):
+            return {raw_extras}
+        if isinstance(raw_extras, list) and all(isinstance(item, str) for item in raw_extras):
+            return set(raw_extras)
+        raise GateConfigurationError("uv.lock dependency extras must be strings")
+
+    def package_is_active(package: dict[str, Any]) -> bool:
+        raw_markers = package.get(
+            "resolution-markers",
+            package.get("resolution-marker"),
+        )
+        if raw_markers is None:
+            return True
+        markers = [raw_markers] if isinstance(raw_markers, str) else raw_markers
+        if not isinstance(markers, list) or not markers:
+            raise GateConfigurationError("uv.lock resolution markers must contain strings")
+        return any(_marker_matches(marker, marker_environment) for marker in markers)
+
+    def enqueue_dependency(dependency: Any, *, extra: str = "") -> None:
+        if not isinstance(dependency, dict) or not isinstance(dependency.get("name"), str):
+            raise GateConfigurationError("uv.lock dependencies must be named objects")
+        if not _marker_matches(dependency.get("marker"), marker_environment, extra=extra):
+            return
+        name = _normalise_python_name(dependency["name"])
+        candidates = packages_by_name.get(name, [])
+        expected_version = dependency.get("version")
+        if expected_version is not None:
+            if not isinstance(expected_version, str):
+                raise GateConfigurationError("uv.lock dependency versions must be strings")
+            candidates = [
+                package for package in candidates if package.get("version") == expected_version
+            ]
+        candidates = [package for package in candidates if package_is_active(package)]
+        if len(candidates) != 1:
+            raise GateConfigurationError(
+                f"uv.lock dependency {name!r} resolves to {len(candidates)} active package records"
+            )
+        package = candidates[0]
+        coordinate = (name, str(package["version"]))
+        requested_extras = dependency_extras(dependency)
+        existing_extras = selected_extras.get(coordinate)
+        if existing_extras is None:
+            selected_extras[coordinate] = requested_extras
+            selected_packages[coordinate] = package
+            queue.append(coordinate)
+        elif not requested_extras <= existing_extras:
+            existing_extras.update(requested_extras)
+            queue.append(coordinate)
+
+    for dependency in roots[0].get("dependencies", []):
+        enqueue_dependency(dependency)
+
+    processed_mandatory: set[tuple[str, str]] = set()
+    processed_extras: dict[tuple[str, str], set[str]] = defaultdict(set)
+    while queue:
+        coordinate = queue.popleft()
+        package = selected_packages[coordinate]
+        if coordinate not in processed_mandatory:
+            for dependency in package.get("dependencies", []):
+                enqueue_dependency(dependency)
+            processed_mandatory.add(coordinate)
+
+        optional_dependencies = package.get("optional-dependencies", {})
+        if not isinstance(optional_dependencies, dict):
+            raise GateConfigurationError("uv.lock optional-dependencies must be an object")
+        pending_extras = selected_extras[coordinate] - processed_extras[coordinate]
+        for extra in sorted(pending_extras):
+            dependencies = optional_dependencies.get(extra)
+            if not isinstance(dependencies, list):
+                raise GateConfigurationError(
+                    f"uv.lock package {coordinate[0]!r} does not define requested extra {extra!r}"
+                )
+            for dependency in dependencies:
+                enqueue_dependency(dependency, extra=extra)
+            processed_extras[coordinate].add(extra)
+
+    production_coordinates = set(selected_packages)
+    sbom_coordinates = _component_coordinates(
+        components,
+        ecosystem="python",
+        findings=findings,
+        subject=str(entry.get("path", "Python SBOM")),
+    )
+    for name, version in sorted(sbom_coordinates - production_coordinates):
         findings.append(
             Finding(
                 "PYTHON_SBOM_COMPONENT_NOT_LOCKED",
                 "error",
                 f"{name}@{version}",
-                "Python SBOM component is not present in uv.lock.",
+                "Python SBOM component is outside the target production lock closure.",
             )
         )
-
-    direct_dependencies = {
-        _normalise_python_name(str(dependency["name"]))
-        for dependency in roots[0].get("dependencies", [])
-        if isinstance(dependency, dict) and isinstance(dependency.get("name"), str)
-    }
-    sbom_names = {name for name, _ in sbom_coordinates}
-    for name in sorted(direct_dependencies - sbom_names):
+    for name, version in sorted(production_coordinates - sbom_coordinates):
         findings.append(
             Finding(
-                "PYTHON_DIRECT_DEPENDENCY_MISSING_FROM_SBOM",
+                "PYTHON_SBOM_PRODUCTION_COMPONENT_MISSING",
                 "error",
-                name,
-                "A direct production dependency is absent from the Python SBOM.",
+                f"{name}@{version}",
+                "A target production dependency reachable from uv.lock is absent from the SBOM.",
             )
         )
 
@@ -363,15 +630,12 @@ def _check_web_lock_coverage(
         version = value.get("version")
         if isinstance(version, str):
             locked.add((_npm_lock_name(dependency_path), version))
-    sbom_coordinates = {
-        (
-            f"{component['group']}/{component['name']}"
-            if component.get("group")
-            else str(component.get("name", "")),
-            str(component.get("version", "")),
-        )
-        for component in components
-    }
+    sbom_coordinates = _component_coordinates(
+        components,
+        ecosystem="web",
+        findings=findings,
+        subject="artifacts/acceptance/sbom-web.cdx.json",
+    )
     for name, version in sorted(sbom_coordinates - locked):
         findings.append(
             Finding(
@@ -381,16 +645,16 @@ def _check_web_lock_coverage(
                 "Web SBOM component is not present in the production npm lock set.",
             )
         )
-
-    direct_dependencies = set(package.get("dependencies", {}))
-    sbom_names = {name for name, _ in sbom_coordinates}
-    for name in sorted(direct_dependencies - sbom_names):
+    for name, version in sorted(locked - sbom_coordinates):
         findings.append(
             Finding(
-                "WEB_DIRECT_DEPENDENCY_MISSING_FROM_SBOM",
+                "WEB_SBOM_PRODUCTION_COMPONENT_MISSING",
                 "error",
-                name,
-                "A direct production dependency is absent from the Web SBOM.",
+                f"{name}@{version}",
+                (
+                    "A production package represented by package-lock.json is absent "
+                    "from the Web SBOM."
+                ),
             )
         )
 
@@ -548,7 +812,7 @@ def _check_sbom(
 
     ecosystem = entry.get("ecosystem")
     if ecosystem == "python":
-        _check_python_lock_coverage(repo, components, findings)
+        _check_python_lock_coverage(repo, entry, components, findings)
     elif ecosystem == "web":
         _check_web_lock_coverage(repo, components, findings)
     else:

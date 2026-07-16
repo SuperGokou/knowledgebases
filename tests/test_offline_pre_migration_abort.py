@@ -6,9 +6,13 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -68,9 +72,9 @@ def test_install_completed_handoff_is_exactly_idempotent() -> None:
     verifier = install.split("verify_completed_install_handoff() (", 1)[1].split(
         "\n)\n\ncleanup_install_contract()", 1
     )[0]
-    completed_handoff = install.split(
-        'set -- "$state_directory"/installed-*.json', 1
-    )[1].split('if [ -e "$state_file" ]; then', 1)[0]
+    completed_handoff = install.split('set -- "$state_directory"/installed-*.json', 1)[1].split(
+        'if [ -e "$state_file" ]; then', 1
+    )[0]
 
     for required in (
         "validate-installed-receipt",
@@ -118,6 +122,9 @@ def test_install_resume_removes_only_exact_stopped_preflight_residuals() -> None
 
 def test_install_has_separate_bound_adoption_and_abort_entry_contracts() -> None:
     install = _source("install-offline.sh")
+    abort_parser = install.split(
+        'elif [ "$#" -eq 9 ] && [ "$1" = "--abort-pre-migration" ]; then', 1
+    )[1].split('else\n  echo "usage:', 1)[0]
 
     for token in (
         "--adoption-journal",
@@ -133,6 +140,12 @@ def test_install_has_separate_bound_adoption_and_abort_entry_contracts() -> None
     ):
         assert token in install
     assert "offline-pre-migration-abort.py" in install
+    assert "--evidence-public-key" not in abort_parser
+    assert "--evidence-signing-key" not in abort_parser
+    assert 'python3 -I "$abort_helper" validate-evidence-trust-root >/dev/null' in install
+    assert install.index("validate-evidence-trust-root") < install.index(
+        "offline_acquire_lock install"
+    )
 
 
 def test_preflight_oneoffs_are_bound_to_the_contract_and_adoption_transaction() -> None:
@@ -152,6 +165,7 @@ def test_preflight_oneoffs_are_bound_to_the_contract_and_adoption_transaction() 
 
 def test_abort_helper_exposes_a_strict_fail_closed_contract() -> None:
     helper = _source("offline-pre-migration-abort.py")
+    parser = helper.split("def _parser()", 1)[1].split("\ndef main(", 1)[0]
 
     for token in (
         "heyi-adoption-transaction-v1",
@@ -165,8 +179,15 @@ def test_abort_helper_exposes_a_strict_fail_closed_contract() -> None:
         "heyi-kb-offline-reconcile.timer",
         "host_isolation_verification",
         "target_resource_counts_after",
+        "/etc/heyi-adoption/trusted-evidence-public.pem",
+        "/etc/heyi-adoption/trusted-evidence-public.sha256",
+        "/run/heyi-adoption-signing/evidence-signing.key",
+        "heyi-adoption-evidence-key-pair-v1",
+        "validate-evidence-trust-root",
     ):
         assert token in helper
+    assert "--evidence-public-key" not in parser
+    assert "--evidence-signing-key" not in parser
     for forbidden in (
         "docker system prune",
         "docker volume prune",
@@ -176,6 +197,246 @@ def test_abort_helper_exposes_a_strict_fail_closed_contract() -> None:
         "systemctl restart docker",
     ):
         assert forbidden not in helper
+
+
+def test_abort_entry_rejects_operator_selected_evidence_keys_before_mutation(
+    tmp_path: Path,
+) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("POSIX sh is unavailable")
+    mutation_root = tmp_path / "must-remain-empty"
+    mutation_root.mkdir()
+
+    rejected = subprocess.run(
+        [
+            shell,
+            str(DEPLOY / "install-offline.sh"),
+            "--abort-pre-migration",
+            "--adoption-journal",
+            str(tmp_path / "journal.json"),
+            "--adoption-binding-key",
+            str(tmp_path / "binding.key"),
+            "--evidence-signing-key",
+            str(tmp_path / "attacker.key"),
+            "--evidence-public-key",
+            str(tmp_path / "attacker.pem"),
+            "--host-isolation-baseline",
+            str(tmp_path / "baseline.json"),
+            "--host-isolation-hmac-key",
+            str(tmp_path / "host.key"),
+        ],
+        cwd=mutation_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert rejected.returncode == 64
+    assert list(mutation_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ("wrong_fingerprint", "wrong_private_key"),
+)
+def test_abort_trust_attacks_fail_before_any_resource_mutation(
+    attack: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_abort_module()
+    contract = "b" * 64
+    public_key = b"trusted public key"
+    fingerprint = hashlib.sha256(public_key).hexdigest().encode("ascii") + b"\n"
+    signing_key = b"trusted private key"
+    if attack == "wrong_fingerprint":
+        fingerprint = b"0" * 64 + b"\n"
+    elif attack == "wrong_private_key":
+        signing_key = b"attacker private key"
+
+    material = {
+        module.TRUSTED_EVIDENCE_PUBLIC_KEY: public_key,
+        module.TRUSTED_EVIDENCE_PUBLIC_KEY_SHA256: fingerprint,
+        module.TRUSTED_EVIDENCE_SIGNING_KEY: signing_key,
+    }
+    mutation_events: list[tuple[str, ...]] = []
+
+    def protected(path: Path, **_kwargs: object) -> bytes:
+        return material[path]
+
+    class MutationTrackingRunner:
+        def validate_evidence_key_pair(self, **kwargs: bytes) -> None:
+            if kwargs["signing_key"] != b"trusted private key":
+                raise module.AbortError(
+                    "ephemeral adoption signer does not match the independently trusted public key"
+                )
+
+        def run(self, argv: tuple[str, ...], **_kwargs: object) -> str:
+            mutation_events.append(argv)
+            raise AssertionError("resource command reached before trust validation")
+
+        def docker_json(self, argv: tuple[str, ...]) -> object:
+            mutation_events.append(argv)
+            raise AssertionError("Docker reached before trust validation")
+
+    monkeypatch.setattr(module, "_require_root_linux", lambda: None)
+    monkeypatch.setattr(module, "_self_bound_contract", lambda: contract)
+    monkeypatch.setattr(module, "_protected_trust_file", protected)
+    monkeypatch.setattr(
+        module,
+        "validate_journal",
+        lambda *_args, **_kwargs: pytest.fail("journal validation reached before trust validation"),
+    )
+    arguments = module.AbortArguments(
+        journal=tmp_path / "journal.json",
+        binding_key=tmp_path / "binding.key",
+        host_baseline=tmp_path / "baseline.json",
+        host_hmac_key=tmp_path / "host.key",
+        execute=True,
+        project=module.PROJECT,
+        contract=contract,
+        adoption_transaction="a" * 32,
+        plan="c" * 64,
+        retirement_receipt="d" * 64,
+        restore_boundary=module.RESTORE_BOUNDARY,
+    )
+
+    with pytest.raises(module.AbortError):
+        module.abort_pre_migration(arguments, runner=MutationTrackingRunner())
+
+    assert mutation_events == []
+    assert not (tmp_path / ".target-pre-migration-abort.pending").exists()
+    assert not (tmp_path / "target-pre-migration-abort").exists()
+
+
+def test_fixed_trust_root_real_openssl_challenge_rejects_wrong_private_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if (
+        sys.platform != "linux"
+        or getattr(os, "geteuid", lambda: -1)() != 0
+        or not Path("/usr/bin/openssl").is_file()
+    ):
+        pytest.skip("the root Linux OpenSSL trust boundary is unavailable")
+    trusted_private = tmp_path / "trusted.key"
+    trusted_public = tmp_path / "trusted.pem"
+    attacker_private = tmp_path / "attacker.key"
+    for private in (trusted_private, attacker_private):
+        subprocess.run(
+            [
+                "/usr/bin/openssl",
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+                str(private),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        private.chmod(0o400)
+    subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "pkey",
+            "-in",
+            str(trusted_private),
+            "-pubout",
+            "-out",
+            str(trusted_public),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    trusted_public.chmod(0o400)
+    fingerprint = tmp_path / "trusted.sha256"
+    fingerprint.write_text(
+        hashlib.sha256(trusted_public.read_bytes()).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    fingerprint.chmod(0o400)
+    module = _load_abort_module()
+    monkeypatch.setattr(
+        module,
+        "TRUSTED_EVIDENCE_PUBLIC_KEY",
+        trusted_public,
+    )
+    monkeypatch.setattr(
+        module,
+        "TRUSTED_EVIDENCE_PUBLIC_KEY_SHA256",
+        fingerprint,
+    )
+    monkeypatch.setattr(module, "TRUSTED_EVIDENCE_SIGNING_KEY", attacker_private)
+    monkeypatch.setattr(
+        module,
+        "_protected_trust_file",
+        lambda path, **_kwargs: path.read_bytes(),
+    )
+
+    with pytest.raises(
+        module.AbortError,
+        match="does not match the independently trusted public key",
+    ):
+        module._validate_evidence_trust_root(module.Runner(), contract="b" * 64)
+
+    monkeypatch.setattr(module, "TRUSTED_EVIDENCE_SIGNING_KEY", trusted_private)
+    assert (
+        module._validate_evidence_trust_root(module.Runner(), contract="b" * 64)
+        == hashlib.sha256(trusted_public.read_bytes()).hexdigest()
+    )
+    assert set(tmp_path.iterdir()) == {
+        trusted_private,
+        trusted_public,
+        attacker_private,
+        fingerprint,
+    }
+
+
+def test_trust_validator_accepts_a_pre_materialization_challenge_context(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_abort_module()
+    context = "b" * 64
+    observed: list[str] = []
+
+    monkeypatch.setattr(module, "_require_root_linux", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "_self_bound_contract",
+        lambda: pytest.fail("explicit pre-materialization context must not require a release path"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_validate_evidence_trust_root",
+        lambda _runner, *, contract: observed.append(contract) or ("c" * 64),
+    )
+
+    assert (
+        module.main(
+            [
+                "validate-evidence-trust-root",
+                "--challenge-context-sha256",
+                context,
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert observed == [context]
+    assert result == {
+        "challenge_context_sha256": context,
+        "public_key_sha256": "c" * 64,
+        "schema_version": 1,
+        "status": "verified",
+    }
 
 
 def test_abort_intent_command_is_exact_and_never_reuses_committed_clear() -> None:
@@ -495,13 +756,26 @@ def test_abort_state_closes_before_migration_command_runs(
         module._read_install_state(journal, pending)
 
 
-def test_abort_docker_inventory_denies_unknown_or_unbound_containers() -> None:
-    module = _load_abort_module()
-    contract = "b" * 64
-    transaction = "a" * 32
-    release_root = Path("/srv/heyi-knowledgebases-offline/releases") / contract
-    container_id = "c" * 64
-    document = {
+def _api_preflight_mounts(module: ModuleType) -> list[dict[str, object]]:
+    return [
+        {
+            "Type": "bind",
+            "RW": False,
+            "Source": str(module.DATA_ROOT / "capacity-probe"),
+            "Destination": "/var/lib/kb-capacity",
+        },
+    ]
+
+
+def _api_preflight_container(
+    module: ModuleType,
+    *,
+    contract: str,
+    transaction: str,
+    release_root: Path,
+    container_id: str,
+) -> dict[str, Any]:
+    return {
         "Id": container_id,
         "Image": "sha256:" + "d" * 64,
         "Config": {
@@ -521,15 +795,62 @@ def test_abort_docker_inventory_denies_unknown_or_unbound_containers() -> None:
         },
         "HostConfig": {"NetworkMode": "none"},
         "State": {"Running": False},
-        "Mounts": [
-            {
-                "Type": "bind",
-                "RW": False,
-                "Source": str(module.DATA_ROOT / "capacity-probe"),
-                "Destination": "/var/lib/kb-capacity",
-            }
-        ],
+        "Mounts": _api_preflight_mounts(module),
     }
+
+
+def test_abort_api_preflight_mount_contract_accepts_exact_read_only_capacity_probe() -> None:
+    module = _load_abort_module()
+
+    assert module._container_mounts_match_contract(
+        "api-preflight",
+        _api_preflight_mounts(module),
+        Path("/srv/heyi-knowledgebases-offline/releases") / ("b" * 64),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mount_index", "field", "value"),
+    [
+        (0, "Source", "/srv/heyi-knowledgebases-offline/data/capacity-probe-drift"),
+        (0, "Destination", "/var/lib/kb-capacity-drift"),
+        (0, "RW", True),
+    ],
+    ids=[
+        "capacity-source-drift",
+        "capacity-destination-drift",
+        "capacity-must-be-read-only",
+    ],
+)
+def test_abort_api_preflight_mount_contract_rejects_drift_or_wrong_access_mode(
+    mount_index: int,
+    field: str,
+    value: object,
+) -> None:
+    module = _load_abort_module()
+    mounts = _api_preflight_mounts(module)
+    mounts[mount_index][field] = value
+
+    assert not module._container_mounts_match_contract(
+        "api-preflight",
+        mounts,
+        Path("/srv/heyi-knowledgebases-offline/releases") / ("b" * 64),
+    )
+
+
+def test_abort_docker_inventory_denies_unknown_or_unbound_containers() -> None:
+    module = _load_abort_module()
+    contract = "b" * 64
+    transaction = "a" * 32
+    release_root = Path("/srv/heyi-knowledgebases-offline/releases") / contract
+    container_id = "c" * 64
+    document = _api_preflight_container(
+        module,
+        contract=contract,
+        transaction=transaction,
+        release_root=release_root,
+        container_id=container_id,
+    )
 
     class FakeRunner:
         def run(self, _argv: tuple[str, ...]) -> str:
@@ -836,8 +1157,6 @@ def test_abort_retry_revalidates_final_receipt_then_preserves_dry_run_schema(
     release_root = tmp_path / "releases"
     (release_root / contract).mkdir(parents=True)
     journal_path = transaction_root / "journal.json"
-    public_key = tmp_path / "public.pem"
-    public_key.write_text("public", encoding="utf-8")
     journal = module.Journal(
         journal_path,
         "c" * 64,
@@ -845,6 +1164,12 @@ def test_abort_retry_revalidates_final_receipt_then_preserves_dry_run_schema(
     )
     monkeypatch.setattr(module, "RELEASE_ROOT", release_root)
     monkeypatch.setattr(module, "_require_root_linux", lambda: None)
+    monkeypatch.setattr(module, "_self_bound_contract", lambda: contract)
+    monkeypatch.setattr(
+        module,
+        "_validate_evidence_trust_root",
+        lambda *_args, **_kwargs: "d" * 64,
+    )
     monkeypatch.setattr(module, "validate_journal", lambda *_args, **_kwargs: journal)
     monkeypatch.setattr(module, "_protected_file", lambda path, **_kwargs: path.read_bytes())
     monkeypatch.setattr(
@@ -855,8 +1180,6 @@ def test_abort_retry_revalidates_final_receipt_then_preserves_dry_run_schema(
     arguments = module.AbortArguments(
         journal=journal_path,
         binding_key=tmp_path / "binding.key",
-        signing_key=tmp_path / "signing.key",
-        public_key=public_key,
         host_baseline=tmp_path / "baseline.json",
         host_hmac_key=tmp_path / "host.key",
         execute=False,

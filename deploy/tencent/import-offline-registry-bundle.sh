@@ -10,12 +10,18 @@ bundle_root=$1
 trusted_public_key=$2
 release_env_file=$3
 release_manifest=$release_env_file.images
+canonical_trusted_public_key=/etc/heyi-release/trusted-release-public.pem
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=deploy/tencent/offline-operation-common.sh
 . "$script_dir/offline-operation-common.sh"
 
 offline_acquire_lock registry-import
 offline_clear_inherited_environment
+
+if [ "$trusted_public_key" != "$canonical_trusted_public_key" ]; then
+  offline_fail registry-import \
+    "trusted release public key must be the canonical host trust root" 65
+fi
 
 validate_protected_path() {
   label=$1
@@ -124,6 +130,10 @@ copy_stable_control_file "$release_env_file" "$import_snapshot/operator-release.
 copy_stable_control_file "$release_manifest" "$import_snapshot/operator-release.env.images"
 
 trusted_public_key=$import_snapshot/trusted-release.pem
+trusted_key_digest=$(sha256sum "$trusted_public_key" | awk '{print $1}') || exit 66
+if ! printf '%s\n' "$trusted_key_digest" | grep -Eq '^[0-9a-f]{64}$'; then
+  offline_fail registry-import "trusted release public key digest is invalid" 65
+fi
 checksums=$import_snapshot/SHA256SUMS
 signature=$import_snapshot/SHA256SUMS.sig
 control=$import_snapshot/bundle.control
@@ -405,7 +415,7 @@ while IFS= read -r control_line || [ -n "$control_line" ]; do
       ;;
     RELEASE_SEQUENCE)
       case "$value" in
-        ""|0|*[!0-9]*) offline_fail registry-import "release sequence is invalid" 65 ;;
+        ""|0*|*[!0-9]*) offline_fail registry-import "release sequence is invalid" 65 ;;
       esac
       if [ "${#value}" -gt 18 ]; then
         offline_fail registry-import "release sequence exceeds the signed boundary" 65
@@ -414,8 +424,12 @@ while IFS= read -r control_line || [ -n "$control_line" ]; do
       ;;
     RELEASE_ID)
       case "$value" in
-        ""|*[!A-Za-z0-9._-]*) offline_fail registry-import "release ID is invalid" 65 ;;
+        ""|"."|".."|*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*|*[!A-Za-z0-9])
+          offline_fail registry-import "release ID is invalid" 65
+          ;;
       esac
+      [ "${#value}" -le 128 ] || \
+        offline_fail registry-import "release ID exceeds the signed boundary" 65
       release_id=$value
       ;;
     RELEASE_GIT_SHA)
@@ -456,6 +470,167 @@ if [ -z "$registry_image" ] || [ -z "$registry_image_id" ] || \
   offline_fail registry-import "bootstrap registry identity is incomplete" 65
 fi
 
+release_digest=$(sha256sum "$operator_release" | awk '{print $1}') || exit 66
+manifest_digest=$(sha256sum "$operator_manifest" | awk '{print $1}') || exit 66
+checksums_digest=$(sha256sum "$checksums" | awk '{print $1}') || exit 66
+signature_digest=$(sha256sum "$signature" | awk '{print $1}') || exit 66
+release_asset_checksums=$(mktemp "$OFFLINE_TMPDIR/release-asset-checksums.XXXXXXXXXX")
+if ! sed -n '/  release\//p' "$checksums" | LC_ALL=C sort \
+  > "$release_asset_checksums"; then
+  rm -f "$release_asset_checksums"
+  offline_fail registry-import "cannot normalize signed release asset checksums" 66
+fi
+if [ ! -s "$release_asset_checksums" ]; then
+  rm -f "$release_asset_checksums"
+  offline_fail registry-import "signed release asset checksums are missing" 65
+fi
+release_assets_digest=$(sha256sum "$release_asset_checksums" | awk '{print $1}') || {
+  rm -f "$release_asset_checksums"
+  exit 66
+}
+rm -f "$release_asset_checksums"
+expected_receipt=$import_snapshot/expected-registry-import-receipt.json
+expected_highest=$import_snapshot/expected-highest-release.json
+printf '%s\n' \
+  "{\"schema_version\":2,\"kind\":\"offline-registry-import\",\"status\":\"verified\",\"release_sequence\":$release_sequence,\"release_id\":\"$release_id\",\"release_git_sha\":\"$release_git_sha\",\"release_schema_head\":\"$release_schema_head\",\"release_sha256\":\"$release_digest\",\"manifest_sha256\":\"$manifest_digest\",\"release_assets_sha256\":\"$release_assets_digest\",\"checksum_set_sha256\":\"$checksums_digest\",\"signature_sha256\":\"$signature_digest\",\"trusted_key_sha256\":\"$trusted_key_digest\"}" \
+  > "$expected_receipt" || exit 73
+printf '%s\n' \
+  "{\"schema_version\":2,\"release_sequence\":$release_sequence,\"release_id\":\"$release_id\",\"release_git_sha\":\"$release_git_sha\",\"release_schema_head\":\"$release_schema_head\",\"manifest_sha256\":\"$manifest_digest\",\"release_assets_sha256\":\"$release_assets_digest\",\"trusted_key_sha256\":\"$trusted_key_digest\"}" \
+  > "$expected_highest" || exit 73
+chmod 0400 "$expected_receipt" "$expected_highest" || exit 73
+sync -f "$expected_receipt" || exit 73
+sync -f "$expected_highest" || exit 73
+
+validate_expected_trust_documents() {
+  if ! python3 -I -c '
+import json
+import pathlib
+import re
+import sys
+
+
+def reject_duplicates(pairs):
+    document = {}
+    for name, value in pairs:
+        if name in document:
+            raise ValueError("duplicate JSON key")
+        document[name] = value
+    return document
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+(
+    receipt_path,
+    highest_path,
+    sequence_text,
+    release_id,
+    release_git_sha,
+    release_schema_head,
+    release_sha256,
+    manifest_sha256,
+    release_assets_sha256,
+    checksum_set_sha256,
+    signature_sha256,
+    trusted_key_sha256,
+) = sys.argv[1:]
+if re.fullmatch(r"[1-9][0-9]{0,17}", sequence_text) is None:
+    raise SystemExit(1)
+if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?", release_id) is None:
+    raise SystemExit(1)
+
+load_options = {
+    "object_pairs_hook": reject_duplicates,
+    "parse_constant": reject_constant,
+}
+receipt = json.loads(pathlib.Path(receipt_path).read_text(encoding="utf-8"), **load_options)
+highest = json.loads(pathlib.Path(highest_path).read_text(encoding="utf-8"), **load_options)
+sequence = int(sequence_text)
+expected_receipt = {
+    "schema_version": 2,
+    "kind": "offline-registry-import",
+    "status": "verified",
+    "release_sequence": sequence,
+    "release_id": release_id,
+    "release_git_sha": release_git_sha,
+    "release_schema_head": release_schema_head,
+    "release_sha256": release_sha256,
+    "manifest_sha256": manifest_sha256,
+    "release_assets_sha256": release_assets_sha256,
+    "checksum_set_sha256": checksum_set_sha256,
+    "signature_sha256": signature_sha256,
+    "trusted_key_sha256": trusted_key_sha256,
+}
+expected_highest = {
+    key: expected_receipt[key]
+    for key in (
+        "schema_version",
+        "release_sequence",
+        "release_id",
+        "release_git_sha",
+        "release_schema_head",
+        "manifest_sha256",
+        "release_assets_sha256",
+        "trusted_key_sha256",
+    )
+}
+valid = (
+    isinstance(receipt, dict)
+    and isinstance(highest, dict)
+    and type(receipt.get("release_sequence")) is int
+    and type(highest.get("release_sequence")) is int
+    and receipt == expected_receipt
+    and highest == expected_highest
+)
+if not valid:
+    raise SystemExit(1)
+' "$expected_receipt" "$expected_highest" "$release_sequence" "$release_id" \
+    "$release_git_sha" "$release_schema_head" "$release_digest" "$manifest_digest" \
+    "$release_assets_digest" "$checksums_digest" "$signature_digest" \
+    "$trusted_key_digest"; then
+    offline_fail registry-import \
+      "deterministic release trust documents failed strict self-validation" 65
+  fi
+}
+
+# Fail before any Docker or durable trust-state mutation if the generated JSON
+# cannot be parsed as the exact schema and types that later readers require.
+validate_expected_trust_documents
+
+tab=$(printf '\t')
+verify_local_signed_images() {
+  while IFS="$tab" read -r image expected_id expected_os expected_arch extra || \
+    [ -n "${image:-}" ]; do
+    if [ -z "${image:-}" ] || [ -n "${extra:-}" ] || \
+      ! printf '%s\n' "$image" | grep -Eq '^127\.0\.0\.1:5000/.+@sha256:[0-9a-f]{64}$' || \
+      ! printf '%s\n' "$expected_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || \
+      [ "$expected_os" != linux ] || [ "$expected_arch" != amd64 ]; then
+      offline_fail registry-import "signed image manifest entry is invalid" 65
+    fi
+    observed_id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) || \
+      offline_fail registry-import "previously imported image is missing" 65
+    observed_os=$(docker image inspect --format '{{.Os}}' "$image") || exit 66
+    observed_arch=$(docker image inspect --format '{{.Architecture}}' "$image") || exit 66
+    observed_repo_digests=$(docker image inspect \
+      --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image") || exit 66
+    reference_without_digest=${image%@sha256:*}
+    digest=sha256:${image##*@sha256:}
+    last_component=${reference_without_digest##*/}
+    case "$last_component" in
+      *:*) repository=${reference_without_digest%:*} ;;
+      *) repository=$reference_without_digest ;;
+    esac
+    if [ "$observed_id" != "$expected_id" ] || [ "$observed_os" != linux ] || \
+      [ "$observed_arch" != amd64 ] || \
+      ! printf '%s\n' "$observed_repo_digests" | grep -Fqx "$repository@$digest"; then
+      offline_fail registry-import \
+        "previously imported image identity, platform or RepoDigest differs" 65
+    fi
+  done < "$signed_manifest"
+}
+
 trust_state_directory=/srv/heyi-knowledgebases-offline/state
 for protected_directory in /srv /srv/heyi-knowledgebases-offline; do
   if [ -L "$protected_directory" ]; then
@@ -483,34 +658,82 @@ if [ -e "$highest_release_file" ]; then
   fi
   highest_release_sequence=$(python3 -I -c '
 import json, pathlib, re, sys
-document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+def reject_duplicates(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON key")
+        result[name] = value
+    return result
+
+document = json.loads(
+    pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+)
 target_schema_head = sys.argv[2]
-required = {"schema_version", "release_sequence", "release_id", "release_git_sha", "release_schema_head", "manifest_sha256", "release_assets_sha256"}
+trusted_key_sha256 = sys.argv[3]
+required = {
+    "schema_version", "release_sequence", "release_id", "release_git_sha",
+    "release_schema_head", "manifest_sha256", "release_assets_sha256",
+    "trusted_key_sha256",
+}
 schema_head = document.get("release_schema_head")
 schema_match = re.fullmatch(r"([0-9]{8})_([0-9]{4})", schema_head) if isinstance(schema_head, str) else None
 target_match = re.fullmatch(r"([0-9]{8})_([0-9]{4})", target_schema_head)
 valid = (
     set(document) == required
-    and document["schema_version"] == 1
-    and isinstance(document["release_sequence"], int)
+    and document["schema_version"] == 2
+    and type(document["release_sequence"]) is int
     and 0 < document["release_sequence"] <= 999_999_999_999_999_999
     and isinstance(document["release_id"], str)
-    and re.fullmatch(r"[A-Za-z0-9._-]+", document["release_id"])
+    and re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?",
+        document["release_id"],
+    )
     and isinstance(document["release_git_sha"], str)
     and re.fullmatch(r"[0-9a-f]{40}", document["release_git_sha"])
     and schema_match is not None
     and target_match is not None
     and tuple(map(int, schema_match.groups())) <= tuple(map(int, target_match.groups()))
     and all(re.fullmatch(r"[0-9a-f]{64}", document[key]) for key in ("manifest_sha256", "release_assets_sha256"))
+    and re.fullmatch(r"[0-9a-f]{64}", trusted_key_sha256) is not None
+    and document["trusted_key_sha256"] == trusted_key_sha256
 )
 if not valid:
     raise SystemExit(1)
 print(document["release_sequence"])
-' "$highest_release_file" "$release_schema_head") || \
-    offline_fail registry-import "highest release state is invalid" 65
+' "$highest_release_file" "$release_schema_head" "$trusted_key_digest") || \
+    offline_fail registry-import \
+      "highest release state is invalid or predates the trusted-key binding; re-import is required" 65
 fi
-if [ "$release_sequence" -le "$highest_release_sequence" ]; then
+if [ "$release_sequence" -lt "$highest_release_sequence" ]; then
   offline_fail registry-import "signed release sequence is replayed or downgraded" 65
+fi
+if [ "$release_sequence" -eq "$highest_release_sequence" ]; then
+  receipt_file=$trust_state_directory/registry-import-$manifest_digest.json
+  if [ ! -e "$receipt_file" ]; then
+    offline_fail registry-import \
+      "highest release state exists without its exact import receipt" 65
+  fi
+  validate_protected_path registry-import-receipt "$receipt_file" file "400"
+  if [ "$(stat -c %h -- "$receipt_file")" -ne 1 ] || \
+    ! cmp -s "$highest_release_file" "$expected_highest" || \
+    ! cmp -s "$receipt_file" "$expected_receipt"; then
+    offline_fail registry-import \
+      "same-sequence release conflicts with the committed issuer state" 65
+  fi
+  validate_protected_path trusted-public-key \
+    "$canonical_trusted_public_key" file "400 444"
+  canonical_trusted_key_digest_noop=$(sha256sum \
+    "$canonical_trusted_public_key" | awk '{print $1}') || exit 66
+  if [ "$canonical_trusted_key_digest_noop" != "$trusted_key_digest" ]; then
+    offline_fail registry-import \
+      "canonical trusted release public key changed before no-op validation" 65
+  fi
+  verify_local_signed_images
+  echo "registry-import: AUDITED_NOOP exact signed release is already imported; receipt=$receipt_file"
+  exit 0
 fi
 
 # Registry import happens before the deployment preflight, so it must protect
@@ -709,7 +932,6 @@ for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
 done
 [ "$ready" = true ] || offline_fail registry-import "loopback registry did not become ready" 70
 
-tab=$(printf '\t')
 while IFS="$tab" read -r image expected_id expected_os expected_arch extra || \
   [ -n "${image:-}" ]; do
   if [ -z "${image:-}" ] || [ -n "${extra:-}" ] || \
@@ -746,6 +968,14 @@ if ! cleanup_registry; then
   offline_fail registry-import \
     "temporary registry resources could not be removed before receipt commit" 71
 fi
+validate_protected_path trusted-public-key \
+  "$canonical_trusted_public_key" file "400 444"
+canonical_trusted_key_digest_after=$(sha256sum \
+  "$canonical_trusted_public_key" | awk '{print $1}') || exit 66
+if [ "$canonical_trusted_key_digest_after" != "$trusted_key_digest" ]; then
+  offline_fail registry-import \
+    "canonical trusted release public key changed during import" 65
+fi
 
 # Persist a root-only, deterministic receipt that binds the verified signature
 # ceremony to the exact release and image manifest consumed by deployment.
@@ -768,32 +998,9 @@ install -d -o root -g root -m 0700 "$receipt_directory"
 validate_protected_path registry-import-receipt-directory \
   "$receipt_directory" directory "700"
 
-release_digest=$(sha256sum "$operator_release" | awk '{print $1}') || exit 66
-manifest_digest=$(sha256sum "$operator_manifest" | awk '{print $1}') || exit 66
-checksums_digest=$(sha256sum "$checksums" | awk '{print $1}') || exit 66
-signature_digest=$(sha256sum "$signature" | awk '{print $1}') || exit 66
-trusted_key_digest=$(sha256sum "$trusted_public_key" | awk '{print $1}') || exit 66
-release_asset_checksums=$(mktemp "$OFFLINE_TMPDIR/release-asset-checksums.XXXXXXXXXX")
-if ! sed -n '/  release\//p' "$checksums" | LC_ALL=C sort \
-  > "$release_asset_checksums"; then
-  rm -f "$release_asset_checksums"
-  offline_fail registry-import "cannot normalize signed release asset checksums" 66
-fi
-if [ ! -s "$release_asset_checksums" ]; then
-  rm -f "$release_asset_checksums"
-  offline_fail registry-import "signed release asset checksums are missing" 65
-fi
-release_assets_digest=$(sha256sum "$release_asset_checksums" | awk '{print $1}') || {
-  rm -f "$release_asset_checksums"
-  exit 66
-}
-rm -f "$release_asset_checksums"
 receipt_file=$receipt_directory/registry-import-$manifest_digest.json
 temporary_receipt=$(mktemp "$receipt_directory/.registry-import.XXXXXXXXXX")
-printf '%s\n' \
-  "{\"schema_version\":2,\"kind\":\"offline-registry-import\",\"status\":\"verified\",\"release_sequence\":$release_sequence,\"release_id\":\"$release_id\",\"release_git_sha\":\"$release_git_sha\",\"release_schema_head\":\"$release_schema_head\",\"release_sha256\":\"$release_digest\",\"manifest_sha256\":\"$manifest_digest\",\"release_assets_sha256\":\"$release_assets_digest\",\"checksum_set_sha256\":\"$checksums_digest\",\"signature_sha256\":\"$signature_digest\",\"trusted_key_sha256\":\"$trusted_key_digest\"}" \
-  > "$temporary_receipt" || exit 73
-chmod 0400 "$temporary_receipt" || exit 73
+install -o root -g root -m 0400 "$expected_receipt" "$temporary_receipt" || exit 73
 sync -f "$temporary_receipt" || exit 73
 if [ -e "$receipt_file" ]; then
   validate_protected_path registry-import-receipt "$receipt_file" file "400"
@@ -807,12 +1014,10 @@ else
   mv -- "$temporary_receipt" "$receipt_file" || exit 73
 fi
 sync -f "$receipt_file" || exit 73
+sync -f "$receipt_directory" || exit 73
 
 temporary_highest=$(mktemp "$trust_state_directory/.highest-release.XXXXXXXXXX")
-printf '%s\n' \
-  "{\"schema_version\":1,\"release_sequence\":$release_sequence,\"release_id\":\"$release_id\",\"release_git_sha\":\"$release_git_sha\",\"release_schema_head\":\"$release_schema_head\",\"manifest_sha256\":\"$manifest_digest\",\"release_assets_sha256\":\"$release_assets_digest\"}" \
-  > "$temporary_highest" || exit 73
-chmod 0400 "$temporary_highest" || exit 73
+install -o root -g root -m 0400 "$expected_highest" "$temporary_highest" || exit 73
 sync -f "$temporary_highest" || exit 73
 mv -f -- "$temporary_highest" "$highest_release_file" || exit 73
 sync -f "$highest_release_file" || exit 73

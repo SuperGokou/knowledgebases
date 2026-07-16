@@ -11,11 +11,13 @@ COMMON_SCRIPT_PATH = REPOSITORY / "deploy/tencent/offline-operation-common.sh"
 INSTALL_ENTRYPOINT_PATH = REPOSITORY / "deploy/tencent/install-offline.sh"
 LEGACY_GUIDE_PATH = REPOSITORY / "docs/LEGACY_OFFLINE_ADOPTION.zh-CN.md"
 LEGACY_TOOL_PATH = REPOSITORY / "scripts/legacy_offline_adoption.py"
+OFFLINE_CA_DRILL_PATH = REPOSITORY / "scripts/offline_ca_restore_drill.py"
 REGISTRY_IMPORT_PATH = REPOSITORY / "deploy/tencent/import-offline-registry-bundle.sh"
 SCHEMA_VERSION_PATH = REPOSITORY / "app/db/schema_version.py"
 TLS_GUIDE_PATH = REPOSITORY / "docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md"
 DEPLOYMENT_GUIDE_PATH = REPOSITORY / "docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md"
 RUNBOOK_PATH = REPOSITORY / "deploy/tencent/README.md"
+UPGRADE_VERIFIER_PATH = REPOSITORY / "deploy/tencent/verify-upgrade-backup.py"
 
 
 def _read(path: Path) -> str:
@@ -108,8 +110,6 @@ def test_predictive_adoption_command_matches_the_entrypoint_contract() -> None:
         "--legacy-binding-key",
         "--backup-evidence",
         "--backup-signature",
-        "--evidence-public-key",
-        "--evidence-signing-key",
         "--retirement-receipt",
         "--retirement-signature",
         "--host-isolation-baseline",
@@ -120,6 +120,21 @@ def test_predictive_adoption_command_matches_the_entrypoint_contract() -> None:
     ):
         assert option in entrypoint
         assert option in legacy_guide
+
+    entrypoint_arguments = entrypoint.split('while [ "$#" -gt 0 ]; do', 1)[1].split(
+        'case "$confirmed_plan_sha256"', 1
+    )[0]
+    assert "--evidence-public-key" not in entrypoint_arguments
+    assert "--evidence-signing-key" not in entrypoint_arguments
+    for trust_contract in (
+        "/etc/heyi-adoption/trusted-evidence-public.pem",
+        "/etc/heyi-adoption/trusted-evidence-public.sha256",
+        "/run/heyi-adoption-signing/evidence-signing.key",
+        "独立预置",
+        "短时",
+        "release_authorization_sha256",
+    ):
+        assert trust_contract in entrypoint or trust_contract in legacy_guide
 
     assert "prepare-offline-contract.sh" in entrypoint
     assert "创建并验证目标 canonical contract" in legacy_guide
@@ -172,21 +187,20 @@ def test_current_schema_and_canonical_asset_counts_are_derived_from_code() -> No
     release_assets = [entry for entry in entries if entry.startswith("release/")]
 
     assert entries[:3] == ["runtime.env", "release.env", "release.env.images"]
-    assert len(entries) == 39
-    assert len(release_assets) == 36
+    assert len(entries) == 42
+    assert len(release_assets) == 39
     assert len(entries) == len(set(entries))
     assert len(release_assets) == len(set(release_assets))
+    assert "release/scripts/offline_ca_restore_drill.py" in release_assets
 
     current_head = "20260715_0021"
-    assert f'EXPECTED_ALEMBIC_HEADS = frozenset({{"{current_head}"}})' in _read(
-        SCHEMA_VERSION_PATH
-    )
+    assert f'EXPECTED_ALEMBIC_HEADS = frozenset({{"{current_head}"}})' in _read(SCHEMA_VERSION_PATH)
     assert f'if [ "$value" != {current_head} ]; then' in _read(REGISTRY_IMPORT_PATH)
     for document_path in (LEGACY_GUIDE_PATH, DEPLOYMENT_GUIDE_PATH, RUNBOOK_PATH):
         document = _read(document_path)
         assert current_head in document
+        assert "42 个" in document
         assert "39 个" in document
-        assert "36 个" in document
 
     deployment_guide = _read(DEPLOYMENT_GUIDE_PATH)
     assert f"RELEASE_SCHEMA_HEAD={current_head}" in deployment_guide
@@ -229,10 +243,54 @@ def test_multi_release_plan_arguments_are_documented() -> None:
     legacy_tool = _read(LEGACY_TOOL_PATH)
     legacy_guide = _read(LEGACY_GUIDE_PATH)
 
+    assert '"schema_version": 4' in legacy_tool
+    assert "计划 schema v4" in legacy_guide
+    assert "schema v3" in legacy_guide
+    assert "fail-closed" in legacy_guide
+    assert "REQUIRED_RUNTIME_KEYS" in legacy_guide
+    assert "未知键和重复键一律拒绝" in legacy_guide
+    assert "不能仅凭“位于 `DATA_ROOT` 下”放行" in legacy_guide
     assert (
         'plan.add_argument("--compose-file", type=Path, action="append", required=True)'
         in legacy_tool
     )
     assert legacy_guide.count("--compose-file") >= 2
+    assert "--target-manifest" not in legacy_guide
+    assert "--git-sha" not in legacy_guide
+    assert "HIGHEST_RELEASE_STATE" in legacy_tool
+    assert "TRUSTED_RELEASE_PUBLIC_KEY" in legacy_tool
     assert "com.docker.compose.project.config_files" in legacy_guide
     assert "一次性容器" in legacy_guide
+
+
+def test_offline_ca_restore_tool_and_v2_signer_binding_are_documented() -> None:
+    legacy_tool = _read(LEGACY_TOOL_PATH)
+    offline_tool = _read(OFFLINE_CA_DRILL_PATH)
+    legacy_guide = _read(LEGACY_GUIDE_PATH)
+
+    assert '"schema_version": 2' in legacy_tool
+    assert "ca_attestation_public_key_sha256" in legacy_tool
+    assert 'prepare.add_argument("--ca-attestation-public-key"' in legacy_tool
+    assert "--ca-attestation-public-key" in legacy_guide
+    assert "offline_ca_restore_drill.py" in legacy_guide
+    assert "--expected-challenge-public-key-sha256" in legacy_guide
+    assert "binding.key" in legacy_guide
+    assert "禁止通过网络传输" in legacy_guide
+    assert "物理断开" in legacy_guide
+    assert "`--network none` 只能作为附加控制" in legacy_guide
+    assert "ca_attestation_public_key_sha256" in offline_tool
+    assert 'OPENSSL: Final = Path("/usr/bin/openssl")' in offline_tool
+
+
+def test_upgrade_backup_verifier_uses_the_fixed_schema_v2_release_authorization() -> None:
+    verifier = _read(UPGRADE_VERIFIER_PATH)
+    legacy_tool = _read(LEGACY_TOOL_PATH)
+    assert "authorization = module._current_release_authorization()" in verifier
+    assert 'highest.get("schema_version") != 2' in legacy_tool
+    assert 'receipt.get("schema_version") != 2' in legacy_tool
+    assert '"release_authorization_sha256"' in verifier
+    assert "_fixed_release_authorization_binding()" in verifier
+    assert (
+        'document["release_authorization_sha256"] != expected_release_authorization_sha256'
+        in verifier
+    )

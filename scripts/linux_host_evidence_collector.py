@@ -39,7 +39,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import ExtensionOID
 
 from scripts.acceptance import collect_worktree_evidence
-from scripts.functional_acceptance import _signature_payload
+from scripts.acceptance_gate import GateIdentity
+from scripts.functional_acceptance import (
+    _signature_payload,
+    build_deployment_identity,
+    external_evidence_target,
+    normalize_deployment_base_url,
+)
 from scripts.host_preflight import (
     MINIMUM_FILESYSTEM_AVAILABLE_BYTES,
     MINIMUM_FILESYSTEM_TOTAL_BYTES,
@@ -323,14 +329,54 @@ def _timestamp(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _validated_deployment_target(target: Mapping[str, object]) -> dict[str, str]:
+    if (
+        set(target) != {"git_head", "content_fingerprint", "run_id", "deployment"}
+        or not isinstance(target.get("git_head"), str)
+        or _HEX40_64.fullmatch(cast(str, target["git_head"])) is None
+        or not isinstance(target.get("content_fingerprint"), str)
+        or _HEX64.fullmatch(cast(str, target["content_fingerprint"])) is None
+        or not isinstance(target.get("run_id"), str)
+        or _RUN_ID.fullmatch(cast(str, target["run_id"])) is None
+    ):
+        _block("evidence_target_invalid")
+    deployment = target.get("deployment")
+    if not isinstance(deployment, Mapping):
+        _block("evidence_target_invalid")
+    required = {
+        "release_id",
+        "offline_contract_sha256",
+        "image_manifest_sha256",
+        "base_url",
+        "host_identity",
+    }
+    if set(deployment) != required or any(
+        not isinstance(deployment.get(key), str) for key in required
+    ):
+        _block("evidence_target_invalid")
+    try:
+        normalized = build_deployment_identity(
+            git_head=cast(str, target["git_head"]),
+            offline_contract_sha256=cast(str, deployment["offline_contract_sha256"]),
+            image_manifest_sha256=cast(str, deployment["image_manifest_sha256"]),
+            base_url=cast(str, deployment["base_url"]),
+        )
+    except ValueError:
+        _block("evidence_target_invalid")
+    if dict(deployment) != normalized:
+        _block("evidence_target_invalid")
+    return normalized
+
+
 def load_signing_material(
     repository: Path,
     key_path: Path,
     challenge_path: Path,
-    target: Mapping[str, str],
+    target: Mapping[str, object],
     *,
     now: datetime,
 ) -> tuple[Ed25519PrivateKey, dict[str, object], bytes]:
+    _validated_deployment_target(target)
     key_bytes = read_protected_file(key_path, repository, _MAX_KEY_BYTES)
     pkcs8_start = key_bytes.startswith(b"-----BEGIN " + _PKCS8_PEM_LABEL + b"-----\n")
     pkcs8_end = key_bytes.rstrip().endswith(b"-----END " + _PKCS8_PEM_LABEL + b"-----")
@@ -375,7 +421,7 @@ def load_signing_material(
         or _CHALLENGE_NONCE.fullmatch(nonce) is None
         or not isinstance(challenge_target, dict)
         or challenge_target != dict(target)
-        or set(challenge_target) != {"git_head", "content_fingerprint", "run_id"}
+        or set(challenge_target) != {"git_head", "content_fingerprint", "run_id", "deployment"}
     ):
         _block("challenge_binding_invalid")
     issued_at = _timestamp(value.get("issued_at"))
@@ -630,6 +676,32 @@ def _validate_release_binding(active: Mapping[str, Any], git_head: str) -> dict[
         "release_id": receipt["release_id"],
         "release_git_sha": receipt["release_git_sha"],
         "release_schema_head": receipt["release_schema_head"],
+    }
+
+
+def _validate_deployment_binding(
+    active: Mapping[str, Any],
+    config: Mapping[str, Any],
+    target: Mapping[str, object],
+) -> dict[str, str]:
+    deployment = _validated_deployment_target(target)
+    if active.get("contract_sha256") != deployment["offline_contract_sha256"]:
+        _block("deployment_contract_mismatch")
+    if active.get("manifest_sha256") != deployment["image_manifest_sha256"]:
+        _block("deployment_manifest_mismatch")
+    origin, _objects_origin, _ca_path = _compose_origins(config)
+    normalized_origin = normalize_deployment_base_url(origin)
+    if normalized_origin != deployment["base_url"]:
+        _block("deployment_base_url_mismatch")
+    hostname = urlsplit(normalized_origin).hostname if normalized_origin is not None else None
+    if hostname is None or hostname.casefold().rstrip(".") != deployment["host_identity"]:
+        _block("deployment_host_identity_mismatch")
+    return {
+        "release_id": deployment["release_id"],
+        "offline_contract_sha256": cast(str, active["contract_sha256"]),
+        "image_manifest_sha256": cast(str, active["manifest_sha256"]),
+        "base_url": normalized_origin,
+        "host_identity": hostname.casefold().rstrip("."),
     }
 
 
@@ -1560,22 +1632,25 @@ def _host_artifact(disk_path: Path) -> dict[str, object]:
 def collect_probe_artifacts(
     repository: Path,
     disk_path: Path,
-    target: Mapping[str, str],
+    target: Mapping[str, object],
     runner: BoundedCommandRunner,
     *,
     now: datetime,
 ) -> dict[str, dict[str, object]]:
     host = _host_artifact(disk_path)
     active = _active_release(repository, runner)
-    release_binding = _validate_release_binding(active, target["git_head"])
+    deployment = _validated_deployment_target(target)
+    release_binding = _validate_release_binding(active, deployment["release_id"])
     staged = _stage_contract(repository, active, runner)
     try:
         config = _compose_config(staged, active, runner)
+        deployment_binding = _validate_deployment_binding(active, config, target)
         data_filesystem = _validate_data_filesystem(config, disk_path)
         host["active_data_filesystem"] = data_filesystem
         service_hashes = _compose_hashes(staged, active, runner)
         offline = _offline_images(staged, active, config, runner)
         offline["release_binding"] = release_binding
+        offline["deployment_binding"] = deployment_binding
         clamav = _clamav(staged, active, config, service_hashes, runner)
         readiness, business = _readiness_and_business(config)
         caddy = _caddy_evidence(
@@ -1599,20 +1674,14 @@ def collect_probe_artifacts(
 
 
 def build_complete_evidence(
-    target: Mapping[str, str],
+    target: Mapping[str, object],
     artifacts: Sequence[Mapping[str, object]],
     private_key: Ed25519PrivateKey,
     challenge: Mapping[str, object],
     *,
     collected_at: datetime,
 ) -> dict[str, object]:
-    if (
-        set(target) != {"git_head", "content_fingerprint", "run_id"}
-        or _HEX40_64.fullmatch(target.get("git_head", "")) is None
-        or _HEX64.fullmatch(target.get("content_fingerprint", "")) is None
-        or _RUN_ID.fullmatch(target.get("run_id", "")) is None
-    ):
-        _block("evidence_target_invalid")
+    _validated_deployment_target(target)
     by_id = {str(item.get("id")): item for item in artifacts}
     expected_artifacts = {
         "host",
@@ -1778,11 +1847,26 @@ def collect(arguments: argparse.Namespace) -> dict[str, object]:
     identity = collect_worktree_evidence(repository)
     if _RUN_ID.fullmatch(arguments.run_id) is None:
         _block("run_id_invalid")
-    target = {
-        "git_head": identity.git_head,
-        "content_fingerprint": identity.content_fingerprint,
-        "run_id": arguments.run_id,
-    }
+    if arguments.release_id != identity.git_head:
+        _block("deployment_release_id_mismatch")
+    try:
+        deployment = build_deployment_identity(
+            git_head=arguments.release_id,
+            offline_contract_sha256=arguments.offline_contract_sha256,
+            image_manifest_sha256=arguments.image_manifest_sha256,
+            base_url=arguments.base_url,
+        )
+        target = external_evidence_target(
+            GateIdentity(
+                git_head=identity.git_head,
+                content_fingerprint=identity.content_fingerprint,
+                run_nonce=arguments.run_id,
+            ),
+            run_id=arguments.run_id,
+            deployment=deployment,
+        )
+    except ValueError:
+        _block("deployment_identity_invalid")
     now = datetime.now(UTC)
     private_key, challenge, challenge_raw = load_signing_material(
         repository,
@@ -1827,6 +1911,10 @@ def _parser() -> argparse.ArgumentParser:
         help="absolute checked-out release repository bound to the evidence",
     )
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--release-id", required=True)
+    parser.add_argument("--offline-contract-sha256", required=True)
+    parser.add_argument("--image-manifest-sha256", required=True)
+    parser.add_argument("--base-url", required=True)
     parser.add_argument("--signing-key", type=Path, required=True)
     parser.add_argument("--challenge", type=Path, required=True)
     parser.add_argument("--disk-path", type=Path, default=PERSISTENT_ROOT)

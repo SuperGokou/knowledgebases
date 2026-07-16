@@ -10,6 +10,8 @@ from typing import Any
 import httpx
 import pytest
 
+import app.services.llm_provider as llm_provider
+from app.services.chat_safety import chat_safety_poisoned
 from app.services.llm_provider import (
     MAX_LLM_LOGICAL_OPERATION_SECONDS,
     LlmClientPool,
@@ -45,6 +47,57 @@ def test_default_shutdown_drain_budget_covers_chat_without_exceeding_stop_grace(
     assert policy.shutdown_drain_timeout_seconds == 110
     assert MAX_LLM_LOGICAL_OPERATION_SECONDS == 105
     assert 105 < policy.shutdown_drain_timeout_seconds < 120
+
+
+@pytest.mark.asyncio
+async def test_cleanup_wait_is_bounded_and_supervised_without_cancelling_the_owner() -> None:
+    release = asyncio.Event()
+
+    async def cleanup_operation() -> None:
+        await release.wait()
+
+    cleanup = asyncio.create_task(cleanup_operation())
+
+    with pytest.raises(TimeoutError, match="llm_cleanup_timeout"):
+        await llm_provider._await_cleanup(cleanup, timeout_seconds=0.01)
+
+    assert cleanup.done() is False
+    assert llm_provider.llm_cleanup_backlog_size() == 1
+    assert chat_safety_poisoned() is True
+
+    release.set()
+    await asyncio.wait_for(cleanup, timeout=1)
+    await asyncio.sleep(0)
+    assert llm_provider.llm_cleanup_backlog_size() == 0
+    assert chat_safety_poisoned() is True
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_dominates_cleanup_failure_and_poisons_worker() -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def failing_cleanup() -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        raise RuntimeError("close failed")
+
+    async def owner() -> None:
+        await llm_provider._await_cleanup(
+            asyncio.create_task(failing_cleanup()),
+            timeout_seconds=1,
+        )
+
+    owner_task = asyncio.create_task(owner())
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    owner_task.cancel()
+    release_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner_task
+
+    assert chat_safety_poisoned() is True
+    assert llm_provider.llm_cleanup_backlog_size() == 0
 
 
 class PassiveAsyncClient:
@@ -760,16 +813,53 @@ async def test_fastapi_lifespan_closes_the_current_event_loop_pool(
 ) -> None:
     from app import main as main_module
 
-    closed = 0
+    events: list[str] = []
 
     async def close_pool() -> None:
-        nonlocal closed
-        closed += 1
+        events.append("pool-closed")
+
+    def complete_chat_safety() -> None:
+        events.append("chat-safety-clean")
 
     monkeypatch.setattr(main_module, "close_shared_llm_clients", close_pool)
+    monkeypatch.setattr(
+        main_module,
+        "complete_chat_safety_shutdown",
+        complete_chat_safety,
+    )
     application = main_module.create_app()
 
     async with application.router.lifespan_context(application):
-        assert closed == 0
+        assert events == []
 
-    assert closed == 1
+    assert events == ["pool-closed", "chat-safety-clean"]
+
+
+@pytest.mark.asyncio
+async def test_fastapi_lifespan_does_not_mark_chat_safety_clean_when_pool_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import main as main_module
+
+    clean_calls = 0
+
+    async def fail_pool_close() -> None:
+        raise RuntimeError("simulated cleanup failure")
+
+    def complete_chat_safety() -> None:
+        nonlocal clean_calls
+        clean_calls += 1
+
+    monkeypatch.setattr(main_module, "close_shared_llm_clients", fail_pool_close)
+    monkeypatch.setattr(
+        main_module,
+        "complete_chat_safety_shutdown",
+        complete_chat_safety,
+    )
+    application = main_module.create_app()
+
+    with pytest.raises(RuntimeError, match="cleanup failure"):
+        async with application.router.lifespan_context(application):
+            pass
+
+    assert clean_calls == 0

@@ -132,9 +132,7 @@ def test_0021_adds_durable_user_retirement_evidence_and_refuses_downgrade() -> N
             }
             assert constraints["fk_users_retired_by_id_users"][0] == "f"
             assert constraints["fk_users_retired_by_id_users"][1] == "r"
-            assert {
-                name for name, (kind, _, _) in constraints.items() if kind == "c"
-            } == {
+            assert {name for name, (kind, _, _) in constraints.items() if kind == "c"} == {
                 "ck_users_retirement_metadata_requires_timestamp",
                 "ck_users_retirement_requires_disabled_status",
                 "ck_users_retirement_actor_not_self",
@@ -181,13 +179,16 @@ def test_0021_adds_durable_user_retirement_evidence_and_refuses_downgrade() -> N
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
                 "20260715_0021"
             )
-            assert connection.scalar(
-                text(
-                    "SELECT count(*) FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'users' "
-                    "AND column_name IN "
-                    "('retired_at', 'retired_by_id', 'retirement_reason')"
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'users' "
+                        "AND column_name IN "
+                        "('retired_at', 'retired_by_id', 'retirement_reason')"
+                    )
                 )
-            ) == 3
+                == 3
+            )
     finally:
         engine.dispose()

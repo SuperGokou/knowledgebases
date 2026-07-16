@@ -203,6 +203,8 @@ class Settings(BaseSettings):
     )
     chat_idempotency_cleanup_batch_size: int = Field(default=1_000, ge=1, le=10_000)
     chat_idempotency_cleanup_max_batches: int = Field(default=5, ge=1, le=100)
+    chat_max_active_requests: int = Field(default=32, ge=1, le=256)
+    chat_safety_state_path: Path | None = None
     malware_scan_host: str = "127.0.0.1"
     malware_scan_port: int = Field(default=3310, ge=1, le=65_535)
     malware_scan_timeout_seconds: float = Field(default=120, gt=0, le=3_600)
@@ -520,6 +522,11 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "KB_STORAGE_CAPACITY_PROBE_PATH must reference the isolated "
                         "read-only capacity probe"
+                    )
+                if self.chat_safety_state_path != Path("/var/lib/kb-chat-safety/poison.json"):
+                    raise ValueError(
+                        "KB_CHAT_SAFETY_STATE_PATH must reference the isolated "
+                        "host-backed poison sentinel"
                     )
                 for field_name, required_value in expected_storage_policy.items():
                     if getattr(self, field_name) != required_value:

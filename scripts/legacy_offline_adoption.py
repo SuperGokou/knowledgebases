@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import hmac
 import importlib.util
@@ -31,7 +32,8 @@ import subprocess
 import sys
 import tarfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -45,6 +47,20 @@ DATA_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/data")
 STATE_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/state")
 BACKUP_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/backups")
 RELEASE_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/releases")
+ARTIFACT_ROOT: Final = Path("/srv/heyi-knowledgebases-offline/artifacts")
+TRUSTED_RELEASE_PUBLIC_KEY: Final = Path("/etc/heyi-release/trusted-release-public.pem")
+TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY: Final = Path("/etc/heyi-adoption/trusted-evidence-public.pem")
+TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY_SHA256: Final = Path(
+    "/etc/heyi-adoption/trusted-evidence-public.sha256"
+)
+EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY: Final = Path(
+    "/run/heyi-adoption-signing/evidence-signing.key"
+)
+TRUSTED_CA_RESTORE_ATTESTATION_PUBLIC_KEY: Final = Path(
+    "/etc/heyi-adoption/ca-restore-attestation.pub"
+)
+HIGHEST_RELEASE_STATE: Final = STATE_ROOT / "highest-release.json"
+HOST_ISOLATION_GUARD_RELATIVE_PATH: Final = "scripts/host_isolation_guard.py"
 EXPECTED_PORTS: Final = frozenset({"19443/tcp", "19444/tcp"})
 PROTECTED_OTHER_PORT: Final = "10050"
 ALLOWED_SERVICES: Final = frozenset(
@@ -119,10 +135,62 @@ REQUIRED_RUNTIME_KEYS: Final = frozenset(
         "KB_CHAT_REPLAY_ENCRYPTION_KEYS",
     }
 )
+ALLOWED_RUNTIME_KEYS: Final = frozenset(
+    {
+        "COMPOSE_PROJECT_NAME",
+        "KB_DATA_ROOT",
+        "KB_BIND_ADDRESS",
+        "KB_PUBLIC_HOST",
+        "KB_HTTPS_PORT",
+        "KB_OBJECTS_HTTPS_PORT",
+        "KB_PUBLIC_ORIGIN",
+        "POSTGRES_DB",
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_APP_USER",
+        "POSTGRES_APP_PASSWORD",
+        "REDIS_PASSWORD",
+        "MINIO_ROOT_USER",
+        "MINIO_ROOT_PASSWORD",
+        "MINIO_APP_USER",
+        "MINIO_APP_PASSWORD",
+        "MINIO_REGION",
+        "MINIO_BUCKET",
+        "MINIO_MULTIPART_MAX_AGE",
+        "MINIO_MULTIPART_CLEANUP_INTERVAL_SECONDS",
+        "KB_JWT_SECRET",
+        "KB_BFF_SHARED_SECRET",
+        "KB_LLM_CREDENTIAL_ENCRYPTION_KEY",
+        "KB_LLM_EGRESS_MODE",
+        "KB_LLM_EGRESS_GATEWAY_URL",
+        "KB_LLM_EGRESS_APPROVED_PROVIDERS",
+        "KB_UPGRADE_BACKUP_EVIDENCE_PATH",
+        "KB_UPGRADE_BACKUP_SIGNATURE_PATH",
+        "KB_UPGRADE_BACKUP_PUBLIC_KEY_PATH",
+        "KB_CHAT_REPLAY_ENCRYPTION_KEYS",
+        "KB_CHAT_REPLAY_ACTIVE_KEY_VERSION",
+        "KB_BOOTSTRAP_ADMIN_EMAIL",
+        "KB_BOOTSTRAP_ADMIN_PASSWORD",
+        "KB_TRUSTED_HOSTS",
+        "KB_CORS_ORIGINS",
+        "KB_MULTIPART_THRESHOLD_BYTES",
+        "CLAMAV_DATABASE_MAX_AGE_SECONDS",
+        "KB_MALWARE_SCAN_TIMEOUT_SECONDS",
+        "KB_MALWARE_SCAN_CHUNK_SIZE_BYTES",
+        "KB_MALWARE_SCAN_RECLAIM_SECONDS",
+        "KB_DATABASE_POOL_SIZE",
+        "KB_DATABASE_MAX_OVERFLOW",
+        "KB_DATABASE_POOL_TIMEOUT_SECONDS",
+        "KB_DATABASE_STATEMENT_TIMEOUT_MS",
+        "KB_DATABASE_LOCK_TIMEOUT_MS",
+        "KB_DATABASE_IDLE_TRANSACTION_TIMEOUT_MS",
+    }
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SCHEMA_HEAD = re.compile(r"^[0-9]{8}_[0-9]{4}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+_RELEASE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IMMUTABLE_IMAGE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
@@ -133,8 +201,40 @@ _DNS_HOST = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
 )
 _HTTP_STATUS = re.compile(rb"^HTTP/1\.[01] ([0-9]{3})(?:[ \t]|$)")
+_OPENSSL_ISO_DATE = re.compile(
+    r"^(notBefore|notAfter)=([0-9]{4}-[0-9]{2}-[0-9]{2} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z)$",
+    re.MULTILINE,
+)
+_PUBLIC_KEY_BITS = re.compile(r"^Public-Key: \(([0-9]+) bit\)$", re.MULTILINE)
+_PEM_BODY = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 MAX_CONTROL_FILE = 8 * 1024 * 1024
 MAX_CA_PLAINTEXT = 64 * 1024 * 1024
+MAX_CA_FILE_BYTES = 64 * 1024
+MIN_CA_RECIPIENT_RSA_BITS = 3072
+CA_FILENAMES: Final = frozenset({"root.crt", "root.key", "intermediate.crt", "intermediate.key"})
+CA_CERTIFICATE_MODES: Final = frozenset({0o400, 0o440, 0o444, 0o600, 0o640, 0o644})
+CA_PRIVATE_KEY_MODES: Final = frozenset({0o400, 0o600})
+CA_RESTORE_CHALLENGE_KEYS: Final = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "project",
+        "run_id",
+        "plan_sha256",
+        "release_authorization_sha256",
+        "nonce",
+        "issued_at",
+        "expires_at",
+        "encrypted_archive_sha256",
+        "encrypted_archive_size_bytes",
+        "plaintext_opaque_hmac_sha256",
+        "file_count",
+        "recipient_certificate_sha256",
+        "ca_attestation_public_key_sha256",
+        "cos_transfer_allowed",
+    }
+)
 _ALLOWED_EXECUTABLES: Final = frozenset({"/usr/bin/docker", "/usr/bin/openssl"})
 _ALLOWED_EXTRA_ENV: Final = frozenset(
     {
@@ -252,6 +352,7 @@ class Runner:
         input_bytes: bytes | None = None,
         extra_env: Mapping[str, str] | None = None,
         stdout_file: BinaryIO | None = None,
+        pass_fds: Sequence[int] = (),
     ) -> bytes:
         if not argv or argv[0] not in _ALLOWED_EXECUTABLES:
             raise CommandError("external executable is outside the fixed allowlist")
@@ -264,6 +365,8 @@ class Runner:
             for argument in argv
         ):
             raise CommandError("external command contains an unsafe argument")
+        if any(type(descriptor) is not int or descriptor < 0 for descriptor in pass_fds):
+            raise CommandError("external command contains an unsafe inherited descriptor")
         environment = self._environment(extra_env)
         try:
             # Security contract: executable and every argument were validated above,
@@ -278,6 +381,7 @@ class Runner:
                 check=False,
                 shell=False,
                 timeout=timeout,
+                pass_fds=tuple(pass_fds),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise CommandError(f"command failed to execute: {Path(argv[0]).name}") from exc
@@ -498,6 +602,55 @@ def _open_protected_bytes(path: Path, *, max_bytes: int = MAX_CONTROL_FILE) -> b
         os.close(descriptor)
 
 
+def _validate_trusted_adoption_evidence_public_key() -> None:
+    public_key = protected_file(
+        TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY,
+        modes=frozenset({0o400, 0o444}),
+        max_bytes=65_536,
+    )
+    fingerprint = protected_file(
+        TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY_SHA256,
+        modes=frozenset({0o400, 0o444}),
+        max_bytes=128,
+    )
+    fingerprint_bytes = _open_protected_bytes(fingerprint, max_bytes=128)
+    if re.fullmatch(rb"[0-9a-f]{64}\n", fingerprint_bytes) is None:
+        raise AdoptionError("trusted adoption evidence key fingerprint is malformed")
+    public_key_bytes = _open_protected_bytes(public_key, max_bytes=65_536)
+    expected_digest = fingerprint_bytes[:-1].decode("ascii")
+    if not hmac.compare_digest(_sha256_bytes(public_key_bytes), expected_digest):
+        raise AdoptionError(
+            "trusted adoption evidence public key differs from its independent fingerprint"
+        )
+
+
+def _validate_production_evidence_key_arguments(arguments: argparse.Namespace) -> None:
+    operation = str(arguments.operation)
+    if operation == "plan":
+        return
+    public_key = getattr(arguments, "evidence_public_key", None)
+    if public_key != TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY:
+        raise AdoptionError("production evidence public key must use the fixed adoption trust root")
+    signing_key = getattr(arguments, "evidence_signing_key", None)
+    if signing_key is not None and signing_key != EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY:
+        raise AdoptionError(
+            "production evidence signing key must use the fixed ephemeral signer path"
+        )
+    if operation == "prepare":
+        ca_key = getattr(arguments, "ca_attestation_public_key", None)
+        if ca_key != TRUSTED_CA_RESTORE_ATTESTATION_PUBLIC_KEY:
+            raise AdoptionError(
+                "CA restore attestation public key must use the fixed adoption trust root"
+            )
+    if operation == "finalize":
+        ca_key = getattr(arguments, "ca_restore_attestation_public_key", None)
+        if ca_key != TRUSTED_CA_RESTORE_ATTESTATION_PUBLIC_KEY:
+            raise AdoptionError(
+                "CA restore attestation public key must use the fixed adoption trust root"
+            )
+    _validate_trusted_adoption_evidence_public_key()
+
+
 def _atomic_write(path: Path, payload: bytes, *, mode: int) -> None:
     parent = protected_directory(path.parent, modes=frozenset({0o700, 0o750}))
     if path.exists() or path.is_symlink():
@@ -538,17 +691,19 @@ def parse_runtime_environment(path: Path, binding_key: bytes) -> tuple[dict[str,
         if "=" not in line:
             raise AdoptionError(f"runtime environment line {number} is malformed")
         key, value = line.split("=", 1)
-        if _ENV_KEY.fullmatch(key) is None or key in values:
+        if _ENV_KEY.fullmatch(key) is None:
             raise AdoptionError(f"runtime environment key at line {number} is invalid")
+        if key in values:
+            raise AdoptionError(f"runtime environment key {key} is duplicated")
+        if key not in ALLOWED_RUNTIME_KEYS:
+            raise AdoptionError(f"runtime environment key {key} is unknown")
         if any(character in value for character in ("\x00", "\r", "\n", "`")):
             raise AdoptionError(f"runtime environment value at line {number} is unsafe")
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
-        if not value:
-            raise AdoptionError(f"runtime environment key {key} is empty")
         values[key] = value
-    missing = REQUIRED_RUNTIME_KEYS - values.keys()
-    if missing:
+    missing_or_empty = {key for key in REQUIRED_RUNTIME_KEYS if not values.get(key)}
+    if missing_or_empty:
         raise AdoptionError("runtime environment is missing required protected values")
     return values, _hmac_binding(raw, binding_key, domain="heyi-runtime-env-v1")
 
@@ -858,6 +1013,33 @@ def _read_binding_key(path: Path) -> bytes:
     return decoded
 
 
+def _current_host_isolation_guard() -> Path:
+    release_root = Path(__file__).resolve(strict=True).parents[1]
+    return protected_file(
+        release_root / HOST_ISOLATION_GUARD_RELATIVE_PATH,
+        modes=frozenset({0o400, 0o440, 0o444, 0o644}),
+    )
+
+
+def _protected_host_isolation_guard(binding: object) -> Path:
+    entry = _object(binding, "host-isolation guard binding")
+    if set(entry) != {"relative_path", "sha256"}:
+        raise AdoptionError("host-isolation guard binding schema differs")
+    relative_path = _string(
+        entry.get("relative_path"),
+        "host-isolation guard relative path",
+    )
+    if relative_path != HOST_ISOLATION_GUARD_RELATIVE_PATH:
+        raise AdoptionError("host-isolation guard relative path differs")
+    expected_digest = _string(entry.get("sha256"), "host-isolation guard digest")
+    if _SHA256.fullmatch(expected_digest) is None:
+        raise AdoptionError("host-isolation guard digest is malformed")
+    guard = _current_host_isolation_guard()
+    if not hmac.compare_digest(_sha256_file(guard), expected_digest):
+        raise AdoptionError("host-isolation guard differs from its plan")
+    return guard
+
+
 def build_plan(
     *,
     inventory: LegacyInventory,
@@ -866,11 +1048,19 @@ def build_plan(
     compose_files: Sequence[Path],
     legacy_env_files: Sequence[Path],
     legacy_env_bindings: Mapping[str, str],
-    target_manifest: Path,
-    git_sha: str,
+    release_authorization: Mapping[str, Any],
 ) -> dict[str, Any]:
+    authorization = dict(release_authorization)
+    git_sha = _string(authorization.get("release_git_sha"), "authorized Git SHA")
     if _GIT_SHA.fullmatch(git_sha) is None:
-        raise AdoptionError("expected Git SHA is malformed")
+        raise AdoptionError("authorized Git SHA is malformed")
+    target_manifest = _object(
+        authorization.get("target_manifest"),
+        "authorized target manifest",
+    )
+    if set(target_manifest) != {"path", "sha256", "size_bytes"}:
+        raise AdoptionError("authorized target manifest descriptor differs")
+    _verify_descriptor(target_manifest)
     if not compose_files:
         raise AdoptionError("at least one legacy Compose file is required")
     compose_paths = tuple(
@@ -886,7 +1076,6 @@ def build_plan(
         raise AdoptionError("legacy environment binding set is incomplete")
     if any(_SHA256.fullmatch(value) is None for value in legacy_env_bindings.values()):
         raise AdoptionError("legacy environment binding is malformed")
-    manifest = protected_file(target_manifest, modes=frozenset({0o400, 0o440, 0o444}))
     protected_file(runtime_env, modes=frozenset({0o400, 0o600}))
     selected_compose = {str(path) for path in compose_paths}
     observed_compose = {path for item in inventory.containers for path in item.config_files}
@@ -899,12 +1088,9 @@ def build_plan(
         if key in service_bindings:
             raise AdoptionError("container Compose binding key is duplicated")
         service_bindings[key] = binding
-    guard = protected_file(
-        Path(__file__).resolve(strict=True).with_name("host_isolation_guard.py"),
-        modes=frozenset({0o400, 0o440, 0o444, 0o644}),
-    )
+    guard = _current_host_isolation_guard()
     return {
-        "schema_version": 2,
+        "schema_version": 4,
         "kind": "heyi-legacy-adoption-plan",
         "project": PROJECT,
         "created_at": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -925,12 +1111,11 @@ def build_plan(
                 for path in env_files
             ],
         },
-        "target_manifest": {
-            "path": str(manifest),
-            "sha256": _sha256_file(manifest),
-        },
+        "target_manifest": target_manifest,
+        "release_authorization": authorization,
+        "release_authorization_sha256": _release_authorization_sha256(authorization),
         "host_isolation_guard": {
-            "path": str(guard),
+            "relative_path": HOST_ISOLATION_GUARD_RELATIVE_PATH,
             "sha256": _sha256_file(guard),
         },
         "inventory_sha256": inventory_sha256(inventory),
@@ -1495,41 +1680,311 @@ def _iter_object_manifest(path: Path) -> Iterable[tuple[str, int, str]]:
             raise AdoptionError("object manifest summary is missing")
 
 
+def _ca_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _recipient_certificate_identity_is_stable(
+    path: Path,
+    descriptor: int,
+    expected: tuple[int, ...],
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+    except OSError as exc:
+        raise AdoptionError("CA recipient certificate changed during validation") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != 0
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) not in CA_CERTIFICATE_MODES
+        or not 0 < opened.st_size <= MAX_CA_FILE_BYTES
+        or _ca_file_identity(opened) != expected
+        or _ca_file_identity(current) != expected
+    ):
+        raise AdoptionError("CA recipient certificate changed during validation")
+
+
+@contextmanager
+def _opened_ca_recipient_certificate(
+    path: Path,
+) -> Iterator[tuple[Path, int, bytes, tuple[int, ...]]]:
+    canonical = protected_file(
+        path,
+        modes=CA_CERTIFICATE_MODES,
+        max_bytes=MAX_CA_FILE_BYTES,
+    )
+    before = canonical.lstat()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(canonical, flags)
+    try:
+        expected = _ca_file_identity(before)
+        _recipient_certificate_identity_is_stable(canonical, descriptor, expected)
+        chunks: list[bytes] = []
+        remaining = MAX_CA_FILE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if not payload or len(payload) > MAX_CA_FILE_BYTES or len(payload) != before.st_size:
+            raise AdoptionError("CA recipient certificate changed during protected read")
+        _recipient_certificate_identity_is_stable(canonical, descriptor, expected)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        yield canonical, descriptor, payload, expected
+    finally:
+        os.close(descriptor)
+
+
+def _validate_single_certificate_pem(payload: bytes) -> None:
+    try:
+        text = payload.decode("ascii")
+    except UnicodeError as exc:
+        raise AdoptionError("CA recipient certificate PEM is malformed") from exc
+    lines = text.splitlines()
+    if (
+        len(lines) < 3
+        or lines[0] != "-----BEGIN CERTIFICATE-----"
+        or lines[-1] != "-----END CERTIFICATE-----"
+        or text.count("-----BEGIN CERTIFICATE-----") != 1
+        or text.count("-----END CERTIFICATE-----") != 1
+        or any(not 0 < len(line) <= 76 or _PEM_BODY.fullmatch(line) is None for line in lines[1:-1])
+    ):
+        raise AdoptionError("CA recipient certificate PEM is malformed")
+    try:
+        decoded = base64.b64decode("".join(lines[1:-1]), validate=True)
+    except binascii.Error as exc:
+        raise AdoptionError("CA recipient certificate PEM is malformed") from exc
+    if not decoded or len(decoded) > MAX_CA_FILE_BYTES:
+        raise AdoptionError("CA recipient certificate PEM is malformed")
+
+
+def _recipient_certificate_window(text: str) -> tuple[datetime, datetime]:
+    observed: dict[str, datetime] = {}
+    for label, value in _OPENSSL_ISO_DATE.findall(text):
+        if label in observed:
+            raise AdoptionError("CA recipient certificate validity is malformed")
+        try:
+            observed[label] = datetime.strptime(value, "%Y-%m-%d %H:%M:%SZ").replace(tzinfo=UTC)
+        except ValueError as exc:
+            raise AdoptionError("CA recipient certificate validity is malformed") from exc
+    if set(observed) != {"notBefore", "notAfter"}:
+        raise AdoptionError("CA recipient certificate validity is malformed")
+    return observed["notBefore"], observed["notAfter"]
+
+
+def _decode_public_openssl_output(payload: bytes, *, label: str) -> str:
+    if not payload or len(payload) > MAX_CONTROL_FILE:
+        raise AdoptionError(f"CA recipient certificate {label} is malformed")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise AdoptionError(f"CA recipient certificate {label} is malformed") from exc
+    if "\x00" in text:
+        raise AdoptionError(f"CA recipient certificate {label} is malformed")
+    return text
+
+
+def _validate_ca_recipient_certificate(
+    runner: Runner,
+    *,
+    certificate_path: str,
+    certificate_descriptor: int,
+    certificate_payload: bytes,
+    now: datetime,
+) -> str:
+    _validate_single_certificate_pem(certificate_payload)
+    if now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise AdoptionError("CA recipient certificate validation time must use UTC")
+    inherited = (certificate_descriptor,)
+
+    def run_certificate(arguments: tuple[str, ...]) -> bytes:
+        os.lseek(certificate_descriptor, 0, os.SEEK_SET)
+        return runner.run(arguments, pass_fds=inherited, timeout=30)
+
+    certificate_text = _decode_public_openssl_output(
+        run_certificate(
+            (
+                "/usr/bin/openssl",
+                "x509",
+                "-in",
+                certificate_path,
+                "-noout",
+                "-dateopt",
+                "iso_8601",
+                "-startdate",
+                "-enddate",
+                "-text",
+            )
+        ),
+        label="contract",
+    )
+    not_before, not_after = _recipient_certificate_window(certificate_text)
+    key_usage = re.findall(
+        r"X509v3 Key Usage:[ \t]*(critical)?[ \t]*\r?\n[ \t]*([^\r\n]+)",
+        certificate_text,
+    )
+    usages = (
+        {value.strip() for value in key_usage[0][1].split(",")} if len(key_usage) == 1 else set()
+    )
+    basic_constraints = re.findall(
+        r"X509v3 Basic Constraints:[^\r\n]*\r?\n[ \t]*([^\r\n]+)",
+        certificate_text,
+    )
+    signature_algorithms = re.findall(
+        r"^[ \t]*Signature Algorithm:[ \t]*([^\r\n]+)[ \t]*$",
+        certificate_text,
+        re.MULTILINE,
+    )
+    if (
+        not not_before <= now.astimezone(UTC) <= not_after
+        or not_before >= not_after
+        or len(key_usage) != 1
+        or key_usage[0][0] != "critical"
+        or "Key Encipherment" not in usages
+        or not usages <= {"Key Encipherment", "Data Encipherment"}
+        or len(basic_constraints) > 1
+        or any("CA:TRUE" in value.replace(" ", "").upper() for value in basic_constraints)
+        or len(re.findall(r"Public Key Algorithm:[ \t]*rsaEncryption", certificate_text)) != 1
+        or not signature_algorithms
+        or any(
+            "sha1" in algorithm.casefold() or "md5" in algorithm.casefold()
+            for algorithm in signature_algorithms
+        )
+    ):
+        raise AdoptionError("CA recipient certificate contract is unsafe")
+
+    public_key = run_certificate(
+        (
+            "/usr/bin/openssl",
+            "x509",
+            "-in",
+            certificate_path,
+            "-pubkey",
+            "-noout",
+        )
+    )
+    if not public_key or len(public_key) > MAX_CA_FILE_BYTES:
+        raise AdoptionError("CA recipient certificate RSA public key is malformed")
+    public_description = _decode_public_openssl_output(
+        runner.run(
+            ("/usr/bin/openssl", "pkey", "-pubin", "-text_pub", "-noout"),
+            input_bytes=public_key,
+            timeout=30,
+        ),
+        label="RSA public key",
+    )
+    bits = _PUBLIC_KEY_BITS.search(public_description)
+    exponent = re.search(r"^Exponent:[ \t]*([0-9]+)", public_description, re.MULTILINE)
+    if (
+        bits is None
+        or int(bits.group(1)) < MIN_CA_RECIPIENT_RSA_BITS
+        or re.search(r"^Modulus:[ \t]*$", public_description, re.MULTILINE) is None
+        or exponent is None
+        or int(exponent.group(1)) < 3
+        or int(exponent.group(1)) % 2 == 0
+    ):
+        raise AdoptionError("CA recipient certificate RSA public key is unsafe")
+    return _sha256_bytes(certificate_payload)
+
+
+def _read_ca_source_file(path: Path, *, modes: frozenset[int]) -> bytes:
+    canonical = protected_file(path, modes=modes, max_bytes=MAX_CA_FILE_BYTES)
+    before = canonical.lstat()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(canonical, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) not in modes
+            or not 0 < opened.st_size <= MAX_CA_FILE_BYTES
+            or _ca_file_identity(opened) != _ca_file_identity(before)
+        ):
+            raise AdoptionError("Caddy CA source file changed during protected open")
+
+        chunks: list[bytes] = []
+        remaining = MAX_CA_FILE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after_descriptor = os.fstat(descriptor)
+        after_path = canonical.lstat()
+        if (
+            not payload
+            or len(payload) > MAX_CA_FILE_BYTES
+            or len(payload) != opened.st_size
+            or _ca_file_identity(after_descriptor) != _ca_file_identity(opened)
+            or _ca_file_identity(after_path) != _ca_file_identity(opened)
+        ):
+            raise AdoptionError("Caddy CA source file changed during protected read")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
 def _ca_tar_payload(ca_root: Path) -> tuple[bytes, int]:
     canonical = protected_directory(ca_root, modes=frozenset({0o700, 0o750, 0o755}))
-    stream = io.BytesIO()
-    count = 0
+
+    def source_names() -> set[str]:
+        try:
+            return {entry.name for entry in canonical.iterdir()}
+        except OSError as exc:
+            raise AdoptionError("Caddy CA source directory could not be inspected") from exc
+
+    observed_names = source_names()
+    if observed_names != CA_FILENAMES:
+        raise AdoptionError("Caddy CA source must contain exactly the four canonical files")
+
+    materials: dict[str, bytes] = {}
     total = 0
+    for filename in sorted(CA_FILENAMES):
+        modes = CA_PRIVATE_KEY_MODES if filename.endswith(".key") else CA_CERTIFICATE_MODES
+        payload = _read_ca_source_file(canonical / filename, modes=modes)
+        total += len(payload)
+        if total > MAX_CA_PLAINTEXT:
+            raise AdoptionError("Caddy CA plaintext exceeds the encrypted escrow limit")
+        materials[filename] = payload
+    if source_names() != CA_FILENAMES:
+        raise AdoptionError("Caddy CA source changed while its protected files were read")
+
+    stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        for current, directories, files in os.walk(canonical, followlinks=False):
-            current_path = Path(current)
-            for directory in directories:
-                candidate = current_path / directory
-                if candidate.is_symlink() or not candidate.is_dir():
-                    raise AdoptionError("Caddy CA tree contains an unsafe directory")
-            for filename in sorted(files):
-                candidate = current_path / filename
-                info = candidate.lstat()
-                if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                    raise AdoptionError("Caddy CA tree contains an unsafe file")
-                payload = candidate.read_bytes()
-                total += len(payload)
-                count += 1
-                if total > MAX_CA_PLAINTEXT:
-                    raise AdoptionError("Caddy CA plaintext exceeds the encrypted escrow limit")
-                relative = candidate.relative_to(canonical).as_posix()
-                member = tarfile.TarInfo(relative)
-                member.size = len(payload)
-                member.mode = 0o600
-                member.uid = 0
-                member.gid = 0
-                member.uname = "root"
-                member.gname = "root"
-                member.mtime = 0
-                archive.addfile(member, io.BytesIO(payload))
-    if count == 0:
-        raise AdoptionError("Caddy CA tree is empty")
-    return stream.getvalue(), count
+        for filename in sorted(materials):
+            payload = materials[filename]
+            member = tarfile.TarInfo(filename)
+            member.size = len(payload)
+            member.mode = 0o600
+            member.uid = 0
+            member.gid = 0
+            member.uname = "root"
+            member.gname = "root"
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(payload))
+    return stream.getvalue(), len(materials)
 
 
 def _encrypt_ca_escrow(
@@ -1540,52 +1995,84 @@ def _encrypt_ca_escrow(
     binding_key: bytes,
     destination: Path,
 ) -> dict[str, Any]:
-    certificate = protected_file(
-        recipient_certificate,
-        modes=frozenset({0o400, 0o440, 0o444}),
-        max_bytes=65_536,
-    )
-    plaintext, file_count = _ca_tar_payload(ca_root)
-    plaintext_hmac = _hmac_binding(plaintext, binding_key, domain="heyi-caddy-ca-v1")
-    parent = protected_directory(destination.parent, modes=frozenset({0o700}))
-    temporary = parent / f".{destination.name}.{secrets.token_hex(16)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
-            runner.run(
-                (
-                    "/usr/bin/openssl",
-                    "cms",
-                    "-encrypt",
-                    "-binary",
-                    "-aes256",
-                    "-outform",
-                    "DER",
-                    "-recip",
-                    str(certificate),
-                ),
-                input_bytes=plaintext,
-                stdout_file=stream,
-                timeout=120,
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, 0o400)
-        os.replace(temporary, destination)
-        directory_descriptor = os.open(parent, os.O_RDONLY)
+    with _opened_ca_recipient_certificate(recipient_certificate) as (
+        certificate,
+        certificate_descriptor,
+        certificate_payload,
+        certificate_identity,
+    ):
+        certificate_path = f"/proc/self/fd/{certificate_descriptor}"
+        certificate_digest = _validate_ca_recipient_certificate(
+            runner,
+            certificate_path=certificate_path,
+            certificate_descriptor=certificate_descriptor,
+            certificate_payload=certificate_payload,
+            now=_utc_now(),
+        )
+        _recipient_certificate_identity_is_stable(
+            certificate,
+            certificate_descriptor,
+            certificate_identity,
+        )
+        plaintext, file_count = _ca_tar_payload(ca_root)
+        plaintext_hmac = _hmac_binding(plaintext, binding_key, domain="heyi-caddy-ca-v1")
+        parent = protected_directory(destination.parent, modes=frozenset({0o700}))
+        temporary = parent / f".{destination.name}.{secrets.token_hex(16)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        _recipient_certificate_identity_is_stable(
+            certificate,
+            certificate_descriptor,
+            certificate_identity,
+        )
+        descriptor = os.open(temporary, flags, 0o600)
         try:
-            os.fsync(directory_descriptor)
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                os.lseek(certificate_descriptor, 0, os.SEEK_SET)
+                runner.run(
+                    (
+                        "/usr/bin/openssl",
+                        "cms",
+                        "-encrypt",
+                        "-binary",
+                        "-aes256",
+                        "-outform",
+                        "DER",
+                        "-recip",
+                        certificate_path,
+                        "-keyopt",
+                        "rsa_padding_mode:oaep",
+                        "-keyopt",
+                        "rsa_oaep_md:sha256",
+                        "-keyopt",
+                        "rsa_mgf1_md:sha256",
+                    ),
+                    input_bytes=plaintext,
+                    stdout_file=stream,
+                    timeout=120,
+                    pass_fds=(certificate_descriptor,),
+                )
+                _recipient_certificate_identity_is_stable(
+                    certificate,
+                    certificate_descriptor,
+                    certificate_identity,
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o400)
+            os.replace(temporary, destination)
+            directory_descriptor = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         finally:
-            os.close(directory_descriptor)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-    finally:
-        # Remove all Python references to the plaintext as early as practical.
-        plaintext = b""
+            # Remove all Python references to the plaintext as early as practical.
+            plaintext = b""
     runner.run(
         (
             "/usr/bin/openssl",
@@ -1605,7 +2092,7 @@ def _encrypt_ca_escrow(
         "ciphertext_size_bytes": destination.stat().st_size,
         "plaintext_opaque_hmac_sha256": plaintext_hmac,
         "file_count": file_count,
-        "recipient_certificate_sha256": _sha256_file(certificate),
+        "recipient_certificate_sha256": certificate_digest,
         "private_key_bytes_in_evidence": False,
         "cos_transfer_allowed": False,
     }
@@ -2192,9 +2679,28 @@ def _timestamp(value: object, label: str) -> datetime:
 
 def _read_json_file(path: Path, *, max_bytes: int = MAX_CONTROL_FILE) -> dict[str, Any]:
     payload = _open_protected_bytes(path, max_bytes=max_bytes)
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        document: dict[str, Any] = {}
+        for name, value in pairs:
+            if name in document:
+                raise AdoptionError("protected JSON document contains duplicate keys")
+            document[name] = value
+        return document
+
+    def reject_constant(value: str) -> Never:
+        raise AdoptionError(f"protected JSON document contains non-finite number: {value}")
+
     try:
-        return _object(json.loads(payload), "JSON document")
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        return _object(
+            json.loads(
+                payload,
+                object_pairs_hook=reject_duplicates,
+                parse_constant=reject_constant,
+            ),
+            "JSON document",
+        )
+    except (UnicodeError, json.JSONDecodeError, AdoptionError) as exc:
         raise AdoptionError("protected JSON document is malformed") from exc
 
 
@@ -2241,6 +2747,191 @@ def _verify_descriptor(value: object, *, root: Path | None = None) -> Path:
     return path
 
 
+def _stable_json_document(
+    path: Path,
+    *,
+    modes: frozenset[int],
+    max_bytes: int = 65_536,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    canonical = protected_file(path, modes=modes, max_bytes=max_bytes)
+    before = _descriptor(canonical)
+    document = _read_json_file(canonical, max_bytes=max_bytes)
+    after = _descriptor(canonical)
+    if before != after:
+        raise AdoptionError("protected release authorization state changed during validation")
+    return document, after
+
+
+def _release_authorization_sha256(value: object) -> str:
+    return _sha256_bytes(_canonical_json(_object(value, "release authorization binding")))
+
+
+def _protected_release_manifest(release_id: str) -> Path:
+    if _RELEASE_ID.fullmatch(release_id) is None:
+        raise AdoptionError("release ID cannot safely identify one artifact directory")
+    candidate = ARTIFACT_ROOT / release_id / "offline-registry-bundle" / "release.env.images"
+    manifest = protected_file(
+        candidate,
+        modes=frozenset({0o400, 0o440, 0o444}),
+        max_bytes=65_536,
+    )
+    try:
+        relative = manifest.relative_to(ARTIFACT_ROOT)
+    except ValueError as exc:
+        raise AdoptionError("materialized target manifest escapes the fixed artifact root") from exc
+    if relative.parts != (release_id, "offline-registry-bundle", "release.env.images"):
+        raise AdoptionError("materialized target manifest path is not canonical")
+    return manifest
+
+
+def _current_release_authorization() -> dict[str, Any]:
+    highest, highest_descriptor = _stable_json_document(
+        HIGHEST_RELEASE_STATE,
+        modes=frozenset({0o400}),
+    )
+    highest_keys = {
+        "schema_version",
+        "release_sequence",
+        "release_id",
+        "release_git_sha",
+        "release_schema_head",
+        "manifest_sha256",
+        "release_assets_sha256",
+        "trusted_key_sha256",
+    }
+    sequence = highest.get("release_sequence")
+    release_id = highest.get("release_id")
+    git_sha = highest.get("release_git_sha")
+    schema_head = highest.get("release_schema_head")
+    manifest_digest = highest.get("manifest_sha256")
+    assets_digest = highest.get("release_assets_sha256")
+    trusted_key_digest = highest.get("trusted_key_sha256")
+    if (
+        set(highest) != highest_keys
+        or highest.get("schema_version") != 2
+        or type(sequence) is not int
+        or not 0 < sequence <= 999_999_999_999_999_999
+        or not isinstance(release_id, str)
+        or _RELEASE_ID.fullmatch(release_id) is None
+        or not isinstance(git_sha, str)
+        or _GIT_SHA.fullmatch(git_sha) is None
+        or not isinstance(schema_head, str)
+        or _SCHEMA_HEAD.fullmatch(schema_head) is None
+        or not isinstance(manifest_digest, str)
+        or _SHA256.fullmatch(manifest_digest) is None
+        or not isinstance(assets_digest, str)
+        or _SHA256.fullmatch(assets_digest) is None
+        or not isinstance(trusted_key_digest, str)
+        or _SHA256.fullmatch(trusted_key_digest) is None
+    ):
+        raise AdoptionError("highest signed release authorization is malformed")
+
+    manifest = _protected_release_manifest(release_id)
+    manifest_descriptor = _descriptor(manifest)
+    if not hmac.compare_digest(
+        _string(manifest_descriptor.get("sha256"), "target manifest digest"),
+        manifest_digest,
+    ):
+        raise AdoptionError("materialized target manifest differs from highest release")
+
+    receipt_path = STATE_ROOT / f"registry-import-{manifest_digest}.json"
+    receipt, receipt_descriptor = _stable_json_document(
+        receipt_path,
+        modes=frozenset({0o400}),
+    )
+    receipt_keys = {
+        "schema_version",
+        "kind",
+        "status",
+        "release_sequence",
+        "release_id",
+        "release_git_sha",
+        "release_schema_head",
+        "release_sha256",
+        "manifest_sha256",
+        "release_assets_sha256",
+        "checksum_set_sha256",
+        "signature_sha256",
+        "trusted_key_sha256",
+    }
+    digest_fields = (
+        "release_sha256",
+        "manifest_sha256",
+        "release_assets_sha256",
+        "checksum_set_sha256",
+        "signature_sha256",
+        "trusted_key_sha256",
+    )
+    if (
+        set(receipt) != receipt_keys
+        or receipt.get("schema_version") != 2
+        or receipt.get("kind") != "offline-registry-import"
+        or receipt.get("status") != "verified"
+        or type(receipt.get("release_sequence")) is not int
+        or receipt.get("release_sequence") != sequence
+        or receipt.get("release_id") != release_id
+        or receipt.get("release_git_sha") != git_sha
+        or receipt.get("release_schema_head") != schema_head
+        or receipt.get("manifest_sha256") != manifest_digest
+        or receipt.get("release_assets_sha256") != assets_digest
+        or receipt.get("trusted_key_sha256") != trusted_key_digest
+        or any(
+            not isinstance(receipt.get(name), str)
+            or _SHA256.fullmatch(str(receipt.get(name))) is None
+            for name in digest_fields
+        )
+    ):
+        raise AdoptionError("signed registry import receipt differs from highest release")
+
+    trusted_key = protected_file(
+        TRUSTED_RELEASE_PUBLIC_KEY,
+        modes=frozenset({0o400, 0o444}),
+        max_bytes=65_536,
+    )
+    trusted_key_descriptor = _descriptor(trusted_key)
+    if not hmac.compare_digest(
+        _string(trusted_key_descriptor.get("sha256"), "trusted release key digest"),
+        trusted_key_digest,
+    ):
+        raise AdoptionError("fixed trusted release public key differs from release state")
+
+    return {
+        "schema_version": 1,
+        "release_sequence": sequence,
+        "release_id": release_id,
+        "release_git_sha": git_sha,
+        "release_schema_head": schema_head,
+        "release_sha256": receipt["release_sha256"],
+        "release_assets_sha256": assets_digest,
+        "checksum_set_sha256": receipt["checksum_set_sha256"],
+        "signature_sha256": receipt["signature_sha256"],
+        "target_manifest": manifest_descriptor,
+        "registry_import_receipt": receipt_descriptor,
+        "highest_release": highest_descriptor,
+        "trusted_release_public_key": trusted_key_descriptor,
+    }
+
+
+def _validate_release_authorization(plan: Mapping[str, Any]) -> dict[str, Any]:
+    planned = _object(plan.get("release_authorization"), "planned release authorization")
+    expected_digest = _string(
+        plan.get("release_authorization_sha256"),
+        "planned release authorization digest",
+    )
+    if _SHA256.fullmatch(expected_digest) is None or not hmac.compare_digest(
+        _release_authorization_sha256(planned),
+        expected_digest,
+    ):
+        raise AdoptionError("planned release authorization binding is malformed")
+    current = _current_release_authorization()
+    if current != planned or not hmac.compare_digest(
+        _release_authorization_sha256(current),
+        expected_digest,
+    ):
+        raise AdoptionError("signed release authorization changed after planning")
+    return current
+
+
 def _env_binding(path: Path, binding_key: bytes) -> str:
     return _hmac_binding(
         _open_protected_bytes(path),
@@ -2264,6 +2955,8 @@ def _load_plan_identity(
         "legacy_compose",
         "host_isolation_guard",
         "target_manifest",
+        "release_authorization",
+        "release_authorization_sha256",
         "inventory_sha256",
         "topology_sha256",
         "inventory",
@@ -2272,7 +2965,7 @@ def _load_plan_identity(
     if set(plan) != expected:
         raise AdoptionError("legacy adoption plan schema differs")
     if (
-        plan.get("schema_version") != 2
+        plan.get("schema_version") != 4
         or plan.get("kind") != "heyi-legacy-adoption-plan"
         or plan.get("project") != PROJECT
         or plan.get("data_root") != str(DATA_ROOT)
@@ -2297,6 +2990,22 @@ def _load_plan_identity(
     }
     if plan.get("safety") != expected_safety:
         raise AdoptionError("legacy adoption plan safety contract differs")
+    release_authorization = _object(
+        plan.get("release_authorization"),
+        "plan release authorization",
+    )
+    release_authorization_digest = plan.get("release_authorization_sha256")
+    if (
+        not isinstance(release_authorization_digest, str)
+        or _SHA256.fullmatch(release_authorization_digest) is None
+        or not hmac.compare_digest(
+            _release_authorization_sha256(release_authorization),
+            release_authorization_digest,
+        )
+        or plan.get("git_sha") != release_authorization.get("release_git_sha")
+        or plan.get("target_manifest") != release_authorization.get("target_manifest")
+    ):
+        raise AdoptionError("legacy adoption plan release authorization differs")
     inventory_digest = plan.get("inventory_sha256")
     topology_digest = plan.get("topology_sha256")
     if (
@@ -2320,6 +3029,7 @@ def _validate_plan(
     enforce_freshness: bool = True,
 ) -> tuple[dict[str, Any], str, dict[str, str], tuple[Path, ...], tuple[Path, ...]]:
     plan, plan_digest = _load_plan_identity(path, enforce_freshness=enforce_freshness)
+    _validate_release_authorization(plan)
 
     runtime_entry = _object(plan.get("runtime_env"), "runtime environment binding")
     if set(runtime_entry) != {"path", "opaque_hmac_sha256"}:
@@ -2399,31 +3109,10 @@ def _validate_plan(
         env_paths.append(env_path)
 
     target_entry = _object(plan.get("target_manifest"), "target manifest binding")
-    if set(target_entry) != {"path", "sha256"}:
+    if set(target_entry) != {"path", "sha256", "size_bytes"}:
         raise AdoptionError("target manifest binding schema differs")
-    target_path = protected_file(
-        Path(_string(target_entry.get("path"), "target manifest path")),
-        modes=frozenset({0o400, 0o440, 0o444}),
-    )
-    target_digest = _string(target_entry.get("sha256"), "target manifest digest")
-    if _SHA256.fullmatch(target_digest) is None or not hmac.compare_digest(
-        _sha256_file(target_path), target_digest
-    ):
-        raise AdoptionError("target manifest differs from its plan")
-    guard_entry = _object(plan.get("host_isolation_guard"), "host-isolation guard binding")
-    if set(guard_entry) != {"path", "sha256"}:
-        raise AdoptionError("host-isolation guard binding schema differs")
-    guard_path = protected_file(
-        Path(_string(guard_entry.get("path"), "host-isolation guard path")),
-        modes=frozenset({0o400, 0o440, 0o444, 0o644}),
-    )
-    if guard_path != Path(__file__).resolve(strict=True).with_name("host_isolation_guard.py"):
-        raise AdoptionError("host-isolation guard is not from this release")
-    guard_digest = _string(guard_entry.get("sha256"), "host-isolation guard digest")
-    if _SHA256.fullmatch(guard_digest) is None or not hmac.compare_digest(
-        _sha256_file(guard_path), guard_digest
-    ):
-        raise AdoptionError("host-isolation guard differs from its plan")
+    _verify_descriptor(target_entry)
+    _protected_host_isolation_guard(plan.get("host_isolation_guard"))
     protected_directory(DATA_ROOT, modes=frozenset({0o700, 0o750, 0o755}))
     return plan, plan_digest, runtime, tuple(compose_paths), tuple(env_paths)
 
@@ -2590,6 +3279,100 @@ def _signature(
     )
 
 
+def _validate_adoption_evidence_key_pair(
+    runner: Runner,
+    *,
+    signing_key: Path,
+    public_key: Path,
+    phase: str,
+) -> tuple[Path, Path]:
+    if phase not in {
+        "prepare-entry",
+        "prepare-ca-challenge-signature",
+        "finalize-entry",
+        "finalize-evidence-signature",
+        "retire-entry",
+        "retire-intent-signature",
+    }:
+        raise AdoptionError("adoption evidence key-pair challenge phase is invalid")
+    if signing_key != EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY:
+        raise AdoptionError("adoption evidence signer path differs from the fixed ephemeral path")
+    if public_key != TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY:
+        raise AdoptionError("adoption evidence public key path differs from the fixed trust root")
+    _validate_trusted_adoption_evidence_public_key()
+    signing = protected_file(
+        signing_key,
+        modes=frozenset({0o400}),
+        max_bytes=65_536,
+    )
+    public = protected_file(
+        public_key,
+        modes=frozenset({0o400, 0o444}),
+        max_bytes=65_536,
+    )
+    challenge = (
+        b"heyi-adoption-evidence-key-pair-v1\0"
+        + phase.encode("ascii")
+        + b"\0"
+        + secrets.token_bytes(32)
+    )
+    try:
+        signature = runner.run(
+            (
+                "/usr/bin/openssl",
+                "dgst",
+                "-sha256",
+                "-sign",
+                str(signing),
+            ),
+            input_bytes=challenge,
+            timeout=30,
+        )
+    except CommandError as exc:
+        raise AdoptionError("ephemeral adoption signer failed the OpenSSL challenge") from exc
+    if not 0 < len(signature) <= 65_536:
+        raise AdoptionError("ephemeral adoption signer returned an invalid challenge signature")
+
+    create_memfd = getattr(os, "memfd_create", None)
+    if create_memfd is None:
+        raise AdoptionError("anonymous key-pair challenge verification is unavailable")
+    descriptor = create_memfd(
+        "heyi-adoption-key-pair",
+        getattr(os, "MFD_CLOEXEC", 0),
+    )
+    try:
+        _posix_fchmod(descriptor, 0o600)
+        view = memoryview(signature)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise AdoptionError("anonymous key-pair challenge signature write failed")
+            view = view[written:]
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            runner.run(
+                (
+                    "/usr/bin/openssl",
+                    "dgst",
+                    "-sha256",
+                    "-verify",
+                    str(public),
+                    "-signature",
+                    f"/proc/self/fd/{descriptor}",
+                ),
+                input_bytes=challenge,
+                timeout=30,
+                pass_fds=(descriptor,),
+            )
+        except CommandError as exc:
+            raise AdoptionError(
+                "ephemeral adoption signer does not match the independently trusted public key"
+            ) from exc
+    finally:
+        os.close(descriptor)
+    return signing, public
+
+
 def _verify_signature(
     runner: Runner,
     *,
@@ -2678,6 +3461,27 @@ def _verify_data_bindings(inventory: LegacyInventory) -> None:
         ]
         if len(matches) != 1 or Path(matches[0][0]) != source:
             raise AdoptionError(f"legacy {service} data bind path differs")
+
+
+def _validated_legacy_ca_root(inventory: LegacyInventory, requested: Path) -> Path:
+    caddy_data = DATA_ROOT / "caddy-data"
+    expected_mount = (str(caddy_data), "/data", True, "bind")
+    edge_services = ["proxy"]
+    if any(item.service == "maintenance-page" and not item.oneoff for item in inventory.containers):
+        edge_services.append("maintenance-page")
+    for service in edge_services:
+        record = _service(inventory, service)
+        data_mounts = tuple(mount for mount in record.mounts if mount[1] == "/data")
+        if data_mounts != (expected_mount,):
+            raise AdoptionError(f"legacy {service} Caddy data bind path differs")
+    expected = caddy_data / "caddy" / "pki" / "authorities" / "local"
+    ca_root = protected_directory(
+        requested,
+        modes=frozenset({0o700, 0o750, 0o755}),
+    )
+    if ca_root != expected:
+        raise AdoptionError("Caddy CA root must equal the derived live proxy CA root")
+    return ca_root
 
 
 def _postgres_control_value(
@@ -2924,15 +3728,22 @@ def _ca_challenge(
     *,
     run_id: str,
     plan_digest: str,
+    release_authorization_sha256: str,
     ca_escrow: Mapping[str, Any],
+    ca_attestation_public_key_sha256: str,
 ) -> dict[str, Any]:
+    if _SHA256.fullmatch(release_authorization_sha256) is None:
+        raise AdoptionError("release authorization binding is malformed")
+    if _SHA256.fullmatch(ca_attestation_public_key_sha256) is None:
+        raise AdoptionError("CA attestation public key binding is malformed")
     issued = _utc_now()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "heyi-caddy-ca-restore-challenge",
         "project": PROJECT,
         "run_id": run_id,
         "plan_sha256": plan_digest,
+        "release_authorization_sha256": release_authorization_sha256,
         "nonce": secrets.token_hex(32),
         "issued_at": issued.isoformat().replace("+00:00", "Z"),
         "expires_at": (issued + timedelta(days=7)).isoformat().replace("+00:00", "Z"),
@@ -2941,8 +3752,44 @@ def _ca_challenge(
         "plaintext_opaque_hmac_sha256": ca_escrow["plaintext_opaque_hmac_sha256"],
         "file_count": ca_escrow["file_count"],
         "recipient_certificate_sha256": ca_escrow["recipient_certificate_sha256"],
+        "ca_attestation_public_key_sha256": ca_attestation_public_key_sha256,
         "cos_transfer_allowed": False,
     }
+
+
+def _validate_ca_challenge_binding(
+    document: Mapping[str, Any],
+    *,
+    run_id: str,
+    plan_digest: str,
+    release_authorization_sha256: str,
+    ca_escrow: Mapping[str, Any],
+    ca_attestation_public_key_sha256: str,
+) -> None:
+    issued = _timestamp(document.get("issued_at"), "CA challenge issued_at")
+    expires = _timestamp(document.get("expires_at"), "CA challenge expires_at")
+    if (
+        set(document) != CA_RESTORE_CHALLENGE_KEYS
+        or document.get("schema_version") != 2
+        or document.get("kind") != "heyi-caddy-ca-restore-challenge"
+        or document.get("project") != PROJECT
+        or document.get("run_id") != run_id
+        or document.get("plan_sha256") != plan_digest
+        or document.get("release_authorization_sha256") != release_authorization_sha256
+        or not isinstance(document.get("nonce"), str)
+        or _SHA256.fullmatch(str(document.get("nonce"))) is None
+        or expires - issued != timedelta(days=7)
+        or document.get("encrypted_archive_sha256") != ca_escrow.get("ciphertext_sha256")
+        or document.get("encrypted_archive_size_bytes") != ca_escrow.get("ciphertext_size_bytes")
+        or document.get("plaintext_opaque_hmac_sha256")
+        != ca_escrow.get("plaintext_opaque_hmac_sha256")
+        or document.get("file_count") != ca_escrow.get("file_count")
+        or document.get("recipient_certificate_sha256")
+        != ca_escrow.get("recipient_certificate_sha256")
+        or document.get("ca_attestation_public_key_sha256") != ca_attestation_public_key_sha256
+        or document.get("cos_transfer_allowed") is not False
+    ):
+        raise AdoptionError("CA challenge differs from its prepared release and escrow binding")
 
 
 def _verify_ca_attestation(
@@ -2961,6 +3808,47 @@ def _verify_ca_attestation(
     )
     challenge_document = _read_json_file(challenge)
     document = _read_json_file(attestation)
+    if set(challenge_document) != CA_RESTORE_CHALLENGE_KEYS:
+        raise AdoptionError("offline CA restore challenge schema differs")
+    challenge_file_count = challenge_document.get("file_count")
+    challenge_archive_size = challenge_document.get("encrypted_archive_size_bytes")
+    challenge_issued = _timestamp(challenge_document.get("issued_at"), "CA challenge issued_at")
+    challenge_expires = _timestamp(challenge_document.get("expires_at"), "CA challenge expires_at")
+    challenge_attestation_key = challenge_document.get("ca_attestation_public_key_sha256")
+    verified_public_key = protected_file(
+        public_key,
+        modes=frozenset({0o400, 0o440, 0o444}),
+        max_bytes=65_536,
+    )
+    if (
+        challenge_document.get("schema_version") != 2
+        or challenge_document.get("kind") != "heyi-caddy-ca-restore-challenge"
+        or challenge_document.get("project") != PROJECT
+        or not isinstance(challenge_document.get("run_id"), str)
+        or _SAFE_NAME.fullmatch(str(challenge_document.get("run_id"))) is None
+        or not isinstance(challenge_document.get("plan_sha256"), str)
+        or _SHA256.fullmatch(str(challenge_document.get("plan_sha256"))) is None
+        or not isinstance(challenge_document.get("release_authorization_sha256"), str)
+        or _SHA256.fullmatch(str(challenge_document.get("release_authorization_sha256"))) is None
+        or not isinstance(challenge_document.get("nonce"), str)
+        or _SHA256.fullmatch(str(challenge_document.get("nonce"))) is None
+        or not isinstance(challenge_document.get("encrypted_archive_sha256"), str)
+        or _SHA256.fullmatch(str(challenge_document.get("encrypted_archive_sha256"))) is None
+        or type(challenge_archive_size) is not int
+        or not 0 < challenge_archive_size <= MAX_CA_PLAINTEXT * 2
+        or not isinstance(challenge_document.get("plaintext_opaque_hmac_sha256"), str)
+        or _SHA256.fullmatch(str(challenge_document.get("plaintext_opaque_hmac_sha256"))) is None
+        or type(challenge_file_count) is not int
+        or not 0 < challenge_file_count <= 128
+        or not isinstance(challenge_document.get("recipient_certificate_sha256"), str)
+        or _SHA256.fullmatch(str(challenge_document.get("recipient_certificate_sha256"))) is None
+        or not isinstance(challenge_attestation_key, str)
+        or _SHA256.fullmatch(challenge_attestation_key) is None
+        or challenge_document.get("cos_transfer_allowed") is not False
+        or challenge_expires - challenge_issued != timedelta(days=7)
+        or not hmac.compare_digest(_sha256_file(verified_public_key), challenge_attestation_key)
+    ):
+        raise AdoptionError("offline CA restore challenge contract differs")
     expected_keys = {
         "schema_version",
         "kind",
@@ -2998,12 +3886,10 @@ def _verify_ca_attestation(
         raise AdoptionError("offline CA restore attestation does not match its challenge")
     tested_at = _timestamp(document.get("tested_at"), "CA restore tested_at")
     now = _utc_now()
-    issued = _timestamp(challenge_document.get("issued_at"), "CA challenge issued_at")
-    expires = _timestamp(challenge_document.get("expires_at"), "CA challenge expires_at")
     if (
         not now - timedelta(days=30) <= tested_at <= now + timedelta(minutes=5)
-        or not issued <= tested_at <= expires
-        or now > expires
+        or not challenge_issued <= tested_at <= challenge_expires
+        or now > challenge_expires
     ):
         raise AdoptionError("offline CA restore attestation is stale or outside its challenge")
     return {
@@ -3013,7 +3899,7 @@ def _verify_ca_attestation(
         "signature": _descriptor(signature),
         "signer_public_key_sha256": _sha256_file(
             protected_file(
-                public_key,
+                verified_public_key,
                 modes=frozenset({0o400, 0o440, 0o444}),
                 max_bytes=65_536,
             )
@@ -3025,6 +3911,12 @@ def _verify_ca_attestation(
 
 
 def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
+    signing_key, public_key = _validate_adoption_evidence_key_pair(
+        runner,
+        signing_key=arguments.evidence_signing_key,
+        public_key=arguments.evidence_public_key,
+        phase="prepare-entry",
+    )
     binding_key = _read_binding_key(arguments.binding_key)
     plan, plan_digest, runtime, compose_paths, env_paths = _validate_plan(
         arguments.plan, binding_key
@@ -3033,26 +3925,14 @@ def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
     if inventory_sha256(inventory) != plan["inventory_sha256"]:
         raise AdoptionError("live legacy inventory differs from the approved plan")
     runtime_path = Path(plan["runtime_env"]["path"])
+    ca_root = _validated_legacy_ca_root(inventory, arguments.ca_root)
     recipient = protected_file(
         arguments.ca_recipient_certificate,
         modes=frozenset({0o400, 0o440, 0o444}),
         max_bytes=65_536,
     )
-    ca_root = protected_directory(
-        arguments.ca_root,
-        modes=frozenset({0o700, 0o750, 0o755}),
-    )
-    try:
-        ca_root.relative_to(DATA_ROOT)
-    except ValueError as exc:
-        raise AdoptionError("Caddy CA root must be inside the fixed legacy data root") from exc
-    signing_key = protected_file(
-        arguments.evidence_signing_key,
-        modes=frozenset({0o400, 0o600}),
-        max_bytes=65_536,
-    )
-    public_key = protected_file(
-        arguments.evidence_public_key,
+    ca_attestation_public_key = protected_file(
+        arguments.ca_attestation_public_key,
         modes=frozenset({0o400, 0o440, 0o444}),
         max_bytes=65_536,
     )
@@ -3137,10 +4017,18 @@ def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
     challenge_document = _ca_challenge(
         run_id=arguments.run_id,
         plan_digest=plan_digest,
+        release_authorization_sha256=plan["release_authorization_sha256"],
         ca_escrow=ca_metadata,
+        ca_attestation_public_key_sha256=_sha256_file(ca_attestation_public_key),
     )
     challenge_path = evidence_dir / "ca-restore-challenge.json"
     challenge_signature = evidence_dir / "ca-restore-challenge.sig"
+    signing_key, public_key = _validate_adoption_evidence_key_pair(
+        runner,
+        signing_key=arguments.evidence_signing_key,
+        public_key=arguments.evidence_public_key,
+        phase="prepare-ca-challenge-signature",
+    )
     _atomic_write(challenge_path, _canonical_json(challenge_document), mode=0o400)
     _signature(
         runner,
@@ -3155,12 +4043,13 @@ def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
         public_key=public_key,
     )
     state_payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "heyi-legacy-prepared-state",
         "project": PROJECT,
         "run_id": arguments.run_id,
         "created_at": _utc_now().isoformat().replace("+00:00", "Z"),
         "plan_sha256": plan_digest,
+        "release_authorization_sha256": plan["release_authorization_sha256"],
         "git_sha": plan["git_sha"],
         "target_manifest_sha256": plan["target_manifest"]["sha256"],
         "source_inventory_sha256": plan["inventory_sha256"],
@@ -3191,6 +4080,7 @@ def _prepare(arguments: argparse.Namespace, runner: Runner) -> None:
             "document": _descriptor(challenge_path),
             "signature": _descriptor(challenge_signature),
             "signer_public_key_sha256": _sha256_file(public_key),
+            "ca_attestation_public_key_sha256": _sha256_file(ca_attestation_public_key),
         },
         "cos_policy": {
             "runtime_env_allowed": False,
@@ -3235,6 +4125,7 @@ def _validate_prepared_state(
         "run_id",
         "created_at",
         "plan_sha256",
+        "release_authorization_sha256",
         "git_sha",
         "target_manifest_sha256",
         "source_inventory_sha256",
@@ -3252,10 +4143,11 @@ def _validate_prepared_state(
     if set(state) != expected_keys:
         raise AdoptionError("prepared-state payload schema differs")
     if (
-        state.get("schema_version") != 1
+        state.get("schema_version") != 2
         or state.get("kind") != "heyi-legacy-prepared-state"
         or state.get("project") != PROJECT
         or state.get("plan_sha256") != plan_digest
+        or state.get("release_authorization_sha256") != plan.get("release_authorization_sha256")
         or state.get("git_sha") != plan.get("git_sha")
         or state.get("target_manifest_sha256")
         != _object(plan.get("target_manifest"), "target manifest").get("sha256")
@@ -3302,6 +4194,35 @@ def _validate_prepared_state(
     }
     if state.get("cos_policy") != expected_cos:
         raise AdoptionError("prepared-state COS isolation policy differs")
+    ca_challenge = _object(state.get("ca_challenge"), "prepared CA challenge binding")
+    ca_attestation_public_key_sha256 = ca_challenge.get("ca_attestation_public_key_sha256")
+    if (
+        set(ca_challenge)
+        != {
+            "document",
+            "signature",
+            "signer_public_key_sha256",
+            "ca_attestation_public_key_sha256",
+        }
+        or not isinstance(ca_challenge.get("signer_public_key_sha256"), str)
+        or _SHA256.fullmatch(str(ca_challenge.get("signer_public_key_sha256"))) is None
+        or not isinstance(ca_attestation_public_key_sha256, str)
+        or _SHA256.fullmatch(ca_attestation_public_key_sha256) is None
+    ):
+        raise AdoptionError("prepared CA challenge signer binding differs")
+    challenge_path = _verify_descriptor(ca_challenge.get("document"), root=canonical_run)
+    challenge_document = _read_json_file(challenge_path)
+    _validate_ca_challenge_binding(
+        challenge_document,
+        run_id=run_id,
+        plan_digest=plan_digest,
+        release_authorization_sha256=_string(
+            state.get("release_authorization_sha256"),
+            "prepared release authorization digest",
+        ),
+        ca_escrow=_object(state.get("ca_escrow"), "prepared CA escrow"),
+        ca_attestation_public_key_sha256=ca_attestation_public_key_sha256,
+    )
     return state, canonical_run
 
 
@@ -3411,6 +4332,12 @@ def _ensure_scratch_root(path: Path, *, create: bool) -> Path:
 
 
 def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
+    signing_key, evidence_public = _validate_adoption_evidence_key_pair(
+        runner,
+        signing_key=arguments.evidence_signing_key,
+        public_key=arguments.evidence_public_key,
+        phase="finalize-entry",
+    )
     binding_key = _read_binding_key(arguments.binding_key)
     plan, plan_digest, runtime, _, _ = _validate_plan(arguments.plan, binding_key)
     state, run = _validate_prepared_state(
@@ -3427,16 +4354,37 @@ def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
         schema_head,
         artifact_context,
     ) = _validate_backup_artifacts(state, run)
-    evidence_public = protected_file(
-        arguments.evidence_public_key,
-        modes=frozenset({0o400, 0o440, 0o444}),
-        max_bytes=65_536,
-    )
     challenge_state = _object(state.get("ca_challenge"), "CA challenge evidence")
     challenge = _verify_descriptor(challenge_state.get("document"), root=run)
     challenge_signature = _verify_descriptor(challenge_state.get("signature"), root=run)
     if challenge_state.get("signer_public_key_sha256") != _sha256_file(evidence_public):
         raise AdoptionError("CA challenge signer public key differs")
+    challenge_document = _read_json_file(challenge)
+    _validate_ca_challenge_binding(
+        challenge_document,
+        run_id=_string(state.get("run_id"), "prepared-state run id"),
+        plan_digest=plan_digest,
+        release_authorization_sha256=_string(
+            state.get("release_authorization_sha256"),
+            "prepared release authorization digest",
+        ),
+        ca_escrow=_object(state.get("ca_escrow"), "prepared CA escrow"),
+        ca_attestation_public_key_sha256=_string(
+            challenge_state.get("ca_attestation_public_key_sha256"),
+            "prepared CA attestation public key digest",
+        ),
+    )
+    if not hmac.compare_digest(
+        _string(
+            challenge_state.get("ca_attestation_public_key_sha256"),
+            "prepared CA attestation public key digest",
+        ),
+        _string(
+            challenge_document.get("ca_attestation_public_key_sha256"),
+            "CA challenge attestation public key digest",
+        ),
+    ):
+        raise AdoptionError("CA attestation public key binding differs from prepared state")
     _verify_signature(
         runner,
         payload=challenge,
@@ -3489,14 +4437,21 @@ def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
         expected_object_bytes=artifact_context["total_bytes"],
         run_token=_string(state.get("run_id"), "prepared-state run id"),
     )
+    signing_key, evidence_public = _validate_adoption_evidence_key_pair(
+        runner,
+        signing_key=arguments.evidence_signing_key,
+        public_key=arguments.evidence_public_key,
+        phase="finalize-evidence-signature",
+    )
     detailed = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "heyi-legacy-adoption-restore-evidence",
         "project": PROJECT,
         "run_id": state["run_id"],
         "generated_at": _utc_now().isoformat().replace("+00:00", "Z"),
         "git_sha": state["git_sha"],
         "plan_sha256": plan_digest,
+        "release_authorization_sha256": state["release_authorization_sha256"],
         "target_manifest_sha256": state["target_manifest_sha256"],
         "source_inventory_sha256": state["source_inventory_sha256"],
         "source_topology_sha256": state["source_topology_sha256"],
@@ -3530,11 +4485,13 @@ def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
     _atomic_write(detailed_path, _canonical_json(detailed), mode=0o400)
     issued = _utc_now()
     top_evidence = {
-        "schema_version": 1,
+        "schema_version": 3,
         "kind": "offline-upgrade-backup",
         "project": PROJECT,
+        "operation_scope": "legacy_adoption",
         "issued_at": issued.isoformat().replace("+00:00", "Z"),
         "expires_at": (issued + timedelta(hours=24)).isoformat().replace("+00:00", "Z"),
+        "release_authorization_sha256": state["release_authorization_sha256"],
         "target_manifest_sha256": state["target_manifest_sha256"],
         "database_backup": _descriptor(database_archive),
         "object_manifest": _descriptor(artifact_context["manifest"]),
@@ -3551,7 +4508,7 @@ def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
     _signature(
         runner,
         payload=evidence_path,
-        signing_key=arguments.evidence_signing_key,
+        signing_key=signing_key,
         destination=signature_path,
     )
     _verify_signature(
@@ -3577,6 +4534,25 @@ def _finalize(arguments: argparse.Namespace, runner: Runner) -> None:
     )
 
 
+def _load_upgrade_backup_verifier() -> ModuleType:
+    release_root = Path(__file__).resolve(strict=True).parents[1]
+    path = protected_file(
+        release_root / "deploy" / "tencent" / "verify-upgrade-backup.py",
+        modes=frozenset({0o400, 0o440, 0o444}),
+        max_bytes=1_048_576,
+    )
+    name = f"heyi_upgrade_backup_verifier_{_sha256_file(path)}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise AdoptionError("trusted upgrade backup verifier could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise AdoptionError("trusted upgrade backup verifier failed to load") from exc
+    return module
+
+
 def _verify_upgrade_evidence(
     runner: Runner,
     *,
@@ -3593,35 +4569,25 @@ def _verify_upgrade_evidence(
         public_key=public_key,
     )
     evidence = _read_json_file(evidence_path, max_bytes=65_536)
-    expected_keys = {
-        "schema_version",
-        "kind",
-        "project",
-        "issued_at",
-        "expires_at",
-        "target_manifest_sha256",
-        "database_backup",
-        "object_manifest",
-        "restore_evidence",
-        "restore_drill",
-    }
-    if set(evidence) != expected_keys:
-        raise AdoptionError("signed upgrade evidence schema differs")
-    target_digest = _object(plan.get("target_manifest"), "target manifest").get("sha256")
-    if (
-        evidence.get("schema_version") != 1
-        or evidence.get("kind") != "offline-upgrade-backup"
-        or evidence.get("project") != PROJECT
-        or evidence.get("target_manifest_sha256") != target_digest
-    ):
-        raise AdoptionError("signed upgrade evidence identity differs")
-    issued = _timestamp(evidence.get("issued_at"), "upgrade evidence issued_at")
-    expires = _timestamp(evidence.get("expires_at"), "upgrade evidence expires_at")
-    now = _utc_now()
-    if not now - timedelta(hours=24) <= issued <= now + timedelta(
-        minutes=5
-    ) or not now < expires <= issued + timedelta(hours=24):
-        raise AdoptionError("signed upgrade evidence is stale or expired")
+    target_digest = _string(
+        _object(plan.get("target_manifest"), "target manifest").get("sha256"),
+        "target manifest digest",
+    )
+    authorization_digest = _string(
+        plan.get("release_authorization_sha256"),
+        "release authorization digest",
+    )
+    verifier = _load_upgrade_backup_verifier()
+    try:
+        verifier.validate_evidence_document(
+            evidence,
+            expected_manifest_sha256=target_digest,
+            expected_release_authorization_sha256=authorization_digest,
+            expected_operation_scope="legacy_adoption",
+            require_current=True,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AdoptionError("signed upgrade evidence contract differs") from exc
     run = evidence_path.parent.parent
     protected_directory(run, modes=frozenset({0o700}))
     try:
@@ -3633,10 +4599,11 @@ def _verify_upgrade_evidence(
     detailed_path = _verify_descriptor(evidence.get("restore_evidence"), root=run)
     detailed = _read_json_file(detailed_path)
     if (
-        detailed.get("schema_version") != 1
+        detailed.get("schema_version") != 2
         or detailed.get("kind") != "heyi-legacy-adoption-restore-evidence"
         or detailed.get("project") != PROJECT
         or detailed.get("plan_sha256") != plan_digest
+        or detailed.get("release_authorization_sha256") != plan.get("release_authorization_sha256")
         or detailed.get("git_sha") != plan.get("git_sha")
         or detailed.get("target_manifest_sha256") != target_digest
         or _object(detailed.get("isolated_restore_drill"), "restore drill").get("status")
@@ -3653,17 +4620,6 @@ def _verify_upgrade_evidence(
         }
     ):
         raise AdoptionError("detailed restore evidence does not satisfy adoption policy")
-    drill = _object(evidence.get("restore_drill"), "upgrade restore drill")
-    if set(drill) != {"status", "tested_at", "source_schema_head"}:
-        raise AdoptionError("upgrade restore drill schema differs")
-    tested = _timestamp(drill.get("tested_at"), "restore drill tested_at")
-    if (
-        drill.get("status") != "passed"
-        or not isinstance(drill.get("source_schema_head"), str)
-        or _SCHEMA_HEAD.fullmatch(str(drill.get("source_schema_head"))) is None
-        or not now - timedelta(days=30) <= tested <= now + timedelta(minutes=5)
-    ):
-        raise AdoptionError("upgrade restore drill is stale or invalid")
     return evidence, detailed, run
 
 
@@ -3931,7 +4887,7 @@ def _release_state_binding() -> dict[str, Any]:
 
 def _load_host_isolation_guard(plan: Mapping[str, Any]) -> ModuleType:
     entry = _object(plan.get("host_isolation_guard"), "host-isolation guard binding")
-    path = Path(_string(entry.get("path"), "host-isolation guard path"))
+    path = _protected_host_isolation_guard(entry)
     name = f"heyi_host_isolation_guard_{_string(entry.get('sha256'), 'guard digest')}"
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -4313,6 +5269,12 @@ def _locate_upgrade_evidence_run(evidence_path: Path) -> tuple[Path, Path]:
 
 
 def _retire(arguments: argparse.Namespace, runner: Runner) -> None:
+    signing_key, public_key = _validate_adoption_evidence_key_pair(
+        runner,
+        signing_key=arguments.evidence_signing_key,
+        public_key=arguments.evidence_public_key,
+        phase="retire-entry",
+    )
     binding_key = _read_binding_key(arguments.binding_key)
     evidence_path, run = _locate_upgrade_evidence_run(arguments.evidence)
     evidence_digest = _sha256_file(evidence_path)
@@ -4325,11 +5287,11 @@ def _retire(arguments: argparse.Namespace, runner: Runner) -> None:
         raise AdoptionError("retirement intent and final receipt coexist ambiguously")
     durable_receipt_exists = intent_exists or final_exists
     if durable_receipt_exists:
-        plan, plan_digest = _load_plan_identity(
+        plan, plan_digest, runtime, _, _ = _validate_plan(
             arguments.plan,
+            binding_key,
             enforce_freshness=False,
         )
-        runtime: dict[str, str] = {}
     else:
         plan, plan_digest, runtime, _, _ = _validate_plan(arguments.plan, binding_key)
     planned = _planned_inventory(plan)
@@ -4438,15 +5400,11 @@ def _retire(arguments: argparse.Namespace, runner: Runner) -> None:
                 )
             )
             return
-        public_key = protected_file(
-            arguments.evidence_public_key,
-            modes=frozenset({0o400, 0o440, 0o444}),
-            max_bytes=65_536,
-        )
-        signing_key = protected_file(
-            arguments.evidence_signing_key,
-            modes=frozenset({0o400, 0o600}),
-            max_bytes=65_536,
+        signing_key, public_key = _validate_adoption_evidence_key_pair(
+            runner,
+            signing_key=arguments.evidence_signing_key,
+            public_key=arguments.evidence_public_key,
+            phase="retire-intent-signature",
         )
         receipt = {
             "schema_version": 2,
@@ -5312,6 +6270,7 @@ def _plan_command(arguments: argparse.Namespace, runner: Runner) -> None:
     env_paths = tuple(arguments.legacy_env_file)
     bindings = {str(path): _env_binding(path, binding_key) for path in env_paths}
     inventory = collect_inventory(runner)
+    release_authorization = _current_release_authorization()
     document = build_plan(
         inventory=inventory,
         runtime_env=runtime_path,
@@ -5319,8 +6278,7 @@ def _plan_command(arguments: argparse.Namespace, runner: Runner) -> None:
         compose_files=tuple(arguments.compose_file),
         legacy_env_files=env_paths,
         legacy_env_bindings=bindings,
-        target_manifest=arguments.target_manifest,
-        git_sha=arguments.git_sha,
+        release_authorization=release_authorization,
     )
     output = arguments.output_plan
     adoption_state = STATE_ROOT / "legacy-adoption"
@@ -5339,6 +6297,8 @@ def _plan_command(arguments: argparse.Namespace, runner: Runner) -> None:
                 "project": PROJECT,
                 "plan": str(output),
                 "plan_sha256": _plan_digest(document),
+                "release_id": release_authorization["release_id"],
+                "release_authorization_sha256": document["release_authorization_sha256"],
                 "next_step": "run prepare without --execute, then repeat with both confirmations",
             },
             sort_keys=True,
@@ -5366,8 +6326,6 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--runtime-env", type=Path, required=True)
     plan.add_argument("--compose-file", type=Path, action="append", required=True)
     plan.add_argument("--legacy-env-file", type=Path, action="append", default=[])
-    plan.add_argument("--target-manifest", type=Path, required=True)
-    plan.add_argument("--git-sha", required=True)
     plan.add_argument(
         "--output-plan",
         type=Path,
@@ -5383,6 +6341,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--backup-root", type=Path, default=BACKUP_ROOT)
     prepare.add_argument("--ca-root", type=Path, required=True)
     prepare.add_argument("--ca-recipient-certificate", type=Path, required=True)
+    prepare.add_argument("--ca-attestation-public-key", type=Path, required=True)
     prepare.add_argument("--evidence-signing-key", type=Path, required=True)
     prepare.add_argument("--evidence-public-key", type=Path, required=True)
     _add_execution_confirmation(prepare)
@@ -5440,6 +6399,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
         _require_root()
+        _validate_production_evidence_key_arguments(arguments)
         runner = Runner()
         operations = {
             "plan": _plan_command,

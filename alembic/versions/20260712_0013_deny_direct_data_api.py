@@ -21,9 +21,7 @@ def upgrade() -> None:
     op.execute("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC")
     op.execute("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC")
     op.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC")
-    op.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC"
-    )
+    op.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC")
 
     # Supabase's Data API connects as anon/authenticated. These roles are not
     # present in the isolated PostgreSQL profile, so the block is portable.

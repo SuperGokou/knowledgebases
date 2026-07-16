@@ -97,6 +97,7 @@ async def test_finalizing_retry_releases_database_lock_before_storage_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    access = _access()
     upload = UploadSession(
         id=uuid4(),
         file_id=uuid4(),
@@ -142,7 +143,12 @@ async def test_finalizing_retry_releases_database_lock_before_storage_io(
     async def consume(*_args: object, **_kwargs: object) -> None:
         events.append("consume")
 
+    async def reauthorize(*_args: object, **_kwargs: object) -> AccessContext:
+        events.append("reauthorize")
+        return access
+
     monkeypatch.setattr(file_routes, "_owned_upload", owned_upload)
+    monkeypatch.setattr(file_routes, "_reauthorize_upload_finalization", reauthorize)
     monkeypatch.setattr(file_routes.QuotaService, "consume_upload_reservations", consume)
     storage = SimpleNamespace(complete_multipart=complete_multipart, head=head)
 
@@ -151,11 +157,11 @@ async def test_finalizing_retry_releases_database_lock_before_storage_io(
         CompleteUploadRequest(parts=[CompletedPart(part_number=1, etag='"etag"')]),
         _request(),  # type: ignore[arg-type]
         session,
-        _access(),
+        access,
         storage,  # type: ignore[arg-type]
     )
 
-    assert events == ["commit", "storage", "consume", "commit"]
+    assert events == ["commit", "storage", "reauthorize", "consume", "commit"]
 
 
 @pytest.mark.asyncio
@@ -280,6 +286,7 @@ async def test_single_completion_releases_all_database_locks_before_storage_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    access = _access()
     upload = UploadSession(
         id=uuid4(),
         file_id=uuid4(),
@@ -337,7 +344,12 @@ async def test_single_completion_releases_all_database_locks_before_storage_io(
     async def consume(*_args: object, **_kwargs: object) -> None:
         events.append("consume")
 
+    async def reauthorize(*_args: object, **_kwargs: object) -> AccessContext:
+        events.append("reauthorize")
+        return access
+
     monkeypatch.setattr(file_routes, "_owned_upload", owned_upload)
+    monkeypatch.setattr(file_routes, "_reauthorize_upload_finalization", reauthorize)
     monkeypatch.setattr(file_routes.QuotaService, "consume_upload_reservations", consume)
     storage = SimpleNamespace(try_head=try_head, promote=promote)
 
@@ -346,7 +358,7 @@ async def test_single_completion_releases_all_database_locks_before_storage_io(
         CompleteUploadRequest(parts=[]),
         _request(),  # type: ignore[arg-type]
         session,
-        _access(),
+        access,
         storage,  # type: ignore[arg-type]
     )
 
@@ -355,6 +367,7 @@ async def test_single_completion_releases_all_database_locks_before_storage_io(
         f"head:{final_key}",
         f"head:{source_key}",
         "promote",
+        "reauthorize",
         "consume",
         "commit",
     ]
@@ -364,6 +377,7 @@ async def test_single_completion_releases_all_database_locks_before_storage_io(
 async def test_completion_cannot_resurrect_a_concurrently_aborted_upload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    access = _access()
     upload_id = uuid4()
     file_id = uuid4()
     user_id = uuid4()
@@ -442,7 +456,11 @@ async def test_completion_cannot_resurrect_a_concurrently_aborted_upload(
     async def delete(*, key: str) -> None:
         deleted.append(key)
 
+    async def reauthorize(*_args: object, **_kwargs: object) -> AccessContext:
+        return access
+
     monkeypatch.setattr(file_routes, "_owned_upload", owned_upload)
+    monkeypatch.setattr(file_routes, "_reauthorize_upload_finalization", reauthorize)
     monkeypatch.setattr(file_routes.QuotaService, "consume_upload_reservations", consume)
     storage = SimpleNamespace(
         complete_multipart=complete_multipart,
@@ -456,7 +474,7 @@ async def test_completion_cannot_resurrect_a_concurrently_aborted_upload(
             CompleteUploadRequest(parts=[CompletedPart(part_number=1, etag='"etag"')]),
             _request(),  # type: ignore[arg-type]
             session,
-            _access(),
+            access,
             storage,  # type: ignore[arg-type]
         )
 

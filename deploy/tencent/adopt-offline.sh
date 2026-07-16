@@ -11,7 +11,6 @@ usage: adopt-offline.sh \
   --runtime-env PATH --release-env PATH \
   --legacy-plan PATH --legacy-binding-key PATH \
   --backup-evidence PATH --backup-signature PATH \
-  --evidence-public-key PATH --evidence-signing-key PATH \
   --retirement-receipt PATH --retirement-signature PATH \
   --host-isolation-baseline PATH --host-isolation-hmac-key PATH \
   --confirm-project heyi-kb-offline --confirm-plan-sha256 SHA256 \
@@ -34,8 +33,6 @@ legacy_plan=
 legacy_binding_key=
 backup_evidence=
 backup_signature=
-evidence_public_key=
-evidence_signing_key=
 retirement_receipt=
 retirement_signature=
 host_isolation_baseline=
@@ -44,13 +41,17 @@ confirmed_project=
 confirmed_plan_sha256=
 confirmed_preserve_data=
 execute_requested=false
+trusted_adoption_evidence_public_key=/etc/heyi-adoption/trusted-evidence-public.pem
+trusted_adoption_evidence_signing_key=/run/heyi-adoption-signing/evidence-signing.key
+evidence_public_key=$trusted_adoption_evidence_public_key
+evidence_signing_key=$trusted_adoption_evidence_signing_key
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --runtime-env|--release-env|--contract-dir|--contract-sha256|\
     --legacy-plan|--legacy-binding-key|--backup-evidence|--backup-signature|\
-    --evidence-public-key|--evidence-signing-key|--retirement-receipt|\
-    --retirement-signature|--host-isolation-baseline|--host-isolation-hmac-key|\
+    --retirement-receipt|--retirement-signature|--host-isolation-baseline|\
+    --host-isolation-hmac-key|\
     --confirm-project|--confirm-plan-sha256|--confirm-preserve-data)
       [ "$#" -ge 2 ] || usage
       option=$1
@@ -65,8 +66,6 @@ while [ "$#" -gt 0 ]; do
         --legacy-binding-key) legacy_binding_key=$value ;;
         --backup-evidence) backup_evidence=$value ;;
         --backup-signature) backup_signature=$value ;;
-        --evidence-public-key) evidence_public_key=$value ;;
-        --evidence-signing-key) evidence_signing_key=$value ;;
         --retirement-receipt) retirement_receipt=$value ;;
         --retirement-signature) retirement_signature=$value ;;
         --host-isolation-baseline) host_isolation_baseline=$value ;;
@@ -86,8 +85,7 @@ done
 
 for required_value in \
   "$legacy_plan" "$legacy_binding_key" "$backup_evidence" "$backup_signature" \
-  "$evidence_public_key" "$evidence_signing_key" "$retirement_receipt" \
-  "$retirement_signature" "$host_isolation_baseline" \
+  "$retirement_receipt" "$retirement_signature" "$host_isolation_baseline" \
   "$host_isolation_hmac_key" "$confirmed_project" \
   "$confirmed_plan_sha256" "$confirmed_preserve_data"; do
   [ -n "$required_value" ] || usage
@@ -119,6 +117,63 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=deploy/tencent/offline-operation-common.sh
 . "$script_dir/offline-operation-common.sh"
 
+validate_protected_file() {
+  label=$1
+  candidate=$2
+  accepted_modes=$3
+  maximum_bytes=$4
+  case "$candidate" in
+    /*) ;;
+    *) offline_fail adoption "$label path must be absolute" 65 ;;
+  esac
+  canonical=$(realpath -e -- "$candidate" 2>/dev/null || true)
+  if [ "$canonical" != "$candidate" ] || [ -L "$candidate" ] || \
+    [ ! -f "$candidate" ]; then
+    offline_fail adoption "$label path must be canonical and regular" 65
+  fi
+  owner=$(stat -c %u -- "$candidate") || exit 66
+  mode=$(stat -c %a -- "$candidate") || exit 66
+  links=$(stat -c %h -- "$candidate") || exit 66
+  bytes=$(stat -c %s -- "$candidate") || exit 66
+  case " $accepted_modes " in
+    *" $mode "*) ;;
+    *) offline_fail adoption "$label permissions are unsafe" 65 ;;
+  esac
+  if [ "$owner" -ne 0 ] || [ "$links" -ne 1 ] || \
+    [ "$bytes" -le 0 ] || [ "$bytes" -gt "$maximum_bytes" ]; then
+    offline_fail adoption "$label metadata is unsafe" 65
+  fi
+  checked_path=$(dirname -- "$candidate")
+  while :; do
+    if [ -L "$checked_path" ] || [ ! -d "$checked_path" ] || \
+      [ "$(stat -c %u -- "$checked_path")" -ne 0 ]; then
+      offline_fail adoption "$label ancestor is unsafe" 65
+    fi
+    checked_mode=$(stat -c %a -- "$checked_path") || exit 66
+    checked_value=$((0$checked_mode))
+    if [ $((checked_value & 022)) -ne 0 ]; then
+      offline_fail adoption "$label ancestor is writable by non-root" 65
+    fi
+    [ "$checked_path" = / ] && break
+    checked_path=$(dirname -- "$checked_path")
+  done
+}
+
+trusted_abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
+validate_adoption_evidence_trust_root() {
+  validate_protected_file \
+    "trusted adoption evidence validator" "$trusted_abort_helper" \
+    "400 440 444 600 640 644" 2097152
+  offline_clear_inherited_environment
+  /usr/bin/python3 -I "$trusted_abort_helper" validate-evidence-trust-root \
+    --challenge-context-sha256 "$confirmed_plan_sha256" >/dev/null || \
+    offline_fail adoption "fixed adoption evidence trust root is invalid" 65
+}
+
+# The signer and independently pinned public-key fingerprint are prerequisites
+# for the transaction itself.  This gate is deliberately before the project
+# lock, contract materialization, temporary workspaces, inventories or backups.
+validate_adoption_evidence_trust_root
 offline_acquire_lock adoption
 
 if [ "$entry_mode" = external ]; then
@@ -141,8 +196,6 @@ if [ "$entry_mode" = external ]; then
       --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256" \
       --legacy-plan "$legacy_plan" --legacy-binding-key "$legacy_binding_key" \
       --backup-evidence "$backup_evidence" --backup-signature "$backup_signature" \
-      --evidence-public-key "$evidence_public_key" \
-      --evidence-signing-key "$evidence_signing_key" \
       --retirement-receipt "$retirement_receipt" \
       --retirement-signature "$retirement_signature" \
       --host-isolation-baseline "$host_isolation_baseline" \
@@ -157,8 +210,6 @@ if [ "$entry_mode" = external ]; then
     --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256" \
     --legacy-plan "$legacy_plan" --legacy-binding-key "$legacy_binding_key" \
     --backup-evidence "$backup_evidence" --backup-signature "$backup_signature" \
-    --evidence-public-key "$evidence_public_key" \
-    --evidence-signing-key "$evidence_signing_key" \
     --retirement-receipt "$retirement_receipt" \
     --retirement-signature "$retirement_signature" \
     --host-isolation-baseline "$host_isolation_baseline" \
@@ -184,9 +235,9 @@ trusted_backup_verifier=$OFFLINE_RELEASE_ROOT/deploy/tencent/verify-upgrade-back
 trusted_environment_validator=$OFFLINE_RELEASE_ROOT/deploy/tencent/validate-offline-environment.py
 trusted_image_verifier=$OFFLINE_RELEASE_ROOT/deploy/tencent/verify-offline-images.sh
 trusted_install_worker=$OFFLINE_RELEASE_ROOT/deploy/tencent/install-offline.sh
-trusted_abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
 trusted_maintenance_worker=$OFFLINE_RELEASE_ROOT/deploy/tencent/enter-maintenance-offline.sh
 trusted_contract_remover=$OFFLINE_RELEASE_ROOT/deploy/tencent/remove-offline-contract.sh
+trusted_release_public_key=/etc/heyi-release/trusted-release-public.pem
 offline_clear_inherited_environment
 
 transaction_tmp=$(mktemp -d "$OFFLINE_TMPDIR/adoption.XXXXXXXXXX") || \
@@ -213,6 +264,7 @@ archive_final=$archive_root/$confirmed_plan_sha256-$contract_sha256
 archive_failed=$archive_root/failed-$confirmed_plan_sha256-$contract_sha256
 target_schema_head=
 legacy_source_schema_head=
+legacy_plan_git_sha=
 install_contract_dir=
 install_contract_sha256=
 adoption_transaction_id=
@@ -263,46 +315,95 @@ cleanup_target_install_contract() {
   fi
 }
 
-validate_protected_file() {
-  label=$1
-  candidate=$2
-  accepted_modes=$3
-  maximum_bytes=$4
-  case "$candidate" in
-    /*) ;;
-    *) offline_fail adoption "$label path must be absolute" 65 ;;
-  esac
-  canonical=$(realpath -e -- "$candidate" 2>/dev/null || true)
-  if [ "$canonical" != "$candidate" ] || [ -L "$candidate" ] || \
-    [ ! -f "$candidate" ]; then
-    offline_fail adoption "$label path must be canonical and regular" 65
-  fi
-  owner=$(stat -c %u -- "$candidate") || exit 66
-  mode=$(stat -c %a -- "$candidate") || exit 66
-  links=$(stat -c %h -- "$candidate") || exit 66
-  bytes=$(stat -c %s -- "$candidate") || exit 66
-  case " $accepted_modes " in
-    *" $mode "*) ;;
-    *) offline_fail adoption "$label permissions are unsafe" 65 ;;
-  esac
-  if [ "$owner" -ne 0 ] || [ "$links" -ne 1 ] || \
-    [ "$bytes" -le 0 ] || [ "$bytes" -gt "$maximum_bytes" ]; then
-    offline_fail adoption "$label metadata is unsafe" 65
-  fi
-  checked_path=$(dirname -- "$candidate")
-  while :; do
-    if [ -L "$checked_path" ] || [ ! -d "$checked_path" ] || \
-      [ "$(stat -c %u -- "$checked_path")" -ne 0 ]; then
-      offline_fail adoption "$label ancestor is unsafe" 65
-    fi
-    checked_mode=$(stat -c %a -- "$checked_path") || exit 66
-    checked_value=$((0$checked_mode))
-    if [ $((checked_value & 022)) -ne 0 ]; then
-      offline_fail adoption "$label ancestor is writable by non-root" 65
-    fi
-    [ "$checked_path" = / ] && break
-    checked_path=$(dirname -- "$checked_path")
-  done
+read_confirmed_legacy_plan_git_sha() {
+  /usr/bin/python3 -I -c '
+import hashlib, hmac, json, pathlib, re, sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON key")
+        result[name] = value
+    return result
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+path = pathlib.Path(sys.argv[1])
+confirmed_digest = sys.argv[2]
+raw = path.read_bytes()
+try:
+    document = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_constant,
+    )
+except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    raise SystemExit(1) from error
+expected = {
+    "schema_version", "kind", "project", "created_at", "git_sha", "data_root",
+    "runtime_env", "legacy_compose", "host_isolation_guard", "target_manifest",
+    "release_authorization", "release_authorization_sha256",
+    "inventory_sha256", "topology_sha256", "inventory", "safety",
+}
+canonical = (
+    json.dumps(
+        document, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
+).encode("utf-8")
+observed_digest = hashlib.sha256(raw).hexdigest()
+authorization = document.get("release_authorization") if isinstance(document, dict) else None
+authorization_digest = (
+    hashlib.sha256(
+        (
+            json.dumps(
+                authorization,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(authorization, dict)
+    else None
+)
+git_sha = authorization.get("release_git_sha") if isinstance(authorization, dict) else None
+authorization_keys = {
+    "schema_version", "release_sequence", "release_id", "release_git_sha",
+    "release_schema_head", "release_sha256", "release_assets_sha256",
+    "checksum_set_sha256", "signature_sha256", "target_manifest",
+    "registry_import_receipt", "highest_release", "trusted_release_public_key",
+}
+valid = (
+    isinstance(document, dict)
+    and set(document) == expected
+    and document.get("schema_version") == 4
+    and document.get("kind") == "heyi-legacy-adoption-plan"
+    and document.get("project") == "heyi-kb-offline"
+    and isinstance(authorization, dict)
+    and set(authorization) == authorization_keys
+    and authorization.get("schema_version") == 1
+    and isinstance(git_sha, str)
+    and re.fullmatch(r"[0-9a-f]{40}", git_sha) is not None
+    and document.get("git_sha") == git_sha
+    and document.get("target_manifest") == authorization.get("target_manifest")
+    and isinstance(document.get("release_authorization_sha256"), str)
+    and hmac.compare_digest(
+        document["release_authorization_sha256"],
+        authorization_digest or "",
+    )
+    and re.fullmatch(r"[0-9a-f]{64}", confirmed_digest) is not None
+    and hmac.compare_digest(observed_digest, confirmed_digest)
+    and hmac.compare_digest(raw, canonical)
+)
+if not valid:
+    raise SystemExit(1)
+print(git_sha)
+' "$legacy_plan" "$confirmed_plan_sha256"
 }
 
 validate_exact_incomplete_staging_file() {
@@ -417,7 +518,7 @@ def validate(report):
         or report.get("change_count") != 0
         or report.get("changes") != []
         or report.get("policy") != expected_policy
-        or not isinstance(report.get("protected_container_count"), int)
+        or type(report.get("protected_container_count")) is not int
         or isinstance(report.get("protected_container_count"), bool)
         or report["protected_container_count"] < 0
         or not isinstance(report.get("current_snapshot"), dict)
@@ -490,6 +591,13 @@ validate_retirement_output_paths() {
 }
 
 validate_registry_release_receipts() {
+  validate_protected_file \
+    "trusted release public key" "$trusted_release_public_key" "400 444" 65536
+  trusted_release_key_digest=$(sha256sum \
+    "$trusted_release_public_key" | awk '{print $1}') || exit 66
+  if ! printf '%s\n' "$trusted_release_key_digest" | grep -Eq '^[0-9a-f]{64}$'; then
+    offline_fail adoption "trusted release public key digest is invalid" 65
+  fi
   release_digest=$(sha256sum "$contract_dir/release.env" | awk '{print $1}') || exit 66
   manifest_digest=$(sha256sum "$contract_dir/release.env.images" | awk '{print $1}') || exit 66
   sed -n '/  release\//p' "$contract_dir/files.sha256" | LC_ALL=C sort \
@@ -501,9 +609,24 @@ validate_registry_release_receipts() {
   validate_protected_file "highest release receipt" "$highest_release" "400" 65536
   /usr/bin/python3 -I -c '
 import json, pathlib, re, sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON key")
+        result[name] = value
+    return result
+
 receipt_path, highest_path = map(pathlib.Path, sys.argv[1:3])
-receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-highest = json.loads(highest_path.read_text(encoding="utf-8"))
+receipt = json.loads(
+    receipt_path.read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+)
+highest = json.loads(
+    highest_path.read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+)
 digest = re.compile(r"[0-9a-f]{64}")
 expected = {
     "schema_version", "kind", "status", "release_sequence", "release_id",
@@ -519,9 +642,11 @@ valid = (
     and receipt["release_sha256"] == sys.argv[3]
     and receipt["manifest_sha256"] == sys.argv[4]
     and receipt["release_assets_sha256"] == sys.argv[5]
+    and receipt["release_git_sha"] == sys.argv[6]
+    and receipt["trusted_key_sha256"] == sys.argv[7]
     and isinstance(receipt["release_schema_head"], str)
     and re.fullmatch(r"[0-9]{8}_[0-9]{4}", receipt["release_schema_head"]) is not None
-    and isinstance(receipt["release_sequence"], int)
+    and type(receipt["release_sequence"]) is int
     and 0 < receipt["release_sequence"] <= 999_999_999_999_999_999
     and re.fullmatch(r"[A-Za-z0-9._-]+", receipt["release_id"] or "") is not None
     and re.fullmatch(r"[0-9a-f]{40}", receipt["release_git_sha"] or "") is not None
@@ -532,15 +657,32 @@ valid = (
 )
 shared = (
     "release_sequence", "release_id", "release_git_sha", "release_schema_head",
-    "manifest_sha256", "release_assets_sha256",
+    "manifest_sha256", "release_assets_sha256", "trusted_key_sha256",
 )
-valid = valid and isinstance(highest, dict) and all(
-    highest.get(key) == receipt.get(key) for key in shared
+highest_expected = {
+    "schema_version", "release_sequence", "release_id", "release_git_sha",
+    "release_schema_head", "manifest_sha256", "release_assets_sha256",
+    "trusted_key_sha256",
+}
+valid = (
+    valid
+    and isinstance(highest, dict)
+    and set(highest) == highest_expected
+    and highest.get("schema_version") == 2
+    and type(highest.get("release_sequence")) is int
+    and 0 < highest["release_sequence"] <= 999_999_999_999_999_999
+    and all(highest.get(key) == receipt.get(key) for key in shared)
 )
 raise SystemExit(0 if valid else 1)
 ' "$registry_receipt" "$highest_release" "$release_digest" \
-    "$manifest_digest" "$release_assets_digest" || \
+    "$manifest_digest" "$release_assets_digest" "$legacy_plan_git_sha" \
+    "$trusted_release_key_digest" || \
     offline_fail adoption "signed target release receipt is invalid or not highest" 65
+  trusted_release_key_digest_after=$(sha256sum \
+    "$trusted_release_public_key" | awk '{print $1}') || exit 66
+  if [ "$trusted_release_key_digest_after" != "$trusted_release_key_digest" ]; then
+    offline_fail adoption "trusted release public key changed during validation" 65
+  fi
   target_schema_head=$(/usr/bin/python3 -I -c \
     'import json,pathlib,sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["release_schema_head"])' \
     "$registry_receipt") || offline_fail adoption "cannot read target schema identity" 66
@@ -689,56 +831,13 @@ validate_target_transaction_assets() {
 }
 
 verify_durable_backup_evidence() {
-  /usr/bin/openssl dgst -sha256 -verify "$evidence_public_key" \
-    -signature "$backup_signature" "$backup_evidence" >/dev/null 2>&1 || \
-    offline_fail adoption "durable upgrade backup evidence signature is invalid" 65
-  /usr/bin/python3 -I -c '
-import importlib.util, json, pathlib, sys
-from datetime import timedelta
-
-verifier_path = pathlib.Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("heyi_durable_backup_verifier", verifier_path)
-if spec is None or spec.loader is None:
-    raise SystemExit(1)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-evidence = module._protected_regular_file(pathlib.Path(sys.argv[2]), max_bytes=65_536)
-document = json.loads(evidence.read_text(encoding="utf-8"))
-expected_keys = {
-    "schema_version", "kind", "project", "issued_at", "expires_at",
-    "target_manifest_sha256", "database_backup", "object_manifest",
-    "restore_evidence", "restore_drill",
-}
-if not isinstance(document, dict) or set(document) != expected_keys:
-    raise SystemExit(1)
-if (
-    document.get("schema_version") != 1
-    or document.get("kind") != "offline-upgrade-backup"
-    or document.get("project") != "heyi-kb-offline"
-    or document.get("target_manifest_sha256") != sys.argv[3]
-):
-    raise SystemExit(1)
-issued = module._timestamp(document.get("issued_at"), "issued_at")
-expires = module._timestamp(document.get("expires_at"), "expires_at")
-if not issued < expires <= issued + timedelta(hours=24):
-    raise SystemExit(1)
-for field in ("database_backup", "object_manifest", "restore_evidence"):
-    module._artifact(document, field)
-drill = document.get("restore_drill")
-if not isinstance(drill, dict) or set(drill) != {
-    "status", "tested_at", "source_schema_head",
-}:
-    raise SystemExit(1)
-tested = module._timestamp(drill.get("tested_at"), "restore_drill.tested_at")
-if (
-    drill.get("status") != "passed"
-    or not isinstance(drill.get("source_schema_head"), str)
-    or module._SCHEMA_HEAD.fullmatch(drill["source_schema_head"]) is None
-    or not issued - timedelta(days=30) <= tested <= issued + timedelta(minutes=5)
-):
-    raise SystemExit(1)
-' "$trusted_backup_verifier" "$backup_evidence" "$manifest_digest" || \
+  /usr/bin/python3 -I "$trusted_backup_verifier" \
+    --evidence "$backup_evidence" \
+    --signature "$backup_signature" \
+    --public-key "$evidence_public_key" \
+    --expected-manifest-sha256 "$manifest_digest" \
+    --expected-operation-scope legacy_adoption \
+    --durable-resume || \
     offline_fail adoption \
       "durable upgrade backup evidence or signed backup artifacts differ" 65
   echo "adoption: durable signed backup evidence and artifact hashes verified"
@@ -749,7 +848,8 @@ verify_fresh_backup_evidence() {
     --evidence "$backup_evidence" \
     --signature "$backup_signature" \
     --public-key "$evidence_public_key" \
-    --expected-manifest-sha256 "$manifest_digest" || \
+    --expected-manifest-sha256 "$manifest_digest" \
+    --expected-operation-scope legacy_adoption || \
     offline_fail adoption "fresh upgrade backup evidence is not current" 65
 }
 
@@ -764,12 +864,11 @@ verify_backup_evidence_for_transaction_state() {
 }
 
 predictive_target_preflight() {
+  validate_adoption_evidence_trust_root
   validate_protected_file "legacy plan" "$legacy_plan" "400 440 444" 8388608
   validate_protected_file "legacy binding key" "$legacy_binding_key" "400 600" 65536
   validate_protected_file "backup evidence" "$backup_evidence" "400 440 444" 65536
   validate_protected_file "backup signature" "$backup_signature" "400 440 444" 16384
-  validate_protected_file "evidence public key" "$evidence_public_key" "400 440 444" 65536
-  validate_protected_file "evidence signing key" "$evidence_signing_key" "400 600" 65536
   validate_protected_file "host isolation baseline" "$host_isolation_baseline" \
     "400 440 444 600" 8388608
   validate_protected_file "host isolation HMAC key" "$host_isolation_hmac_key" \
@@ -792,6 +891,15 @@ if not isinstance(value, str) or re.fullmatch(r"[0-9]{8}_[0-9]{4}", value) is No
 print(value)
 ' "$backup_evidence") || \
     offline_fail adoption "cannot read the verified legacy schema identity" 65
+  if [ "$resume_journal_present" != true ]; then
+    capture_reconcile_baseline "$reconcile_baseline_file"
+  fi
+  # The trusted dry-run validates the plan digest, binding key, protected
+  # runtime/Compose inputs, signed backup and live legacy topology before
+  # registry authorization is allowed to consume the plan's Git identity.
+  validate_legacy_retirement_dry_run
+  legacy_plan_git_sha=$(read_confirmed_legacy_plan_git_sha) || \
+    offline_fail adoption "confirmed legacy plan identity is invalid or non-canonical" 65
   validate_registry_release_receipts
   sh "$trusted_image_verifier" verify \
     --contract-dir "$contract_dir" --contract-sha256 "$contract_sha256"
@@ -809,8 +917,6 @@ print(value)
     fi
     echo "adoption: verified resumable transaction=$adoption_transaction_id"
   else
-    capture_reconcile_baseline "$reconcile_baseline_file"
-    validate_legacy_retirement_dry_run
     if [ "$retirement_already_published" != true ] && \
       [ "$retirement_resume_pending" != true ]; then
       enumerate_legacy_receipts "$pre_retire_inventory"
@@ -837,6 +943,7 @@ prepare_target_install_contract() {
 }
 
 retire_legacy() {
+  validate_adoption_evidence_trust_root
   /usr/bin/python3 -I "$trusted_legacy_tool" retire \
     --plan "$legacy_plan" \
     --binding-key "$legacy_binding_key" \
@@ -1662,6 +1769,7 @@ finally:
 }
 
 reactivate_legacy() {
+  validate_adoption_evidence_trust_root
   /usr/bin/python3 -I "$trusted_legacy_tool" reactivate \
     --plan "$legacy_plan" \
     --binding-key "$legacy_binding_key" \
@@ -2252,12 +2360,11 @@ raise SystemExit(0 if valid else 1)
 }
 
 abort_target_pre_migration() {
+  validate_adoption_evidence_trust_root
   sh "$trusted_install_worker" \
     --abort-pre-migration \
     --adoption-journal "$adoption_journal" \
     --adoption-binding-key "$legacy_binding_key" \
-    --evidence-signing-key "$evidence_signing_key" \
-    --evidence-public-key "$evidence_public_key" \
     --host-isolation-baseline "$host_isolation_baseline" \
     --host-isolation-hmac-key "$host_isolation_hmac_key" \
     > "$abort_dry_run_output" || return 1
@@ -2288,8 +2395,6 @@ raise SystemExit(0 if valid else 1)
     --abort-pre-migration \
     --adoption-journal "$adoption_journal" \
     --adoption-binding-key "$legacy_binding_key" \
-    --evidence-signing-key "$evidence_signing_key" \
-    --evidence-public-key "$evidence_public_key" \
     --host-isolation-baseline "$host_isolation_baseline" \
     --host-isolation-hmac-key "$host_isolation_hmac_key" \
     --execute \
@@ -2400,6 +2505,7 @@ for item in items:
 }
 
 publish_completion_receipt() {
+  validate_adoption_evidence_trust_root
   installed_receipt=$OFFLINE_STATE_DIRECTORY/installed-$contract_sha256.json
   active_release=$OFFLINE_STATE_DIRECTORY/active-release.json
   validate_journal_bound_install_document "$installed_receipt" completed >/dev/null

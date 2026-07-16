@@ -173,9 +173,7 @@ def validate(project: str, requested: list[ipaddress.IPv4Network]) -> None:
                 and device in allowed_devices
             ):
                 continue
-            raise RuntimeError(
-                f"requested Docker CIDR overlaps a host route: {routed}"
-            )
+            raise RuntimeError(f"requested Docker CIDR overlaps a host route: {routed}")
 
 
 def main(arguments: list[str]) -> int:

@@ -24,7 +24,7 @@
     },
     "challenge": {
       "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "challenge_id", "evidence_id", "nonce", "issued_at", "expires_at", "status"],
+      "required": ["schema_version", "challenge_id", "evidence_id", "nonce", "issued_at", "expires_at", "status", "target"],
       "properties": {
         "schema_version": {"const": 1},
         "challenge_id": {"type": "string", "minLength": 16},
@@ -40,14 +40,38 @@
           "properties": {
             "git_head": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
             "content_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"}
+            "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{8,80}$"},
+            "deployment": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "release_id",
+                "offline_contract_sha256",
+                "image_manifest_sha256",
+                "base_url",
+                "host_identity"
+              ],
+              "properties": {
+                "release_id": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+                "offline_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "image_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "base_url": {"type": "string", "pattern": "^https://[^/?#]+$"},
+                "host_identity": {"type": "string", "pattern": "^[A-Za-z0-9.:-]{1,253}$"}
+              }
+            }
           }
         }
       },
       "allOf": [
         {
-          "if": {"properties": {"evidence_id": {"const": "EXT-BROWSER-E2E-001"}}},
-          "then": {"required": ["target"]}
+          "if": {
+            "properties": {
+              "evidence_id": {
+                "enum": ["EXT-BROWSER-E2E-001", "EXT-LINUX-HOST-001"]
+              }
+            }
+          },
+          "then": {"properties": {"target": {"required": ["deployment"]}}}
         }
       ]
     }

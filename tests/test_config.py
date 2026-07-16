@@ -230,6 +230,7 @@ def test_isolated_production_accepts_only_compose_local_data_services() -> None:
         s3_public_endpoint_url="https://knowledge.internal:19444",
         malware_scan_host="clamd",
         storage_capacity_probe_path="/var/lib/kb-capacity",
+        chat_safety_state_path="/var/lib/kb-chat-safety/poison.json",
     )
 
     assert settings.deployment_profile == "isolated"
@@ -256,6 +257,7 @@ def test_isolated_production_accepts_only_the_fixed_controlled_llm_gateway() -> 
         s3_public_endpoint_url="https://knowledge.internal:19444",
         malware_scan_host="clamd",
         storage_capacity_probe_path="/var/lib/kb-capacity",
+        chat_safety_state_path="/var/lib/kb-chat-safety/poison.json",
     )
 
     assert settings.llm_egress_mode == "controlled_gateway"
@@ -356,6 +358,7 @@ def test_isolated_production_requires_fixed_storage_safety_policy() -> None:
         "s3_public_endpoint_url": "https://knowledge.internal:19444",
         "malware_scan_host": "clamd",
         "storage_capacity_probe_path": "/var/lib/kb-capacity",
+        "chat_safety_state_path": "/var/lib/kb-chat-safety/poison.json",
     }
 
     settings = production_settings(**common)

@@ -577,6 +577,34 @@ done
 
 install -d -o root -g root -m 0750 "$deployment_root" "$KB_DATA_ROOT"
 
+chat_safety_directory=$KB_DATA_ROOT/chat-safety
+if [ -L "$chat_safety_directory" ]; then
+  offline_fail preflight "chat safety directory must not be symbolic" 65
+fi
+if [ -e "$chat_safety_directory" ]; then
+  [ -d "$chat_safety_directory" ] || \
+    offline_fail preflight "chat safety path must be a directory" 65
+else
+  install -d -o 10001 -g 10001 -m 0700 "$chat_safety_directory"
+fi
+chat_safety_canonical=$(realpath -e -- "$chat_safety_directory" 2>/dev/null || true)
+chat_safety_uid=$(stat -c %u -- "$chat_safety_directory") || \
+  offline_fail preflight "cannot inspect chat safety directory owner" 66
+chat_safety_gid=$(stat -c %g -- "$chat_safety_directory") || \
+  offline_fail preflight "cannot inspect chat safety directory group" 66
+chat_safety_mode=$(stat -c %a -- "$chat_safety_directory") || \
+  offline_fail preflight "cannot inspect chat safety directory mode" 66
+if [ "$chat_safety_canonical" != "$chat_safety_directory" ] || \
+  [ "$chat_safety_uid" -ne 10001 ] || [ "$chat_safety_gid" -ne 10001 ] || \
+  [ "$chat_safety_mode" != 700 ]; then
+  offline_fail preflight "chat safety directory ownership or mode is invalid" 65
+fi
+sync -f "$chat_safety_directory" || \
+  offline_fail preflight "cannot sync chat safety directory" 73
+sync -f "$KB_DATA_ROOT" || \
+  offline_fail preflight "cannot sync chat safety parent directory" 73
+offline_require_no_chat_safety_poison preflight
+
 project_marker_volume=heyi-kb-offline-owner-marker
 project_owner_label=jiangsu-heyi-knowledgebases
 project_resource_candidates=$(mktemp "$OFFLINE_TMPDIR/project-resources.XXXXXXXXXX")
@@ -895,12 +923,6 @@ if [ "$preflight_mode" = upgrade ]; then
   if [ ! -x /usr/bin/openssl ]; then
     offline_fail preflight "the reviewed /usr/bin/openssl verifier is required" 69
   fi
-  python3 -I "$snapshot_script_dir/verify-upgrade-backup.py" \
-    --evidence "$KB_UPGRADE_BACKUP_EVIDENCE_PATH" \
-    --signature "$KB_UPGRADE_BACKUP_SIGNATURE_PATH" \
-    --public-key "$KB_UPGRADE_BACKUP_PUBLIC_KEY_PATH" \
-    --expected-manifest-sha256 "$manifest_digest" || \
-    offline_fail preflight "signed backup and restore-drill gate failed" 65
 fi
 contract_release_checksums=$(mktemp "$OFFLINE_TMPDIR/contract-release-assets.XXXXXXXXXX")
 if ! sed -n '/  release\//p' "$contract_dir/files.sha256" | LC_ALL=C sort \
@@ -913,17 +935,79 @@ release_assets_digest=$(sha256sum "$contract_release_checksums" | awk '{print $1
   exit 66
 }
 rm -f "$contract_release_checksums"
+trusted_release_public_key=/etc/heyi-release/trusted-release-public.pem
+trusted_release_public_key_mode=$(stat -c %a -- \
+  "$trusted_release_public_key" 2>/dev/null || echo 0)
+trusted_release_public_key_size=$(stat -c %s -- \
+  "$trusted_release_public_key" 2>/dev/null || echo 0)
+if [ -L "$trusted_release_public_key" ] || \
+  [ ! -f "$trusted_release_public_key" ] || \
+  [ "$(realpath -e -- "$trusted_release_public_key" 2>/dev/null || true)" != \
+    "$trusted_release_public_key" ] || \
+  [ "$(stat -c %u -- "$trusted_release_public_key" 2>/dev/null || echo -1)" -ne 0 ] || \
+  [ "$(stat -c %h -- "$trusted_release_public_key" 2>/dev/null || echo 0)" -ne 1 ]; then
+  offline_fail preflight "trusted release public key is missing or unsafe" 65
+fi
+case "$trusted_release_public_key_mode" in
+  400|444) ;;
+  *) offline_fail preflight "trusted release public key permissions are unsafe" 65 ;;
+esac
+case "$trusted_release_public_key_size" in
+  ""|*[!0-9]*|0) offline_fail preflight "trusted release public key size is invalid" 65 ;;
+esac
+if [ "$trusted_release_public_key_size" -gt 65536 ]; then
+  offline_fail preflight "trusted release public key is oversized" 65
+fi
+trusted_release_ancestor=$(dirname -- "$trusted_release_public_key")
+while :; do
+  if [ -L "$trusted_release_ancestor" ] || \
+    [ ! -d "$trusted_release_ancestor" ] || \
+    [ "$(stat -c %u -- "$trusted_release_ancestor")" -ne 0 ]; then
+    offline_fail preflight "trusted release public key ancestor is unsafe" 65
+  fi
+  trusted_release_ancestor_mode=$(stat -c %a -- "$trusted_release_ancestor") || exit 66
+  trusted_release_ancestor_mode_value=$((0$trusted_release_ancestor_mode))
+  if [ $((trusted_release_ancestor_mode_value & 022)) -ne 0 ]; then
+    offline_fail preflight \
+      "trusted release public key ancestor is writable by non-root" 65
+  fi
+  [ "$trusted_release_ancestor" = / ] && break
+  trusted_release_ancestor=$(dirname -- "$trusted_release_ancestor")
+done
+trusted_release_key_digest=$(sha256sum \
+  "$trusted_release_public_key" | awk '{print $1}') || exit 66
+if ! printf '%s\n' "$trusted_release_key_digest" | grep -Eq '^[0-9a-f]{64}$'; then
+  offline_fail preflight "trusted release public key digest is invalid" 65
+fi
 registry_receipt=$registry_receipt_directory/registry-import-$manifest_digest.json
 if [ -L "$registry_receipt" ] || [ ! -f "$registry_receipt" ] || \
   [ "$(realpath -e -- "$registry_receipt" 2>/dev/null || true)" != "$registry_receipt" ] || \
   [ "$(stat -c %u -- "$registry_receipt" 2>/dev/null || echo -1)" -ne 0 ] || \
   [ "$(stat -c %a -- "$registry_receipt" 2>/dev/null || echo 0)" != 400 ] || \
-  [ "$(stat -c %h -- "$registry_receipt" 2>/dev/null || echo 0)" -ne 1 ]; then
+  [ "$(stat -c %h -- "$registry_receipt" 2>/dev/null || echo 0)" -ne 1 ] || \
+  [ "$(stat -c %s -- "$registry_receipt" 2>/dev/null || echo 0)" -le 0 ] || \
+  [ "$(stat -c %s -- "$registry_receipt" 2>/dev/null || echo 65537)" -gt 65536 ]; then
   offline_fail preflight "signed registry import receipt is missing or unsafe" 65
 fi
 if ! python3 -I -c '
-import json, re, sys
-document = json.loads(open(sys.argv[1], encoding="utf-8").read())
+import json, pathlib, re, sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON key")
+        result[name] = value
+    return result
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+document = json.loads(
+    pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"),
+    object_pairs_hook=reject_duplicates,
+    parse_constant=reject_constant,
+)
 expected_keys = {
     "schema_version", "kind", "status", "release_sequence", "release_id",
     "release_git_sha", "release_schema_head", "release_sha256", "manifest_sha256",
@@ -938,7 +1022,8 @@ valid = (
     and document["release_sha256"] == sys.argv[2]
     and document["manifest_sha256"] == sys.argv[3]
     and document["release_assets_sha256"] == sys.argv[4]
-    and isinstance(document["release_sequence"], int)
+    and document["trusted_key_sha256"] == sys.argv[5]
+    and type(document["release_sequence"]) is int
     and 0 < document["release_sequence"] <= 999_999_999_999_999_999
     and isinstance(document["release_id"], str)
     and re.fullmatch(r"[A-Za-z0-9._-]+", document["release_id"])
@@ -953,7 +1038,8 @@ valid = (
     )
 )
 raise SystemExit(0 if valid else 1)
-' "$registry_receipt" "$release_digest" "$manifest_digest" "$release_assets_digest"; then
+' "$registry_receipt" "$release_digest" "$manifest_digest" \
+  "$release_assets_digest" "$trusted_release_key_digest"; then
   offline_fail preflight "signed registry import receipt does not match this release" 65
 fi
 
@@ -962,17 +1048,83 @@ if [ -L "$highest_release_file" ] || [ ! -f "$highest_release_file" ] || \
   [ "$(realpath -e -- "$highest_release_file" 2>/dev/null || true)" != "$highest_release_file" ] || \
   [ "$(stat -c %u -- "$highest_release_file" 2>/dev/null || echo -1)" -ne 0 ] || \
   [ "$(stat -c %a -- "$highest_release_file" 2>/dev/null || echo 0)" != 400 ] || \
-  [ "$(stat -c %h -- "$highest_release_file" 2>/dev/null || echo 0)" -ne 1 ]; then
+  [ "$(stat -c %h -- "$highest_release_file" 2>/dev/null || echo 0)" -ne 1 ] || \
+  [ "$(stat -c %s -- "$highest_release_file" 2>/dev/null || echo 0)" -le 0 ] || \
+  [ "$(stat -c %s -- "$highest_release_file" 2>/dev/null || echo 65537)" -gt 65536 ]; then
   offline_fail preflight "highest accepted release state is missing or unsafe" 65
 fi
 if ! python3 -I -c '
-import json, pathlib, sys
-receipt = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-highest = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-shared = ("release_sequence", "release_id", "release_git_sha", "release_schema_head", "manifest_sha256", "release_assets_sha256")
-raise SystemExit(0 if all(receipt.get(key) == highest.get(key) for key in shared) else 1)
-' "$registry_receipt" "$highest_release_file"; then
+import json, pathlib, re, sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate JSON key")
+        result[name] = value
+    return result
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+def read(path):
+    return json.loads(
+        pathlib.Path(path).read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_constant,
+    )
+
+receipt = read(sys.argv[1])
+highest = read(sys.argv[2])
+trusted_key_sha256 = sys.argv[3]
+receipt_expected = {
+    "schema_version", "kind", "status", "release_sequence", "release_id",
+    "release_git_sha", "release_schema_head", "release_sha256", "manifest_sha256",
+    "release_assets_sha256", "checksum_set_sha256", "signature_sha256",
+    "trusted_key_sha256",
+}
+highest_expected = {
+    "schema_version", "release_sequence", "release_id", "release_git_sha",
+    "release_schema_head", "manifest_sha256", "release_assets_sha256",
+    "trusted_key_sha256",
+}
+shared = (
+    "release_sequence", "release_id", "release_git_sha", "release_schema_head",
+    "manifest_sha256", "release_assets_sha256", "trusted_key_sha256",
+)
+valid = (
+    isinstance(receipt, dict)
+    and set(receipt) == receipt_expected
+    and receipt.get("schema_version") == 2
+    and receipt.get("kind") == "offline-registry-import"
+    and receipt.get("status") == "verified"
+    and isinstance(highest, dict)
+    and set(highest) == highest_expected
+    and highest.get("schema_version") == 2
+    and type(highest.get("release_sequence")) is int
+    and 0 < highest["release_sequence"] <= 999_999_999_999_999_999
+    and re.fullmatch(r"[0-9a-f]{64}", trusted_key_sha256) is not None
+    and receipt.get("trusted_key_sha256") == trusted_key_sha256
+    and highest.get("trusted_key_sha256") == trusted_key_sha256
+    and all(receipt.get(key) == highest.get(key) for key in shared)
+)
+raise SystemExit(0 if valid else 1)
+' "$registry_receipt" "$highest_release_file" "$trusted_release_key_digest"; then
   offline_fail preflight "release receipt is not the highest issuer-accepted release" 65
+fi
+trusted_release_key_digest_after=$(sha256sum \
+  "$trusted_release_public_key" | awk '{print $1}') || exit 66
+if [ "$trusted_release_key_digest_after" != "$trusted_release_key_digest" ]; then
+  offline_fail preflight "trusted release public key changed during validation" 65
+fi
+if [ "$preflight_mode" = upgrade ]; then
+  python3 -I "$snapshot_script_dir/verify-upgrade-backup.py" \
+    --evidence "$KB_UPGRADE_BACKUP_EVIDENCE_PATH" \
+    --signature "$KB_UPGRADE_BACKUP_SIGNATURE_PATH" \
+    --public-key "$KB_UPGRADE_BACKUP_PUBLIC_KEY_PATH" \
+    --expected-manifest-sha256 "$manifest_digest" \
+    --expected-operation-scope active_upgrade || \
+    offline_fail preflight "signed backup and restore-drill gate failed" 65
 fi
 
 sh "$snapshot_script_dir/verify-offline-images.sh" verify \

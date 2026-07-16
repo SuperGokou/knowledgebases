@@ -179,7 +179,9 @@ fi
 if ! selection_json=$(python3 -I "$state_helper" select); then
   echo "recovery-dispatcher: no valid transaction exists; stopping the offline business boundary" >&2
   fail_closed_project || exit 71
-  exit 0
+  # A missing/invalid receipt is a durable safety incident, not a healthy
+  # steady state.  Keep the boundary stopped and make systemd surface failure.
+  exit 65
 fi
 selection_fields=$(printf '%s\n' "$selection_json" | python3 -I -c '
 import json,re,sys
@@ -238,7 +240,14 @@ if [ -L "$worker" ] || [ ! -f "$worker" ] || \
   exit 65
 fi
 
-exec sh "$worker" \
+if sh "$worker" \
   --selection "$selection" \
   --contract-sha256 "$contract_sha256" \
-  --transaction-id "$transaction_id"
+  --transaction-id "$transaction_id"; then
+  exit 0
+else
+  worker_status=$?
+fi
+echo "recovery-dispatcher: selected recovery worker failed; isolating the business boundary" >&2
+fail_closed_project || exit 71
+exit "$worker_status"

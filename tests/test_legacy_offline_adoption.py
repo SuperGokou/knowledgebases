@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -16,16 +17,21 @@ import pytest
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "scripts" / "legacy_offline_adoption.py"
+RESTORE_SCRIPT = REPOSITORY / "scripts" / "offline_ca_restore_drill.py"
+UPGRADE_VERIFIER = REPOSITORY / "deploy" / "tencent" / "verify-upgrade-backup.py"
 
 
-def _module() -> ModuleType:
-    name = "legacy_offline_adoption_under_test"
-    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+def _module_from_script(script: Path, *, name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _module() -> ModuleType:
+    return _module_from_script(SCRIPT, name="legacy_offline_adoption_under_test")
 
 
 def _container_document(
@@ -94,6 +100,124 @@ def _inventory(module: ModuleType) -> Any:
     return module.LegacyInventory((container,), (), ())
 
 
+def _write_ca_source(ca_root: Path) -> dict[str, bytes]:
+    materials = {
+        "root.crt": (
+            b"-----BEGIN CERTIFICATE-----\ncm9vdC1jZXJ0aWZpY2F0ZQ==\n-----END CERTIFICATE-----\n"
+        ),
+        "root.key": (
+            b"-----BEGIN PRIVATE KEY-----\n"  # gitleaks:allow
+            b"cm9vdC1wcml2YXRlLWtleQ==\n"
+            b"-----END PRIVATE KEY-----\n"
+        ),
+        "intermediate.crt": (
+            b"-----BEGIN CERTIFICATE-----\n"
+            b"aW50ZXJtZWRpYXRlLWNlcnRpZmljYXRl\n"
+            b"-----END CERTIFICATE-----\n"
+        ),
+        "intermediate.key": (
+            b"-----BEGIN PRIVATE KEY-----\n"  # gitleaks:allow
+            b"aW50ZXJtZWRpYXRlLXByaXZhdGUta2V5\n"
+            b"-----END PRIVATE KEY-----\n"
+        ),
+    }
+    ca_root.mkdir()
+    os.chmod(ca_root, 0o700)
+    for name, payload in materials.items():
+        path = ca_root / name
+        path.write_bytes(payload)
+        os.chmod(path, 0o600 if name.endswith(".key") else 0o644)
+    return materials
+
+
+def _write_real_adoption_signer_material(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path]:
+    trusted_private = tmp_path / "trusted.key"
+    trusted_public = tmp_path / "trusted.pub"
+    attacker_private = tmp_path / "attacker.key"
+    for private in (trusted_private, attacker_private):
+        subprocess.run(
+            [
+                "/usr/bin/openssl",
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+                str(private),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        private.chmod(0o400)
+    subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "pkey",
+            "-in",
+            str(trusted_private),
+            "-pubout",
+            "-out",
+            str(trusted_public),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    trusted_public.chmod(0o444)
+    fingerprint = tmp_path / "trusted.sha256"
+    fingerprint.write_text(
+        hashlib.sha256(trusted_public.read_bytes()).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    fingerprint.chmod(0o444)
+    return trusted_private, trusted_public, attacker_private, fingerprint
+
+
+def _release_authorization(
+    target_manifest: Path,
+    *,
+    git_sha: str = "a" * 40,
+    manifest_sha256: str = "d" * 64,
+    size_bytes: int = 1,
+) -> dict[str, Any]:
+    descriptor = {
+        "path": str(target_manifest),
+        "sha256": manifest_sha256,
+        "size_bytes": size_bytes,
+    }
+    return {
+        "schema_version": 1,
+        "release_sequence": 202607160001,
+        "release_id": "2026.07.16.1",
+        "release_git_sha": git_sha,
+        "release_schema_head": "20260715_0021",
+        "release_sha256": "1" * 64,
+        "release_assets_sha256": "2" * 64,
+        "checksum_set_sha256": "3" * 64,
+        "signature_sha256": "4" * 64,
+        "target_manifest": descriptor,
+        "registry_import_receipt": {
+            "path": "/srv/heyi-knowledgebases-offline/state/registry-import-" + "d" * 64 + ".json",
+            "sha256": "5" * 64,
+            "size_bytes": 1,
+        },
+        "highest_release": {
+            "path": "/srv/heyi-knowledgebases-offline/state/highest-release.json",
+            "sha256": "6" * 64,
+            "size_bytes": 1,
+        },
+        "trusted_release_public_key": {
+            "path": "/etc/heyi-release/trusted-release-public.pem",
+            "sha256": "7" * 64,
+            "size_bytes": 1,
+        },
+    }
+
+
 def test_runner_rejects_untrusted_executable_and_arguments_before_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -129,6 +253,121 @@ def test_runner_rebuilds_path_and_rejects_environment_override(
     assert observed["PATH"] == "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     with pytest.raises(module.CommandError, match="unapproved key"):
         runner.run(("/usr/bin/docker", "version"), extra_env={"PATH": "/tmp"})
+
+
+def test_runtime_parser_preserves_optional_empty_values_and_binds_raw_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    required = "\n".join(
+        f"{key}=required-{index}"
+        for index, key in enumerate(sorted(module.REQUIRED_RUNTIME_KEYS), 1)
+    )
+    with_empty = (
+        required
+        + "\nKB_LLM_EGRESS_GATEWAY_URL=\n"
+        + "KB_LLM_EGRESS_APPROVED_PROVIDERS=''\n"
+        + "KB_UPGRADE_BACKUP_EVIDENCE_PATH=\n"
+        + "KB_UPGRADE_BACKUP_SIGNATURE_PATH=\n"
+        + "KB_UPGRADE_BACKUP_PUBLIC_KEY_PATH=\n"
+        + 'KB_BOOTSTRAP_ADMIN_PASSWORD=""\n'
+    ).encode()
+    without_empty = (required + "\n").encode()
+    payloads = {
+        Path("/runtime-with-empty.env"): with_empty,
+        Path("/runtime-without-empty.env"): without_empty,
+    }
+    monkeypatch.setattr(module, "_open_protected_bytes", lambda path: payloads[path])
+
+    values, digest = module.parse_runtime_environment(
+        Path("/runtime-with-empty.env"),
+        b"k" * 32,
+    )
+    _, digest_without_empty = module.parse_runtime_environment(
+        Path("/runtime-without-empty.env"),
+        b"k" * 32,
+    )
+
+    for key in (
+        "KB_LLM_EGRESS_GATEWAY_URL",
+        "KB_LLM_EGRESS_APPROVED_PROVIDERS",
+        "KB_UPGRADE_BACKUP_EVIDENCE_PATH",
+        "KB_UPGRADE_BACKUP_SIGNATURE_PATH",
+        "KB_UPGRADE_BACKUP_PUBLIC_KEY_PATH",
+        "KB_BOOTSTRAP_ADMIN_PASSWORD",
+    ):
+        assert key in values
+        assert values[key] == ""
+    assert digest == module._hmac_binding(
+        with_empty,
+        b"k" * 32,
+        domain="heyi-runtime-env-v1",
+    )
+    assert digest != digest_without_empty
+
+
+def test_runtime_parser_accepts_the_standard_strict_offline_example(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    payload = (REPOSITORY / "deploy" / "tencent" / "offline.env.example").read_bytes()
+    monkeypatch.setattr(module, "_open_protected_bytes", lambda path: payload)
+
+    values, digest = module.parse_runtime_environment(Path("/runtime.env"), b"k" * 32)
+
+    assert values["KB_LLM_EGRESS_MODE"] == "strict_offline"
+    assert values["KB_LLM_EGRESS_GATEWAY_URL"] == ""
+    assert values["KB_LLM_EGRESS_APPROVED_PROVIDERS"] == ""
+    assert values["KB_UPGRADE_BACKUP_EVIDENCE_PATH"] == ""
+    assert digest == module._hmac_binding(
+        payload,
+        b"k" * 32,
+        domain="heyi-runtime-env-v1",
+    )
+
+
+def test_runtime_parser_rejects_empty_required_unknown_and_duplicate_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    required_values = {
+        key: f"required-{index}"
+        for index, key in enumerate(sorted(module.REQUIRED_RUNTIME_KEYS), 1)
+    }
+
+    def payload(overrides: dict[str, str], *extra_lines: str) -> bytes:
+        values = {**required_values, **overrides}
+        lines = [f"{key}={value}" for key, value in sorted(values.items())]
+        return ("\n".join([*lines, *extra_lines]) + "\n").encode()
+
+    documents = {
+        Path("/empty-required.env"): payload({"POSTGRES_DB": ""}),
+        Path("/unknown.env"): payload({}, "UNEXPECTED_RUNTIME_KEY=value"),
+        Path("/release-image.env"): payload(
+            {},
+            "KB_API_IMAGE=registry.invalid/api@sha256:" + "a" * 64,
+        ),
+        Path("/duplicate.env"): payload({}, "POSTGRES_DB=duplicate"),
+    }
+    monkeypatch.setattr(module, "_open_protected_bytes", lambda path: documents[path])
+
+    with pytest.raises(module.AdoptionError, match="required protected values"):
+        module.parse_runtime_environment(Path("/empty-required.env"), b"k" * 32)
+    with pytest.raises(module.AdoptionError, match="unknown"):
+        module.parse_runtime_environment(Path("/unknown.env"), b"k" * 32)
+    with pytest.raises(module.AdoptionError, match="unknown"):
+        module.parse_runtime_environment(Path("/release-image.env"), b"k" * 32)
+    with pytest.raises(module.AdoptionError, match="duplicate"):
+        module.parse_runtime_environment(Path("/duplicate.env"), b"k" * 32)
+
+
+def test_runtime_parser_allowlist_matches_offline_environment_validator() -> None:
+    module = _module()
+    validator = _module_from_script(
+        REPOSITORY / "deploy" / "tencent" / "validate-offline-environment.py",
+        name="offline_environment_validator_under_test",
+    )
+    assert module.ALLOWED_RUNTIME_KEYS == validator._RUNTIME_KEYS
 
 
 def test_container_contract_rejects_protected_port_and_external_writable_bind(
@@ -188,6 +427,11 @@ def test_plan_contains_opaque_environment_bindings_only(
     target = Path("/srv/target/release.env.images")
     monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
     monkeypatch.setattr(module, "_sha256_file", lambda path: "d" * 64)
+    monkeypatch.setattr(
+        module,
+        "_verify_descriptor",
+        lambda value, **kwargs: Path(value["path"]),
+    )
     inventory = module.LegacyInventory(
         (replace(inventory.containers[0], config_files=(str(compose),)),), (), ()
     )
@@ -198,14 +442,131 @@ def test_plan_contains_opaque_environment_bindings_only(
         compose_files=(compose,),
         legacy_env_files=(legacy_env,),
         legacy_env_bindings={str(legacy_env): "f" * 64},
-        target_manifest=target,
-        git_sha="a" * 40,
+        release_authorization=_release_authorization(target),
     )
     serialized = json.dumps(document)
     assert document["runtime_env"]["opaque_hmac_sha256"] == "e" * 64
     assert document["legacy_compose"]["env_files"][0]["opaque_hmac_sha256"] == "f" * 64
+    assert document["schema_version"] == 4
+    assert document["git_sha"] == "a" * 40
+    assert document["release_authorization_sha256"] == module._release_authorization_sha256(
+        document["release_authorization"]
+    )
+    assert document["host_isolation_guard"] == {
+        "relative_path": "scripts/host_isolation_guard.py",
+        "sha256": "d" * 64,
+    }
     assert "bound-at-execution" not in serialized
     assert "POSTGRES_PASSWORD" not in serialized
+
+
+def test_release_authorization_is_derived_only_from_fixed_state_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    state = tmp_path / "state"
+    artifacts = tmp_path / "artifacts"
+    trust_key = tmp_path / "trusted-release-public.pem"
+    highest_path = state / "highest-release.json"
+    manifest = artifacts / "2026.07.16.1" / "offline-registry-bundle" / "release.env.images"
+    receipt_path = state / f"registry-import-{'2' * 64}.json"
+    highest = {
+        "schema_version": 2,
+        "release_sequence": 202607160001,
+        "release_id": "2026.07.16.1",
+        "release_git_sha": "a" * 40,
+        "release_schema_head": "20260715_0021",
+        "manifest_sha256": "2" * 64,
+        "release_assets_sha256": "3" * 64,
+        "trusted_key_sha256": "7" * 64,
+    }
+    receipt = {
+        "schema_version": 2,
+        "kind": "offline-registry-import",
+        "status": "verified",
+        **{
+            key: highest[key]
+            for key in (
+                "release_sequence",
+                "release_id",
+                "release_git_sha",
+                "release_schema_head",
+                "manifest_sha256",
+                "release_assets_sha256",
+                "trusted_key_sha256",
+            )
+        },
+        "release_sha256": "1" * 64,
+        "checksum_set_sha256": "4" * 64,
+        "signature_sha256": "5" * 64,
+    }
+    descriptors = {
+        highest_path: {"path": str(highest_path), "sha256": "6" * 64, "size_bytes": 1},
+        receipt_path: {"path": str(receipt_path), "sha256": "8" * 64, "size_bytes": 1},
+        manifest: {"path": str(manifest), "sha256": "2" * 64, "size_bytes": 1},
+        trust_key: {"path": str(trust_key), "sha256": "7" * 64, "size_bytes": 1},
+    }
+    monkeypatch.setattr(module, "STATE_ROOT", state)
+    monkeypatch.setattr(module, "ARTIFACT_ROOT", artifacts)
+    monkeypatch.setattr(module, "HIGHEST_RELEASE_STATE", highest_path)
+    monkeypatch.setattr(module, "TRUSTED_RELEASE_PUBLIC_KEY", trust_key)
+    monkeypatch.setattr(
+        module,
+        "_stable_json_document",
+        lambda path, **kwargs: (
+            highest if path == highest_path else receipt,
+            descriptors[path],
+        ),
+    )
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    monkeypatch.setattr(module, "_descriptor", lambda path: descriptors[path])
+
+    authorization = module._current_release_authorization()
+
+    assert authorization["release_git_sha"] == "a" * 40
+    assert authorization["target_manifest"] == descriptors[manifest]
+    assert authorization["registry_import_receipt"] == descriptors[receipt_path]
+    assert authorization["trusted_release_public_key"] == descriptors[trust_key]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"schema_version":2,"schema_version":2}\n',
+        b'{"schema_version":NaN}\n',
+        b'{"schema_version":Infinity}\n',
+    ],
+)
+def test_protected_json_rejects_duplicate_keys_and_nonfinite_numbers(
+    payload: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "_open_protected_bytes", lambda *args, **kwargs: payload)
+    with pytest.raises(module.AdoptionError, match="malformed"):
+        module._read_json_file(Path("/protected/state.json"))
+
+
+def test_release_authorization_is_revalidated_after_plan_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    authorization = _release_authorization(Path("/srv/release.env.images"))
+    plan = {
+        "release_authorization": authorization,
+        "release_authorization_sha256": module._release_authorization_sha256(authorization),
+    }
+    current = {"authorization": authorization}
+    monkeypatch.setattr(
+        module,
+        "_current_release_authorization",
+        lambda: current["authorization"],
+    )
+    assert module._validate_release_authorization(plan) == authorization
+    current["authorization"] = {**authorization, "release_sequence": 202607160002}
+    with pytest.raises(module.AdoptionError, match="changed after planning"):
+        module._validate_release_authorization(plan)
 
 
 def test_confirmations_are_fail_closed() -> None:
@@ -293,20 +654,75 @@ def test_source_has_no_global_or_volume_destructive_commands() -> None:
     assert "shell=False" in source
 
 
+def _recipient_certificate_pem() -> bytes:
+    return b"-----BEGIN CERTIFICATE-----\nUkVDSVBJRU5ULUNFUlRJRklDQVRF\n-----END CERTIFICATE-----\n"
+
+
+def _recipient_certificate_contract(
+    *,
+    not_before: str = "2026-07-15 00:00:00Z",
+    not_after: str = "2026-08-15 00:00:00Z",
+    key_usage: str = "Key Encipherment, Data Encipherment",
+    public_key_algorithm: str = "rsaEncryption",
+) -> bytes:
+    return (
+        "Certificate:\n"
+        "    Data:\n"
+        f"            Public Key Algorithm: {public_key_algorithm}\n"
+        "        X509v3 extensions:\n"
+        "            X509v3 Basic Constraints: critical\n"
+        "                CA:FALSE\n"
+        "            X509v3 Key Usage: critical\n"
+        f"                {key_usage}\n"
+        "    Signature Algorithm: sha256WithRSAEncryption\n"
+        f"notBefore={not_before}\n"
+        f"notAfter={not_after}\n"
+    ).encode("ascii")
+
+
+def _recipient_rsa_public_description(bits: int = 3072) -> bytes:
+    return (f"Public-Key: ({bits} bit)\nModulus:\n    00:aa\nExponent: 65537 (0x10001)\n").encode(
+        "ascii"
+    )
+
+
 def test_ca_escrow_is_ciphertext_with_only_an_opaque_plaintext_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _module()
     ca_root = tmp_path / "ca"
-    ca_root.mkdir()
-    secret = b"low-entropy-ca-private-key"
-    (ca_root / "root.key").write_bytes(secret)
+    materials = _write_ca_source(ca_root)
+    secret = materials["root.key"]
     certificate = tmp_path / "recipient.pem"
-    certificate.write_text("offline recipient certificate", encoding="ascii")
+    certificate.write_bytes(_recipient_certificate_pem())
+    os.chmod(certificate, 0o444)
     output = tmp_path / "escrow.p7m"
+    events: list[str] = []
     monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
     monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    monkeypatch.setattr(
+        module,
+        "_recipient_certificate_identity_is_stable",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        module,
+        "_read_ca_source_file",
+        lambda path, **kwargs: materials[path.name],
+    )
+    original_ca_tar_payload = module._ca_tar_payload
+
+    def tracked_ca_tar_payload(path: Path) -> tuple[bytes, int]:
+        events.append("ca-private-material-read")
+        return original_ca_tar_payload(path)
+
+    monkeypatch.setattr(module, "_ca_tar_payload", tracked_ca_tar_payload)
+    monkeypatch.setattr(
+        module,
+        "_utc_now",
+        lambda: module.datetime(2026, 7, 16, 12, 0, tzinfo=module.UTC),
+    )
     real_open = os.open
     anchor = tmp_path / "ca-directory-fsync.anchor"
 
@@ -325,14 +741,43 @@ def test_ca_escrow_is_ciphertext_with_only_an_opaque_plaintext_binding(
             input_bytes: bytes | None = None,
             stdout_file: Any = None,
             timeout: int = 0,
+            pass_fds: tuple[int, ...] = (),
         ) -> bytes:
             del timeout
+            values = tuple(argv)
+            if values[1:3] == ("x509", "-in") and "-text" in values:
+                events.append("recipient-contract")
+                assert len(pass_fds) == 1
+                return _recipient_certificate_contract()
+            if values[1:3] == ("x509", "-in") and "-pubkey" in values:
+                events.append("recipient-public-key")
+                assert len(pass_fds) == 1
+                return (
+                    b"-----BEGIN PUBLIC KEY-----\n"
+                    b"UkVDSVBJRU5ULVBVQkxJQw==\n"
+                    b"-----END PUBLIC KEY-----\n"
+                )
+            if values[1:3] == ("pkey", "-pubin"):
+                events.append("recipient-rsa-policy")
+                assert input_bytes is not None
+                return _recipient_rsa_public_description()
             if "-encrypt" in argv:
+                events.append("cms-encrypt")
                 assert "-aes256" in argv
+                assert argv[-6:] == (
+                    "-keyopt",
+                    "rsa_padding_mode:oaep",
+                    "-keyopt",
+                    "rsa_oaep_md:sha256",
+                    "-keyopt",
+                    "rsa_mgf1_md:sha256",
+                )
                 assert input_bytes is not None and secret in input_bytes
                 assert stdout_file is not None
+                assert len(pass_fds) == 1
                 stdout_file.write(b"CMS-CIPHERTEXT")
             else:
+                events.append("cms-parse")
                 assert "-cmsout" in argv
             return b""
 
@@ -349,6 +794,403 @@ def test_ca_escrow_is_ciphertext_with_only_an_opaque_plaintext_binding(
     assert "plaintext_sha256" not in metadata
     assert metadata["private_key_bytes_in_evidence"] is False
     assert metadata["cos_transfer_allowed"] is False
+    assert metadata["file_count"] == 4
+    assert metadata["recipient_certificate_sha256"] == module._sha256_bytes(
+        _recipient_certificate_pem()
+    )
+    assert events == [
+        "recipient-contract",
+        "recipient-public-key",
+        "recipient-rsa-policy",
+        "ca-private-material-read",
+        "cms-encrypt",
+        "cms-parse",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "contract", "public_description", "certificate_payload"),
+    [
+        (
+            "rsa-2048",
+            _recipient_certificate_contract(),
+            _recipient_rsa_public_description(2048),
+            _recipient_certificate_pem(),
+        ),
+        (
+            "expired",
+            _recipient_certificate_contract(not_after="2026-07-15 23:59:59Z"),
+            _recipient_rsa_public_description(),
+            _recipient_certificate_pem(),
+        ),
+        (
+            "not-yet-valid",
+            _recipient_certificate_contract(not_before="2026-07-17 00:00:00Z"),
+            _recipient_rsa_public_description(),
+            _recipient_certificate_pem(),
+        ),
+        (
+            "missing-key-encipherment",
+            _recipient_certificate_contract(key_usage="Digital Signature"),
+            _recipient_rsa_public_description(),
+            _recipient_certificate_pem(),
+        ),
+        (
+            "wrong-public-key-algorithm",
+            _recipient_certificate_contract(public_key_algorithm="id-ecPublicKey"),
+            b"Public-Key: (256 bit)\nASN1 OID: prime256v1\n",
+            _recipient_certificate_pem(),
+        ),
+        (
+            "certificate-chain",
+            _recipient_certificate_contract(),
+            _recipient_rsa_public_description(),
+            _recipient_certificate_pem() + _recipient_certificate_pem(),
+        ),
+    ],
+)
+def test_ca_recipient_policy_blocks_before_any_private_ca_read_or_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    contract: bytes,
+    public_description: bytes,
+    certificate_payload: bytes,
+) -> None:
+    module = _module()
+    certificate = tmp_path / f"{case}.pem"
+    certificate.write_bytes(certificate_payload)
+    os.chmod(certificate, 0o444)
+    output = tmp_path / f"{case}.p7m"
+    ca_reads = 0
+
+    def forbidden_ca_read(path: Path) -> tuple[bytes, int]:
+        nonlocal ca_reads
+        del path
+        ca_reads += 1
+        raise AssertionError("recipient policy must run before reading CA private material")
+
+    class InvalidRecipientRunner:
+        def run(
+            self,
+            argv: tuple[str, ...],
+            *,
+            input_bytes: bytes | None = None,
+            stdout_file: Any = None,
+            timeout: int = 0,
+            pass_fds: tuple[int, ...] = (),
+        ) -> bytes:
+            del stdout_file, timeout
+            values = tuple(argv)
+            if values[1:3] == ("x509", "-in") and "-text" in values:
+                assert len(pass_fds) == 1
+                return contract
+            if values[1:3] == ("x509", "-in") and "-pubkey" in values:
+                assert len(pass_fds) == 1
+                return (
+                    b"-----BEGIN PUBLIC KEY-----\n"
+                    b"UkVDSVBJRU5ULVBVQkxJQw==\n"
+                    b"-----END PUBLIC KEY-----\n"
+                )
+            if values[1:3] == ("pkey", "-pubin"):
+                assert input_bytes is not None
+                return public_description
+            raise AssertionError(f"recipient validation reached an unexpected command: {values}")
+
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    monkeypatch.setattr(module, "_ca_tar_payload", forbidden_ca_read)
+    monkeypatch.setattr(
+        module,
+        "_utc_now",
+        lambda: module.datetime(2026, 7, 16, 12, 0, tzinfo=module.UTC),
+    )
+
+    with pytest.raises(module.AdoptionError, match="recipient certificate"):
+        module._encrypt_ca_escrow(
+            InvalidRecipientRunner(),
+            ca_root=tmp_path / "must-not-be-read",
+            recipient_certificate=certificate,
+            binding_key=b"k" * 32,
+            destination=output,
+        )
+
+    assert ca_reads == 0
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("unexpected_kind", ("extra", "nested"))
+def test_ca_tar_rejects_extra_or_nested_source_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unexpected_kind: str,
+) -> None:
+    module = _module()
+    ca_root = tmp_path / "ca"
+    _write_ca_source(ca_root)
+    if unexpected_kind == "extra":
+        (ca_root / "notes.txt").write_text("not CA material", encoding="ascii")
+    else:
+        (ca_root / "archive").mkdir()
+        (ca_root / "archive" / "root.key").write_text("stale key", encoding="ascii")
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+    with pytest.raises(module.AdoptionError, match="exactly the four canonical files"):
+        module._ca_tar_payload(ca_root)
+
+
+def test_ca_tar_rejects_directory_drift_during_protected_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    ca_root = tmp_path / "ca"
+    materials = _write_ca_source(ca_root)
+    calls = 0
+
+    def read_with_namespace_drift(path: Path, **kwargs: object) -> bytes:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls == 1:
+            (ca_root / "notes.txt").write_text("late extra entry", encoding="ascii")
+        return materials[path.name]
+
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+    monkeypatch.setattr(module, "_read_ca_source_file", read_with_namespace_drift)
+    with pytest.raises(module.AdoptionError, match="changed while"):
+        module._ca_tar_payload(ca_root)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="real CA ownership and mode checks require root Linux",
+)
+def test_ca_tar_rejects_group_or_world_readable_private_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    ca_root = tmp_path / "ca"
+    _write_ca_source(ca_root)
+    os.chmod(ca_root / "root.key", 0o644)
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    with pytest.raises(module.AdoptionError, match="protected open"):
+        module._ca_tar_payload(ca_root)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="real CA hard-link and ownership checks require root Linux",
+)
+def test_ca_tar_rejects_hardlinked_private_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    ca_root = tmp_path / "ca"
+    _write_ca_source(ca_root)
+    try:
+        os.link(ca_root / "root.key", tmp_path / "root-key-hardlink")
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    with pytest.raises(module.AdoptionError, match="protected open"):
+        module._ca_tar_payload(ca_root)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or not hasattr(os, "geteuid")
+    or os.geteuid() != 0
+    or not Path("/usr/bin/openssl").is_file(),
+    reason="real recipient-certificate policy requires root Linux and OpenSSL 3",
+)
+def test_real_recipient_policy_rejects_weak_time_usage_and_non_rsa_before_ca_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+
+    def issue_certificate(
+        name: str,
+        *,
+        newkey: tuple[str, ...],
+        key_usage: str,
+    ) -> Path:
+        key = tmp_path / f"{name}.key"
+        certificate = tmp_path / f"{name}.pem"
+        subprocess.run(
+            (
+                "/usr/bin/openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                *newkey,
+                "-nodes",
+                "-sha256",
+                "-days",
+                "2",
+                "-subj",
+                f"/CN={name}",
+                "-addext",
+                f"keyUsage=critical,{key_usage}",
+                "-keyout",
+                str(key),
+                "-out",
+                str(certificate),
+            ),
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=60,
+        )
+        return certificate
+
+    compliant = issue_certificate(
+        "recipient-rsa-3072",
+        newkey=("rsa:3072",),
+        key_usage="keyEncipherment",
+    )
+    weak = issue_certificate(
+        "recipient-rsa-2048",
+        newkey=("rsa:2048",),
+        key_usage="keyEncipherment",
+    )
+    wrong_usage = issue_certificate(
+        "recipient-signing-only",
+        newkey=("rsa:3072",),
+        key_usage="digitalSignature",
+    )
+    non_rsa = issue_certificate(
+        "recipient-ec-p256",
+        newkey=("ec", "-pkeyopt", "ec_paramgen_curve:P-256"),
+        key_usage="keyEncipherment",
+    )
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    ca_reads = 0
+
+    def forbidden_ca_read(path: Path) -> tuple[bytes, int]:
+        nonlocal ca_reads
+        del path
+        ca_reads += 1
+        raise AssertionError("invalid recipient certificate reached CA private material")
+
+    monkeypatch.setattr(module, "_ca_tar_payload", forbidden_ca_read)
+    current = module.datetime.now(module.UTC)
+    cases = (
+        ("weak", weak, current),
+        ("expired", compliant, module.datetime(2100, 1, 1, tzinfo=module.UTC)),
+        ("not-yet-valid", compliant, module.datetime(2000, 1, 1, tzinfo=module.UTC)),
+        ("wrong-usage", wrong_usage, current),
+        ("non-rsa", non_rsa, current),
+    )
+    for name, certificate, validation_time in cases:
+        monkeypatch.setattr(module, "_utc_now", lambda value=validation_time: value)
+        output = tmp_path / f"{name}.p7m"
+        with pytest.raises(module.AdoptionError, match="recipient certificate"):
+            module._encrypt_ca_escrow(
+                module.Runner(),
+                ca_root=tmp_path / "must-not-be-read",
+                recipient_certificate=certificate,
+                binding_key=b"k" * 32,
+                destination=output,
+            )
+        assert not output.exists()
+        assert not list(tmp_path.glob(f".{output.name}.*.tmp"))
+
+    assert ca_reads == 0
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or not hasattr(os, "geteuid")
+    or os.geteuid() != 0
+    or not Path("/usr/bin/openssl").is_file(),
+    reason="real producer-to-consumer CMS roundtrip requires root Linux and OpenSSL 3",
+)
+def test_real_ca_escrow_roundtrip_matches_restore_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    producer = _module()
+    consumer = _module_from_script(
+        RESTORE_SCRIPT,
+        name="offline_ca_restore_drill_for_producer_roundtrip",
+    )
+    ca_root = tmp_path / "ca"
+    materials = _write_ca_source(ca_root)
+    recipient_key = tmp_path / "recipient.key"
+    recipient_certificate = tmp_path / "recipient.pem"
+    subprocess.run(
+        (
+            "/usr/bin/openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:3072",
+            "-nodes",
+            "-sha256",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=Heyi Offline CA Escrow Recipient",
+            "-addext",
+            "keyUsage=critical,keyEncipherment",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-keyout",
+            str(recipient_key),
+            "-out",
+            str(recipient_certificate),
+        ),
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        timeout=60,
+    )
+    output = tmp_path / "caddy-ca.cms.p7m"
+    monkeypatch.setattr(producer, "protected_directory", lambda path, **kwargs: path)
+    monkeypatch.setattr(producer, "protected_file", lambda path, **kwargs: path)
+    metadata = producer._encrypt_ca_escrow(
+        producer.Runner(),
+        ca_root=ca_root,
+        recipient_certificate=recipient_certificate,
+        binding_key=b"k" * 32,
+        destination=output,
+    )
+
+    openssl = consumer.OpenSSLRunner()
+    consumer._validate_cms_contract(openssl, output)
+    plaintext = openssl.run(
+        (
+            "cms",
+            "-decrypt",
+            "-binary",
+            "-inform",
+            "DER",
+            "-in",
+            str(output),
+            "-recip",
+            str(recipient_certificate),
+            "-inkey",
+            str(recipient_key),
+        ),
+        timeout=120,
+        max_output=consumer.MAX_CA_PLAINTEXT_BYTES,
+    )
+    assert (
+        consumer._read_ca_archive(
+            plaintext,
+            expected_file_count=metadata["file_count"],
+        )
+        == materials
+    )
 
 
 def test_ca_restore_attestation_fails_closed_on_cos_or_server_private_key(
@@ -360,13 +1202,24 @@ def test_ca_restore_attestation_fails_closed_on_cos_or_server_private_key(
     attestation_path = Path("/protected/attestation.json")
     signature_path = Path("/protected/attestation.sig")
     public_key = Path("/protected/offline-public.pem")
+    issued_at = now - module.timedelta(hours=1)
     challenge = {
-        "issued_at": (now - module.timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-        "expires_at": (now + module.timedelta(days=6)).isoformat().replace("+00:00", "Z"),
+        "schema_version": 2,
+        "kind": "heyi-caddy-ca-restore-challenge",
+        "project": module.PROJECT,
+        "run_id": "restore-drill-001",
+        "plan_sha256": "e" * 64,
+        "release_authorization_sha256": "8" * 64,
+        "nonce": "f" * 64,
+        "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": (issued_at + module.timedelta(days=7)).isoformat().replace("+00:00", "Z"),
         "encrypted_archive_sha256": "b" * 64,
+        "encrypted_archive_size_bytes": 4096,
         "plaintext_opaque_hmac_sha256": "c" * 64,
-        "file_count": 2,
+        "file_count": 4,
         "recipient_certificate_sha256": "d" * 64,
+        "ca_attestation_public_key_sha256": "a" * 64,
+        "cos_transfer_allowed": False,
     }
     attestation = {
         "schema_version": 1,
@@ -375,7 +1228,7 @@ def test_ca_restore_attestation_fails_closed_on_cos_or_server_private_key(
         "challenge_sha256": "a" * 64,
         "encrypted_archive_sha256": "b" * 64,
         "plaintext_opaque_hmac_sha256": "c" * 64,
-        "file_count": 2,
+        "file_count": 4,
         "recipient_certificate_sha256": "d" * 64,
         "status": "passed",
         "tested_at": now.isoformat().replace("+00:00", "Z"),
@@ -409,6 +1262,37 @@ def test_ca_restore_attestation_fails_closed_on_cos_or_server_private_key(
             signature=signature_path,
             public_key=public_key,
         )
+    attestation["cos_used"] = False
+    challenge["ca_attestation_public_key_sha256"] = "9" * 64
+    with pytest.raises(module.AdoptionError, match="challenge contract differs"):
+        module._verify_ca_attestation(
+            object(),
+            challenge=challenge_path,
+            attestation=attestation_path,
+            signature=signature_path,
+            public_key=public_key,
+        )
+
+
+def test_ca_challenge_v2_binds_preapproved_attestation_public_key() -> None:
+    module = _module()
+    document = module._ca_challenge(
+        run_id="restore-drill-001",
+        plan_digest="a" * 64,
+        release_authorization_sha256="f" * 64,
+        ca_escrow={
+            "ciphertext_sha256": "b" * 64,
+            "ciphertext_size_bytes": 4096,
+            "plaintext_opaque_hmac_sha256": "c" * 64,
+            "file_count": 4,
+            "recipient_certificate_sha256": "d" * 64,
+        },
+        ca_attestation_public_key_sha256="e" * 64,
+    )
+    assert document["schema_version"] == 2
+    assert document["release_authorization_sha256"] == "f" * 64
+    assert document["ca_attestation_public_key_sha256"] == "e" * 64
+    assert set(document) == module.CA_RESTORE_CHALLENGE_KEYS
 
 
 def test_retirement_intent_is_forward_only_after_publication() -> None:
@@ -481,6 +1365,11 @@ def test_plan_binds_mixed_compose_paths_per_service(
     inventory = module.LegacyInventory((api, web), (), ())
     monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
     monkeypatch.setattr(module, "_sha256_file", lambda path: "d" * 64)
+    monkeypatch.setattr(
+        module,
+        "_verify_descriptor",
+        lambda value, **kwargs: Path(value["path"]),
+    )
     document = module.build_plan(
         inventory=inventory,
         runtime_env=Path("/srv/runtime.env"),
@@ -488,10 +1377,9 @@ def test_plan_binds_mixed_compose_paths_per_service(
         compose_files=(first, second),
         legacy_env_files=(),
         legacy_env_bindings={},
-        target_manifest=Path("/srv/release.env.images"),
-        git_sha="a" * 40,
+        release_authorization=_release_authorization(Path("/srv/release.env.images")),
     )
-    assert document["schema_version"] == 2
+    assert document["schema_version"] == 4
     assert document["legacy_compose"]["service_bindings"] == {
         "api": [str(first)],
         "web": [str(second)],
@@ -500,6 +1388,126 @@ def test_plan_binds_mixed_compose_paths_per_service(
         str(first),
         str(second),
     ]
+
+
+def test_host_isolation_guard_binding_survives_release_materialization_path_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle_root = tmp_path / "bundle-source"
+    materialized_root = tmp_path / "materialized-release"
+    guard_payload = b"def marker():\n    return 'same-release-control'\n"
+    for root in (bundle_root, materialized_root):
+        scripts = root / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "legacy_offline_adoption.py").write_bytes(SCRIPT.read_bytes())
+        (scripts / "host_isolation_guard.py").write_bytes(guard_payload)
+
+    compose = tmp_path / "compose.yml"
+    runtime = tmp_path / "runtime.env"
+    target = tmp_path / "release.env.images"
+    compose.write_text("services: {}\n", encoding="utf-8")
+    runtime.write_text("KEY=value\n", encoding="utf-8")
+    target.write_text("IMAGE=example.invalid/app@sha256:" + "a" * 64 + "\n", encoding="utf-8")
+
+    build_module = _module_from_script(
+        bundle_root / "scripts" / "legacy_offline_adoption.py",
+        name="legacy_offline_adoption_bundle_source",
+    )
+    build_inventory = _inventory(build_module)
+    build_inventory = build_module.LegacyInventory(
+        (
+            replace(
+                build_inventory.containers[0],
+                config_files=(str(compose.resolve()),),
+            ),
+        ),
+        (),
+        (),
+    )
+    monkeypatch.setattr(
+        build_module,
+        "protected_file",
+        lambda path, **kwargs: path.resolve(strict=True),
+    )
+    plan = build_module.build_plan(
+        inventory=build_inventory,
+        runtime_env=runtime.resolve(),
+        runtime_binding="e" * 64,
+        compose_files=(compose.resolve(),),
+        legacy_env_files=(),
+        legacy_env_bindings={},
+        release_authorization=_release_authorization(
+            target.resolve(),
+            manifest_sha256=build_module._sha256_file(target.resolve()),
+            size_bytes=target.stat().st_size,
+        ),
+    )
+
+    materialized_module = _module_from_script(
+        materialized_root / "scripts" / "legacy_offline_adoption.py",
+        name="legacy_offline_adoption_materialized_release",
+    )
+    monkeypatch.setattr(
+        materialized_module,
+        "protected_file",
+        lambda path, **kwargs: path.resolve(strict=True),
+    )
+    resolved = materialized_module._protected_host_isolation_guard(plan["host_isolation_guard"])
+
+    assert plan["host_isolation_guard"] == {
+        "relative_path": materialized_module.HOST_ISOLATION_GUARD_RELATIVE_PATH,
+        "sha256": materialized_module._sha256_bytes(guard_payload),
+    }
+    assert (
+        bundle_root / build_module.HOST_ISOLATION_GUARD_RELATIVE_PATH
+        != materialized_root / materialized_module.HOST_ISOLATION_GUARD_RELATIVE_PATH
+    )
+    assert (
+        resolved
+        == (materialized_root / materialized_module.HOST_ISOLATION_GUARD_RELATIVE_PATH).resolve()
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "../scripts/host_isolation_guard.py",
+        "scripts/../scripts/host_isolation_guard.py",
+        "/scripts/host_isolation_guard.py",
+        "host_isolation_guard.py",
+        "scripts\\host_isolation_guard.py",
+    ],
+)
+def test_host_isolation_guard_binding_rejects_traversal_or_noncanonical_relative_path(
+    relative_path: str,
+) -> None:
+    module = _module()
+    with pytest.raises(module.AdoptionError, match="relative path differs"):
+        module._protected_host_isolation_guard(
+            {
+                "relative_path": relative_path,
+                "sha256": "a" * 64,
+            }
+        )
+
+
+def test_host_isolation_guard_binding_rejects_legacy_or_extended_schema() -> None:
+    module = _module()
+    with pytest.raises(module.AdoptionError, match="schema differs"):
+        module._protected_host_isolation_guard(
+            {
+                "path": "/bundle/scripts/host_isolation_guard.py",
+                "sha256": "a" * 64,
+            }
+        )
+    with pytest.raises(module.AdoptionError, match="schema differs"):
+        module._protected_host_isolation_guard(
+            {
+                "relative_path": module.HOST_ISOLATION_GUARD_RELATIVE_PATH,
+                "sha256": "a" * 64,
+                "path": "/bundle/scripts/host_isolation_guard.py",
+            }
+        )
 
 
 def test_plan_parser_accepts_repeatable_compose_files() -> None:
@@ -515,13 +1523,97 @@ def test_plan_parser_accepts_repeatable_compose_files() -> None:
             "/srv/one.yml",
             "--compose-file",
             "/srv/two.yml",
-            "--target-manifest",
-            "/srv/release.env.images",
-            "--git-sha",
-            "a" * 40,
         ]
     )
     assert arguments.compose_file == [Path("/srv/one.yml"), Path("/srv/two.yml")]
+    with pytest.raises(module.AdoptionError, match="unrecognized arguments"):
+        module._parser().parse_args(
+            [
+                "plan",
+                "--binding-key",
+                "/srv/key",
+                "--runtime-env",
+                "/srv/runtime.env",
+                "--compose-file",
+                "/srv/one.yml",
+                "--target-manifest",
+                "/srv/release.env.images",
+            ]
+        )
+
+
+def test_prepare_parser_requires_preapproved_ca_attestation_public_key() -> None:
+    module = _module()
+    base = [
+        "prepare",
+        "--plan",
+        "/srv/plan.json",
+        "--binding-key",
+        "/srv/binding.key",
+        "--run-id",
+        "restore-drill-001",
+        "--ca-root",
+        "/srv/ca",
+        "--ca-recipient-certificate",
+        "/srv/recipient.pem",
+        "--evidence-signing-key",
+        "/srv/evidence.key",
+        "--evidence-public-key",
+        "/srv/evidence.pub",
+    ]
+    with pytest.raises(module.AdoptionError, match="required"):
+        module._parser().parse_args(base)
+    arguments = module._parser().parse_args(
+        [
+            *base,
+            "--ca-attestation-public-key",
+            "/srv/ca-attestation.pub",
+        ]
+    )
+    assert arguments.ca_attestation_public_key == Path("/srv/ca-attestation.pub")
+
+
+def test_production_cli_rejects_operator_selected_evidence_and_ca_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    trust_checks: list[bool] = []
+    monkeypatch.setattr(
+        module,
+        "_validate_trusted_adoption_evidence_public_key",
+        lambda: trust_checks.append(True),
+    )
+    accepted = argparse.Namespace(
+        operation="prepare",
+        evidence_public_key=module.TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY,
+        evidence_signing_key=module.EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY,
+        ca_attestation_public_key=module.TRUSTED_CA_RESTORE_ATTESTATION_PUBLIC_KEY,
+    )
+    module._validate_production_evidence_key_arguments(accepted)
+    assert trust_checks == [True]
+
+    for field, attacker_path in (
+        ("evidence_public_key", Path("/root/attacker-evidence.pub")),
+        ("evidence_signing_key", Path("/root/attacker-evidence.key")),
+        ("ca_attestation_public_key", Path("/root/attacker-ca.pub")),
+    ):
+        forged = argparse.Namespace(**vars(accepted))
+        setattr(forged, field, attacker_path)
+        with pytest.raises(module.AdoptionError, match="fixed"):
+            module._validate_production_evidence_key_arguments(forged)
+    assert trust_checks == [True]
+
+
+def test_plan_does_not_require_the_adoption_signer_trust_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_validate_trusted_adoption_evidence_public_key",
+        lambda: (_ for _ in ()).throw(AssertionError("plan must not load adoption signer state")),
+    )
+    module._validate_production_evidence_key_arguments(argparse.Namespace(operation="plan"))
 
 
 def test_reactivate_parser_requires_host_guard_and_pre_migration_contract() -> None:
@@ -654,6 +1746,370 @@ def test_retirement_data_gate_requires_exact_postgres_and_minio_bind_paths() -> 
     )
     with pytest.raises(module.AdoptionError, match="minio data bind path differs"):
         module._verify_data_bindings(drifted)
+
+
+def test_prepare_ca_root_is_derived_from_exact_live_edge_data_binds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    data_root = tmp_path / "data"
+    caddy_data = data_root / "caddy-data"
+    expected_ca = caddy_data / "caddy" / "pki" / "authorities" / "local"
+    base = _inventory(module).containers[0]
+    proxy = replace(
+        base,
+        service="proxy",
+        mounts=((str(caddy_data), "/data", True, "bind"),),
+    )
+    maintenance = replace(
+        base,
+        service="maintenance-page",
+        container_id="2" * 64,
+        mounts=((str(caddy_data), "/data", True, "bind"),),
+    )
+    inventory = module.LegacyInventory((proxy, maintenance), (), ())
+    monkeypatch.setattr(module, "DATA_ROOT", data_root)
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+
+    assert module._validated_legacy_ca_root(inventory, expected_ca) == expected_ca
+
+
+@pytest.mark.parametrize(
+    ("proxy_mount", "requested_suffix", "error"),
+    [
+        (("caddy-data", "/data", True, "volume"), "caddy-data", "proxy Caddy data bind"),
+        (("caddy-data", "/data", False, "bind"), "caddy-data", "proxy Caddy data bind"),
+        (("decoy-caddy", "/data", True, "bind"), "decoy-caddy", "proxy Caddy data bind"),
+        (("caddy-data", "/wrong", True, "bind"), "caddy-data", "proxy Caddy data bind"),
+        (("caddy-data", "/data", True, "bind"), "fake-ca", "must equal the derived"),
+    ],
+)
+def test_prepare_ca_root_rejects_nonexact_bind_or_other_data_root_subdirectory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_mount: tuple[str, str, bool, str],
+    requested_suffix: str,
+    error: str,
+) -> None:
+    module = _module()
+    data_root = tmp_path / "data"
+    source_name, destination, writable, kind = proxy_mount
+    source = data_root / source_name
+    requested = data_root / requested_suffix / "caddy" / "pki" / "authorities" / "local"
+    proxy = replace(
+        _inventory(module).containers[0],
+        service="proxy",
+        mounts=((str(source), destination, writable, kind),),
+    )
+    inventory = module.LegacyInventory((proxy,), (), ())
+    monkeypatch.setattr(module, "DATA_ROOT", data_root)
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+
+    with pytest.raises(module.AdoptionError, match=error):
+        module._validated_legacy_ca_root(inventory, requested)
+
+
+def test_prepare_ca_root_rejects_mismatched_maintenance_page_data_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    data_root = tmp_path / "data"
+    caddy_data = data_root / "caddy-data"
+    expected_ca = caddy_data / "caddy" / "pki" / "authorities" / "local"
+    base = _inventory(module).containers[0]
+    proxy = replace(
+        base,
+        service="proxy",
+        mounts=((str(caddy_data), "/data", True, "bind"),),
+    )
+    maintenance = replace(
+        base,
+        service="maintenance-page",
+        container_id="2" * 64,
+        mounts=((str(data_root / "decoy"), "/data", True, "bind"),),
+    )
+    inventory = module.LegacyInventory((proxy, maintenance), (), ())
+    monkeypatch.setattr(module, "DATA_ROOT", data_root)
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+
+    with pytest.raises(module.AdoptionError, match="maintenance-page Caddy data bind"):
+        module._validated_legacy_ca_root(inventory, expected_ca)
+
+
+def test_prepare_command_applies_live_inventory_ca_root_gate_before_backup_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    data_root = tmp_path / "data"
+    caddy_data = data_root / "caddy-data"
+    proxy = replace(
+        _inventory(module).containers[0],
+        service="proxy",
+        mounts=((str(caddy_data), "/data", True, "bind"),),
+    )
+    inventory = module.LegacyInventory((proxy,), (), ())
+    plan = {
+        "inventory_sha256": module.inventory_sha256(inventory),
+        "runtime_env": {"path": "/runtime.env"},
+    }
+    arguments = argparse.Namespace(
+        binding_key=tmp_path / "binding.key",
+        plan=tmp_path / "plan.json",
+        ca_root=data_root / "fake-ca" / "caddy" / "pki" / "authorities" / "local",
+        evidence_signing_key=tmp_path / "evidence-signing.key",
+        evidence_public_key=tmp_path / "evidence-public.pem",
+    )
+    monkeypatch.setattr(
+        module,
+        "_validate_adoption_evidence_key_pair",
+        lambda *args, **kwargs: (
+            arguments.evidence_signing_key,
+            arguments.evidence_public_key,
+        ),
+    )
+    monkeypatch.setattr(module, "DATA_ROOT", data_root)
+    monkeypatch.setattr(module, "_read_binding_key", lambda path: b"k" * 32)
+    monkeypatch.setattr(
+        module,
+        "_validate_plan",
+        lambda path, key: (plan, "d" * 64, {}, (), ()),
+    )
+    monkeypatch.setattr(module, "collect_inventory", lambda runner: inventory)
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+
+    with pytest.raises(module.AdoptionError, match="must equal the derived"):
+        module._prepare(arguments, object())
+
+
+def test_prepare_validates_signer_before_any_downstream_or_mutating_operation() -> None:
+    module = _module()
+    source = inspect.getsource(module._prepare)
+
+    entry_challenge = source.index('phase="prepare-entry"')
+    binding_read = source.index("_read_binding_key")
+    run_directory = source.index("_create_run_directory")
+    quiesce = source.index("_quiesce_legacy")
+    signature_challenge = source.index('phase="prepare-ca-challenge-signature"')
+    challenge_persistence = source.index("_atomic_write(challenge_path")
+
+    assert entry_challenge < binding_read < run_directory < quiesce
+    assert signature_challenge < challenge_persistence
+    assert source.count("_validate_adoption_evidence_key_pair(") == 2
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or not Path("/usr/bin/openssl").is_file()
+    or getattr(os, "memfd_create", None) is None,
+    reason="real adoption signer challenge requires Linux, memfd, and OpenSSL",
+)
+def test_prepare_rejects_mismatched_fixed_signer_with_zero_downstream_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    trusted_private, trusted_public, attacker_private, fingerprint = (
+        _write_real_adoption_signer_material(tmp_path)
+    )
+
+    monkeypatch.setattr(module, "TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY", trusted_public)
+    monkeypatch.setattr(
+        module,
+        "TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY_SHA256",
+        fingerprint,
+    )
+    monkeypatch.setattr(
+        module,
+        "EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY",
+        trusted_private,
+    )
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+
+    runner = module.Runner()
+    assert module._validate_adoption_evidence_key_pair(
+        runner,
+        signing_key=trusted_private,
+        public_key=trusted_public,
+        phase="prepare-entry",
+    ) == (trusted_private, trusted_public)
+
+    monkeypatch.setattr(
+        module,
+        "EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY",
+        attacker_private,
+    )
+    downstream_calls: list[str] = []
+
+    def forbidden(name: str) -> Any:
+        def call(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            downstream_calls.append(name)
+            raise AssertionError(f"{name} ran before signer validation")
+
+        return call
+
+    for function_name in (
+        "_read_binding_key",
+        "_validate_plan",
+        "collect_inventory",
+        "_create_run_directory",
+        "_new_private_directory",
+        "_atomic_write",
+        "_quiesce_legacy",
+        "_database_backup",
+        "_run_mc_backup",
+        "_encrypt_ca_escrow",
+    ):
+        monkeypatch.setattr(module, function_name, forbidden(function_name))
+
+    arguments = argparse.Namespace(
+        evidence_signing_key=attacker_private,
+        evidence_public_key=trusted_public,
+    )
+    with pytest.raises(
+        module.AdoptionError,
+        match="does not match the independently trusted public key",
+    ):
+        module._prepare(arguments, runner)
+    assert downstream_calls == []
+
+
+def test_finalize_and_retire_validate_signer_before_sensitive_work() -> None:
+    module = _module()
+    finalize_source = inspect.getsource(module._finalize)
+    retire_source = inspect.getsource(module._retire)
+
+    assert (
+        finalize_source.index('phase="finalize-entry"')
+        < finalize_source.index("_read_binding_key")
+        < finalize_source.index("collect_inventory")
+        < finalize_source.index("_run_restore_drill")
+    )
+    assert finalize_source.index('phase="finalize-evidence-signature"') < finalize_source.index(
+        "_atomic_write(detailed_path"
+    )
+    assert finalize_source.count("_validate_adoption_evidence_key_pair(") == 2
+
+    assert (
+        retire_source.index('phase="retire-entry"')
+        < retire_source.index("_read_binding_key")
+        < retire_source.index("collect_inventory")
+        < retire_source.index("_publish_retirement_intent")
+        < retire_source.index("_retire_exact_resources")
+    )
+    assert retire_source.index('phase="retire-intent-signature"') < retire_source.index(
+        "_publish_retirement_intent"
+    )
+    assert retire_source.count("_validate_adoption_evidence_key_pair(") == 2
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or not Path("/usr/bin/openssl").is_file()
+    or getattr(os, "memfd_create", None) is None,
+    reason="real adoption signer challenge requires Linux, memfd, and OpenSSL",
+)
+@pytest.mark.parametrize(
+    ("operation", "downstream_functions"),
+    [
+        (
+            "finalize",
+            (
+                "_read_binding_key",
+                "_validate_plan",
+                "_validate_prepared_state",
+                "_validate_backup_artifacts",
+                "collect_inventory",
+                "_ensure_scratch_root",
+                "_run_restore_drill",
+                "_atomic_write",
+                "_signature",
+            ),
+        ),
+        (
+            "retire",
+            (
+                "_read_binding_key",
+                "_locate_upgrade_evidence_run",
+                "_validate_plan",
+                "_planned_inventory",
+                "_verify_upgrade_evidence",
+                "collect_inventory",
+                "_publish_retirement_intent",
+                "_retire_exact_resources",
+                "_atomic_publish_receipt_directory",
+            ),
+        ),
+    ],
+)
+def test_finalize_and_retire_reject_mismatched_signer_with_zero_downstream_calls(
+    operation: str,
+    downstream_functions: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    trusted_private, trusted_public, attacker_private, fingerprint = (
+        _write_real_adoption_signer_material(tmp_path)
+    )
+    monkeypatch.setattr(module, "TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY", trusted_public)
+    monkeypatch.setattr(
+        module,
+        "TRUSTED_ADOPTION_EVIDENCE_PUBLIC_KEY_SHA256",
+        fingerprint,
+    )
+    monkeypatch.setattr(
+        module,
+        "EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY",
+        trusted_private,
+    )
+    monkeypatch.setattr(module, "protected_file", lambda path, **kwargs: path)
+    entrypoint = module._finalize if operation == "finalize" else module._retire
+    trusted_downstream_calls: list[str] = []
+
+    def stop_after_trusted_challenge(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        trusted_downstream_calls.append("_read_binding_key")
+        raise module.AdoptionError("trusted signer reached downstream")
+
+    monkeypatch.setattr(module, "_read_binding_key", stop_after_trusted_challenge)
+    trusted_arguments = argparse.Namespace(
+        evidence_signing_key=trusted_private,
+        evidence_public_key=trusted_public,
+        binding_key=tmp_path / "binding.key",
+    )
+    with pytest.raises(module.AdoptionError, match="trusted signer reached downstream"):
+        entrypoint(trusted_arguments, module.Runner())
+    assert trusted_downstream_calls == ["_read_binding_key"]
+
+    monkeypatch.setattr(
+        module,
+        "EPHEMERAL_ADOPTION_EVIDENCE_SIGNING_KEY",
+        attacker_private,
+    )
+    downstream_calls: list[str] = []
+
+    def forbidden(name: str) -> Any:
+        def call(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            downstream_calls.append(name)
+            raise AssertionError(f"{name} ran before signer validation")
+
+        return call
+
+    for function_name in downstream_functions:
+        monkeypatch.setattr(module, function_name, forbidden(function_name))
+
+    arguments = argparse.Namespace(
+        evidence_signing_key=attacker_private,
+        evidence_public_key=trusted_public,
+        binding_key=tmp_path / "binding.key",
+    )
+    with pytest.raises(
+        module.AdoptionError,
+        match="does not match the independently trusted public key",
+    ):
+        entrypoint(arguments, module.Runner())
+    assert downstream_calls == []
 
 
 def test_retirement_data_gate_requires_postgres_major_17_and_signed_schema() -> None:
@@ -970,6 +2426,113 @@ def test_retirement_uses_one_fixed_signed_intent_before_resource_removal() -> No
     assert "_verify_retirement_receipt(" in source
 
 
+def test_schema_v3_legacy_evidence_passes_shared_and_deep_validators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    verifier = _module_from_script(
+        UPGRADE_VERIFIER,
+        name="legacy_upgrade_backup_verifier_under_test",
+    )
+    now = module._utc_now().replace(microsecond=0)
+    run = tmp_path / "backups" / "run-1"
+    evidence_directory = run / "evidence"
+    evidence_directory.mkdir(parents=True)
+    evidence_path = evidence_directory / "upgrade-backup-evidence.json"
+    detailed_path = evidence_directory / "restore-evidence.json"
+    artifact = {
+        "path": str(run / "artifact"),
+        "sha256": "c" * 64,
+        "size_bytes": 1,
+    }
+    top_evidence = {
+        "schema_version": 3,
+        "kind": "offline-upgrade-backup",
+        "project": module.PROJECT,
+        "operation_scope": "legacy_adoption",
+        "issued_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + module.timedelta(hours=24)).isoformat().replace("+00:00", "Z"),
+        "release_authorization_sha256": "a" * 64,
+        "target_manifest_sha256": "b" * 64,
+        "database_backup": artifact,
+        "object_manifest": artifact,
+        "restore_evidence": {
+            "path": str(detailed_path),
+            "sha256": "d" * 64,
+            "size_bytes": 1,
+        },
+        "restore_drill": {
+            "status": "passed",
+            "tested_at": now.isoformat().replace("+00:00", "Z"),
+            "source_schema_head": "20260715_0021",
+        },
+    }
+    detailed = {
+        "schema_version": 2,
+        "kind": "heyi-legacy-adoption-restore-evidence",
+        "project": module.PROJECT,
+        "plan_sha256": "e" * 64,
+        "release_authorization_sha256": "a" * 64,
+        "git_sha": "f" * 40,
+        "target_manifest_sha256": "b" * 64,
+        "isolated_restore_drill": {"status": "passed"},
+        "ca_restore_attestation": {"status": "passed"},
+        "secret_policy": {
+            "runtime_secret_values_recorded": False,
+            "low_entropy_secret_sha256_recorded": False,
+            "ca_private_key_plaintext_on_server": False,
+            "ca_recipient_private_key_on_server": False,
+            "private_artifacts_on_cos": False,
+        },
+    }
+    plan = {
+        "target_manifest": {"sha256": "b" * 64},
+        "release_authorization_sha256": "a" * 64,
+        "git_sha": "f" * 40,
+    }
+
+    monkeypatch.setattr(
+        verifier,
+        "_artifact",
+        lambda _document, _field: (run / "artifact", "c" * 64, 1),
+    )
+    verifier.validate_evidence_document(
+        top_evidence,
+        expected_manifest_sha256="b" * 64,
+        expected_release_authorization_sha256="a" * 64,
+        expected_operation_scope="legacy_adoption",
+        require_current=True,
+    )
+
+    monkeypatch.setattr(module, "BACKUP_ROOT", tmp_path / "backups")
+    monkeypatch.setattr(module, "_verify_signature", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "_read_json_file",
+        lambda path, **_kwargs: top_evidence if path == evidence_path else detailed,
+    )
+    monkeypatch.setattr(module, "protected_directory", lambda path, **kwargs: path)
+    monkeypatch.setattr(
+        module,
+        "_verify_descriptor",
+        lambda value, **_kwargs: Path(value["path"]),
+    )
+    monkeypatch.setattr(module, "_load_upgrade_backup_verifier", lambda: verifier)
+
+    verified, verified_detailed, verified_run = module._verify_upgrade_evidence(
+        object(),
+        evidence_path=evidence_path,
+        signature_path=evidence_directory / "upgrade-backup-evidence.sig",
+        public_key=evidence_directory / "evidence.pub",
+        plan=plan,
+        plan_digest="e" * 64,
+    )
+    assert verified == top_evidence
+    assert verified_detailed == detailed
+    assert verified_run == run
+
+
 def test_fresh_retire_process_resumes_signed_partial_intent_without_live_recollection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1004,6 +2567,11 @@ def test_fresh_retire_process_resumes_signed_partial_intent_without_live_recolle
         confirm_plan_sha256=plan_digest,
         confirm_preserve_data="PRESERVE_BIND_DATA_AND_NAMED_VOLUMES",
     )
+    monkeypatch.setattr(
+        module,
+        "_validate_adoption_evidence_key_pair",
+        lambda runner, **kwargs: (kwargs["signing_key"], kwargs["public_key"]),
+    )
     monkeypatch.setattr(module, "_read_binding_key", lambda path: b"k" * 32)
     monkeypatch.setattr(
         module,
@@ -1011,17 +2579,16 @@ def test_fresh_retire_process_resumes_signed_partial_intent_without_live_recolle
         lambda path: (path, run),
     )
     monkeypatch.setattr(module, "_sha256_file", lambda path: "e" * 64)
-    monkeypatch.setattr(
-        module,
-        "_load_plan_identity",
-        lambda path, enforce_freshness: (plan, plan_digest),
-    )
+    plan_validations: list[bool] = []
+
+    def validate_plan(*args: object, **kwargs: object) -> object:
+        plan_validations.append(kwargs["enforce_freshness"] is False)
+        return plan, plan_digest, {}, (), ()
+
     monkeypatch.setattr(
         module,
         "_validate_plan",
-        lambda *args: (_ for _ in ()).throw(
-            AssertionError("durable intent must not revalidate mutable plan material")
-        ),
+        validate_plan,
     )
     monkeypatch.setattr(
         module,
@@ -1063,6 +2630,7 @@ def test_fresh_retire_process_resumes_signed_partial_intent_without_live_recolle
     module._retire(arguments, object())
     assert retired == [True]
     assert promoted == [(intent, evidence_directory / "retirement")]
+    assert plan_validations == [True]
 
 
 def test_tampered_retirement_intent_blocks_before_any_resource_mutation(
@@ -1083,6 +2651,11 @@ def test_tampered_retirement_intent_blocks_before_any_resource_mutation(
         execute=True,
         confirm_preserve_data="PRESERVE_BIND_DATA_AND_NAMED_VOLUMES",
     )
+    monkeypatch.setattr(
+        module,
+        "_validate_adoption_evidence_key_pair",
+        lambda runner, **kwargs: (kwargs["signing_key"], kwargs["public_key"]),
+    )
     monkeypatch.setattr(module, "_read_binding_key", lambda path: b"k" * 32)
     monkeypatch.setattr(
         module,
@@ -1092,8 +2665,8 @@ def test_tampered_retirement_intent_blocks_before_any_resource_mutation(
     monkeypatch.setattr(module, "_sha256_file", lambda path: "e" * 64)
     monkeypatch.setattr(
         module,
-        "_load_plan_identity",
-        lambda path, enforce_freshness: (plan, "d" * 64),
+        "_validate_plan",
+        lambda *args, **kwargs: (plan, "d" * 64, {}, (), ()),
     )
     monkeypatch.setattr(
         module,
@@ -1147,14 +2720,20 @@ def test_fresh_retire_process_accepts_committed_final_without_stale_evidence_gat
         evidence=tmp_path / "upgrade-backup-evidence.json",
         evidence_signature=tmp_path / "evidence.sig",
         evidence_public_key=tmp_path / "public.pem",
+        evidence_signing_key=tmp_path / "private.pem",
         execute=True,
         confirm_preserve_data="PRESERVE_BIND_DATA_AND_NAMED_VOLUMES",
+    )
+    monkeypatch.setattr(
+        module,
+        "_validate_adoption_evidence_key_pair",
+        lambda runner, **kwargs: (kwargs["signing_key"], kwargs["public_key"]),
     )
     monkeypatch.setattr(module, "_read_binding_key", lambda path: b"k" * 32)
     monkeypatch.setattr(
         module,
-        "_load_plan_identity",
-        lambda path, enforce_freshness: (plan, plan_digest),
+        "_validate_plan",
+        lambda *args, **kwargs: (plan, plan_digest, {}, (), ()),
     )
     monkeypatch.setattr(module, "_planned_inventory", lambda document: inventory)
     monkeypatch.setattr(module, "_locate_upgrade_evidence_run", lambda path: (path, run))
@@ -1275,8 +2854,9 @@ def test_plan_identity_supports_explicit_31_day_recovery_mode(
 ) -> None:
     module = _module()
     inventory = {"containers": [], "networks": [], "volumes": []}
+    release_authorization = _release_authorization(Path("/srv/release.env.images"))
     plan = {
-        "schema_version": 2,
+        "schema_version": 4,
         "kind": "heyi-legacy-adoption-plan",
         "project": module.PROJECT,
         "created_at": "2026-06-01T00:00:00Z",
@@ -1285,7 +2865,9 @@ def test_plan_identity_supports_explicit_31_day_recovery_mode(
         "runtime_env": {},
         "legacy_compose": {},
         "host_isolation_guard": {},
-        "target_manifest": {},
+        "target_manifest": release_authorization["target_manifest"],
+        "release_authorization": release_authorization,
+        "release_authorization_sha256": module._release_authorization_sha256(release_authorization),
         "inventory_sha256": module._sha256_bytes(module._canonical_json(inventory)),
         "topology_sha256": "b" * 64,
         "inventory": inventory,
@@ -1299,12 +2881,17 @@ def test_plan_identity_supports_explicit_31_day_recovery_mode(
             "restart_docker_daemon": False,
         },
     }
-    monkeypatch.setattr(module, "_read_json_file", lambda path: plan)
+    active_plan = {"document": plan}
+    monkeypatch.setattr(module, "_read_json_file", lambda path: active_plan["document"])
     monkeypatch.setattr(
         module,
         "_utc_now",
         lambda: module.datetime(2026, 7, 15, tzinfo=module.UTC),
     )
+    active_plan["document"] = {**plan, "schema_version": 3}
+    with pytest.raises(module.AdoptionError, match="identity differs"):
+        module._load_plan_identity(tmp_path / "plan.json", enforce_freshness=False)
+    active_plan["document"] = plan
     with pytest.raises(module.AdoptionError, match="stale or future-dated"):
         module._load_plan_identity(tmp_path / "plan.json")
     loaded, digest = module._load_plan_identity(

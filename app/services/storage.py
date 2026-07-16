@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -36,6 +38,20 @@ class StoredObject:
     version_id: str | None
     checksum_sha256: str | None
     content_type: str | None
+
+
+def checksum_sha256_base64_to_hex(value: str | None) -> str | None:
+    """Normalize an S3 ChecksumSHA256 value to the canonical database hex form."""
+
+    if value is None:
+        return None
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) != 32:
+        return None
+    return decoded.hex()
 
 
 class StorageService:

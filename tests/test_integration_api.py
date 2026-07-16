@@ -28,6 +28,7 @@ from app.db.base import Base
 from app.db.models import (
     ApiKey,
     AuditLog,
+    AuditResult,
     File,
     FileStatus,
     KnowledgeBase,
@@ -83,6 +84,7 @@ class FakeRedis:
 @dataclass
 class FakeStorage:
     head_size: int = 1
+    head_checksum_sha256: str | None = None
     initiated_keys: list[str] = field(default_factory=list)
     completed_uploads: list[str] = field(default_factory=list)
     deleted_keys: list[str] = field(default_factory=list)
@@ -135,7 +137,7 @@ class FakeStorage:
             size_bytes=self.head_size,
             etag='"etag"',
             version_id=None,
-            checksum_sha256=None,
+            checksum_sha256=self.head_checksum_sha256,
             content_type="application/pdf",
         )
 
@@ -468,6 +470,10 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
     tokens = await api_harness.login()
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
     api_harness.storage.head_size = 5
+    stored_checksum = hashlib.sha256(b"12345")
+    api_harness.storage.head_checksum_sha256 = base64.b64encode(stored_checksum.digest()).decode(
+        "ascii"
+    )
     knowledge_base = await api_harness.client.post(
         "/api/v1/knowledge-bases",
         headers=headers,
@@ -501,6 +507,8 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
     assert completed.status_code == 200, completed.text
     assert completed.json()["status"] == "quarantined"
     assert completed.json()["malware_scan_status"] == "pending"
+    assert completed.json()["checksum_algorithm"] == "SHA256"
+    assert completed.json()["checksum_value"] == stored_checksum.hexdigest()
     assert api_harness.storage.promoted_keys
     assert api_harness.storage.sealed_keys == [
         (api_harness.storage.promoted_keys[0][0], upload["upload_session_id"])
@@ -1027,6 +1035,10 @@ async def test_maintenance_promotes_stale_single_finalization_without_db_locking
     tokens = await api_harness.login()
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
     api_harness.storage.head_size = 5
+    stored_checksum = hashlib.sha256(b"12345")
+    api_harness.storage.head_checksum_sha256 = base64.b64encode(stored_checksum.digest()).decode(
+        "ascii"
+    )
     initiated = await api_harness.client.post(
         "/api/v1/files/uploads",
         headers=headers,
@@ -1058,6 +1070,81 @@ async def test_maintenance_promotes_stale_single_finalization_without_db_locking
         assert file is not None
         assert file.status is FileStatus.QUARANTINED
         assert file.object_key.startswith("objects/")
+        assert file.checksum_algorithm == "SHA256"
+        assert file.checksum_value == stored_checksum.hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_rejects_stale_finalization_with_wrong_declared_checksum(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    expected_checksum = hashlib.sha256(b"expected bytes").hexdigest()
+    stored_checksum = base64.b64encode(hashlib.sha256(b"tampered bytes").digest()).decode("ascii")
+    api_harness.storage.head_size = 5
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=headers,
+        json={
+            "filename": "checksum-recovery.txt",
+            "size_bytes": 5,
+            "checksum_sha256": expected_checksum,
+            "idempotency_key": "single-maintenance-checksum-recovery-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload_id = UUID(initiated.json()["upload_session_id"])
+
+    async def mismatched_head(*, key: str) -> StoredObject:
+        assert key in api_harness.storage.initiated_keys
+        return StoredObject(
+            size_bytes=5,
+            etag='"tampered"',
+            version_id=None,
+            checksum_sha256=stored_checksum,
+            content_type="text/plain",
+        )
+
+    monkeypatch.setattr(api_harness.storage, "head", mismatched_head)
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        upload.status = UploadSessionStatus.FINALIZING
+        upload.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+
+    async with api_harness.session_factory() as session:
+        cleaned = await cleanup_expired_uploads(session, api_harness.storage)
+
+    assert cleaned == 1
+    assert api_harness.storage.promoted_keys == []
+    assert api_harness.storage.deleted_keys
+    assert api_harness.storage.sealed_keys
+    async with api_harness.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None
+        file = await session.get(File, upload.file_id)
+        reservations = list(
+            (
+                await session.scalars(
+                    select(QuotaReservation).where(QuotaReservation.upload_session_id == upload_id)
+                )
+            ).all()
+        )
+        rejection = await session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "upload.rejected_checksum_mismatch",
+                AuditLog.resource_id == str(upload.file_id),
+            )
+        )
+        assert upload.status is UploadSessionStatus.FAILED
+        assert file is not None and file.status is FileStatus.FAILED
+        assert file.checksum_algorithm == "SHA256"
+        assert file.checksum_value == expected_checksum
+        assert {item.status for item in reservations} == {ReservationStatus.RELEASED}
+        assert rejection is not None and rejection.result is AuditResult.DENIED
 
 
 @pytest.mark.asyncio
@@ -3725,6 +3812,159 @@ async def test_concurrent_abort_wins_over_inflight_multipart_completion(
         )
         assert held is None
     assert api_harness.storage.deleted_keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revocation_mode", "expected_status", "expected_error_code"),
+    [
+        ("remove_roles", 401, "token_revoked"),
+        ("disable_user", 401, "inactive_user"),
+        ("remove_knowledge_base_grant", 404, "knowledge_base_not_found"),
+    ],
+)
+async def test_concurrent_authorization_revocation_blocks_inflight_multipart_finalization(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    revocation_mode: str,
+    expected_status: int,
+    expected_error_code: str,
+) -> None:
+    tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=admin_headers,
+        json={"name": "Inflight upload revocation"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    knowledge_base_id = knowledge_base.json()["id"]
+    uploader_role = await api_harness.client.post(
+        "/api/v1/roles",
+        headers=admin_headers,
+        json={
+            "code": "inflight_upload_editor",
+            "name": "Inflight Upload Editor",
+            "permission_codes": ["file:upload"],
+            "limits": {
+                "requests_per_minute": 1000,
+                "max_upload_bytes": 2_000_000_000,
+                "daily_upload_bytes": 2_000_000_000,
+                "storage_bytes": 2_000_000_000,
+            },
+        },
+    )
+    assert uploader_role.status_code == 201, uploader_role.text
+    role_id = uploader_role.json()["id"]
+    grant = await api_harness.client.put(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+        headers=admin_headers,
+        json={
+            "expected_version": 1,
+            "grants": [{"role_id": role_id, "access_level": "editor"}],
+        },
+    )
+    assert grant.status_code == 200, grant.text
+    created_user = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={
+            "email": "inflight-uploader@example.com",
+            "password": "Inflight-uploader-password-123!",
+            "role_ids": [role_id],
+        },
+    )
+    assert created_user.status_code == 201, created_user.text
+    user = created_user.json()
+    uploader_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": "inflight-uploader@example.com",
+            "password": "Inflight-uploader-password-123!",
+        },
+    )
+    assert uploader_login.status_code == 200, uploader_login.text
+    uploader_headers = {
+        "Authorization": f"Bearer {uploader_login.json()['access_token']}",
+    }
+    size = get_settings().multipart_threshold_bytes + 1
+    api_harness.storage.head_size = size
+    initiated = await api_harness.client.post(
+        "/api/v1/files/uploads",
+        headers=uploader_headers,
+        json={
+            "filename": "revoked-during-finalization.pdf",
+            "size_bytes": size,
+            "knowledge_base_id": knowledge_base_id,
+            "idempotency_key": "inflight-role-revocation-001",
+        },
+    )
+    assert initiated.status_code == 201, initiated.text
+    upload = initiated.json()
+    entered_storage = asyncio.Event()
+    release_storage = asyncio.Event()
+    original_complete = api_harness.storage.complete_multipart
+
+    async def delayed_complete(**kwargs: Any) -> None:
+        entered_storage.set()
+        await release_storage.wait()
+        await original_complete(**kwargs)
+
+    monkeypatch.setattr(api_harness.storage, "complete_multipart", delayed_complete)
+    completion_task = asyncio.create_task(
+        api_harness.client.post(
+            f"/api/v1/files/uploads/{upload['upload_session_id']}/complete",
+            headers=uploader_headers,
+            json={
+                "parts": [
+                    {"part_number": number, "etag": f'"etag-{number}"'}
+                    for number in range(1, upload["part_count"] + 1)
+                ]
+            },
+        )
+    )
+    await asyncio.wait_for(entered_storage.wait(), timeout=5)
+    if revocation_mode == "remove_roles":
+        revoked = await api_harness.client.put(
+            f"/api/v1/users/{user['id']}/roles",
+            headers=admin_headers,
+            json={
+                "expected_version": user["role_assignment_version"],
+                "role_ids": [],
+            },
+        )
+    elif revocation_mode == "disable_user":
+        revoked = await api_harness.client.patch(
+            f"/api/v1/users/{user['id']}",
+            headers=admin_headers,
+            json={"status": "disabled"},
+        )
+    else:
+        revoked = await api_harness.client.put(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/role-grants",
+            headers=admin_headers,
+            json={"expected_version": 2, "grants": []},
+        )
+    assert revoked.status_code == 200, revoked.text
+    release_storage.set()
+    completed = await asyncio.wait_for(completion_task, timeout=5)
+
+    assert completed.status_code == expected_status, completed.text
+    assert completed.json()["error"]["code"] == expected_error_code
+    assert api_harness.storage.deleted_keys
+    upload_id = UUID(upload["upload_session_id"])
+    async with api_harness.session_factory() as session:
+        persisted = await session.get(UploadSession, upload_id)
+        assert persisted is not None
+        reservations = list(
+            (
+                await session.scalars(
+                    select(QuotaReservation).where(QuotaReservation.upload_session_id == upload_id)
+                )
+            ).all()
+        )
+        assert persisted.status is UploadSessionStatus.FINALIZING
+        assert {item.status for item in reservations} == {ReservationStatus.HELD}
 
 
 @pytest.mark.asyncio

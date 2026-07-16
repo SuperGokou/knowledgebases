@@ -25,7 +25,7 @@ elif [ "$#" -eq 10 ] && [ "$1" = "--contract-dir" ] && \
   adoption_journal=$6
   adoption_binding_key=$8
   adoption_transaction_id=${10}
-elif [ "$#" -eq 13 ] && [ "$1" = "--abort-pre-migration" ]; then
+elif [ "$#" -eq 9 ] && [ "$1" = "--abort-pre-migration" ]; then
   entry_mode=abort-pre-migration-dry-run
   shift
   [ "$1" = "--adoption-journal" ] || exit 64
@@ -34,12 +34,6 @@ elif [ "$#" -eq 13 ] && [ "$1" = "--abort-pre-migration" ]; then
   [ "$1" = "--adoption-binding-key" ] || exit 64
   abort_adoption_binding_key=$2
   shift 2
-  [ "$1" = "--evidence-signing-key" ] || exit 64
-  abort_evidence_signing_key=$2
-  shift 2
-  [ "$1" = "--evidence-public-key" ] || exit 64
-  abort_evidence_public_key=$2
-  shift 2
   [ "$1" = "--host-isolation-baseline" ] || exit 64
   abort_host_isolation_baseline=$2
   shift 2
@@ -47,7 +41,7 @@ elif [ "$#" -eq 13 ] && [ "$1" = "--abort-pre-migration" ]; then
   abort_host_isolation_hmac_key=$2
   shift 2
   [ "$#" -eq 0 ] || exit 64
-elif [ "$#" -eq 26 ] && [ "$1" = "--abort-pre-migration" ]; then
+elif [ "$#" -eq 22 ] && [ "$1" = "--abort-pre-migration" ]; then
   entry_mode=abort-pre-migration
   shift
   [ "$1" = "--adoption-journal" ] || exit 64
@@ -55,12 +49,6 @@ elif [ "$#" -eq 26 ] && [ "$1" = "--abort-pre-migration" ]; then
   shift 2
   [ "$1" = "--adoption-binding-key" ] || exit 64
   abort_adoption_binding_key=$2
-  shift 2
-  [ "$1" = "--evidence-signing-key" ] || exit 64
-  abort_evidence_signing_key=$2
-  shift 2
-  [ "$1" = "--evidence-public-key" ] || exit 64
-  abort_evidence_public_key=$2
   shift 2
   [ "$1" = "--host-isolation-baseline" ] || exit 64
   abort_host_isolation_baseline=$2
@@ -99,44 +87,53 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=deploy/tencent/offline-operation-common.sh
 . "$script_dir/offline-operation-common.sh"
 
+case "$entry_mode" in
+  abort-pre-migration-dry-run)
+    case "$OFFLINE_RELEASE_ROOT" in
+      /srv/heyi-knowledgebases-offline/releases/*) ;;
+      *) offline_fail install "dry-run worker is outside the materialized release" 65 ;;
+    esac
+    ;;
+  abort-pre-migration)
+    if [ "$abort_confirm_restore_boundary" != PRE_MIGRATION_ONLY ]; then
+      offline_fail install "abort confirmation is not PRE_MIGRATION_ONLY" 65
+    fi
+    expected_materialized_root=/srv/heyi-knowledgebases-offline/releases/$abort_confirm_contract_sha256
+    if [ "$OFFLINE_RELEASE_ROOT" != "$expected_materialized_root" ]; then
+      offline_fail install "abort worker is not running from the confirmed release" 65
+    fi
+    ;;
+esac
+case "$entry_mode" in
+  abort-pre-migration-dry-run|abort-pre-migration)
+    abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
+    if [ -L "$abort_helper" ] || [ ! -f "$abort_helper" ] || \
+      [ "$(realpath -e -- "$abort_helper" 2>/dev/null || true)" != "$abort_helper" ] || \
+      [ "$(stat -c %u -- "$abort_helper" 2>/dev/null || echo -1)" -ne 0 ]; then
+      offline_fail install "trusted pre-migration abort helper is unsafe" 65
+    fi
+    offline_clear_inherited_environment
+    python3 -I "$abort_helper" validate-evidence-trust-root >/dev/null || \
+      offline_fail install "fixed adoption evidence trust root is invalid" 65
+    ;;
+esac
+
 offline_acquire_lock install
 if [ "$entry_mode" = abort-pre-migration-dry-run ]; then
-  case "$OFFLINE_RELEASE_ROOT" in
-    /srv/heyi-knowledgebases-offline/releases/*) ;;
-    *) offline_fail install "dry-run worker is outside the materialized release" 65 ;;
-  esac
-  abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
   offline_clear_inherited_environment
   # shellcheck disable=SC2093
   exec python3 -I "$abort_helper" abort-dry-run \
     --adoption-journal "$abort_adoption_journal" \
     --adoption-binding-key "$abort_adoption_binding_key" \
-    --evidence-signing-key "$abort_evidence_signing_key" \
-    --evidence-public-key "$abort_evidence_public_key" \
     --host-isolation-baseline "$abort_host_isolation_baseline" \
     --host-isolation-hmac-key "$abort_host_isolation_hmac_key"
   offline_fail install "cannot execute the pre-migration abort dry-run" 73
 elif [ "$entry_mode" = abort-pre-migration ]; then
-  if [ "$abort_confirm_restore_boundary" != PRE_MIGRATION_ONLY ]; then
-    offline_fail install "abort confirmation is not PRE_MIGRATION_ONLY" 65
-  fi
-  expected_materialized_root=/srv/heyi-knowledgebases-offline/releases/$abort_confirm_contract_sha256
-  if [ "$OFFLINE_RELEASE_ROOT" != "$expected_materialized_root" ]; then
-    offline_fail install "abort worker is not running from the confirmed release" 65
-  fi
-  abort_helper=$OFFLINE_RELEASE_ROOT/deploy/tencent/offline-pre-migration-abort.py
-  if [ -L "$abort_helper" ] || [ ! -f "$abort_helper" ] || \
-    [ "$(realpath -e -- "$abort_helper" 2>/dev/null || true)" != "$abort_helper" ] || \
-    [ "$(stat -c %u -- "$abort_helper" 2>/dev/null || echo -1)" -ne 0 ]; then
-    offline_fail install "trusted pre-migration abort helper is unsafe" 65
-  fi
   offline_clear_inherited_environment
   # shellcheck disable=SC2093
   exec python3 -I "$abort_helper" abort \
     --adoption-journal "$abort_adoption_journal" \
     --adoption-binding-key "$abort_adoption_binding_key" \
-    --evidence-signing-key "$abort_evidence_signing_key" \
-    --evidence-public-key "$abort_evidence_public_key" \
     --host-isolation-baseline "$abort_host_isolation_baseline" \
     --host-isolation-hmac-key "$abort_host_isolation_hmac_key" \
     --execute \
@@ -820,6 +817,7 @@ fi
 if [ "$resume_migration_invoked" != true ]; then
   write_install_state preflight_passed
 fi
+offline_require_no_chat_safety_poison install
 
 # This fsynced state is the irreversible boundary.  Once written, every
 # recovery path must forward-fix even if Compose is killed before creating the

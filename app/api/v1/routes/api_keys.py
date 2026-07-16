@@ -38,16 +38,12 @@ async def _lock_api_key_mutation(
     api_key_id: UUID,
 ) -> tuple[ApiKey, AccessContext, User]:
     candidate = await session.scalar(select(ApiKey).where(ApiKey.id == api_key_id))
-    if candidate is None or (
-        not access.user.is_superuser and candidate.user_id != access.user.id
-    ):
+    if candidate is None or (not access.user.is_superuser and candidate.user_id != access.user.id):
         raise ApiError(status_code=404, code="api_key_not_found", message="API key not found")
 
     await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(
-        select(User)
-        .where(User.id == access.user.id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == access.user.id).execution_options(populate_existing=True)
     )
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
@@ -57,9 +53,7 @@ async def _lock_api_key_mutation(
     # Re-read and object-authorize under RBAC-X before taking another user's
     # activity lock. A scoped key manager must not lock arbitrary principals.
     candidate = await session.scalar(
-        select(ApiKey)
-        .where(ApiKey.id == api_key_id)
-        .execution_options(populate_existing=True)
+        select(ApiKey).where(ApiKey.id == api_key_id).execution_options(populate_existing=True)
     )
     if candidate is None or (
         not current.user.is_superuser and candidate.user_id != current.user.id
@@ -73,11 +67,7 @@ async def _lock_api_key_mutation(
         },
     )
     users = list(
-        (
-            await session.scalars(
-                locked_users_statement({actor.id, candidate.user_id})
-            )
-        ).all()
+        (await session.scalars(locked_users_statement({actor.id, candidate.user_id}))).all()
     )
     users_by_id = {user.id: user for user in users}
     await lock_role_union(session, user_ids=users_by_id)
@@ -108,18 +98,14 @@ async def _lock_api_key_creation(
 
     await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(
-        select(User)
-        .where(User.id == access.user.id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == access.user.id).execution_options(populate_existing=True)
     )
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
     await lock_role_union(session, user_ids={actor.id})
     current = await refresh_locked_actor_access(session, actor, {"api-key:manage"})
     candidate = await session.scalar(
-        select(User)
-        .where(User.id == target_user_id)
-        .execution_options(populate_existing=True)
+        select(User).where(User.id == target_user_id).execution_options(populate_existing=True)
     )
     if candidate is None:
         raise ApiError(status_code=404, code="user_not_found", message="Active user not found")
@@ -136,13 +122,7 @@ async def _lock_api_key_creation(
             candidate.id: ActivityLockMode.SHARED,
         },
     )
-    users = list(
-        (
-            await session.scalars(
-                locked_users_statement({actor.id, candidate.id})
-            )
-        ).all()
-    )
+    users = list((await session.scalars(locked_users_statement({actor.id, candidate.id}))).all())
     users_by_id = {user.id: user for user in users}
     actor = users_by_id.get(actor.id)
     target = users_by_id.get(target_user_id)

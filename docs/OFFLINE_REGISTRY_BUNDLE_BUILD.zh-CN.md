@@ -15,7 +15,7 @@
 - `bundle.control` 只生成 `REGISTRY_BOOTSTRAP_IMAGE`、`REGISTRY_BOOTSTRAP_IMAGE_ID`、`RELEASE_SEQUENCE`、`RELEASE_ID`、`RELEASE_GIT_SHA`、`RELEASE_SCHEMA_HEAD`、`REGISTRY_UNPACKED_BYTES`、`REGISTRY_UNPACKED_INODES` 八个字段。
 - 容量字段基于最终去重 manifest digest 集合生成一次 Docker image archive，并按其中唯一 layer path 逐层校验 DiffID、计算未压缩普通文件逻辑字节，同时统计 layer root、显式路径和隐式父目录 inode。共享层只计算一次；不允许使用压缩 Registry 目录大小或经验倍数代替。
 - `release/` 在运行时从 canonical `offline_contract_files` 读取资产清单，逐文件复制已提交 HEAD 的原始字节，不缓存当前工作目录内容。
-- bundle 内 `SHA256SUMS` 精确覆盖 `bundle.control`、`release.env`、`release.env.images` 以及 `release/`、`registry/` 下每个普通文件；随后使用 OpenSSL SHA-256 签名。
+- bundle 内 `SHA256SUMS` 精确覆盖 `bundle.control`、`release.env`、`release.env.images` 以及 `release/`、`registry/`、`sbom/` 下每个普通文件；随后使用 OpenSSL SHA-256 签名。
 - 采用排他锁、同卷临时目录和原子目录改名；失败时只清理本次随机 Run ID 所有的临时容器、网络和目录。
 
 ## 前置条件
@@ -69,7 +69,7 @@ powershell -NoProfile -ExecutionPolicy Bypass `
   -ReleaseId 2026.07.14
 ```
 
-`RELEASE_SEQUENCE` 必须是发布方管理的单调递增正整数，最多 18 位，且大于目标服务器已接受的最高序号。相同 Release ID 不等于允许重放旧序号。
+`RELEASE_SEQUENCE` 必须是发布方管理的 canonical 十进制正整数：只能使用 `1-9` 开头的 1–18 位 ASCII 数字，不得带前导零，最大值为 `999999999999999999`；新发行必须大于目标服务器已接受的最高序号。`RELEASE_ID` 必须为 1–128 个字符，只允许 ASCII 字母、数字、点、下划线和连字符，并且首尾必须是字母或数字，因此 `.`、`..`、路径分隔符以及首尾标点均会被拒绝。相同 Release ID 不等于允许重放旧序号。运输或响应丢失后可以重试同一已签名 bundle：只有目标机最高状态、精确回执、固定信任根和九个本机镜像全部与本次 bundle 一致时，导入器才返回 `AUDITED_NOOP`；同序号但任一内容不同都会失败关闭。
 
 正式构建完成镜像推送、精确拉回和 Compose 镜像合同核对后，构建器会对最终 manifest digest 集合去重，并对对应 config ID 集合执行一次 `docker image save`。测量器只读取本次临时 archive：它要求 archive config 集合与最终镜像集合完全一致，逐层验证未压缩 tar 的 SHA-256 等于镜像 config 中的 DiffID，再按唯一 layer path 汇总未压缩字节与 inode。两个结果必须是最多 18 位的正整数，写入 `bundle.control` 后由 `SHA256SUMS.sig` 覆盖。正式发布日志也会输出这两个数字，便于容量复核。目标导入器会在任何镜像 pull 前要求 DockerRootDir 同时容纳该签名上界、40 GiB 回滚空间和 inode 回滚储备。
 
@@ -91,6 +91,12 @@ heyi-kb-<release-id>-registry-bootstrap.tar.sha256.sig
 ```
 
 Bootstrap tar 独立于 Registry bundle；先验签、再 `docker load`。主 bundle 是可由 Linux root 解压的 POSIX PAX tar，归档内 owner/group 固定为 `root:root`，目录模式为 `0750`、文件模式为 `0444`，mtime 固定为 Git commit timestamp。
+
+必须区分三种身份和目录边界：
+
+- `RELEASE_GIT_SHA` 是 40 位源码提交溯源，只证明构建来源，不是服务器目录名；
+- 已签名 bundle 是运输制品，包含控制字段、两个发布环境文件、`release/` 控制面、`registry/` 镜像数据、`sbom/` 和签名清单；
+- 安装、升级或接管入口创建的 canonical contract 还会加入服务器上的 `runtime.env`，其 64 位 contract SHA-256 是 `files.sha256` 的摘要。入口只把 contract 中的 `release/*` 物化到 `/srv/heyi-knowledgebases-offline/releases/<contract-sha256>`；该目录不包含 `runtime.env`、`release.env`、Registry 或 SBOM，不能把 bundle 整体复制进去，也不能用 Git SHA 或含义不明的“content SHA”代替 contract SHA。
 
 ## 传输前复核
 
@@ -115,17 +121,18 @@ openssl dgst -sha256 -verify $publicKey `
 以下命令只展示制品边界；实际目录必须纳入 root-only 发布流程：
 
 ```bash
-sudo install -d -o root -g root -m 0700 /srv/heyi-knowledgebases-offline/artifacts
-cd /srv/heyi-knowledgebases-offline/artifacts
+sudo install -d -o root -g root -m 0700 \
+  /srv/heyi-knowledgebases-offline/artifacts/<release-id>
+cd /srv/heyi-knowledgebases-offline/artifacts/<release-id>
 
 # 1. 使用受信公钥验证两个 checksum 签名及 tar SHA-256。
 # 2. 先加载独立 Bootstrap Registry 镜像。
 sudo docker load --input heyi-kb-<release-id>-registry-bootstrap.tar
 
-# 3. 解压主 bundle；PAX tar 可由 Linux root 正确恢复数值 owner/mode。
+# 3. 在该发行专属目录解压主 bundle；PAX tar 可由 Linux root 正确恢复数值 owner/mode。
 sudo tar --extract --file heyi-kb-<release-id>-offline-registry-bundle.tar
 
-# 4. 继续执行部署文档中的 import-offline-registry-bundle.sh。
+# 4. 从刚解压且已验签的 bundle/release 控制面执行 import-offline-registry-bundle.sh。
 ```
 
-导入器会再次验证 bundle 内 `SHA256SUMS.sig`、精确文件清单、八字段 control、四列镜像清单、签名容量上界、release 资产逐字节一致性、`linux/amd64`、config ID、RepoDigest 和防降级序号。任何一项不一致都必须视为发布失败，不能通过手工改写 `release.env`、容量字段或 digest 绕过。
+导入器会再次验证 bundle 内 `SHA256SUMS.sig`、精确文件清单、八字段 control、四列镜像清单、签名容量上界、release 资产逐字节一致性、`linux/amd64`、config ID、RepoDigest 和防降级序号。任何一项不一致都必须视为发布失败，不能通过手工改写 `release.env`、容量字段或 digest 绕过。正常导入先持久化 Registry 回执和目录，再推进最高发行状态；因此 receipt→highest 或 highest→响应两个断电窗口都能通过原命令安全恢复。相同序号只允许完全一致的审计 no-op，不会创建临时 Registry 网络/容器或重新 pull。导入完成后，当前只允许从同一 bundle 的 `release/deploy/tencent/` 执行首次安装或 legacy adoption，并把 bundle 根的 `release.env` 作为参数；常规升级入口仅为合同占位，受 `active_upgrade` **NO-GO / fail-closed** 门禁约束，禁止执行。获准入口会自行创建 contract 和物化不可变 worker，不得预先手工创建 `/releases/<contract-sha256>`。

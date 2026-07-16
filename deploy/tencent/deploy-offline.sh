@@ -367,6 +367,7 @@ maintenance_active=true
 if ! quiesce_owned_business_writers; then
   offline_fail deploy "business writers remained active before migration" 70
 fi
+offline_require_no_chat_safety_poison deploy
 if [ "$selected_egress_profile" != controlled-egress ] && \
   ! remove_exact_llm_egress; then
   offline_fail deploy "strict_offline could not remove the exact stale LLM gateway" 71
