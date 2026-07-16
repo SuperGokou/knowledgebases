@@ -17,6 +17,9 @@ from scripts import linux_host_evidence_collector as collector
 from scripts.functional_acceptance import _signature_payload
 from scripts.host_preflight import HostFacts
 
+REPOSITORY = Path(__file__).resolve().parents[1]
+DOCUMENTATION = REPOSITORY / "docs/LINUX_HOST_EVIDENCE_COLLECTOR.zh-CN.md"
+
 
 def _deployment(
     *,
@@ -92,6 +95,26 @@ def test_collector_contract_is_frozen_to_exact_twelve_checks() -> None:
         "caddy_automatic_certificate_management",
         "caddy_renewal_health",
     )
+
+
+def test_formal_collection_command_documents_every_current_cli_option_in_order() -> None:
+    documentation = DOCUMENTATION.read_text(encoding="utf-8")
+    section = documentation.split("## 5. 正式采集命令", 1)[1].split("## 6.", 1)[0]
+    command = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    documented_options = tuple(
+        line.strip().split(maxsplit=1)[0]
+        for line in command.splitlines()
+        if line.strip().startswith("--")
+    )
+    parser_options = tuple(
+        action.option_strings[0]
+        for action in collector._parser()._actions
+        if action.option_strings and action.dest != "help"
+    )
+
+    assert documented_options == parser_options
+    assert "检查全部必填参数是否齐全" in documentation
+    assert "检查五个参数是否齐全" not in documentation
 
 
 def test_complete_evidence_is_signed_with_canonical_challenge_payload() -> None:

@@ -224,7 +224,7 @@ sudo sh "$TARGET_ENTRY/deploy/tencent/adopt-offline.sh" \
 
 预测成功的固定输出是 `adoption: predictive-only PASS; legacy project unchanged; execute=false`。它只说明本次输入与目标机当前状态满足切换前置条件，不是上线批准，也不延长用于发起新切换的 24 小时备份证据有效期。durable resume 例外只适用于已持久化的同一退役/接管事务，不能用来启动新事务或绕过固定发布授权。当前发布的 Schema head 为 `20260715_0021`；`offline_contract_files` 当前共有 42 个固定条目，其中 3 个是环境/镜像清单，39 个是 `release/` 发布控制面资产。数量或清单发生变化时必须重新构建、签名并导入整个发布包，不能手工补文件。
 
-双人复核 predictive-only 输出、计划摘要和变更单后，使用**完全相同的参数**重新运行上面的命令，并在末尾追加 `--execute`。闭合事务在同一个 root-only 项目锁中按固定顺序执行：预测预检 → 准备隔离安装合同 → 精确退役 → 退役收据验签 → 主机零漂移复核 → 旧收据带 SHA-256 原子归档 → 写入 HMAC 绑定的接管事务日志 → 目标安装 → 最终主机复核 → 签名完成收据。任何人都不得跳过入口而单独调用退役、安装或迁移命令。
+双人复核 predictive-only 输出、计划摘要和变更单后，使用**完全相同的参数**重新运行上面的命令，并在末尾追加 `--execute`。闭合事务在同一个 root-only 项目锁中按固定顺序执行：预测预检 → 准备隔离安装合同 → 精确退役 → 退役收据验签 → 主机零漂移复核 → 准备旧收据清单 → 写入 HMAC 绑定的接管事务日志 → 旧收据带 SHA-256 原子归档 → 目标安装 → 最终主机复核 → 签名完成收据。HMAC 日志必须在归档开始前完成持久化，使断电续跑能够先验证同一计划、合同、退役收据和预期归档清单，再继续或失败关闭；任何人都不得跳过入口而单独调用退役、安装或迁移命令。
 
 目标安装会在执行迁移命令前先持久化 `migration_invoked`，该状态是不可逆边界。若目标安装在此之前失败，闭合入口会调用受签名发布约束的 `offline-pre-migration-abort.py`：先 dry-run，再只停止并删除与合同及事务精确绑定的 `api-preflight`、`clamav-db-preflight`、`llm-egress-preflight` 容器，删除精确 owner marker，恢复 reconcile service/timer 的“从未安装”基线，归档未提交的安装状态与切换意图，并再次证明目标容器、网络、项目卷、owner marker 均为零。它不删除 bind 数据、命名数据卷，不执行全局 Docker 操作，并生成状态为 `aborted_pre_migration`、边界为 `PRE_MIGRATION_ONLY` 的签名收据。
 

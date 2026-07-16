@@ -191,12 +191,21 @@ stat -c '%U:%G %a %F %n' "$SIGNING_KEY" "$CHALLENGE"
 ```bash
 cd -- "$REPOSITORY"
 
+RELEASE_ID="$(git -C "$REPOSITORY" rev-parse HEAD)"
+OFFLINE_CONTRACT_SHA256='REPLACE_WITH_ACTIVE_CONTRACT_SHA256'
+IMAGE_MANIFEST_SHA256='REPLACE_WITH_ACTIVE_IMAGE_MANIFEST_SHA256'
+BASE_URL='https://knowledge.example.internal'
+
 sudo -H /usr/bin/env -i \
   PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   LANG=C.UTF-8 \
   /usr/bin/python3 -I scripts/linux_host_evidence_collector.py \
   --repository "$REPOSITORY" \
   --run-id "$RUN_ID" \
+  --release-id "$RELEASE_ID" \
+  --offline-contract-sha256 "$OFFLINE_CONTRACT_SHA256" \
+  --image-manifest-sha256 "$IMAGE_MANIFEST_SHA256" \
+  --base-url "$BASE_URL" \
   --signing-key "$SIGNING_KEY" \
   --challenge "$CHALLENGE" \
   --disk-path "$DISK_PATH"
@@ -209,6 +218,12 @@ case "$RC" in
   *)  echo '非预期失败：不得手工补写正式证据' ;;
 esac
 ```
+
+`RELEASE_ID` 必须是当前待验收仓库的 40 位 Git HEAD。`OFFLINE_CONTRACT_SHA256` 与
+`IMAGE_MANIFEST_SHA256` 必须分别取自同一已提交 active release 的
+`contract_sha256` 与 `manifest_sha256`；`BASE_URL` 必须是本次部署的规范 HTTPS origin。
+四个值还必须与 challenge 的 deployment target 完全一致，禁止混用另一批发布、旧收据或
+非规范 URL。
 
 如果目标系统的 Python 不在 `/usr/bin/python3`，应由发布工程统一安装/固定解释器；不得临时从公网下载依赖，也不得用别名、可写 PATH 或未经审核的解释器替换正式运行时。
 
@@ -279,7 +294,7 @@ sudo -H /usr/bin/env -i \
 
 | 现象 | 安全排查方向 | 禁止操作 |
 | --- | --- | --- |
-| 退出码 `64` | 检查五个参数是否齐全、路径是否绝对、`run_id` 是否符合 8–80 字符规则 | 修改脚本常量、通过软链接伪装路径 |
+| 退出码 `64` | 检查全部必填参数是否齐全、路径是否绝对、`run_id` 是否符合 8–80 字符规则 | 修改脚本常量、通过软链接伪装路径 |
 | key/challenge 权限错误 | 用 `stat` 检查 root 所有、普通文件、`0400/0600`；检查父目录是否在仓库外 | 放宽到 `0644/0666`、把私钥复制进仓库 |
 | target/challenge 不匹配 | 确认 challenge 是在当前仓库内容冻结后签发，并绑定同一个 `RUN_ID` | 手改 challenge、回滚 target 字段、复用旧 challenge |
 | `cpu_8`/`memory_16g` 失败 | 检查 VM 实际规格、cgroup 和 CPU affinity | 修改阈值或把宿主机总资源冒充进程可用资源 |

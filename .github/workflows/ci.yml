@@ -35,7 +35,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: "24"
+          node-version: "24.18.0"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -123,7 +123,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -258,7 +258,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -270,14 +270,70 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: "24"
+          node-version: "24.18.0"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: Install locked dependencies
+      - name: Pin trusted Node executable
+        shell: bash
         run: |
-          uv sync --frozen --extra dev
-          npm ci --prefix web --no-audit --no-fund
+          set -euo pipefail
+          node_source="$(readlink -f -- "$(command -v node)")"
+          uv_source="$(readlink -f -- "$(command -v uv)")"
+          npm_cli="$(readlink -f -- "$(command -v npm)")"
+          test "$node_source" = \
+            /opt/hostedtoolcache/node/24.18.0/x64/bin/node
+          test "$uv_source" = \
+            /opt/hostedtoolcache/uv/0.11.15/x86_64/uv
+          test "$npm_cli" = \
+            /opt/hostedtoolcache/node/24.18.0/x64/lib/node_modules/npm/bin/npm-cli.js
+          test -x "$node_source"
+          test -x "$uv_source"
+          test -f "$npm_cli"
+          test "$("$node_source" --version)" = "v24.18.0"
+          test "$("$uv_source" --version)" = "uv 0.11.15"
+          test "$("$node_source" "$npm_cli" --version)" = "11.16.0"
+          npm_package_root="${npm_cli%/bin/npm-cli.js}"
+          sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
+          sudo install -o root -g root -m 0755 "$node_source" \
+            /usr/local/lib/heyi-acceptance/node
+          sudo install -o root -g root -m 0755 "$uv_source" \
+            /usr/local/lib/heyi-acceptance/uv
+          sudo cp -aL -- "$npm_package_root" /usr/local/lib/heyi-acceptance/npm
+          sudo chown -R root:root /usr/local/lib/heyi-acceptance/npm
+          sudo chmod -R go-w /usr/local/lib/heyi-acceptance/npm
+          sudo chmod 0755 /usr/local/lib/heyi-acceptance/npm/bin/npm-cli.js
+          sudo install -o root -g root -m 0755 "$node_source" /usr/local/sbin/node
+          sudo ln -sfn /usr/local/lib/heyi-acceptance/npm/bin/npm-cli.js \
+            /usr/local/sbin/npm
+
+      - name: Install root-protected acceptance runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_source="$(readlink -f -- "$(command -v python)")"
+          test "$python_source" = \
+            /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12
+          test -x "$python_source"
+          test "$("$python_source" --version)" = "Python 3.12.13"
+          sudo install -d -o root -g root -m 0755 /opt/heyi-acceptance
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            "$python_source" -I -m venv --copies /opt/heyi-acceptance/venv
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            UV_PROJECT_ENVIRONMENT=/opt/heyi-acceptance/venv \
+            /usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev \
+            --no-install-project
+          sudo chown -R root:root /opt/heyi-acceptance
+          sudo chmod -R go-w /opt/heyi-acceptance
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /opt/heyi-acceptance/venv/bin/python -c \
+            'import shutil, sys; from scripts.acceptance import _root_protected_executable; _root_protected_executable((sys.executable,)); _root_protected_executable((shutil.which("npm") or "",))'
 
       - name: Install document parser sandbox tools
         run: |
@@ -285,19 +341,35 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             bubblewrap libreoffice-nogui poppler-utils procps
 
-      - name: Pin trusted Node executable
+      - name: Install locked dependencies
         run: |
-          sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
-          sudo install -o root -g root -m 0755 "$(command -v node)" /usr/local/lib/heyi-acceptance/node
-          echo /usr/local/lib/heyi-acceptance >> "$GITHUB_PATH"
+          /usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/local/sbin/npm ci --prefix web --no-audit --no-fund
 
       - name: Run enterprise acceptance profile
-        run: >-
-          uv run --frozen python scripts/acceptance.py
-          --profile ci
-          --report-dir artifacts/acceptance
-          --node-executable /usr/local/lib/heyi-acceptance/node
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -H /usr/bin/env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            CI="$CI" \
+            KB_ENVIRONMENT="$KB_ENVIRONMENT" \
+            NEXT_TELEMETRY_DISABLED="$NEXT_TELEMETRY_DISABLED" \
+            /opt/heyi-acceptance/venv/bin/python scripts/acceptance.py \
+            --profile ci \
+            --report-dir artifacts/acceptance \
+            --node-executable /usr/local/lib/heyi-acceptance/node
 
       - name: Publish redacted acceptance summary
-        if: always() && hashFiles('artifacts/acceptance/acceptance.md') != ''
-        run: tee -a "$GITHUB_STEP_SUMMARY" < artifacts/acceptance/acceptance.md
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if sudo --non-interactive test -f artifacts/acceptance/acceptance.md; then
+            sudo --non-interactive cat artifacts/acceptance/acceptance.md |
+              tee -a "$GITHUB_STEP_SUMMARY"
+          fi

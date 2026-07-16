@@ -283,24 +283,111 @@ def test_enterprise_acceptance_workflow_pins_node_to_a_root_protected_path() -> 
     repository = Path(acceptance_module.__file__).resolve().parents[1]
     workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
-    pin_step = (
-        "      - name: Pin trusted Node executable\n"
-        "        run: |\n"
-        "          sudo install -d -o root -g root -m 0755 "
-        "/usr/local/lib/heyi-acceptance\n"
-        '          sudo install -o root -g root -m 0755 "$(command -v node)" '
-        "/usr/local/lib/heyi-acceptance/node\n"
-        '          echo /usr/local/lib/heyi-acceptance >> "$GITHUB_PATH"\n'
-    )
+    pin_step = "- name: Pin trusted Node executable"
+    runtime_step = "- name: Install root-protected acceptance runtime"
+    dependency_step = "- name: Install locked dependencies"
 
+    assert 'python-version: "3.12.13"' in acceptance_job
+    assert 'node-version: "24.18.0"' in acceptance_job
+    assert 'version: "0.11.15"' in acceptance_job
     assert pin_step in acceptance_job
-    assert acceptance_job.index("- name: Set up Node.js") < acceptance_job.index(pin_step)
+    assert runtime_step in acceptance_job
+    assert dependency_step in acceptance_job
     assert (
-        acceptance_job.index("- name: Install document parser sandbox tools")
-        < (acceptance_job.index(pin_step))
-        < acceptance_job.index("- name: Run enterprise acceptance profile")
+        "sudo install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance" in acceptance_job
     )
+    assert (
+        'sudo install -o root -g root -m 0755 "$node_source" \\\n'
+        "            /usr/local/lib/heyi-acceptance/node" in acceptance_job
+    )
+    assert "npm root --global" not in acceptance_job
+
+    pin_block = acceptance_job.split("      - name: Pin trusted Node executable\n", maxsplit=1)[
+        1
+    ].split("      - name: Install root-protected acceptance runtime\n", maxsplit=1)[0]
+    assert 'node_source="$(readlink -f -- "$(command -v node)")"' in pin_block
+    assert 'uv_source="$(readlink -f -- "$(command -v uv)")"' in pin_block
+    assert 'npm_cli="$(readlink -f -- "$(command -v npm)")"' in pin_block
+    assert (
+        'test "$node_source" = \\\n'
+        "            /opt/hostedtoolcache/node/24.18.0/x64/bin/node" in pin_block
+    )
+    assert (
+        'test "$uv_source" = \\\n            /opt/hostedtoolcache/uv/0.11.15/x86_64/uv' in pin_block
+    )
+    assert (
+        'test "$npm_cli" = \\\n'
+        "            /opt/hostedtoolcache/node/24.18.0/x64/lib/node_modules/"
+        "npm/bin/npm-cli.js" in pin_block
+    )
+    assert 'test "$("$node_source" "$npm_cli" --version)" = "11.16.0"' in pin_block
+    assert 'npm_package_root="${npm_cli%/bin/npm-cli.js}"' in pin_block
+
+    setup_python_index = acceptance_job.index("- name: Set up Python")
+    setup_uv_index = acceptance_job.index("- name: Set up uv")
+    setup_node_index = acceptance_job.index("- name: Set up Node.js")
+    pin_index = acceptance_job.index(pin_step)
+    runtime_index = acceptance_job.index(runtime_step)
+    dependency_index = acceptance_job.index(dependency_step)
+    npm_ci_index = acceptance_job.index("npm ci --prefix web")
+
+    assert (
+        setup_python_index
+        < setup_uv_index
+        < setup_node_index
+        < pin_index
+        < runtime_index
+        < dependency_index
+        < npm_ci_index
+    )
+    parser_index = acceptance_job.index("- name: Install document parser sandbox tools")
+    assert runtime_index < parser_index < dependency_index
+    assert npm_ci_index < acceptance_job.index("- name: Run enterprise acceptance profile")
     assert "--node-executable /usr/local/lib/heyi-acceptance/node" in acceptance_job
+
+
+def test_enterprise_acceptance_workflow_uses_a_root_protected_runtime() -> None:
+    repository = Path(acceptance_module.__file__).resolve().parents[1]
+    workflow = (repository / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    acceptance_job = workflow.split("  acceptance:\n", maxsplit=1)[1]
+
+    assert "- name: Install root-protected acceptance runtime" in acceptance_job
+    assert "UV_PROJECT_ENVIRONMENT=/opt/heyi-acceptance/venv" in acceptance_job
+    assert "/usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev" in acceptance_job
+    assert "/usr/local/sbin/npm" in acceptance_job
+    assert "/usr/local/sbin/node" in acceptance_job
+    runtime_step = acceptance_job.split(
+        "      - name: Install root-protected acceptance runtime\n", maxsplit=1
+    )[1].split("      - name: Install locked dependencies\n", maxsplit=1)[0]
+    assert 'python_source="$(readlink -f -- "$(command -v python)")"' in runtime_step
+    assert (
+        'test "$python_source" = \\\n'
+        "            /opt/hostedtoolcache/Python/3.12.13/x64/bin/python3.12" in runtime_step
+    )
+    assert '"$python_source" -I -m venv --copies /opt/heyi-acceptance/venv' in runtime_step
+    assert "sudo chown -R root:root /opt/heyi-acceptance" in runtime_step
+    assert "sudo chmod -R go-w /opt/heyi-acceptance" in runtime_step
+
+    dependency_step = acceptance_job.split(
+        "      - name: Install locked dependencies\n", maxsplit=1
+    )[1].split("      - name: Run enterprise acceptance profile\n", maxsplit=1)[0]
+    assert "/usr/local/lib/heyi-acceptance/uv sync --frozen --extra dev" in dependency_step
+    assert "/usr/local/sbin/npm ci --prefix web --no-audit --no-fund" in dependency_step
+
+    run_step = acceptance_job.split(
+        "      - name: Run enterprise acceptance profile\n", maxsplit=1
+    )[1].split("      - name: Publish redacted acceptance summary\n", maxsplit=1)[0]
+    assert "sudo -H /usr/bin/env -i" in run_step
+    assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in run_step
+    assert "/opt/heyi-acceptance/venv/bin/python scripts/acceptance.py" in run_step
+    assert "uv run" not in run_step
+
+    publish_step = acceptance_job.split(
+        "      - name: Publish redacted acceptance summary\n", maxsplit=1
+    )[1]
+    assert "if: always()" in publish_step
+    assert "sudo --non-interactive cat artifacts/acceptance/acceptance.md" in publish_step
+    assert "hashFiles('artifacts/acceptance/acceptance.md')" not in publish_step
 
 
 def test_declared_preflight_exit_code_is_reported_as_blocked() -> None:

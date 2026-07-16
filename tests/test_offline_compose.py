@@ -944,8 +944,19 @@ def test_offline_deployment_documentation_matches_the_enforced_release_boundary(
     deployment = (REPOSITORY / "docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md").read_text(
         encoding="utf-8"
     )
+    acceptance_standard = (
+        REPOSITORY / "docs/ENTERPRISE_FINAL_ACCEPTANCE_STANDARD.zh-CN.md"
+    ).read_text(encoding="utf-8")
     capacity = (REPOSITORY / "docs/PERFORMANCE_CAPACITY_MODEL.zh-CN.md").read_text(encoding="utf-8")
 
+    def final_acceptance_block(document: str) -> str:
+        for fenced in document.split("```bash\n")[1:]:
+            block, separator, _remainder = fenced.partition("\n```")
+            if separator and "scripts/acceptance.py" in block:
+                return block
+        raise AssertionError("final acceptance Bash block is missing")
+
+    assert final_acceptance_block(deployment) == final_acceptance_block(acceptance_standard)
     assert deployment.count("up -d --pull never --no-build") >= 1
     assert "install-offline.sh" in deployment
     assert "deploy-offline.sh" in deployment

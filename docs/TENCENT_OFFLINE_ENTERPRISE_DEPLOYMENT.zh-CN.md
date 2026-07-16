@@ -400,17 +400,21 @@ RUNTIME_ENV='/srv/heyi-knowledgebases-offline/shared/runtime.env'
 RELEASE_ENV="$BUNDLE_ROOT/release.env"
 EVIDENCE_ROOT='/srv/heyi-knowledgebases-offline/evidence'
 TRUST_ROOT='/etc/heyi-acceptance'
-RELEASE_ID='REPLACE_WITH_IMMUTABLE_RELEASE_ID'
+RELEASE_ID='REPLACE_WITH_40_CHAR_GIT_SHA'
 NODE_EXECUTABLE='/usr/local/lib/heyi-acceptance/node'
+DEPLOYMENT_BASE_URL='https://knowledge.example.internal'
+BROWSER_EVIDENCE="$SOURCE_CHECKOUT/artifacts/acceptance/functional/browser-e2e.json"
+LINUX_HOST_EVIDENCE="$SOURCE_CHECKOUT/artifacts/acceptance/functional/linux-host.json"
 
 test -d "$SOURCE_CHECKOUT/.git" || test -f "$SOURCE_CHECKOUT/.git"
 test -f "$RELEASE_ENV"
 test -f "$RELEASE_ENV.images"
-test "$RELEASE_ID" != 'REPLACE_WITH_IMMUTABLE_RELEASE_ID'
+test "$RELEASE_ID" != 'REPLACE_WITH_40_CHAR_GIT_SHA'
 cd -- "$SOURCE_CHECKOUT"
 
 install -d -o root -g root -m 0755 /usr/local/lib/heyi-acceptance
 install -o root -g root -m 0755 "$(command -v node)" "$NODE_EXECUTABLE"
+install -d -o root -g root -m 0750 "$(dirname "$BROWSER_EVIDENCE")"
 
 PYTHONPATH="$SOURCE_CHECKOUT" /usr/bin/python3 scripts/acceptance.py \
   --profile final \
@@ -420,11 +424,14 @@ PYTHONPATH="$SOURCE_CHECKOUT" /usr/bin/python3 scripts/acceptance.py \
   --offline-runtime-env-file "$RUNTIME_ENV" \
   --offline-release-env-file "$RELEASE_ENV" \
   --offline-runtime-evidence "$EVIDENCE_ROOT/offline-runtime/offline-runtime-evidence.json" \
-  --e2e-evidence "$EVIDENCE_ROOT/browser-e2e.json" \
+  --e2e-evidence "$BROWSER_EVIDENCE" \
+  --linux-host-evidence "$LINUX_HOST_EVIDENCE" \
   --functional-trust-store "$TRUST_ROOT/functional-trust.json" \
   --functional-challenge-store /var/lib/heyi-acceptance/challenges \
   --e2e-signing-key-path "$TRUST_ROOT/browser-e2e-ed25519.key" \
   --e2e-signing-key-id browser-e2e-ed25519 \
+  --linux-host-signing-key-path "$TRUST_ROOT/linux-host-ed25519.key" \
+  --deployment-base-url "$DEPLOYMENT_BASE_URL" \
   --malware-evidence "$EVIDENCE_ROOT/malware.json" \
   --security-scan-evidence "$EVIDENCE_ROOT/security-scan.json" \
   --release-id "$RELEASE_ID" \

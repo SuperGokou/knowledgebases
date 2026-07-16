@@ -175,6 +175,38 @@ def test_execute_adoption_documents_the_signed_pre_migration_abort_boundary() ->
     assert "验签" in documents
 
 
+def test_documented_adoption_transaction_order_matches_the_entrypoint() -> None:
+    entrypoint = _read(ADOPTION_ENTRYPOINT_PATH)
+    legacy_guide = _read(LEGACY_GUIDE_PATH)
+    orchestrator = entrypoint.split("run_adoption_orchestrator() {", 1)[1].split(
+        "\n}\n\nrun_adoption_orchestrator", 1
+    )[0]
+    documented_sequence = next(
+        paragraph
+        for paragraph in legacy_guide.split("\n\n")
+        if "闭合事务在同一个 root-only 项目锁中" in paragraph
+    )
+
+    implementation_steps = (
+        "prepare_signed_receipt_inventory",
+        "write_adoption_journal",
+        "archive_legacy_receipts",
+    )
+    documented_steps = (
+        "准备旧收据清单",
+        "写入 HMAC 绑定的接管事务日志",
+        "旧收据带 SHA-256 原子归档",
+    )
+
+    assert [orchestrator.index(step) for step in implementation_steps] == sorted(
+        orchestrator.index(step) for step in implementation_steps
+    )
+    assert [documented_sequence.index(step) for step in documented_steps] == sorted(
+        documented_sequence.index(step) for step in documented_steps
+    )
+    assert "旧收据带 SHA-256 原子归档 → 写入 HMAC" not in documented_sequence
+
+
 def test_current_schema_and_canonical_asset_counts_are_derived_from_code() -> None:
     common = _read(COMMON_SCRIPT_PATH)
     match = re.search(
