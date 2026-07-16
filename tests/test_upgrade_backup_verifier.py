@@ -5,11 +5,12 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,40 @@ def _load_verifier() -> ModuleType:
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _artifact_stat_view(
+    observed: os.stat_result,
+    *,
+    uid: int,
+    atime_ns: int | None = None,
+    ctime_ns: int | None = None,
+) -> SimpleNamespace:
+    """Build the subset of descriptor metadata consumed by the verifier."""
+    return SimpleNamespace(
+        st_dev=observed.st_dev,
+        st_ino=observed.st_ino,
+        st_uid=uid,
+        st_gid=observed.st_gid,
+        st_mode=observed.st_mode,
+        st_nlink=observed.st_nlink,
+        st_size=observed.st_size,
+        st_atime_ns=observed.st_atime_ns if atime_ns is None else atime_ns,
+        st_ctime_ns=observed.st_ctime_ns if ctime_ns is None else ctime_ns,
+    )
+
+
+def _simulate_root_owned_descriptor_reads(
+    verifier: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model the root-owned production precondition for content-level tests."""
+    real_fstat = verifier.os.fstat
+
+    def root_owned_fstat(descriptor: int) -> SimpleNamespace:
+        return _artifact_stat_view(real_fstat(descriptor), uid=0)
+
+    monkeypatch.setattr(verifier.os, "fstat", root_owned_fstat)
 
 
 def _timestamp(value: datetime) -> str:
@@ -590,8 +625,10 @@ def test_control_state_manifest_rejects_a_different_well_formed_contract_path(
 
 def test_control_state_archive_rejects_a_different_registry_receipt_path(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     verifier = _load_verifier()
+    _simulate_root_owned_descriptor_reads(verifier, monkeypatch)
     issued_at = datetime.now(UTC).replace(microsecond=0)
     document = _control_state_manifest(captured_at=issued_at)
     records = document["records"]
@@ -693,8 +730,12 @@ def _control_state_tar(
     return stream.getvalue()
 
 
-def test_control_state_archive_and_manifest_are_verified_end_to_end(tmp_path: Path) -> None:
+def test_control_state_archive_and_manifest_are_verified_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     verifier = _load_verifier()
+    _simulate_root_owned_descriptor_reads(verifier, monkeypatch)
     issued_at = datetime.now(UTC).replace(microsecond=0)
     document = _control_state_manifest(captured_at=issued_at)
     archive_payload = _control_state_tar(verifier, document)
@@ -718,8 +759,12 @@ def test_control_state_archive_and_manifest_are_verified_end_to_end(tmp_path: Pa
     )
 
 
-def test_control_state_archive_rejects_an_extra_member(tmp_path: Path) -> None:
+def test_control_state_archive_rejects_an_extra_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     verifier = _load_verifier()
+    _simulate_root_owned_descriptor_reads(verifier, monkeypatch)
     issued_at = datetime.now(UTC).replace(microsecond=0)
     document = _control_state_manifest(captured_at=issued_at)
     archive_payload = _control_state_tar(verifier, document, extra_member=True)
@@ -769,12 +814,14 @@ def test_control_state_archive_rejects_an_extra_member(tmp_path: Path) -> None:
 )
 def test_control_state_archive_rejects_cross_contract_receipts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     record_id: str,
     field: str,
     invalid_value: str,
     message: str,
 ) -> None:
     verifier = _load_verifier()
+    _simulate_root_owned_descriptor_reads(verifier, monkeypatch)
     issued_at = datetime.now(UTC).replace(microsecond=0)
     document = _control_state_manifest(captured_at=issued_at)
     payloads = _control_state_payloads(document)
@@ -807,8 +854,10 @@ def test_control_state_archive_rejects_cross_contract_receipts(
 
 def test_control_state_archive_rejects_contract_manifest_from_another_contract(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     verifier = _load_verifier()
+    _simulate_root_owned_descriptor_reads(verifier, monkeypatch)
     issued_at = datetime.now(UTC).replace(microsecond=0)
     document = _control_state_manifest(captured_at=issued_at)
     archive_payload = _control_state_tar(
@@ -838,6 +887,71 @@ def test_control_state_archive_rejects_contract_manifest_from_another_contract(
             expected_archive_size_bytes=document["archive_size_bytes"],
             issued_at=issued_at,
         )
+
+
+def test_verified_artifact_reader_rejects_non_root_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _load_verifier()
+    payload = b"root ownership is mandatory"
+    artifact = tmp_path / "artifact.tar"
+    artifact.write_bytes(payload)
+    artifact.chmod(0o400)
+    real_fstat = verifier.os.fstat
+
+    def non_root_fstat(descriptor: int) -> SimpleNamespace:
+        return _artifact_stat_view(real_fstat(descriptor), uid=1000)
+
+    monkeypatch.setattr(verifier.os, "fstat", non_root_fstat)
+
+    with pytest.raises(
+        ValueError,
+        match="protected artifact metadata changed during verification",
+    ):
+        verifier._read_verified_artifact_bytes(
+            artifact,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            expected_size_bytes=len(payload),
+            max_bytes=1024,
+        )
+
+
+def test_verified_artifact_reader_ignores_read_induced_timestamp_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _load_verifier()
+    payload = b"timestamps are not security identity"
+    artifact = tmp_path / "artifact.tar"
+    artifact.write_bytes(payload)
+    artifact.chmod(0o400)
+    real_fstat = verifier.os.fstat
+    observations = 0
+
+    def timestamp_changing_fstat(descriptor: int) -> SimpleNamespace:
+        nonlocal observations
+        observations += 1
+        observed = real_fstat(descriptor)
+        return _artifact_stat_view(
+            observed,
+            uid=0,
+            atime_ns=observed.st_atime_ns + observations,
+            ctime_ns=observed.st_ctime_ns + observations,
+        )
+
+    monkeypatch.setattr(verifier.os, "fstat", timestamp_changing_fstat)
+
+    assert (
+        verifier._read_verified_artifact_bytes(
+            artifact,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            expected_size_bytes=len(payload),
+            max_bytes=1024,
+        )
+        == payload
+    )
+    assert observations == 2
 
 
 def test_fresh_and_durable_shell_paths_share_the_materialized_verifier() -> None:

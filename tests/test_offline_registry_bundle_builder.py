@@ -97,8 +97,8 @@ def test_builder_uses_canonical_release_sequence_and_safe_release_id_contracts()
 @pytest.mark.parametrize(
     ("sequence", "release_id", "expected_message"),
     [
-        ("0001", "release-1", "canonical positive integer"),
-        ("08", "release-1", "canonical positive integer"),
+        ("0001", "release-1", "integer with 1-18 digits and no leading zero"),
+        ("08", "release-1", "integer with 1-18 digits and no leading zero"),
         ("1", ".", "release ID must be 1-128 characters"),
         ("1", "..", "release ID must be 1-128 characters"),
     ],
