@@ -411,7 +411,7 @@ requires-dist = [
     { name = "packaging", marker = "extra == 'dev'", specifier = ">=26,<27" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = "==2.10.1" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
-    { name = "pwdlib", extras = ["argon2"], specifier = ">=0.2,<1" },
+    { name = "pwdlib", extras = ["argon2"], specifier = ">=0.3.0,<1" },
     { name = "pydantic-settings", specifier = ">=2.10,<3" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3,<10" },
