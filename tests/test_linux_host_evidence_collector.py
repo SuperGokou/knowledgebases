@@ -289,6 +289,19 @@ def _caddy_probe_stubs(
     actual_caddyfile = tmp_path / "Caddyfile"
     actual_caddyfile.write_text("tls internal\n", encoding="utf-8")
     actual_caddyfile.chmod(0o444)
+    original_stat = type(actual_caddyfile).stat
+
+    def root_owned_caddyfile_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        metadata = original_stat(path, follow_symlinks=follow_symlinks)
+        if path != actual_caddyfile:
+            return metadata
+        # The production bind mount must be root-owned.  CI intentionally runs
+        # unprivileged, so model only that deployment metadata in this fixture.
+        values = list(metadata)
+        values[4] = 0
+        return os.stat_result(values)
+
+    monkeypatch.setattr(type(actual_caddyfile), "stat", root_owned_caddyfile_stat)
     monkeypatch.setattr(
         collector,
         "_compose_origins",

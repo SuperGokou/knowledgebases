@@ -256,8 +256,9 @@ for row in (root / "bundle.control").read_text(encoding="ascii").splitlines():
     control[key] = value
 index = json.loads((root / "sbom/image-sbom-index.json").read_text(encoding="utf-8"))
 scanner = index.get("scanner")
+schema_key = "\u0024schema"
 if (
-    index.get("$schema")
+    index.get(schema_key)
     != "https://knowledgebases.local/schemas/image-sbom-index-v1.schema.json"
     or index.get("schema_version") != 1
     or index.get("release_git_sha") != control.get("RELEASE_GIT_SHA")

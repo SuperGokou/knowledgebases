@@ -93,11 +93,19 @@ for required_value in \
   [ -n "$required_value" ] || usage
 done
 if [ "$entry_mode" = external ]; then
-  [ -n "$runtime_source" ] && [ -n "$release_source" ] || usage
-  [ -z "$contract_dir" ] && [ -z "$contract_sha256" ] || usage
+  if [ -z "$runtime_source" ] || [ -z "$release_source" ]; then
+    usage
+  fi
+  if [ -n "$contract_dir" ] || [ -n "$contract_sha256" ]; then
+    usage
+  fi
 else
-  [ -z "$runtime_source" ] && [ -z "$release_source" ] || usage
-  [ -n "$contract_dir" ] && [ -n "$contract_sha256" ] || usage
+  if [ -n "$runtime_source" ] || [ -n "$release_source" ]; then
+    usage
+  fi
+  if [ -z "$contract_dir" ] || [ -z "$contract_sha256" ]; then
+    usage
+  fi
 fi
 
 case "$confirmed_plan_sha256" in
@@ -990,8 +998,10 @@ validate_resumable_archive_distribution() {
       validate_exact_incomplete_staging_file "$archive_write_staging"
     done
   fi
-  [ ! -e "$archive_failed" ] && [ ! -L "$archive_failed" ] || \
-    offline_fail adoption "failed receipt archive state requires a new signed adoption plan" 65
+  if [ -e "$archive_failed" ] || [ -L "$archive_failed" ]; then
+    offline_fail adoption \
+      "failed receipt archive state requires a new signed adoption plan" 65
+  fi
 
   /usr/bin/python3 -I -c '
 import hashlib, os, pathlib, stat, sys
@@ -1120,8 +1130,9 @@ archive_one_legacy_receipt() {
   archived_path=$archive_pending/$receipt_name
   if [ -e "$archived_path" ] || [ -L "$archived_path" ]; then
     validate_protected_file "pending archived receipt" "$archived_path" "400" 8388608
-    [ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || \
+    if [ -e "$receipt_path" ] || [ -L "$receipt_path" ]; then
       offline_fail adoption "legacy receipt exists both live and archived" 65
+    fi
   else
     validate_protected_file "legacy state receipt" "$receipt_path" "400" 8388608
     mv -- "$receipt_path" "$archived_path" || exit 73
@@ -1191,8 +1202,9 @@ raise SystemExit(0 if document == expected else 1)
       offline_fail adoption "published receipt archive identity differs" 65
     while IFS='  ' read -r _ receipt_path; do
       [ -n "$receipt_path" ] || continue
-      [ ! -e "$receipt_path" ] && [ ! -L "$receipt_path" ] || \
+      if [ -e "$receipt_path" ] || [ -L "$receipt_path" ]; then
         offline_fail adoption "published archive still has a live legacy receipt" 65
+      fi
     done < "$receipt_inventory"
     return 0
   fi
@@ -1809,8 +1821,11 @@ validate_resumable_target_runtime_resources() {
       target_stack=$(docker inspect --format \
         '{{ index .Config.Labels "io.heyi.knowledgebases.stack" }}' \
         "$target_container_id" 2>/dev/null) || { runtime_inventory_valid=false; break; }
-      [ "$target_owner" = jiangsu-heyi-knowledgebases ] && \
-        [ "$target_stack" = offline ] || { runtime_inventory_valid=false; break; }
+      if [ "$target_owner" != jiangsu-heyi-knowledgebases ] || \
+        [ "$target_stack" != offline ]; then
+        runtime_inventory_valid=false
+        break
+      fi
       case "$target_service" in
         api-preflight|clamav-db-preflight|llm-egress-preflight|migrate|bootstrap)
           target_oneoff=$(docker inspect --format \
@@ -1818,8 +1833,14 @@ validate_resumable_target_runtime_resources() {
             "$target_container_id" 2>/dev/null) || { runtime_inventory_valid=false; break; }
           target_running=$(docker inspect --format '{{.State.Running}}' \
             "$target_container_id" 2>/dev/null) || { runtime_inventory_valid=false; break; }
-          { [ "$target_oneoff" = True ] || [ "$target_oneoff" = true ]; } && \
-            [ "$target_running" = false ] || { runtime_inventory_valid=false; break; }
+          case "$target_oneoff" in
+            True|true) ;;
+            *) runtime_inventory_valid=false; break ;;
+          esac
+          if [ "$target_running" != false ]; then
+            runtime_inventory_valid=false
+            break
+          fi
           ;;
         postgres|redis|minio|minio-init|minio-multipart-gc|clamd|api|maintenance|web|proxy|llm-egress)
           case "$seen_services" in
@@ -1853,8 +1874,11 @@ validate_resumable_target_runtime_resources() {
       case "$seen_networks" in
         *" $target_network_name "*) runtime_inventory_valid=false; break ;;
       esac
-      [ "$target_network_owner" = jiangsu-heyi-knowledgebases ] && \
-        [ "$target_network_stack" = offline ] || { runtime_inventory_valid=false; break; }
+      if [ "$target_network_owner" != jiangsu-heyi-knowledgebases ] || \
+        [ "$target_network_stack" != offline ]; then
+        runtime_inventory_valid=false
+        break
+      fi
       seen_networks="$seen_networks$target_network_name "
     done < "$target_inventory"
   fi
@@ -2085,10 +2109,12 @@ classify_journal_bound_target_state() {
     offline_fail adoption "multiple installed target receipts are ambiguous" 65
 
   if [ -e "$target_installed" ] || [ -L "$target_installed" ]; then
-    [ ! -e "$install_state" ] && [ ! -L "$install_state" ] || \
+    if [ -e "$install_state" ] || [ -L "$install_state" ]; then
       offline_fail adoption "completed and in-progress target states coexist" 65
-    [ -e "$target_active" ] && [ ! -L "$target_active" ] || \
+    fi
+    if [ ! -e "$target_active" ] || [ -L "$target_active" ]; then
       offline_fail adoption "completed target install lacks its active release" 65
+    fi
     validate_journal_bound_install_document "$target_installed" completed >/dev/null
     validate_target_active_release >/dev/null
     target_adoption_state=target_install_committed
@@ -2111,8 +2137,9 @@ classify_journal_bound_target_state() {
     return 0
   fi
 
-  [ ! -e "$target_active" ] && [ ! -L "$target_active" ] || \
+  if [ -e "$target_active" ] || [ -L "$target_active" ]; then
     offline_fail adoption "active target release exists without install state" 65
+  fi
   assert_target_runtime_resources_absent || \
     offline_fail adoption "target-not-started journal has runtime resources" 69
   capture_reconcile_baseline "$reconcile_after_abort_file"

@@ -287,6 +287,8 @@ def atomic_write_bytes(path: Path, raw: bytes) -> None:
                 destination = os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
             except FileNotFoundError:
                 destination = None
+            if destination is not None and stat.S_ISLNK(destination.st_mode):
+                raise AcceptanceGateError("acceptance evidence destination cannot be a symlink")
             if destination is not None and not stat.S_ISREG(destination.st_mode):
                 raise AcceptanceGateError("acceptance evidence destination is not a regular file")
             descriptor = os.open(

@@ -1490,6 +1490,12 @@ def test_offline_runtime_evidence_requires_real_target_bound_chain(
     evidence.write_text(json.dumps(document), encoding="utf-8")
     monkeypatch.setattr("scripts.acceptance.platform.system", lambda: "Linux")
     monkeypatch.setattr("scripts.acceptance._offline_runtime_host_fingerprint", lambda: "a" * 64)
+    monkeypatch.setattr(
+        "scripts.acceptance._protected_regular_file",
+        lambda path, *, maximum_bytes: (
+            path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= maximum_bytes
+        ),
+    )
 
     accepted, summary = verify_offline_runtime_evidence(evidence, repository)
 

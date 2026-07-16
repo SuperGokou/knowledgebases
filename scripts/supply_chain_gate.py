@@ -18,6 +18,27 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 Mode = Literal["inventory", "release"]
+
+# ``mimetypes`` consults the host MIME database, so the same byte-identical
+# asset can be classified differently across Windows and Linux (notably ICO:
+# ``image/x-icon`` versus ``image/vnd.microsoft.icon``).  Supply-chain
+# evidence must be reproducible across build hosts, therefore repository asset
+# types use an explicit, platform-independent registry.
+CANONICAL_ASSET_MEDIA_TYPES = {
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".mp4": "video/mp4",
+    ".otf": "font/otf",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ttf": "font/ttf",
+    ".webm": "video/webm",
+    ".webp": "image/webp",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
 Severity = Literal["error", "review", "info"]
 
 DATA_URI_PATTERN = re.compile(
@@ -539,6 +560,13 @@ def _is_excluded(path: Path, root: Path, excluded: set[str]) -> bool:
     return any(part in excluded for part in relative_parts)
 
 
+def _asset_media_type(path: Path) -> str:
+    canonical = CANONICAL_ASSET_MEDIA_TYPES.get(path.suffix.lower())
+    if canonical is not None:
+        return canonical
+    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
 def _discover_assets(repo: Path, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     extensions = {str(value).lower() for value in manifest["asset_extensions"]}
     text_extensions = {str(value).lower() for value in manifest["embedded_text_extensions"]}
@@ -568,7 +596,7 @@ def _discover_assets(repo: Path, manifest: dict[str, Any]) -> dict[str, dict[str
                     "path": relative_path,
                     "bytes": len(payload),
                     "sha256": _sha256_bytes(payload),
-                    "media_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    "media_type": _asset_media_type(path),
                 }
             if path.suffix.lower() not in text_extensions or path.stat().st_size > 10_000_000:
                 continue

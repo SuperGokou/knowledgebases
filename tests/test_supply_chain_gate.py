@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 
 from scripts.generate_offline_image_sboms import generate_image_sboms
-from scripts.supply_chain_gate import GateConfigurationError, _write_report, main, run_gate
+from scripts.supply_chain_gate import (
+    GateConfigurationError,
+    _asset_media_type,
+    _write_report,
+    main,
+    run_gate,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_FILES = (
@@ -162,6 +168,17 @@ def test_inventory_gate_passes_integrity_but_does_not_claim_release_approval() -
         "LICENSE_MANUAL_REVIEW_REQUIRED",
     } <= _finding_codes(report)
     assert "not legal advice" in " ".join(report["limitations"])
+
+
+def test_asset_media_type_is_independent_of_the_host_mime_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scripts.supply_chain_gate.mimetypes.guess_type",
+        lambda _name: ("image/vnd.microsoft.icon", None),
+    )
+
+    assert _asset_media_type(Path("favicon.ico")) == "image/x-icon"
 
 
 def test_inventory_report_is_deterministic() -> None:
