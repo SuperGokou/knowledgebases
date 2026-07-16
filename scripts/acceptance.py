@@ -1041,8 +1041,16 @@ def _validate_functional_child_document(
         from scripts.functional_acceptance import evaluate_contract, load_manifest
 
         manifest = load_manifest(repository / "docs/functional_acceptance_manifest.json")
-        expected_contract = asdict(evaluate_contract(repository, manifest))
-    except (ImportError, OSError, RuntimeError, UnicodeError, ValueError):
+        expected_contract = _strict_json_object(
+            json.dumps(
+                asdict(evaluate_contract(repository, manifest)),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"),
+            label="expected functional acceptance contract",
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, UnicodeError, ValueError):
         return False
     if document.get("contract") != expected_contract:
         return False

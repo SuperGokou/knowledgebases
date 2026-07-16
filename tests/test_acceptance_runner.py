@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sysconfig
 import textwrap
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from xml.etree import ElementTree as StdlibElementTree
@@ -58,6 +58,7 @@ from scripts.functional_acceptance import (
     _signature_payload,
     _trusted_policy,
     _validate_external_provenance,
+    evaluate_contract,
     load_manifest,
 )
 from scripts.postgres_acceptance import (
@@ -2825,6 +2826,56 @@ def test_machine_child_evidence_rejects_minimal_self_reported_success(
 
     assert accepted is False
     assert evidence_sha256 is None
+
+
+def test_functional_child_contract_survives_persisted_json_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    manifest = load_manifest(repository / "docs/functional_acceptance_manifest.json")
+    command_entries = manifest["test_commands"]
+    external_entries = manifest["external_evidence"]
+    assert isinstance(command_entries, list)
+    assert isinstance(external_entries, list)
+    emitted_document = {
+        "schema_version": 2,
+        "profile": "source",
+        "source_verdict": "PASS",
+        "runtime_functional_verdict": "BLOCKED",
+        "verdict": "PASS",
+        "contract": asdict(evaluate_contract(repository, manifest)),
+        "test_commands": [
+            {"command_id": entry["id"]} for entry in command_entries if isinstance(entry, dict)
+        ],
+        "external_evidence": {
+            "verdict": "BLOCKED",
+            "results": [
+                {
+                    "evidence_id": entry["id"],
+                    "status": "blocked",
+                    "summary": "external runtime evidence is unavailable in source profile",
+                }
+                for entry in external_entries
+                if isinstance(entry, dict)
+            ],
+        },
+        "kind": "functional-acceptance",
+        "target": GateIdentity("a" * 40, "b" * 64, "c" * 32).target(),
+        "status": "complete",
+        "policy_status": "passed",
+    }
+    persisted_document = json.loads(json.dumps(emitted_document))
+    monkeypatch.setattr(
+        acceptance_module,
+        "_validate_functional_test_result",
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert acceptance_module._validate_functional_child_document(
+        persisted_document,
+        repository=repository,
+        identity=GateIdentity("a" * 40, "b" * 64, "c" * 32),
+    )
 
 
 def _write_child_junit(
