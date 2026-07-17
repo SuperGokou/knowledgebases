@@ -59,6 +59,8 @@ def _write_scanner(parent: Path) -> tuple[Path, str]:
 
 def _fake_runner(command: Sequence[str], environment: dict[str, str], timeout: int) -> None:
     assert command[1] == "scan"
+    assert command[2].startswith("docker:sha256:")
+    assert len(command[2]) == len("docker:sha256:") + 64
     assert command[3] == "-o"
     assert environment["SYFT_CHECK_FOR_APP_UPDATE"] == "false"
     assert not {key.casefold() for key in environment} & {

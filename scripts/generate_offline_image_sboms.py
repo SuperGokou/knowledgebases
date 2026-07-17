@@ -305,7 +305,12 @@ def generate_image_sboms(
             command = [
                 str(scanner_path),
                 "scan",
-                image.reference,
+                # The release reference names the target host's loopback
+                # Registry and is intentionally unavailable after the isolated
+                # build Registry stops. Scan the already verified local Docker
+                # image by its exact config digest to prevent network fallback
+                # while retaining the final reference in the signed evidence.
+                f"docker:{image.config_id}",
                 "-o",
                 f"cyclonedx-json={raw_path}",
             ]
