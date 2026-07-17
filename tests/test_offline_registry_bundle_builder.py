@@ -462,6 +462,17 @@ def test_builder_uses_atomic_publish_lock_and_owned_failure_cleanup() -> None:
     assert "Remove-OwnedRegistryIfPresent" in script
     assert "Remove-OwnedNetworkIfPresent" in script
     assert "cleanup incomplete" in script
+    assert "[IO.Path]::GetPathRoot($output)" in script
+    assert 'Join-Path $outputVolumeRoot ".hkb-$runId"' in script
+    assert "Join-Path $workspace 'b'" in script
+    assert 'Join-Path $outputParent ".$leaf.work.$runId"' not in script
+    assert "temporary workspace identity collided with an existing path" in script
+    assert "temporary workspace must remain outside the Git repository" in script
+    assert "temporary workspace must not be a symbolic link or reparse point" in script
+    assert "$primaryFailure = $null" in script
+    assert "catch {\n    $primaryFailure = $_\n}\nfinally {" in script
+    assert "$($primaryFailure.Exception.Message); cleanup incomplete:" in script
+    assert "throw $primaryFailure" in script
     assert "temporary Registry ownership changed; manual cleanup is required" in script
     assert "temporary network ownership changed; manual cleanup is required" in script
     assert "'--publish', '127.0.0.1:0:5000/tcp'" in script
@@ -486,6 +497,45 @@ def test_builder_uses_atomic_publish_lock_and_owned_failure_cleanup() -> None:
     assert "'{{json .Labels}}'" in script
     assert '{{ index .Config.Labels "io.heyi.bundle-builder.run" }}' not in script
     assert '{{ index .Labels "io.heyi.bundle-builder.run" }}' not in script
+
+
+def test_builder_bounds_fixed_registry_paths_below_legacy_windows_max_path() -> None:
+    compose = COMPOSE.read_text(encoding="utf-8")
+    fixed_references = re.findall(
+        r"(?m)^\s+image:\s+"
+        r"(127\.0\.0\.1:5000/heyi-mirror/\S+@sha256:[0-9a-f]{64})\s*$",
+        compose,
+    )
+    assert fixed_references
+
+    workspace = "C:\\.hkb-" + ("a" * 32)
+    candidate_lengths: list[int] = []
+    for reference in fixed_references:
+        repository_and_tag, digest = reference.rsplit("@sha256:", maxsplit=1)
+        repository_and_tag = repository_and_tag.removeprefix("127.0.0.1:5000/")
+        repository, tag = repository_and_tag.rsplit(":", maxsplit=1)
+        manifest_path = "\\".join(
+            (
+                workspace,
+                "b",
+                "registry",
+                "docker",
+                "registry",
+                "v2",
+                "repositories",
+                *repository.split("/"),
+                "_manifests",
+                "tags",
+                tag,
+                "index",
+                "sha256",
+                digest,
+            )
+        )
+        candidate_lengths.append(len(manifest_path))
+
+    assert max(candidate_lengths) < 260
+    assert max(candidate_lengths) > 200
 
 
 def test_builder_creates_a_deterministic_root_owned_posix_tar() -> None:

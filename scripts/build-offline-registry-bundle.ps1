@@ -817,12 +817,21 @@ Invoke-Quiet $tar @('--version') 'POSIX tar support is unavailable'
 $leaf = Split-Path -Leaf $output
 $runId = [Guid]::NewGuid().ToString('N')
 $lockPath = Join-Path $outputParent ".$leaf.lock"
-$workspace = Join-Path $outputParent ".$leaf.work.$runId"
+$outputVolumeRoot = [IO.Path]::GetPathRoot($output)
+if (-not $outputVolumeRoot -or $outputVolumeRoot -notmatch '^[A-Za-z]:\\$') {
+    Fail 'output directory must be on a local Windows volume'
+}
+# Registry v2 paths can exceed the legacy Windows MAX_PATH limit when they
+# inherit a user-profile/output prefix. Keep the ephemeral build workspace
+# unique and at the output volume root; only the flat publish directory stays
+# beside the requested output for the final atomic rename.
+$workspace = Join-Path $outputVolumeRoot ".hkb-$runId"
 $publish = Join-Path $outputParent ".$leaf.publish.$runId"
 $lockStream = $null
 $registryContainerId = ''
 $registryNetworkId = ''
 $published = $false
+$primaryFailure = $null
 
 try {
     try {
@@ -841,10 +850,20 @@ try {
     $lockStream.Write($lockBytes, 0, $lockBytes.Length)
     $lockStream.Flush($true)
 
+    if (Test-Path -LiteralPath $workspace) {
+        Fail 'temporary workspace identity collided with an existing path'
+    }
+    if (Test-IsWithin $workspace $repository) {
+        Fail 'temporary workspace must remain outside the Git repository'
+    }
     [void][IO.Directory]::CreateDirectory($workspace)
+    $workspaceItem = Get-Item -LiteralPath $workspace -Force
+    if (($workspaceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'temporary workspace must not be a symbolic link or reparse point'
+    }
     [void][IO.Directory]::CreateDirectory($publish)
-    $snapshotTar = Join-Path $workspace 'source.tar'
-    $sourceRoot = Join-Path $workspace 'source'
+    $snapshotTar = Join-Path $workspace 's.tar'
+    $sourceRoot = Join-Path $workspace 's'
     [void][IO.Directory]::CreateDirectory($sourceRoot)
     Invoke-Quiet $git @(
         '-C', $repository, 'archive', '--format=tar', "--output=$snapshotTar", $gitHead
@@ -877,7 +896,7 @@ try {
         }
     }
 
-    $publicKey = Join-Path $workspace 'release-public.pem'
+    $publicKey = Join-Path $workspace 'pub.pem'
     Invoke-Quiet $openssl @('pkey', '-in', $key, '-pubout', '-out', $publicKey) `
         'signing key cannot produce a public key'
     $publicDescription = @(Invoke-Captured $openssl @(
@@ -930,7 +949,7 @@ try {
     Write-AsciiFile $bootstrapChecksum @("$(Get-Sha256 $bootstrapTar)  $bootstrapTarName")
     Sign-And-Verify $openssl $key $publicKey $bootstrapChecksum "$bootstrapChecksum.sig"
 
-    $bundleRoot = Join-Path $workspace 'offline-registry-bundle'
+    $bundleRoot = Join-Path $workspace 'b'
     $registryData = Join-Path $bundleRoot 'registry'
     $releaseRoot = Join-Path $bundleRoot 'release'
     [void][IO.Directory]::CreateDirectory($registryData)
@@ -1239,6 +1258,9 @@ try {
     Write-Output "REGISTRY_UNPACKED_BYTES=$registryUnpackedBytes"
     Write-Output "REGISTRY_UNPACKED_INODES=$registryUnpackedInodes"
 }
+catch {
+    $primaryFailure = $_
+}
 finally {
     $cleanupFailures = New-Object 'System.Collections.Generic.List[string]'
     if ($registryContainerId) {
@@ -1289,6 +1311,14 @@ finally {
         }
     }
     if ($cleanupFailures.Count -ne 0) {
+        if ($null -ne $primaryFailure) {
+            throw ("offline-bundle-builder: build failed: " +
+                "$($primaryFailure.Exception.Message); cleanup incomplete: " +
+                "$($cleanupFailures -join '; ')")
+        }
         throw "offline-bundle-builder: cleanup incomplete: $($cleanupFailures -join '; ')"
     }
+}
+if ($null -ne $primaryFailure) {
+    throw $primaryFailure
 }
