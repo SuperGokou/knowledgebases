@@ -11,7 +11,7 @@ import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import type { KnowledgeBase } from "@/lib/types";
 
 export function KnowledgePanel() {
-  const { can, canAny, loading: accessLoading } = useAccess();
+  const { can, canAny, me, loading: accessLoading } = useAccess();
   const feedback = useActionFeedback();
   const actionLock = useRef(createActionLock()).current;
   const [items, setItems] = useState<KnowledgeBase[] | null>(null);
@@ -21,6 +21,7 @@ export function KnowledgePanel() {
   const [description, setDescription] = useState("");
   const [externalProcessing, setExternalProcessing] = useState(false);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
   const load = useCallback(async () => {
@@ -80,7 +81,7 @@ export function KnowledgePanel() {
   }
 
   async function toggleExternalProcessing(item: KnowledgeBase) {
-    if (pending || updatingId !== null) return;
+    if (pending || updatingId !== null || deletingId !== null) return;
     const enabled = !item.external_llm_processing_enabled;
     if (enabled && !window.confirm("开启后，符合条件的 TXT/CSV 内容会发送给当前启用的外部模型生成 OKF 草稿。确认该知识空间允许外部模型处理吗？")) {
       return;
@@ -109,6 +110,31 @@ export function KnowledgePanel() {
     }
   }
 
+  async function removeKnowledgeBase(item: KnowledgeBase) {
+    if (pending || updatingId !== null || deletingId !== null) return;
+    const canDelete = Boolean(me && (me.is_superuser || item.owner_id === me.id));
+    if (!canDelete) return;
+    if (!window.confirm(`确认删除知识空间“${item.name}”吗？知识条目及授权会一并删除，原始上传文件仍会保留。此操作不可撤销。`)) {
+      return;
+    }
+    if (!actionLock.acquire()) return;
+    setDeletingId(item.id);
+    setError("");
+    feedback.dismiss();
+    try {
+      await apiRequest<void>(`/api/v1/knowledge-bases/${item.id}`, { method: "DELETE" });
+      setItems((current) => current?.filter((candidate) => candidate.id !== item.id) ?? []);
+      feedback.success(`知识空间“${item.name}”已删除，原始上传文件仍然保留。`, "知识空间删除成功");
+    } catch (reason) {
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "知识空间删除失败");
+    } finally {
+      actionLock.release();
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div className="page-stack">
       <section className="knowledge-hero">
@@ -134,7 +160,7 @@ export function KnowledgePanel() {
                   <button
                     className="button secondary compact-button"
                     type="button"
-                    disabled={pending || updatingId !== null}
+                    disabled={pending || updatingId !== null || deletingId !== null}
                     onClick={() => void toggleExternalProcessing(item)}
                     aria-pressed={item.external_llm_processing_enabled}
                     aria-busy={updatingId === item.id}
@@ -145,6 +171,17 @@ export function KnowledgePanel() {
                       : item.external_llm_processing_enabled
                         ? "外部模型自动转换：已开启"
                         : "外部模型自动转换：未开启"}
+                  </button>
+                ) : null}
+                {me && (me.is_superuser || item.owner_id === me.id) ? (
+                  <button
+                    className="button danger compact-button"
+                    type="button"
+                    disabled={pending || updatingId !== null || deletingId !== null}
+                    onClick={() => void removeKnowledgeBase(item)}
+                    aria-busy={deletingId === item.id}
+                  >
+                    {deletingId === item.id ? <><span className="spinner" />删除中…</> : "删除"}
                   </button>
                 ) : null}
                 <StatusBadge tone={item.access_level === "manager" ? "success" : "neutral"}>
@@ -176,7 +213,7 @@ export function KnowledgePanel() {
                 />
                 <span><strong>允许当前外部模型自动转换</strong><small>仅第一阶段支持 UTF-8 TXT/CSV；内容会发送到后台选定的 DeepSeek、Qwen 或 MiniMax，默认关闭。</small></span>
               </label>
-              <div className="form-actions full"><button className="button primary" type="submit" disabled={pending || updatingId !== null || !name.trim()} aria-busy={pending}>{pending ? <><span className="spinner" />正在创建…</> : "创建空间"}</button></div>
+              <div className="form-actions full"><button className="button primary" type="submit" disabled={pending || updatingId !== null || deletingId !== null || !name.trim()} aria-busy={pending}>{pending ? <><span className="spinner" />正在创建…</> : "创建空间"}</button></div>
             </form>
           </details>
         ) : null}

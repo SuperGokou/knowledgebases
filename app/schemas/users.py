@@ -27,6 +27,10 @@ class UserUpdate(BaseModel):
         return value
 
 
+class UserPasswordReset(BaseModel):
+    password: str = Field(min_length=12, max_length=256)
+
+
 class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

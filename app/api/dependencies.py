@@ -198,6 +198,18 @@ def require_any_permission(*permissions: str) -> Callable[..., object]:
     return dependency
 
 
+async def require_authenticated_access(
+    response: Response,
+    access: Annotated[AccessContext, Depends(get_access_context)],
+    redis: Annotated[Redis, Depends(redis_dependency)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AccessContext:
+    """Require a live user session while retaining the account rate limit."""
+
+    await _enforce_access_rate_limit(response, access, redis, settings)
+    return access
+
+
 async def get_api_key_access(
     cleartext: Annotated[str | None, Depends(api_key_header)],
     request: Request,

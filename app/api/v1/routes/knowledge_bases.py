@@ -7,7 +7,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import Select, delete, func, select
 
-from app.api.dependencies import DatabaseSession, require_any_permission, require_permission
+from app.api.dependencies import (
+    DatabaseSession,
+    require_any_permission,
+    require_authenticated_access,
+    require_permission,
+)
 from app.api.egress_leases import deny_if_active_external_llm_egress
 from app.api.errors import ApiError
 from app.core.config import Settings, get_settings
@@ -239,6 +244,70 @@ async def update_knowledge_base(
     await session.commit()
     await session.refresh(item.knowledge_base)
     return _knowledge_base_read(item)
+
+
+@router.delete("/{knowledge_base_id}", status_code=204)
+async def delete_knowledge_base(
+    knowledge_base_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_authenticated_access)],
+) -> Response:
+    knowledge_base = await session.scalar(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.id == knowledge_base_id)
+        .with_for_update()
+    )
+    if knowledge_base is None:
+        raise ApiError(
+            status_code=404,
+            code="knowledge_base_not_found",
+            message="Knowledge base not found",
+        )
+    if not access.user.is_superuser and knowledge_base.owner_id != access.user.id:
+        add_audit_event(
+            session,
+            actor_id=access.user.id,
+            action="knowledge_base.delete_denied",
+            result=AuditResult.DENIED,
+            resource_type="knowledge_base",
+            resource_id=str(knowledge_base_id),
+            request_id=getattr(request.state, "request_id", None),
+            details={"reason_code": "owner_or_superuser_required"},
+        )
+        await session.commit()
+        raise ApiError(
+            status_code=403,
+            code="knowledge_base_delete_denied",
+            message="Only the knowledge base owner or a superuser can delete it",
+        )
+
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="knowledge_base_delete",
+        resource_type="knowledge_base",
+        resource_id=str(knowledge_base_id),
+        knowledge_base_id=knowledge_base_id,
+    )
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="knowledge_base.deleted",
+        result=AuditResult.SUCCESS,
+        resource_type="knowledge_base",
+        resource_id=str(knowledge_base_id),
+        request_id=getattr(request.state, "request_id", None),
+        details={
+            "knowledge_base_name": knowledge_base.name,
+            "owner_id": str(knowledge_base.owner_id),
+            "source_files_preserved": True,
+        },
+    )
+    await session.delete(knowledge_base)
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.get(

@@ -10,7 +10,12 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy import and_, exists, false, func, or_, select, text
 
-from app.api.dependencies import DatabaseSession, get_storage_service, require_permission
+from app.api.dependencies import (
+    DatabaseSession,
+    get_storage_service,
+    require_authenticated_access,
+    require_permission,
+)
 from app.api.errors import ApiError
 from app.core.config import Settings, get_settings
 from app.core.time import as_utc
@@ -1141,6 +1146,102 @@ async def approve_processed_file(
     await session.commit()
     await session.refresh(file)
     return file
+
+
+@router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_file(
+    file_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_authenticated_access)],
+    storage: Annotated[StorageService, Depends(get_storage_service)],
+) -> None:
+    file = await session.scalar(
+        select(File)
+        .where(File.id == file_id, File.deleted_at.is_(None))
+        .with_for_update()
+    )
+    if file is None:
+        raise ApiError(status_code=404, code="file_not_found", message="File not found")
+
+    if not access.user.is_superuser and file.owner_id != access.user.id:
+        add_audit_event(
+            session,
+            actor_id=access.user.id,
+            action="file.delete",
+            result=AuditResult.DENIED,
+            resource_type="file",
+            resource_id=str(file.id),
+            request_id=getattr(request.state, "request_id", None),
+            ip_address=request.client.host if request.client else None,
+            details={"reason": "not_file_owner"},
+        )
+        await session.commit()
+        raise ApiError(
+            status_code=403,
+            code="file_delete_denied",
+            message="Only the file owner or a super administrator can delete this file",
+        )
+
+    object_key = file.object_key
+    owner_id = file.owner_id
+    actor_id = access.user.id
+    try:
+        # S3-compatible DELETE is idempotent: a missing object is already clean.
+        await storage.delete(key=object_key)
+    except Exception as error:
+        await session.rollback()
+        add_audit_event(
+            session,
+            actor_id=actor_id,
+            action="file.delete",
+            result=AuditResult.FAILURE,
+            resource_type="file",
+            resource_id=str(file_id),
+            request_id=getattr(request.state, "request_id", None),
+            ip_address=request.client.host if request.client else None,
+            details={"reason": "object_storage_delete_failed"},
+        )
+        await session.commit()
+        raise ApiError(
+            status_code=503,
+            code="file_storage_delete_failed",
+            message="File storage is temporarily unavailable; the file was not deleted",
+        ) from error
+
+    deleted_at = datetime.now(UTC)
+    file.status = FileStatus.DELETED
+    file.deleted_at = deleted_at
+    entries = list(
+        (
+            await session.scalars(
+                select(KnowledgeEntry)
+                .where(
+                    KnowledgeEntry.source_file_id == file.id,
+                    KnowledgeEntry.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    for entry in entries:
+        entry.deleted_at = deleted_at
+
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="file.deleted",
+        result=AuditResult.SUCCESS,
+        resource_type="file",
+        resource_id=str(file.id),
+        request_id=getattr(request.state, "request_id", None),
+        ip_address=request.client.host if request.client else None,
+        details={
+            "owner_id": str(owner_id),
+            "source_entries_deleted": len(entries),
+        },
+    )
+    await session.commit()
 
 
 @router.post("/{file_id}/download", response_model=DownloadGrant)

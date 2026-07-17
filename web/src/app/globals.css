@@ -410,7 +410,7 @@ tbody tr:hover { background: #fbfbfd; }
 .feature-list { display: grid; gap: 2px; }
 .feature-link { display: grid; grid-template-columns: 38px minmax(0,1fr) 20px; align-items: center; gap: 12px; padding: 14px 4px; border-bottom: 1px solid #eff0f4; }
 .feature-link:last-child { border-bottom: 0; }.feature-link > span:first-child { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 10px; background: #f1f3f8; color: #667086; }.feature-link svg { width: 16px; height: 16px; }.feature-link strong { display: block; margin-bottom: 4px; color: #353b4b; font-size: 11px; }.feature-link small { color: var(--muted); font-size: 9px; }.feature-link > svg { color: #b1b6c2; }
-.knowledge-space-row { grid-template-columns: 38px minmax(150px,1fr) auto auto; }
+.knowledge-space-row { grid-template-columns: 38px minmax(150px,1fr) auto auto auto; }
 .compact-button { min-height: 32px; padding: 7px 10px; font-size: 9px; white-space: nowrap; }
 .consent-control { display: flex !important; flex-direction: row !important; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fafbfc; }
 .consent-control input { width: 16px; height: 16px; min-height: 0; margin-top: 2px; }

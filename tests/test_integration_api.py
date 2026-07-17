@@ -25,9 +25,13 @@ from app.core.security import PasswordService
 from app.db.base import Base
 from app.db.models import (
     ApiKey,
+    AuditLog,
+    AuditResult,
     File,
     FileStatus,
     KnowledgeBase,
+    KnowledgeBaseAccessLevel,
+    KnowledgeBaseRoleGrant,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
     KnowledgeIngestionStatus,
@@ -84,6 +88,7 @@ class FakeStorage:
     promoted_keys: list[tuple[str, str]] = field(default_factory=list)
     sealed_keys: list[tuple[str, str]] = field(default_factory=list)
     object_bytes: bytes = b"clean test object"
+    delete_error: Exception | None = None
 
     async def initiate(self, **kwargs: Any) -> InitiatedStorageUpload:
         key = str(kwargs["key"])
@@ -143,6 +148,8 @@ class FakeStorage:
         self.deleted_keys.append(key)
 
     async def delete(self, *, key: str) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
         self.deleted_keys.append(key)
 
     async def seal_single_upload(self, *, key: str, upload_session_id: str) -> None:
@@ -514,6 +521,141 @@ async def test_single_upload_approval_and_download_workflow(api_harness: ApiHarn
     listed = await api_harness.client.get("/api/v1/files", headers=headers)
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == file_id
+
+
+@pytest.mark.asyncio
+async def test_file_delete_enforces_owner_or_superuser_and_cleans_source_entries(
+    api_harness: ApiHarness,
+) -> None:
+    owner_password = "File-owner-password-123!"
+    outsider_password = "File-outsider-password-123!"
+    async with api_harness.session_factory() as session:
+        admin = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert admin is not None
+        admin.is_superuser = True
+
+        owner = User(
+            email="file-owner@example.com",
+            password_hash=PasswordService().hash(owner_password),
+        )
+        outsider = User(
+            email="file-outsider@example.com",
+            password_hash=PasswordService().hash(outsider_password),
+        )
+        # No role or file permission is assigned: database ownership is the grant.
+        session.add_all([owner, outsider])
+        await session.flush()
+        knowledge_base = KnowledgeBase(owner_id=owner.id, name="File deletion tests")
+        session.add(knowledge_base)
+        await session.flush()
+
+        files = [
+            File(
+                owner_id=owner.id,
+                knowledge_base_id=knowledge_base.id,
+                bucket="kb",
+                object_key=f"objects/delete-{label}-{uuid4()}.txt",
+                original_name=f"{label}.txt",
+                extension=".txt",
+                content_type="text/plain",
+                size_bytes=10,
+                status=FileStatus.AVAILABLE,
+            )
+            for label in ("owner", "superuser", "storage-failure")
+        ]
+        session.add_all(files)
+        await session.flush()
+        entries = [
+            KnowledgeEntry(
+                knowledge_base_id=knowledge_base.id,
+                source_file_id=file.id,
+                entry_type="document",
+                title=file.original_name,
+                content="searchable source text",
+            )
+            for file in files
+        ]
+        session.add_all(entries)
+        await session.commit()
+        owner_id = owner.id
+        outsider_id = outsider.id
+        file_ids = [file.id for file in files]
+        object_keys = [file.object_key for file in files]
+        entry_ids = [entry.id for entry in entries]
+
+    async def login(email: str, password: str) -> dict[str, str]:
+        response = await api_harness.client.post(
+            "/api/v1/auth/token",
+            data={"username": email, "password": password},
+        )
+        assert response.status_code == 200, response.text
+        return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+    owner_headers = await login("file-owner@example.com", owner_password)
+    outsider_headers = await login("file-outsider@example.com", outsider_password)
+    admin_headers = {
+        "Authorization": f"Bearer {(await api_harness.login())['access_token']}"
+    }
+
+    # Ownership alone is sufficient: this account has neither file:read nor file:delete.
+    owner_delete = await api_harness.client.delete(
+        f"/api/v1/files/{file_ids[0]}", headers=owner_headers
+    )
+    assert owner_delete.status_code == 204, owner_delete.text
+
+    denied = await api_harness.client.delete(
+        f"/api/v1/files/{file_ids[1]}", headers=outsider_headers
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "file_delete_denied"
+
+    superuser_delete = await api_harness.client.delete(
+        f"/api/v1/files/{file_ids[1]}", headers=admin_headers
+    )
+    assert superuser_delete.status_code == 204, superuser_delete.text
+
+    api_harness.storage.delete_error = RuntimeError("storage offline")
+    failed = await api_harness.client.delete(
+        f"/api/v1/files/{file_ids[2]}", headers=owner_headers
+    )
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "file_storage_delete_failed"
+    api_harness.storage.delete_error = None
+
+    assert api_harness.storage.deleted_keys == object_keys[:2]
+    async with api_harness.session_factory() as session:
+        persisted_files = [await session.get(File, file_id) for file_id in file_ids]
+        persisted_entries = [await session.get(KnowledgeEntry, entry_id) for entry_id in entry_ids]
+        assert all(item is not None for item in persisted_files)
+        assert all(item is not None for item in persisted_entries)
+        assert persisted_files[0].status is FileStatus.DELETED  # type: ignore[union-attr]
+        assert persisted_files[0].deleted_at is not None  # type: ignore[union-attr]
+        assert persisted_entries[0].deleted_at is not None  # type: ignore[union-attr]
+        assert persisted_files[1].status is FileStatus.DELETED  # type: ignore[union-attr]
+        assert persisted_entries[1].deleted_at is not None  # type: ignore[union-attr]
+        assert persisted_files[2].status is FileStatus.AVAILABLE  # type: ignore[union-attr]
+        assert persisted_files[2].deleted_at is None  # type: ignore[union-attr]
+        assert persisted_entries[2].deleted_at is None  # type: ignore[union-attr]
+
+        audits = list(
+            (
+                await session.scalars(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.resource_type == "file",
+                        AuditLog.resource_id.in_([str(file_id) for file_id in file_ids]),
+                        AuditLog.action.in_(["file.delete", "file.deleted"]),
+                    )
+                    .order_by(AuditLog.id)
+                )
+            ).all()
+        )
+        assert [(audit.actor_id, audit.result) for audit in audits] == [
+            (owner_id, AuditResult.SUCCESS),
+            (outsider_id, AuditResult.DENIED),
+            (admin.id, AuditResult.SUCCESS),
+            (owner_id, AuditResult.FAILURE),
+        ]
 
 
 @pytest.mark.parametrize(
@@ -1161,6 +1303,162 @@ async def test_admin_rejects_duplicate_and_unknown_user_role_mutations(
             f"/api/v1/users/{missing}", headers=headers, json={"display_name": "Missing"}
         )
     ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_only_superuser_can_delete_unowned_user_account(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    blocked_target = await api_harness.client.post(
+        "/api/v1/users",
+        headers=headers,
+        json={"email": "owns-data@example.com", "password": "Owns-data-password-123!"},
+    )
+    deletable_target = await api_harness.client.post(
+        "/api/v1/users",
+        headers=headers,
+        json={"email": "delete-me@example.com", "password": "Delete-me-password-123!"},
+    )
+    assert blocked_target.status_code == 201
+    assert deletable_target.status_code == 201
+
+    target_id = UUID(deletable_target.json()["id"])
+    denied = await api_harness.client.delete(f"/api/v1/users/{target_id}", headers=headers)
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "superuser_required"
+
+    async with api_harness.session_factory() as session:
+        admin = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert admin is not None
+        admin.is_superuser = True
+        blocked_user_id = UUID(blocked_target.json()["id"])
+        knowledge_base = KnowledgeBase(owner_id=blocked_user_id, name="保留数据")
+        session.add(knowledge_base)
+        await session.flush()
+        session.add(
+            File(
+                owner_id=blocked_user_id,
+                knowledge_base_id=knowledge_base.id,
+                bucket="kb",
+                object_key=f"objects/user-delete-blocked-{uuid4()}.txt",
+                original_name="保留文件.txt",
+                extension=".txt",
+                content_type="text/plain",
+                size_bytes=1,
+            )
+        )
+        await session.commit()
+        admin_id = admin.id
+
+    self_delete = await api_harness.client.delete(f"/api/v1/users/{admin_id}", headers=headers)
+    assert self_delete.status_code == 409
+    assert self_delete.json()["error"]["code"] == "self_delete_denied"
+
+    owns_data = await api_harness.client.delete(f"/api/v1/users/{blocked_user_id}", headers=headers)
+    assert owns_data.status_code == 409
+    assert owns_data.json()["error"]["code"] == "user_owns_resources"
+    assert owns_data.json()["error"]["details"] == {
+        "owned_files": 1,
+        "owned_knowledge_bases": 1,
+    }
+
+    deleted = await api_harness.client.delete(f"/api/v1/users/{target_id}", headers=headers)
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+
+    async with api_harness.session_factory() as session:
+        assert await session.get(User, target_id) is None
+        audit = await session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "user.deleted",
+                AuditLog.resource_id == str(target_id),
+            )
+        )
+        assert audit is not None
+        assert audit.actor_id == admin_id
+        assert audit.details["email"] == "delete-me@example.com"
+
+
+@pytest.mark.asyncio
+async def test_only_superuser_can_reset_password_and_existing_sessions_are_revoked(
+    api_harness: ApiHarness,
+) -> None:
+    admin_tokens = await api_harness.login()
+    admin_headers = {"Authorization": f"Bearer {admin_tokens['access_token']}"}
+    old_password = "Original-password-123!"
+    new_password = "Replacement-password-456!"
+    created = await api_harness.client.post(
+        "/api/v1/users",
+        headers=admin_headers,
+        json={"email": "password-target@example.com", "password": old_password},
+    )
+    assert created.status_code == 201
+    target_id = UUID(created.json()["id"])
+    target_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "password-target@example.com", "password": old_password},
+    )
+    assert target_login.status_code == 200
+
+    denied = await api_harness.client.put(
+        f"/api/v1/users/{target_id}/password",
+        headers=admin_headers,
+        json={"password": new_password},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "superuser_required"
+
+    async with api_harness.session_factory() as session:
+        admin = await session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert admin is not None
+        admin.is_superuser = True
+        await session.commit()
+        admin_id = admin.id
+
+    too_short = await api_harness.client.put(
+        f"/api/v1/users/{target_id}/password",
+        headers=admin_headers,
+        json={"password": "short"},
+    )
+    assert too_short.status_code == 422
+    reset = await api_harness.client.put(
+        f"/api/v1/users/{target_id}/password",
+        headers=admin_headers,
+        json={"password": new_password},
+    )
+    assert reset.status_code == 204
+    assert reset.content == b""
+
+    revoked_access = await api_harness.client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {target_login.json()['access_token']}"},
+    )
+    assert revoked_access.status_code == 401
+    assert revoked_access.json()["error"]["code"] == "token_revoked"
+    old_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "password-target@example.com", "password": old_password},
+    )
+    assert old_login.status_code == 401
+    new_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": "password-target@example.com", "password": new_password},
+    )
+    assert new_login.status_code == 200
+
+    async with api_harness.session_factory() as session:
+        audit = await session.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "user.password_reset",
+                AuditLog.resource_id == str(target_id),
+            )
+        )
+        assert audit is not None
+        assert audit.actor_id == admin_id
+        assert audit.details == {"sessions_revoked": True}
 
 
 @pytest.mark.asyncio
@@ -3226,3 +3524,129 @@ async def test_bulk_watermark_stops_new_part_urls_for_an_existing_session(
 
     assert response.status_code == 507
     assert response.json()["error"]["code"] == "storage_bulk_uploads_paused"
+
+
+@pytest.mark.asyncio
+async def test_knowledge_base_delete_enforces_owner_or_superuser_and_preserves_files(
+    api_harness: ApiHarness,
+) -> None:
+    async with api_harness.session_factory() as session:
+        await session.execute(text("PRAGMA foreign_keys=ON"))
+        admin_role = await session.scalar(select(Role).where(Role.code == "admin"))
+        assert admin_role is not None
+        owner = User(
+            email="knowledge-owner@example.com",
+            password_hash=PasswordService().hash("Owner-password-123!"),
+        )
+        superuser = User(
+            email="knowledge-superuser@example.com",
+            password_hash=PasswordService().hash("Superuser-password-123!"),
+            is_superuser=True,
+        )
+        session.add_all([owner, superuser])
+        await session.flush()
+
+        owner_knowledge_base = KnowledgeBase(owner_id=owner.id, name="Owner deletable")
+        session.add(owner_knowledge_base)
+        await session.flush()
+        source_file = File(
+            owner_id=owner.id,
+            knowledge_base_id=owner_knowledge_base.id,
+            bucket="kb",
+            object_key=f"objects/preserved-{uuid4()}.txt",
+            original_name="preserved.txt",
+            extension=".txt",
+            content_type="text/plain",
+            size_bytes=9,
+        )
+        session.add(source_file)
+        await session.flush()
+        entry = KnowledgeEntry(
+            knowledge_base_id=owner_knowledge_base.id,
+            source_file_id=source_file.id,
+            entry_type="document",
+            title="Delete with space",
+            content="knowledge",
+        )
+        grant = KnowledgeBaseRoleGrant(
+            knowledge_base_id=owner_knowledge_base.id,
+            role_id=admin_role.id,
+            access_level=KnowledgeBaseAccessLevel.READER,
+            granted_by=owner.id,
+        )
+        session.add_all([entry, grant])
+
+        manager_knowledge_base = KnowledgeBase(owner_id=owner.id, name="Manager cannot delete")
+        session.add(manager_knowledge_base)
+        await session.flush()
+        manager_grant = KnowledgeBaseRoleGrant(
+            knowledge_base_id=manager_knowledge_base.id,
+            role_id=admin_role.id,
+            access_level=KnowledgeBaseAccessLevel.MANAGER,
+            granted_by=owner.id,
+        )
+        session.add(manager_grant)
+        await session.commit()
+        owner_knowledge_base_id = owner_knowledge_base.id
+        manager_knowledge_base_id = manager_knowledge_base.id
+        source_file_id = source_file.id
+        entry_id = entry.id
+        grant_id = grant.id
+
+    owner_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={"username": owner.email, "password": "Owner-password-123!"},
+    )
+    assert owner_login.status_code == 200, owner_login.text
+    owner_deleted = await api_harness.client.delete(
+        f"/api/v1/knowledge-bases/{owner_knowledge_base_id}",
+        headers={"Authorization": f"Bearer {owner_login.json()['access_token']}"},
+    )
+    assert owner_deleted.status_code == 204, owner_deleted.text
+
+    async with api_harness.session_factory() as session:
+        assert await session.get(KnowledgeBase, owner_knowledge_base_id) is None
+        assert await session.get(KnowledgeEntry, entry_id) is None
+        assert await session.get(KnowledgeBaseRoleGrant, grant_id) is None
+        preserved_file = await session.get(File, source_file_id)
+        assert preserved_file is not None
+        assert preserved_file.knowledge_base_id is None
+
+    admin_tokens = await api_harness.login()
+    manager_denied = await api_harness.client.delete(
+        f"/api/v1/knowledge-bases/{manager_knowledge_base_id}",
+        headers={"Authorization": f"Bearer {admin_tokens['access_token']}"},
+    )
+    assert manager_denied.status_code == 403, manager_denied.text
+    assert manager_denied.json()["error"]["code"] == "knowledge_base_delete_denied"
+
+    superuser_login = await api_harness.client.post(
+        "/api/v1/auth/token",
+        data={
+            "username": superuser.email,
+            "password": "Superuser-password-123!",
+        },
+    )
+    assert superuser_login.status_code == 200, superuser_login.text
+    superuser_deleted = await api_harness.client.delete(
+        f"/api/v1/knowledge-bases/{manager_knowledge_base_id}",
+        headers={"Authorization": f"Bearer {superuser_login.json()['access_token']}"},
+    )
+    assert superuser_deleted.status_code == 204, superuser_deleted.text
+
+    async with api_harness.session_factory() as session:
+        assert await session.get(KnowledgeBase, manager_knowledge_base_id) is None
+        actions = list(
+            (
+                await session.scalars(
+                    select(AuditLog.action).where(
+                        AuditLog.resource_type == "knowledge_base",
+                        AuditLog.resource_id.in_(
+                            [str(owner_knowledge_base_id), str(manager_knowledge_base_id)]
+                        ),
+                    )
+                )
+            ).all()
+        )
+        assert actions.count("knowledge_base.deleted") == 2
+        assert actions.count("knowledge_base.delete_denied") == 1

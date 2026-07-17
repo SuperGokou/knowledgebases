@@ -7,8 +7,9 @@ import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { createActionLock } from "@/lib/action-lock";
-import { apiRequest, readableError } from "@/lib/api-client";
+import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import type { Role, User, UserStatus } from "@/lib/types";
+import { canDeleteUser, deleteUser } from "@/lib/user-deletion";
 
 const statusLabel: Record<UserStatus, string> = { active: "正常", disabled: "已停用", locked: "已锁定" };
 const statusTone: Record<UserStatus, "success" | "neutral" | "danger"> = { active: "success", disabled: "neutral", locked: "danger" };
@@ -16,10 +17,12 @@ type PendingAction =
   | { type: "create" }
   | { type: "status"; userId: string; status: UserStatus }
   | { type: "roles"; userId: string }
+  | { type: "password"; userId: string }
+  | { type: "delete"; userId: string }
   | null;
 
 export function UsersPanel() {
-  const { can, loading: accessLoading } = useAccess();
+  const { can, loading: accessLoading, me } = useAccess();
   const feedback = useActionFeedback();
   const actionLock = useRef(createActionLock()).current;
   const [users, setUsers] = useState<User[] | null>(null);
@@ -33,6 +36,9 @@ export function UsersPanel() {
   const [newRoleIds, setNewRoleIds] = useState<string[]>([]);
   const [editingUserId, setEditingUserId] = useState("");
   const [editingRoleIds, setEditingRoleIds] = useState<string[]>([]);
+  const [passwordUserId, setPasswordUserId] = useState("");
+  const [resetPassword, setResetPassword] = useState("");
+  const [resetPasswordConfirm, setResetPasswordConfirm] = useState("");
 
   const load = useCallback(async () => {
     if (accessLoading) return;
@@ -139,6 +145,69 @@ export function UsersPanel() {
     }
   }
 
+  async function removeUser(user: User) {
+    const userName = user.display_name || user.email;
+    if (!window.confirm(`确定永久删除账号“${userName}”吗？此操作无法撤销。`)) return;
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "delete", userId: user.id });
+    setError("");
+    try {
+      await deleteUser(user.id, (path, init) => apiRequest<void>(path, init));
+      if (editingUserId === user.id) setEditingUserId("");
+      if (passwordUserId === user.id) setPasswordUserId("");
+      await load();
+      feedback.success(`账号“${userName}”已永久删除。`, "账号已删除");
+    } catch (reason) {
+      const message = reason instanceof ApiClientError && reason.code === "user_owns_resources"
+        ? "该账号仍拥有文件或知识库，请先处理这些资源后再删除账号。"
+        : readableError(reason);
+      setError(message);
+      feedback.error(message, "账号删除失败");
+    } finally {
+      actionLock.release();
+      setPendingAction(null);
+    }
+  }
+
+  async function savePassword(userId: string) {
+    const user = users?.find((item) => item.id === userId);
+    const userName = user?.display_name || user?.email || "当前成员";
+    if (resetPassword.length < 12) {
+      const message = "新密码至少需要 12 位。";
+      setError(message);
+      feedback.error(message, "密码修改失败");
+      return;
+    }
+    if (resetPassword !== resetPasswordConfirm) {
+      const message = "两次输入的密码不一致。";
+      setError(message);
+      feedback.error(message, "密码修改失败");
+      return;
+    }
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "password", userId });
+    setError("");
+    try {
+      await apiRequest<void>(`/api/v1/users/${userId}/password`, {
+        method: "PUT",
+        body: JSON.stringify({ password: resetPassword }),
+      });
+      setPasswordUserId("");
+      setResetPassword("");
+      setResetPasswordConfirm("");
+      feedback.success(`成员“${userName}”的密码已修改，旧登录会话已失效。`, "密码修改成功");
+    } catch (reason) {
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "密码修改失败");
+    } finally {
+      actionLock.release();
+      setPendingAction(null);
+    }
+  }
+
   if (!accessLoading && !can("user:manage")) {
     return <EmptyState icon="lock" title="没有账号管理权限" description="当前角色不包含 user:manage。管理入口已从导航隐藏，FastAPI 仍会执行最终权限校验。" />;
   }
@@ -170,12 +239,35 @@ export function UsersPanel() {
                           ? <><span className="spinner" />{pendingAction.status === "active" ? "正在启用…" : "正在停用…"}</>
                           : user.status === "active" ? "停用" : "启用"}
                       </button>
-                      {can("role:assign") && roles.length ? <button className="button secondary small" type="button" disabled={pending} onClick={() => { setEditingUserId(user.id); setEditingRoleIds(user.role_ids); }}>分配角色</button> : null}
+                      {can("role:assign") && roles.length ? <button className="button secondary small" type="button" disabled={pending} onClick={() => { setPasswordUserId(""); setEditingUserId(user.id); setEditingRoleIds(user.role_ids); }}>分配角色</button> : null}
+                      {me?.is_superuser ? (
+                        <button className="button secondary small" type="button" disabled={pending} onClick={() => { setEditingUserId(""); setPasswordUserId(user.id); setResetPassword(""); setResetPasswordConfirm(""); }}>修改密码</button>
+                      ) : null}
+                      {canDeleteUser(me, user) ? (
+                        <button className="button danger small" type="button" disabled={pending} aria-busy={pendingAction?.type === "delete" && pendingAction.userId === user.id} onClick={() => void removeUser(user)}>
+                          {pendingAction?.type === "delete" && pendingAction.userId === user.id ? <><span className="spinner" />正在删除…</> : "删除"}
+                        </button>
+                      ) : null}
                     </div></td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          </div>
+        ) : null}
+        {passwordUserId ? (
+          <div className="inline-editor">
+            <div><strong>修改账号密码</strong><p>新密码至少 12 位；保存后该账号的旧登录会话会立即失效。</p></div>
+            <div className="form-grid">
+              <label>新密码<input type="password" minLength={12} maxLength={256} value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} autoComplete="new-password" /></label>
+              <label>确认新密码<input type="password" minLength={12} maxLength={256} value={resetPasswordConfirm} onChange={(event) => setResetPasswordConfirm(event.target.value)} autoComplete="new-password" /></label>
+            </div>
+            <div className="form-actions">
+              <button className="button ghost" type="button" disabled={pending} onClick={() => { setPasswordUserId(""); setResetPassword(""); setResetPasswordConfirm(""); }}>取消</button>
+              <button className="button primary" type="button" disabled={pending || resetPassword.length < 12 || resetPassword !== resetPasswordConfirm} aria-busy={pendingAction?.type === "password" && pendingAction.userId === passwordUserId} onClick={() => void savePassword(passwordUserId)}>
+                {pendingAction?.type === "password" && pendingAction.userId === passwordUserId ? <><span className="spinner" />正在保存密码…</> : "保存新密码"}
+              </button>
+            </div>
           </div>
         ) : null}
         {editingUserId ? (

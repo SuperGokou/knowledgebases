@@ -13,6 +13,8 @@ from app.api.errors import ApiError
 from app.core.password_async import hash_password
 from app.core.security import PasswordService
 from app.db.models import (
+    File,
+    KnowledgeBase,
     KnowledgeBaseAccessLevel,
     KnowledgeBaseRoleGrant,
     LimitDefinition,
@@ -24,7 +26,13 @@ from app.db.models import (
     UserRole,
     UserStatus,
 )
-from app.schemas.users import RoleAssignmentUpdate, UserCreate, UserRead, UserUpdate
+from app.schemas.users import (
+    RoleAssignmentUpdate,
+    UserCreate,
+    UserPasswordReset,
+    UserRead,
+    UserUpdate,
+)
 from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
@@ -357,6 +365,181 @@ async def update_user(
     await session.commit()
     await session.refresh(user)
     return await _user_read(session, user)
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+    user_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
+) -> None:
+    """Permanently delete an unowned account; only a superuser may do so."""
+
+    await acquire_rbac_mutation_lock(session)
+    locked_users = list(
+        (
+            await session.scalars(
+                select(User)
+                .where(User.id.in_({access.user.id, user_id}))
+                .order_by(User.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    users_by_id = {item.id: item for item in locked_users}
+    actor = users_by_id.get(access.user.id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    access = await _refresh_locked_actor_access(session, actor, {"user:manage"})
+    if not access.user.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="superuser_required",
+            message="Only a superuser can delete user accounts",
+        )
+    if user_id == access.user.id:
+        raise ApiError(
+            status_code=409,
+            code="self_delete_denied",
+            message="A superuser cannot delete their own account",
+        )
+
+    user = users_by_id.get(user_id)
+    if user is None:
+        raise ApiError(status_code=404, code="user_not_found", message="User not found")
+    if user.is_superuser:
+        await _lock_superuser_guard(session)
+        remaining = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(
+                    User.is_superuser.is_(True),
+                    User.status == UserStatus.ACTIVE,
+                    User.id != user.id,
+                )
+            )
+            or 0
+        )
+        if not remaining:
+            raise ApiError(
+                status_code=409,
+                code="last_superuser_protected",
+                message="The final active superuser cannot be deleted",
+            )
+
+    owned_resources = {
+        "owned_files": int(
+            await session.scalar(
+                select(func.count()).select_from(File).where(File.owner_id == user.id)
+            )
+            or 0
+        ),
+        "owned_knowledge_bases": int(
+            await session.scalar(
+                select(func.count())
+                .select_from(KnowledgeBase)
+                .where(KnowledgeBase.owner_id == user.id)
+            )
+            or 0
+        ),
+    }
+    if any(owned_resources.values()):
+        raise ApiError(
+            status_code=409,
+            code="user_owns_resources",
+            message="The user still owns files or knowledge bases and cannot be deleted",
+            details=owned_resources,
+        )
+
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="user_delete",
+        resource_type="user",
+        resource_id=str(user.id),
+        user_id=user.id,
+    )
+    audit_details = {
+        "display_name": user.display_name,
+        "email": user.email,
+        "is_superuser": user.is_superuser,
+    }
+    await session.delete(user)
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="user.deleted",
+        result=AuditResult.SUCCESS,
+        resource_type="user",
+        resource_id=str(user_id),
+        request_id=getattr(request.state, "request_id", None),
+        details=audit_details,
+    )
+    await session.commit()
+
+
+@router.put("/{user_id}/password", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_user_password(
+    user_id: UUID,
+    payload: UserPasswordReset,
+    request: Request,
+    session: DatabaseSession,
+    access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
+    passwords: Annotated[PasswordService, Depends(get_password_service)],
+) -> None:
+    """Reset an account password and revoke every existing session."""
+
+    await acquire_rbac_mutation_lock(session)
+    locked_users = list(
+        (
+            await session.scalars(
+                select(User)
+                .where(User.id.in_({access.user.id, user_id}))
+                .order_by(User.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    users_by_id = {item.id: item for item in locked_users}
+    actor = users_by_id.get(access.user.id)
+    if actor is None:
+        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
+    access = await _refresh_locked_actor_access(session, actor, {"user:manage"})
+    if not access.user.is_superuser:
+        raise ApiError(
+            status_code=403,
+            code="superuser_required",
+            message="Only a superuser can reset account passwords",
+        )
+    user = users_by_id.get(user_id)
+    if user is None:
+        raise ApiError(status_code=404, code="user_not_found", message="User not found")
+
+    await deny_if_active_external_llm_egress(
+        session,
+        request,
+        access,
+        revocation_scope="user_password",
+        resource_type="user",
+        resource_id=str(user.id),
+        user_id=user.id,
+    )
+    user.password_hash = await hash_password(passwords, payload.password)
+    user.token_version += 1
+    add_audit_event(
+        session,
+        actor_id=access.user.id,
+        action="user.password_reset",
+        result=AuditResult.SUCCESS,
+        resource_type="user",
+        resource_id=str(user.id),
+        request_id=getattr(request.state, "request_id", None),
+        details={"sessions_revoked": True},
+    )
+    await session.commit()
 
 
 @router.put("/{user_id}/roles", response_model=UserRead)

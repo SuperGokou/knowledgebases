@@ -8,6 +8,7 @@ import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
 import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, formatBytes, readableError } from "@/lib/api-client";
+import { canDeleteFile } from "@/lib/file-deletion";
 import { fileKnowledgePresentation } from "@/lib/file-knowledge-status";
 import type { FileRecord, KnowledgeBase, PartUrlResponse, UploadPlan } from "@/lib/types";
 
@@ -55,7 +56,7 @@ async function concurrentMap<T, R>(items: T[], concurrency: number, worker: (ite
 }
 
 export function FilesPanel() {
-  const { can, loading: accessLoading } = useAccess();
+  const { can, me, loading: accessLoading } = useAccess();
   const feedback = useActionFeedback();
   const actionLock = useRef(createActionLock()).current;
   const [files, setFiles] = useState<FileRecord[] | null>(null);
@@ -66,6 +67,7 @@ export function FilesPanel() {
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [phase, setPhase] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -225,6 +227,27 @@ export function FilesPanel() {
     }
   }
 
+  async function removeFile(file: FileRecord) {
+    if (!canDeleteFile(me, file) || deletingId !== null || pending || approvingId !== null) return;
+    if (!window.confirm(`确定删除文件“${file.original_name}”吗？删除后将无法从知识库中检索或下载。`)) return;
+    if (!actionLock.acquire()) return;
+    setDeletingId(file.id);
+    setError("");
+    feedback.dismiss();
+    try {
+      await apiRequest<void>(`/api/v1/files/${file.id}`, { method: "DELETE" });
+      await load();
+      feedback.success(`文件“${file.original_name}”已删除。`, "文件删除成功");
+    } catch (reason) {
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "文件删除失败");
+    } finally {
+      actionLock.release();
+      setDeletingId(null);
+    }
+  }
+
   const canReadFiles = !accessLoading && can("file:read");
   const canUploadFiles = !accessLoading && can("file:upload");
 
@@ -268,7 +291,7 @@ export function FilesPanel() {
               </div>
             ) : null}
             {phase ? <div aria-live="polite" role="progressbar" aria-label="文件上传进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><div className="progress-meta"><span>{phase}</span><span>{progress}%</span></div></div> : null}
-            <button className="button primary" style={{ width: "100%", marginTop: 15 }} type="button" onClick={() => void upload()} disabled={!selected || !knowledgeBaseId || pending || approvingId !== null || accessLoading || !can("file:upload")} aria-busy={pending}>
+            <button className="button primary" style={{ width: "100%", marginTop: 15 }} type="button" onClick={() => void upload()} disabled={!selected || !knowledgeBaseId || pending || approvingId !== null || deletingId !== null || accessLoading || !can("file:upload")} aria-busy={pending}>
               {pending ? <span className="spinner" /> : <Icon name="upload" />}{pending ? "正在上传" : "开始安全上传"}
             </button>
           </div>
@@ -297,8 +320,9 @@ export function FilesPanel() {
                       </td>
                       <td>{new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(file.updated_at))}</td>
                       <td><div className="button-row">
-                        {file.status === "available" && can("file:read") ? <button className="button ghost small" type="button" onClick={() => void download(file)}>下载</button> : null}
-                        {file.status === "processing" && can("file:approve") ? <button className="button secondary small" type="button" onClick={() => void approve(file)} disabled={approvingId !== null || pending} aria-busy={approvingId === file.id}>{approvingId === file.id ? <><span className="spinner" />正在审批…</> : "审批"}</button> : null}
+                        {file.status === "available" && can("file:read") ? <button className="button ghost small" type="button" onClick={() => void download(file)} disabled={deletingId !== null}>下载</button> : null}
+                        {file.status === "processing" && can("file:approve") ? <button className="button secondary small" type="button" onClick={() => void approve(file)} disabled={approvingId !== null || deletingId !== null || pending} aria-busy={approvingId === file.id}>{approvingId === file.id ? <><span className="spinner" />正在审批…</> : "审批"}</button> : null}
+                        {canDeleteFile(me, file) ? <button className="button danger small" type="button" onClick={() => void removeFile(file)} disabled={deletingId !== null || approvingId !== null || pending} aria-busy={deletingId === file.id}>{deletingId === file.id ? <><span className="spinner" />正在删除…</> : "删除"}</button> : null}
                       </div></td>
                     </tr>
                   ))}
