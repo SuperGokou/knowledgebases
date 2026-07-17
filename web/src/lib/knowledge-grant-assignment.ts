@@ -8,6 +8,12 @@ import type {
 export const STALE_KNOWLEDGE_GRANTS_MESSAGE =
   "该知识库的角色授权已被其他管理员更新。系统已加载最新授权，旧草稿已关闭；请重新打开授权编辑后再操作。";
 
+export const SAVED_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE =
+  "访问等级已保存，但最新授权刷新失败。请手动刷新确认，请勿重复提交。";
+
+export const STALE_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE =
+  "检测到其他管理员已更新授权，但最新数据刷新失败。旧草稿已关闭，请手动刷新后重新操作。";
+
 export type KnowledgeGrantEditor = {
   knowledgeBaseId: string;
   expectedVersion: number;
@@ -20,7 +26,9 @@ export type KnowledgeGrantInput = {
 
 export type KnowledgeGrantSaveResult =
   | { status: "saved"; grants: KnowledgeBaseRoleGrant[] }
-  | { status: "stale" };
+  | { status: "saved_refresh_failed"; grants: KnowledgeBaseRoleGrant[]; error: unknown }
+  | { status: "stale" }
+  | { status: "stale_refresh_failed"; error: unknown };
 
 export type KnowledgeGrantReloadReason = "saved" | "stale";
 
@@ -56,8 +64,9 @@ export async function saveKnowledgeGrantAssignment(
 ): Promise<KnowledgeGrantSaveResult> {
   const request = dependencies.request
     ?? ((path, init) => apiRequest<KnowledgeBaseRoleGrant[]>(path, init));
+  let savedGrants: KnowledgeBaseRoleGrant[];
   try {
-    const savedGrants = await request(
+    savedGrants = await request(
       `/api/v1/knowledge-bases/${editor.knowledgeBaseId}/role-grants`,
       {
         method: "PUT",
@@ -67,8 +76,6 @@ export async function saveKnowledgeGrantAssignment(
         }),
       },
     );
-    await dependencies.reloadLatest("saved");
-    return { status: "saved", grants: savedGrants };
   } catch (error) {
     if (
       error instanceof ApiClientError
@@ -77,9 +84,20 @@ export async function saveKnowledgeGrantAssignment(
     ) {
       // Never replay an obsolete replacement set. Reloading is a read-only
       // reconciliation; the operator must explicitly open a new draft.
-      await dependencies.reloadLatest("stale");
-      return { status: "stale" };
+      try {
+        await dependencies.reloadLatest("stale");
+        return { status: "stale" };
+      } catch (refreshError) {
+        return { status: "stale_refresh_failed", error: refreshError };
+      }
     }
     throw error;
   }
+
+  try {
+    await dependencies.reloadLatest("saved");
+  } catch (error) {
+    return { status: "saved_refresh_failed", grants: savedGrants, error };
+  }
+  return { status: "saved", grants: savedGrants };
 }

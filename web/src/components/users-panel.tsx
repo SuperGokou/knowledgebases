@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, readableError } from "@/lib/api-client";
 import {
   ADMIN_LIST_PAGE_SIZE,
@@ -54,6 +56,8 @@ const statusTone: Record<UserStatus, "success" | "neutral" | "danger"> = { activ
 
 export function UsersPanel() {
   const { can, loading: accessLoading, me, reload: reloadAccess } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useMemo(() => createActionLock(), []);
   const [users, setUsers] = useState<User[] | null>(null);
   const [knownRoles, setKnownRoles] = useState<Role[]>([]);
   const [roleCandidates, setRoleCandidates] = useState<Role[]>([]);
@@ -64,8 +68,8 @@ export function UsersPanel() {
   const [roleCatalogLoading, setRoleCatalogLoading] = useState(false);
   const [roleCatalogError, setRoleCatalogError] = useState("");
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [pending, setPending] = useState(false);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
@@ -83,11 +87,21 @@ export function UsersPanel() {
   const [replacementOwnerError, setReplacementOwnerError] = useState("");
   const loadController = useMemo(() => createLatestRequestController(), []);
   const roleLoadController = useMemo(() => createLatestRequestController(), []);
+  const skipNextAutoLoadRef = useRef(false);
+  const memberHeadingRef = useRef<HTMLHeadingElement>(null);
+
+  function focusMemberAction(userId: string, action: "roles" | "password") {
+    window.requestAnimationFrame(() => {
+      const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>(`[data-member-action="${action}"]`));
+      const target = buttons.find((button) => button.dataset.memberId === userId);
+      (target ?? memberHeadingRef.current)?.focus();
+    });
+  }
 
   const load = useCallback(async ({
     propagateError = false,
-    offset = userOffset,
-    search = activeSearch,
+    offset = 0,
+    search = "",
   }: { propagateError?: boolean; offset?: number; search?: string } = {}) => {
     if (accessLoading) {
       loadController.invalidate();
@@ -101,7 +115,7 @@ export function UsersPanel() {
     }
     setError("");
     try {
-      await loadController.run(
+      const outcome = await loadController.run(
         () => apiRequest<User[]>(buildOffsetListPath("/api/v1/users", { offset, search })),
         (userItems) => {
           const page = splitOffsetPage(userItems);
@@ -109,11 +123,14 @@ export function UsersPanel() {
           setHasNextUsers(page.hasNext);
         },
       );
+      if (propagateError && outcome === "superseded") {
+        throw new Error("成员列表刷新已被新的请求取代，请等待最新刷新完成后确认结果。");
+      }
     } catch (reason) {
       setError(readableError(reason));
       if (propagateError) throw reason;
     }
-  }, [accessLoading, activeSearch, can, loadController, userOffset]);
+  }, [accessLoading, can, loadController]);
 
   const loadRoleCandidates = useCallback(async ({
     offset = 0,
@@ -158,12 +175,18 @@ export function UsersPanel() {
   }, [accessLoading, can, roleLoadController]);
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => void load(), 0);
-    return () => {
-      window.clearTimeout(timeout);
-      loadController.invalidate();
-    };
-  }, [load, loadController]);
+    if (skipNextAutoLoadRef.current) {
+      skipNextAutoLoadRef.current = false;
+      return;
+    }
+    const timeout = window.setTimeout(
+      () => void load({ offset: userOffset, search: activeSearch }),
+      0,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [activeSearch, load, userOffset]);
+
+  useEffect(() => () => loadController.invalidate(), [loadController]);
 
   useEffect(() => {
     const timeout = window.setTimeout(
@@ -268,10 +291,12 @@ export function UsersPanel() {
 
   async function createUser(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!actionLock.acquire()) return;
+    let userCreated = false;
     setPending(true);
+    setPendingAction("create");
     setError("");
-    setNotice("");
-    setNotice("");
+    feedback.dismiss();
     try {
       validateStrongPassword(password);
       await apiRequest<User>("/api/v1/users", {
@@ -283,42 +308,65 @@ export function UsersPanel() {
           role_ids: can("role:assign") ? newRoleIds : [],
         }),
       });
+      userCreated = true;
       setEmail("");
       setPassword("");
       setDisplayName("");
       setNewRoleIds([]);
       setSearchDraft("");
+      skipNextAutoLoadRef.current = activeSearch !== "" || userOffset !== 0;
       setActiveSearch("");
       setUserOffset(0);
-      await load({ offset: 0, search: "" });
-      setNotice("成员账号已创建，列表已刷新。请按最小权限原则分配角色。");
+      await load({ offset: 0, search: "", propagateError: true });
+      feedback.success("成员账号已创建，列表已刷新。请按最小权限原则分配角色。", "成员创建成功");
     } catch (reason) {
-      setError(readableError(reason));
+      const detail = readableError(reason);
+      const message = userCreated
+        ? `成员账号已创建，但列表刷新失败。请手动刷新确认，请勿重复创建。错误详情：${detail}`
+        : detail;
+      setError(message);
+      feedback.error(message, userCreated ? "已创建，但刷新失败" : "成员创建失败");
     } finally {
+      actionLock.release();
+      setPendingAction(null);
       setPending(false);
     }
   }
 
   async function setStatus(user: User, status: UserStatus) {
+    if (!actionLock.acquire()) return;
+    let statusCommitted = false;
     setPending(true);
+    setPendingAction(`status:${user.id}`);
     setError("");
+    feedback.dismiss();
     try {
       await apiRequest<User>(`/api/v1/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ status }) });
-      await load();
+      statusCommitted = true;
+      await load({ offset: userOffset, search: activeSearch, propagateError: true });
+      feedback.success(`成员“${user.display_name || user.email}”已${status === "active" ? "启用" : "停用"}。`, "成员状态已更新");
     } catch (reason) {
-      setError(readableError(reason));
+      const detail = readableError(reason);
+      const message = statusCommitted
+        ? `成员“${user.display_name || user.email}”的状态已更新，但列表刷新失败。请手动刷新确认，请勿重复操作。错误详情：${detail}`
+        : detail;
+      setError(message);
+      feedback.error(message, statusCommitted ? "已更新，但刷新失败" : "成员状态更新失败");
     } finally {
+      actionLock.release();
+      setPendingAction(null);
       setPending(false);
     }
   }
 
   async function saveRoles() {
-    if (!roleEditor) return;
+    if (!roleEditor || !actionLock.acquire()) return;
     const editorSnapshot = roleEditor;
     let draftInvalidatedFor: RoleAssignmentDraftInvalidationReason | null = null;
     setPending(true);
+    setPendingAction("roles");
     setError("");
-    setNotice("");
+    feedback.dismiss();
     try {
       const result = await saveUserRoleAssignment(editorSnapshot, {
         invalidateDraft: (reason) => {
@@ -327,74 +375,100 @@ export function UsersPanel() {
           setRoleEditor(null);
           setUsers(null);
         },
-        reloadLatest: () => load({ propagateError: true }),
+        reloadLatest: () => load({ offset: userOffset, search: activeSearch, propagateError: true }),
       });
       if (result.status === "stale") {
-        setNotice(STALE_ROLE_ASSIGNMENT_MESSAGE);
+        feedback.info(STALE_ROLE_ASSIGNMENT_MESSAGE, "角色分配已更新");
       } else {
-        setNotice("成员角色已保存，成员列表已刷新为最新版本。");
+        feedback.success("成员角色已保存，成员列表已刷新为最新版本。", "成员角色已保存");
       }
     } catch (reason) {
-      setNotice("");
       const message = draftInvalidatedFor === "saved"
         ? SAVED_ROLE_ASSIGNMENT_REFRESH_FAILED_MESSAGE
         : STALE_ROLE_ASSIGNMENT_REFRESH_FAILED_MESSAGE;
-      setError(draftInvalidatedFor
+      const errorMessage = draftInvalidatedFor
         ? `${message} ${readableError(reason)}`
-        : readableError(reason));
+        : readableError(reason);
+      setError(errorMessage);
+      feedback.error(errorMessage, draftInvalidatedFor === "saved" ? "已保存，但刷新失败" : "成员角色保存失败");
     } finally {
+      actionLock.release();
+      setPendingAction(null);
       setPending(false);
+      if (draftInvalidatedFor) focusMemberAction(editorSnapshot.userId, "roles");
     }
   }
 
   async function resetPassword() {
-    if (!passwordEditor || pending) return;
+    if (!passwordEditor || pending || !actionLock.acquire()) return;
     const editorSnapshot = { ...passwordEditor };
+    let passwordCommitted = false;
     setPending(true);
+    setPendingAction("password");
     setError("");
-    setNotice("");
+    feedback.dismiss();
     try {
       await resetUserPassword(editorSnapshot);
+      passwordCommitted = true;
       setPasswordEditor(null);
       if (passwordResetRevokesCurrentSession(editorSnapshot.userId, me?.id)) {
-        setNotice("当前管理员密码已重置，所有旧会话均已撤销，正在安全退出并返回登录页。请使用新密码重新登录。");
+        feedback.success("当前管理员密码已重置，所有旧会话均已撤销，正在安全退出并返回登录页。请使用新密码重新登录。", "密码修改成功");
         await reloadAccess();
         return;
       }
-      setNotice("管理员密码重置已完成。目标账号的全部旧会话已撤销，成员必须使用新密码重新登录。系统从不显示或读取旧密码。");
+      feedback.success("管理员密码重置已完成。目标账号的全部旧会话已撤销，成员必须使用新密码重新登录。", "密码重置成功");
     } catch (reason) {
-      setError(readablePasswordResetError(reason));
+      const message = readablePasswordResetError(reason);
+      setError(message);
+      feedback.error(message, "密码修改失败");
     } finally {
+      actionLock.release();
+      setPendingAction(null);
       setPending(false);
+      if (passwordCommitted && !passwordResetRevokesCurrentSession(editorSnapshot.userId, me?.id)) {
+        focusMemberAction(editorSnapshot.userId, "password");
+      }
     }
   }
 
   async function confirmRetirement() {
-    if (!retirementEditor || pending) return;
+    if (!retirementEditor || pending || !actionLock.acquire()) return;
+    let retirementCommitted = false;
     setPending(true);
+    setPendingAction("retirement");
     setError("");
-    setNotice("");
+    feedback.dismiss();
     try {
       const editorSnapshot = retirementEditor;
       const outcome = await retireUserWithRefresh(editorSnapshot, {
         onCommitted: () => {
+          retirementCommitted = true;
           setUsers((current) => current?.map((user) => user.id === editorSnapshot.userId
             ? { ...user, status: "disabled", retired_at: new Date().toISOString(), role_ids: [] }
             : user) ?? current);
           setRetirementEditor(null);
           setReplacementOwnerQuery("");
           setReplacementOwnerCandidates([]);
-          setNotice("成员账号已安全退休：登录凭证和 API 密钥已撤销，角色已移除。知识库实际接管结果请在知识库与审计记录中核验；审计与业务历史继续保留。");
+          feedback.success("成员账号已安全退休：登录凭证和 API 密钥已撤销，角色已移除。知识库实际接管结果请在知识库与审计记录中核验。", "成员账号已删除");
         },
-        reload: () => load({ propagateError: true }),
+        reload: () => load({ offset: userOffset, search: activeSearch, propagateError: true }),
       });
       if (outcome.status === "refresh_failed") {
-        setError(`账号已退休，但列表刷新失败，请手动刷新。${readableError(outcome.error)}`);
+        const message = `账号已退休，但列表刷新失败，请手动刷新。${readableError(outcome.error)}`;
+        setError(message);
+        feedback.error(message, "账号已删除，但刷新失败");
       }
     } catch (reason) {
-      setError(readableUserRetirementError(reason));
+      const message = readableUserRetirementError(reason);
+      setError(message);
+      feedback.error(message, "成员账号删除失败");
     } finally {
+      actionLock.release();
+      setPendingAction(null);
       setPending(false);
+      if (retirementCommitted) {
+        window.requestAnimationFrame(() => memberHeadingRef.current?.focus());
+      }
     }
   }
 
@@ -404,11 +478,10 @@ export function UsersPanel() {
 
   return (
     <div className="page-stack">
-      {error ? <ErrorState message={error} onRetry={() => void load()} /> : null}
-      {notice ? <div className="notice info-notice" role="status"><Icon name="refresh" /><div><strong>成员数据已同步</strong><p>{notice}</p></div></div> : null}
+      {error ? <ErrorState message={error} onRetry={() => void load({ offset: userOffset, search: activeSearch })} /> : null}
       <section className="panel">
         <div className="panel-header">
-          <div><h2>成员账号</h2><p>创建账号、调整状态，并按角色授予能力</p></div>
+          <div><h2 ref={memberHeadingRef} tabIndex={-1}>成员账号</h2><p>创建账号、调整状态，并按角色授予能力</p></div>
           <form className="toolbar" role="search" onSubmit={(event) => {
             event.preventDefault();
             closeMemberEditors();
@@ -417,7 +490,7 @@ export function UsersPanel() {
           }}>
             <div className="search-box"><Icon name="search" /><input aria-label="搜索成员" maxLength={200} placeholder="搜索邮箱或显示名称" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} /></div>
             <button className="button secondary small" type="submit" disabled={pending}>搜索</button>
-            <button className="button ghost small" type="button" disabled={pending} onClick={() => { closeMemberEditors(); setNotice(""); void load(); }}><Icon name="refresh" />刷新</button>
+            <button className="button ghost small" type="button" disabled={pending} onClick={() => { closeMemberEditors(); feedback.dismiss(); void load({ offset: userOffset, search: activeSearch }); }}><Icon name="refresh" />刷新</button>
           </form>
         </div>
         {can("role:read") && can("role:assign") ? (
@@ -473,9 +546,9 @@ export function UsersPanel() {
                     <td><StatusBadge tone={retired ? "neutral" : statusTone[user.status]}>{retired ? "已退休" : statusLabel[user.status]}</StatusBadge></td>
                     <td>{new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(new Date(user.created_at))}</td>
                     <td><div className="button-row">
-                      <button className="button ghost small" type="button" aria-label={`${user.status === "active" ? "停用" : "启用"} ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => void setStatus(user, user.status === "active" ? "disabled" : "active")}>{user.status === "active" ? "停用" : "启用"}</button>
+                      <button className="button ghost small" type="button" aria-label={`${user.status === "active" ? "停用" : "启用"} ${user.email}`} disabled={pending || retired || protectedTarget} aria-busy={pendingAction === `status:${user.id}`} onClick={() => void setStatus(user, user.status === "active" ? "disabled" : "active")}>{pendingAction === `status:${user.id}` ? <><span className="spinner" />处理中…</> : user.status === "active" ? "停用" : "启用"}</button>
                       {canResetUserPassword(user.id, me?.id, Boolean(me?.is_superuser)) ? (
-                        <button className="button ghost small" type="button" aria-label={`修改密码 ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => {
+                        <button className="button ghost small" type="button" data-member-action="password" data-member-id={user.id} aria-label={`修改密码 ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => {
                           setRoleEditor(null);
                           setRetirementEditor(null);
                           setPasswordEditor({
@@ -487,7 +560,7 @@ export function UsersPanel() {
                           });
                         }}>修改密码</button>
                       ) : null}
-                      {can("role:assign") && can("role:read") ? <button className="button secondary small" type="button" aria-label={`分配角色 ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => { setPasswordEditor(null); setRetirementEditor(null); setRoleEditor(openRoleAssignmentEditor(user)); }}>分配角色</button> : null}
+                      {can("role:assign") && can("role:read") ? <button className="button secondary small" type="button" data-member-action="roles" data-member-id={user.id} aria-label={`分配角色 ${user.email}`} disabled={pending || retired || protectedTarget} onClick={() => { setPasswordEditor(null); setRetirementEditor(null); setRoleEditor(openRoleAssignmentEditor(user)); }}>分配角色</button> : null}
                       <button
                         className="button danger small"
                         type="button"
@@ -548,7 +621,7 @@ export function UsersPanel() {
                 </label>
               ))}
             </div> : <p>当前检索没有可分配角色。可以重试目录或更换搜索条件。</p>}
-            <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setRoleEditor(null)}>取消</button><button className="button primary" type="button" disabled={pending} onClick={() => void saveRoles()}>保存角色</button></div>
+            <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setRoleEditor(null)}>取消</button><button className="button primary" type="button" disabled={pending} aria-busy={pendingAction === "roles"} onClick={() => void saveRoles()}>{pendingAction === "roles" ? <><span className="spinner" />正在保存…</> : "保存角色"}</button></div>
           </div>
         ) : null}
         {passwordEditor ? (
@@ -566,7 +639,7 @@ export function UsersPanel() {
               <label className="full">新密码<input type="password" minLength={12} maxLength={256} autoComplete="new-password" value={passwordEditor.newPassword} disabled={pending} onChange={(event) => setPasswordEditor((current) => current ? { ...current, newPassword: event.target.value } : current)} placeholder="12–256 位可打印 ASCII，包含大小写字母、数字和符号" required /></label>
               <label className="full">确认新密码<input type="password" minLength={12} maxLength={256} autoComplete="new-password" value={passwordEditor.confirmation} disabled={pending} onChange={(event) => setPasswordEditor((current) => current ? { ...current, confirmation: event.target.value } : current)} required /></label>
             </div>
-            <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setPasswordEditor(null)}>取消</button><button className="button primary" type="submit" disabled={pending}>{pending ? "正在修改…" : "确认修改并撤销旧会话"}</button></div>
+            <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setPasswordEditor(null)}>取消</button><button className="button primary" type="submit" disabled={pending} aria-busy={pendingAction === "password"}>{pendingAction === "password" ? <><span className="spinner" />正在修改…</> : "确认修改并撤销旧会话"}</button></div>
           </form>
         ) : null}
         {retirementEditor ? (
@@ -605,7 +678,7 @@ export function UsersPanel() {
             </div>
             <div className="form-actions">
               <button className="button ghost" type="button" disabled={pending} onClick={() => setRetirementEditor(null)}>取消</button>
-              <button className="button danger" type="submit" disabled={pending || retirementEditor.confirmationEmail.trim() !== retirementEditor.email}>{pending ? "正在安全退休…" : "确认删除账号"}</button>
+              <button className="button danger" type="submit" disabled={pending || retirementEditor.confirmationEmail.trim() !== retirementEditor.email} aria-busy={pendingAction === "retirement"}>{pendingAction === "retirement" ? <><span className="spinner" />正在安全退休…</> : "确认删除账号"}</button>
             </div>
           </form>
         ) : null}
@@ -616,7 +689,7 @@ export function UsersPanel() {
             <label>显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
             <label className="full">初始密码<input type="password" minLength={12} maxLength={256} autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="12–256 位可打印 ASCII，包含大小写字母、数字和符号" required /></label>
             {can("role:assign") && can("role:read") ? <fieldset className="full fieldset"><legend>初始角色</legend>{missingNewUserRoles ? <p className="inline-error">已保留 {missingNewUserRoles} 个尚未加载详情的已选角色。</p> : null}<div className="checkbox-grid">{newUserRoleOptions.map((role) => <label className="check-option" key={role.id}><input type="checkbox" checked={newRoleIds.includes(role.id)} onChange={() => toggleRole(role.id, newRoleIds, setNewRoleIds)} /><span>{role.name}<small>{role.code}</small></span></label>)}</div>{newUserRoleOptions.length === 0 ? <p>当前检索没有可分配角色。</p> : null}</fieldset> : null}
-            <div className="form-actions full"><button className="button primary" type="submit" disabled={pending}>{pending ? "正在创建…" : "创建账号"}</button></div>
+            <div className="form-actions full"><button className="button primary" type="submit" disabled={pending} aria-busy={pendingAction === "create"}>{pendingAction === "create" ? <><span className="spinner" />正在创建…</> : "创建账号"}</button></div>
           </form>
         </details>
       </section>

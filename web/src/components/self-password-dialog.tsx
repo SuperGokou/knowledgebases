@@ -149,8 +149,8 @@ export function SelfPasswordDialog() {
             <button className="button ghost" type="button" disabled={pending} onClick={closeDialog}>
               取消
             </button>
-            <button className="button primary" type="submit" disabled={pending || !me}>
-              {pending ? "正在安全更新…" : "确认修改"}
+            <button className="button primary" type="submit" disabled={pending || !me} aria-busy={pending}>
+              {pending ? <><span className="spinner" />正在安全更新…</> : "确认修改"}
             </button>
           </div>
         </form>

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   apiRequest,
+  ApiClientError,
+  mutationOutcomeMayBeUncertain,
   PERMISSIONS_STALE_EVENT,
   signalPermissionsStale,
 } from "../src/lib/api-client";
@@ -60,5 +62,19 @@ describe("permission refresh signaling", () => {
       status: 503,
       code: "service_error",
     });
+  });
+});
+
+describe("mutation outcome classification", () => {
+  it("treats network, timeout, and server failures as outcome-uncertain", () => {
+    expect(mutationOutcomeMayBeUncertain(new TypeError("network failed"))).toBe(true);
+    expect(mutationOutcomeMayBeUncertain(new ApiClientError("timeout", 408))).toBe(true);
+    expect(mutationOutcomeMayBeUncertain(new ApiClientError("server", 503))).toBe(true);
+  });
+
+  it("keeps definitive client rejections in the ordinary failure path", () => {
+    expect(mutationOutcomeMayBeUncertain(new ApiClientError("invalid", 400))).toBe(false);
+    expect(mutationOutcomeMayBeUncertain(new ApiClientError("forbidden", 403))).toBe(false);
+    expect(mutationOutcomeMayBeUncertain(new ApiClientError("conflict", 409))).toBe(false);
   });
 });

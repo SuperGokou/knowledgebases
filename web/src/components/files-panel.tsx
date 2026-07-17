@@ -1,11 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, formatBytes, readableError } from "@/lib/api-client";
+import { createLatestRequestController } from "@/lib/latest-request";
 import {
   fileApprovalErrorMessage,
   fileApprovalPresentation,
@@ -71,6 +74,8 @@ async function concurrentMap<T, R>(items: T[], concurrency: number, worker: (ite
 
 export function FilesPanel() {
   const { can, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useMemo(() => createActionLock(), []);
   const [files, setFiles] = useState<FileRecord[] | null>(null);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [knowledgeBaseId, setKnowledgeBaseId] = useState("");
@@ -87,15 +92,25 @@ export function FilesPanel() {
   const [hasNextFiles, setHasNextFiles] = useState(false);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [phase, setPhase] = useState("");
   const [dragging, setDragging] = useState(false);
   const knowledgeRequestId = useRef(0);
+  const skipNextAutoLoadRef = useRef(false);
+  const uploadHeadingRef = useRef<HTMLHeadingElement>(null);
+  const fileCenterHeadingRef = useRef<HTMLHeadingElement>(null);
+  const fileListLoadController = useMemo(() => createLatestRequestController(), []);
+
+  function focusFileWorkspace() {
+    window.requestAnimationFrame(() => (fileCenterHeadingRef.current ?? uploadHeadingRef.current)?.focus());
+  }
 
   const load = useCallback(async ({
-    offset = fileOffset,
-    search = activeSearch,
-  }: { offset?: number; search?: string } = {}) => {
+    offset = 0,
+    search = "",
+    propagateError = false,
+  }: { offset?: number; search?: string; propagateError?: boolean } = {}) => {
     if (accessLoading) return;
     setError("");
     if (!can("file:read")) {
@@ -104,21 +119,36 @@ export function FilesPanel() {
       return;
     }
     try {
-      const items = await apiRequest<FileRecord[]>(
-        buildOffsetListPath("/api/v1/files", { offset, search }),
+      const outcome = await fileListLoadController.run(
+        () => apiRequest<FileRecord[]>(buildOffsetListPath("/api/v1/files", { offset, search })),
+        (items) => {
+          const page = splitOffsetPage(items);
+          setFiles(page.items);
+          setHasNextFiles(page.hasNext);
+        },
       );
-      const page = splitOffsetPage(items);
-      setFiles(page.items);
-      setHasNextFiles(page.hasNext);
+      if (propagateError && outcome === "superseded") {
+        throw new Error("文件列表刷新已被新的请求取代，请等待最新刷新完成后确认结果。");
+      }
     } catch (reason) {
       setError(readableError(reason));
+      if (propagateError) throw reason;
     }
-  }, [accessLoading, activeSearch, can, fileOffset]);
+  }, [accessLoading, can, fileListLoadController]);
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => void load(), 0);
+    if (skipNextAutoLoadRef.current) {
+      skipNextAutoLoadRef.current = false;
+      return;
+    }
+    const timeout = window.setTimeout(
+      () => void load({ offset: fileOffset, search: activeSearch }),
+      0,
+    );
     return () => window.clearTimeout(timeout);
-  }, [load]);
+  }, [activeSearch, fileOffset, load]);
+
+  useEffect(() => () => fileListLoadController.invalidate(), [fileListLoadController]);
 
   const loadKnowledgeBases = useCallback(async (
     search: string,
@@ -168,11 +198,13 @@ export function FilesPanel() {
   }, [debouncedKnowledgeQuery, loadKnowledgeBases]);
 
   async function upload() {
-    if (!selected || !knowledgeBaseId || pending || !can("file:upload")) return;
+    if (!selected || !knowledgeBaseId || pending || approvingId !== null || !can("file:upload") || !actionLock.acquire()) return;
+    let uploadCommitted = false;
     setPending(true);
     setError("");
     setProgress(2);
     setPhase("正在创建安全上传会话");
+    feedback.dismiss();
     try {
       const idempotencyKey = crypto.randomUUID();
       const plan = await apiRequest<UploadPlan>("/api/v1/files/uploads", {
@@ -229,18 +261,28 @@ export function FilesPanel() {
         method: "POST",
         body: JSON.stringify({ parts: parts.sort((a, b) => a.part_number - b.part_number) }),
       });
+      uploadCommitted = true;
       setProgress(100);
       setPhase("上传完成，正在生成知识草稿");
       setSelected(null);
       setQuery("");
+      skipNextAutoLoadRef.current = activeSearch !== "" || fileOffset !== 0;
       setActiveSearch("");
       setFileOffset(0);
-      await load({ offset: 0, search: "" });
+      await load({ offset: 0, search: "", propagateError: true });
+      feedback.success("文件已安全上传，后台正在执行病毒扫描、内容转换和知识审核。", "文件上传成功");
     } catch (reason) {
-      setError(readableError(reason));
-      setPhase("上传未完成");
+      const detail = readableError(reason);
+      const message = uploadCommitted
+        ? `文件已上传并提交后台处理，但列表刷新失败。请手动刷新确认，请勿重复上传。错误详情：${detail}`
+        : detail;
+      setError(message);
+      setPhase(uploadCommitted ? "上传完成，但列表刷新失败" : "上传未完成");
+      feedback.error(message, uploadCommitted ? "已上传，但刷新失败" : "文件上传失败");
     } finally {
+      actionLock.release();
       setPending(false);
+      if (uploadCommitted) focusFileWorkspace();
     }
   }
 
@@ -259,16 +301,33 @@ export function FilesPanel() {
       setError(presentation.reason || "当前文件暂不可审批，请刷新状态后重试。");
       return;
     }
+    if (!actionLock.acquire()) return;
+    let approvalCommitted = false;
+    setApprovingId(file.id);
+    setError("");
+    feedback.dismiss();
     try {
       await apiRequest<FileRecord>(`/api/v1/files/${file.id}/approve`, { method: "POST", body: "{}" });
-      await load();
+      approvalCommitted = true;
+      await load({ offset: fileOffset, search: activeSearch, propagateError: true });
+      feedback.success(`文件“${file.original_name}”已审批通过并进入可检索状态。`, "文件审批成功");
     } catch (reason) {
-      setError(fileApprovalErrorMessage(reason) ?? readableError(reason));
+      const detail = fileApprovalErrorMessage(reason) ?? readableError(reason);
+      const message = approvalCommitted
+        ? `文件“${file.original_name}”已审批通过，但列表刷新失败。请手动刷新确认，请勿重复审批。错误详情：${detail}`
+        : detail;
+      setError(message);
+      feedback.error(message, approvalCommitted ? "已审批，但刷新失败" : "文件审批失败");
+    } finally {
+      actionLock.release();
+      setApprovingId(null);
+      if (approvalCommitted) focusFileWorkspace();
     }
   }
 
   const canReadFiles = !accessLoading && can("file:read");
   const canUploadFiles = !accessLoading && can("file:upload");
+  const fileMutationPending = pending || approvingId !== null;
   const selectableKnowledgeBases = candidatesWithSelection(
     knowledgeBases ?? [],
     selectedKnowledgeBase,
@@ -276,10 +335,10 @@ export function FilesPanel() {
 
   return (
     <div className="page-stack">
-      {error ? <ErrorState message={error} onRetry={() => void load()} /> : null}
+      {error ? <ErrorState message={error} onRetry={() => void load({ offset: fileOffset, search: activeSearch })} /> : null}
       <section className="panel-grid">
         {canUploadFiles ? <article className={`panel ${canReadFiles ? "span-4" : "span-12"}`}>
-          <div className="panel-header"><div><h2>上传文件</h2><p>文件字节直接进入对象存储</p></div><Icon name="upload" /></div>
+          <div className="panel-header"><div><h2 ref={uploadHeadingRef} tabIndex={-1}>上传文件</h2><p>文件字节直接进入对象存储</p></div><Icon name="upload" /></div>
           <div className="panel-body">
             <label>目标知识库
               <select
@@ -289,7 +348,7 @@ export function FilesPanel() {
                   setKnowledgeBaseId(next?.id ?? "");
                   setSelectedKnowledgeBase(next);
                 }}
-                disabled={pending || !selectableKnowledgeBases.length}
+                disabled={fileMutationPending || !selectableKnowledgeBases.length}
               >
                 {!selectableKnowledgeBases.length ? <option value="">没有可编辑的知识库</option> : null}
                 {selectableKnowledgeBases.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
@@ -302,7 +361,7 @@ export function FilesPanel() {
                 value={knowledgeQuery}
                 onChange={(event) => setKnowledgeQuery(event.target.value)}
                 placeholder="输入知识库名称"
-                disabled={pending}
+                disabled={fileMutationPending}
               />
             </label>
             {knowledgeError ? (
@@ -316,7 +375,7 @@ export function FilesPanel() {
               <button
                 className="button secondary small"
                 type="button"
-                disabled={knowledgeLoading || pending}
+                disabled={knowledgeLoading || fileMutationPending}
                 onClick={() => void loadKnowledgeBases(
                   debouncedKnowledgeQuery,
                   knowledgeBases?.length ?? 0,
@@ -353,22 +412,22 @@ export function FilesPanel() {
               </div>
             ) : null}
             {phase ? <div aria-live="polite" role="progressbar" aria-label="文件上传进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><div className="progress-meta"><span>{phase}</span><span>{progress}%</span></div></div> : null}
-            <button className="button primary" style={{ width: "100%", marginTop: 15 }} type="button" onClick={() => void upload()} disabled={!selected || !knowledgeBaseId || pending || accessLoading || !can("file:upload")}>
+              <button className="button primary" style={{ width: "100%", marginTop: 15 }} type="button" onClick={() => void upload()} disabled={!selected || !knowledgeBaseId || pending || approvingId !== null || accessLoading || !can("file:upload")} aria-busy={pending}>
               {pending ? <span className="spinner" /> : <Icon name="upload" />}{pending ? "正在上传" : "开始安全上传"}
             </button>
           </div>
         </article> : null}
         {canReadFiles ? <article className={`panel ${canUploadFiles ? "span-8" : "span-12"}`}>
           <div className="panel-header">
-            <div><h2>文件中心</h2><p>查看上传、处理、隔离和可用状态</p></div>
+            <div><h2 ref={fileCenterHeadingRef} tabIndex={-1}>文件中心</h2><p>查看上传、处理、隔离和可用状态</p></div>
             <form className="toolbar" role="search" onSubmit={(event) => {
               event.preventDefault();
               setFileOffset(0);
               setActiveSearch(query.trim());
             }}>
-              <div className="search-box"><Icon name="search" /><input aria-label="搜索文件名" maxLength={200} placeholder="搜索全部文件名" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
-              <button className="button secondary small" type="submit">搜索</button>
-              <button className="button ghost small" type="button" onClick={() => void load()}><Icon name="refresh" />刷新</button>
+              <div className="search-box"><Icon name="search" /><input aria-label="搜索文件名" maxLength={200} placeholder="搜索全部文件名" value={query} onChange={(event) => setQuery(event.target.value)} disabled={fileMutationPending} /></div>
+              <button className="button secondary small" type="submit" disabled={fileMutationPending}>搜索</button>
+              <button className="button ghost small" type="button" disabled={fileMutationPending} onClick={() => void load({ offset: fileOffset, search: activeSearch })}><Icon name="refresh" />刷新</button>
             </form>
           </div>
           {files === null && !error ? <LoadingRows count={5} /> : null}
@@ -399,9 +458,11 @@ export function FilesPanel() {
                               className="button secondary small"
                               type="button"
                               title={approval.reason}
+                              disabled={pending || approvingId !== null}
+                              aria-busy={approvingId === file.id}
                               onClick={() => void approve(file)}
                             >
-                              审批
+                              {approvingId === file.id ? <><span className="spinner" />审批中…</> : "审批"}
                             </button>
                           ) : (
                             <span className="file-action-status" role="status">
@@ -423,8 +484,8 @@ export function FilesPanel() {
               <nav className="pagination-bar" aria-label="文件列表分页">
                 <span>第 {offsetPageNumber(fileOffset)} 页 · 本页 {files.length} 项</span>
                 <div className="button-row">
-                  <button className="button ghost small" type="button" disabled={fileOffset === 0} onClick={() => setFileOffset(previousOffset(fileOffset))}>上一页</button>
-                  <button className="button ghost small" type="button" disabled={!hasNextFiles} onClick={() => setFileOffset(fileOffset + ADMIN_LIST_PAGE_SIZE)}>下一页</button>
+                  <button className="button ghost small" type="button" disabled={fileMutationPending || fileOffset === 0} onClick={() => setFileOffset(previousOffset(fileOffset))}>上一页</button>
+                  <button className="button ghost small" type="button" disabled={fileMutationPending || !hasNextFiles} onClick={() => setFileOffset(fileOffset + ADMIN_LIST_PAGE_SIZE)}>下一页</button>
                 </div>
               </nav>
             </div>

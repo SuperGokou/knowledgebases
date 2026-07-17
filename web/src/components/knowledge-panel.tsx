@@ -1,11 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
-import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
+import { createActionLock } from "@/lib/action-lock";
+import { ApiClientError, apiRequest, mutationOutcomeMayBeUncertain, readableError } from "@/lib/api-client";
+import { createLatestRequestController } from "@/lib/latest-request";
 import {
   knowledgeCandidatePagePath,
   mergeKnowledgeCandidates,
@@ -15,6 +18,8 @@ import type { KnowledgeBase } from "@/lib/types";
 
 export function KnowledgePanel() {
   const { can, canAny, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useMemo(() => createActionLock(), []);
   const [items, setItems] = useState<KnowledgeBase[] | null>(null);
   const [query, setQuery] = useState("");
   const [activeQuery, setActiveQuery] = useState("");
@@ -27,12 +32,15 @@ export function KnowledgePanel() {
   const [externalProcessing, setExternalProcessing] = useState(false);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const skipNextAutoLoadRef = useRef(false);
+  const catalogLoadController = useMemo(() => createLatestRequestController(), []);
 
   const load = useCallback(async ({
-    search = activeQuery,
+    search = "",
     offset = 0,
     append = false,
-  }: { search?: string; offset?: number; append?: boolean } = {}) => {
+    propagateError = false,
+  }: { search?: string; offset?: number; append?: boolean; propagateError?: boolean } = {}) => {
     if (accessLoading) return;
     setError("");
     if (!canAny(["knowledge:read", "chat:query", "file:upload"])) {
@@ -41,16 +49,25 @@ export function KnowledgePanel() {
       return;
     }
     setCatalogLoading(true);
+    let requestSuperseded = false;
     try {
-      const response = await apiRequest<KnowledgeBase[]>(knowledgeCandidatePagePath({
-        offset,
-        query: search,
-        minimumAccessLevel: "reader",
-      }));
-      const page = splitKnowledgeCandidatePage(response);
-      setItems((current) => mergeKnowledgeCandidates(current ?? [], page.items, !append));
-      setHasMore(page.hasMore);
-      setUnavailable(false);
+      const outcome = await catalogLoadController.run(
+        () => apiRequest<KnowledgeBase[]>(knowledgeCandidatePagePath({
+          offset,
+          query: search,
+          minimumAccessLevel: "reader",
+        })),
+        (response) => {
+          const page = splitKnowledgeCandidatePage(response);
+          setItems((current) => mergeKnowledgeCandidates(current ?? [], page.items, !append));
+          setHasMore(page.hasMore);
+          setUnavailable(false);
+        },
+      );
+      if (outcome === "superseded") {
+        requestSuperseded = true;
+        if (propagateError) throw new Error("知识空间列表刷新已被新的请求取代，请等待最新刷新完成后确认结果。");
+      }
     } catch (reason) {
       if (reason instanceof ApiClientError && [404, 501].includes(reason.status)) {
         setItems([]);
@@ -58,20 +75,33 @@ export function KnowledgePanel() {
       } else {
         setError(readableError(reason));
       }
+      if (propagateError) throw reason;
     } finally {
-      setCatalogLoading(false);
+      if (!requestSuperseded) setCatalogLoading(false);
     }
-  }, [accessLoading, activeQuery, canAny]);
+  }, [accessLoading, canAny, catalogLoadController]);
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => void load(), 0);
+    if (skipNextAutoLoadRef.current) {
+      skipNextAutoLoadRef.current = false;
+      return;
+    }
+    const timeout = window.setTimeout(
+      () => void load({ search: activeQuery, offset: 0, append: false }),
+      0,
+    );
     return () => window.clearTimeout(timeout);
-  }, [load]);
+  }, [activeQuery, load]);
+
+  useEffect(() => () => catalogLoadController.invalidate(), [catalogLoadController]);
 
   async function create(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!actionLock.acquire()) return;
+    let createdKnowledgeBase: KnowledgeBase | null = null;
     setPending(true);
     setError("");
+    feedback.dismiss();
     try {
       const created = await apiRequest<KnowledgeBase>("/api/v1/knowledge-bases", {
         method: "POST",
@@ -81,18 +111,36 @@ export function KnowledgePanel() {
           external_llm_processing_enabled: externalProcessing,
         }),
       });
+      createdKnowledgeBase = created;
       setName("");
       setDescription("");
       setExternalProcessing(false);
       setQuery("");
+      skipNextAutoLoadRef.current = activeQuery !== "";
       setActiveQuery("");
       if (canAny(["knowledge:read", "chat:query", "file:upload"])) {
-        await load({ search: "", offset: 0, append: false });
+        await load({ search: "", offset: 0, append: false, propagateError: true });
       }
       else setItems((current) => [...(current ?? []), created]);
+      feedback.success(`知识库“${created.name}”已创建，可以开始上传并审核企业资料。`, "知识库创建成功");
     } catch (reason) {
-      setError(readableError(reason));
+      const detail = readableError(reason);
+      const outcomeUncertain = !createdKnowledgeBase && mutationOutcomeMayBeUncertain(reason);
+      if (outcomeUncertain) {
+        void load({ search: "", offset: 0, append: false });
+      }
+      const message = createdKnowledgeBase
+        ? `知识库“${createdKnowledgeBase.name}”已创建，但列表刷新失败。请手动刷新确认，请勿重复创建。错误详情：${detail}`
+        : outcomeUncertain
+          ? `知识库的创建结果无法确认。请先刷新列表核验，请勿重复创建。错误详情：${detail}`
+        : detail;
+      setError(message);
+      feedback.error(
+        message,
+        createdKnowledgeBase ? "已创建，但刷新失败" : outcomeUncertain ? "创建结果无法确认" : "知识库创建失败",
+      );
     } finally {
+      actionLock.release();
       setPending(false);
     }
   }
@@ -102,17 +150,28 @@ export function KnowledgePanel() {
     if (enabled && !window.confirm("开启后，符合条件的 TXT/CSV 内容会发送给当前启用的外部模型生成 OKF 草稿。确认该知识空间允许外部模型处理吗？")) {
       return;
     }
+    if (!actionLock.acquire()) return;
+    let updateCommitted = false;
     setUpdatingId(item.id);
     setError("");
+    feedback.dismiss();
     try {
       await apiRequest<KnowledgeBase>(`/api/v1/knowledge-bases/${item.id}`, {
         method: "PATCH",
         body: JSON.stringify({ external_llm_processing_enabled: enabled }),
       });
-      await load();
+      updateCommitted = true;
+      await load({ search: activeQuery, offset: 0, append: false, propagateError: true });
+      feedback.success(`知识库“${item.name}”的外部模型自动转换已${enabled ? "开启" : "关闭"}。`, "处理策略已保存");
     } catch (reason) {
-      setError(readableError(reason));
+      const detail = readableError(reason);
+      const message = updateCommitted
+        ? `知识库“${item.name}”的处理策略已保存，但列表刷新失败。请手动刷新确认，请勿重复操作。错误详情：${detail}`
+        : detail;
+      setError(message);
+      feedback.error(message, updateCommitted ? "已保存，但刷新失败" : "处理策略保存失败");
     } finally {
+      actionLock.release();
       setUpdatingId(null);
     }
   }
@@ -125,7 +184,7 @@ export function KnowledgePanel() {
         <p>知识空间负责组织文件、检索范围与访问策略；文件字节仍直接进入对象存储，不经过 Web 或 FastAPI。</p>
         <div className="knowledge-steps"><span><b>1</b>建立知识空间</span><span><b>2</b>上传并完成内容审核</span><span><b>3</b>授权角色并开放问答</span></div>
       </section>
-      {error ? <ErrorState message={error} onRetry={() => void load()} /> : null}
+      {error ? <ErrorState message={error} onRetry={() => void load({ search: activeQuery, offset: 0, append: false })} /> : null}
       <section className="panel">
         <div className="panel-header">
           <div><h2>知识空间</h2><p>按业务域组织知识与后续检索边界</p></div>
@@ -133,8 +192,8 @@ export function KnowledgePanel() {
             event.preventDefault();
             setActiveQuery(query.trim());
           }}>
-            <input aria-label="搜索知识空间" type="search" maxLength={200} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="按名称搜索全部知识空间" />
-            <button className="button secondary small" type="submit" disabled={catalogLoading}>搜索</button>
+            <input aria-label="搜索知识空间" type="search" maxLength={200} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="按名称搜索全部知识空间" disabled={pending || updatingId !== null} />
+            <button className="button secondary small" type="submit" disabled={catalogLoading || pending || updatingId !== null}>搜索</button>
             {!unavailable ? <StatusBadge tone="info">API 已连接</StatusBadge> : <StatusBadge tone="warning">等待后台 API</StatusBadge>}
           </form>
         </div>
@@ -149,12 +208,13 @@ export function KnowledgePanel() {
                   <button
                     className="button secondary compact-button"
                     type="button"
-                    disabled={updatingId === item.id}
+                    disabled={updatingId !== null}
+                    aria-busy={updatingId === item.id}
                     onClick={() => void toggleExternalProcessing(item)}
                     aria-pressed={item.external_llm_processing_enabled}
                   >
                     {updatingId === item.id
-                      ? "保存中…"
+                      ? <><span className="spinner" />保存中…</>
                       : item.external_llm_processing_enabled
                         ? "外部模型自动转换：已开启"
                         : "外部模型自动转换：未开启"}
@@ -166,7 +226,7 @@ export function KnowledgePanel() {
               </div>
             ))}
             {hasMore ? (
-              <button className="button secondary" type="button" disabled={catalogLoading} onClick={() => void load({ search: activeQuery, offset: items.length, append: true })}>
+              <button className="button secondary" type="button" disabled={catalogLoading || pending || updatingId !== null} onClick={() => void load({ search: activeQuery, offset: items.length, append: true })}>
                 {catalogLoading ? "正在加载…" : "加载更多知识空间"}
               </button>
             ) : null}
@@ -194,7 +254,7 @@ export function KnowledgePanel() {
                 />
                 <span><strong>允许当前外部模型自动转换</strong><small>仅第一阶段支持 UTF-8 TXT/CSV；内容会发送到后台选定的 DeepSeek、Qwen 或 MiniMax，默认关闭。</small></span>
               </label>
-              <div className="form-actions full"><button className="button primary" type="submit" disabled={pending || !name.trim()}>{pending ? "正在创建…" : "创建空间"}</button></div>
+              <div className="form-actions full"><button className="button primary" type="submit" disabled={pending || updatingId !== null || !name.trim()} aria-busy={pending}>{pending ? <><span className="spinner" />正在创建…</> : "创建空间"}</button></div>
             </form>
           </details>
         ) : null}

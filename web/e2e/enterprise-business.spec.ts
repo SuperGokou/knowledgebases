@@ -825,6 +825,8 @@ test("@enterprise account lifecycle rejects duplicates and revokes active access
     assertStatus(assigned.status(), 200, "assign member role through the admin UI");
     createdUser = row(await assigned.json(), "assign member role through the admin UI");
     expect(createdUser.role_ids).toContain(String(role.id));
+    await expect(page.locator(".action-feedback.success")).toContainText("成员角色已保存");
+    await expect(page.locator("[data-action-feedback-announcer]")).toHaveAttribute("aria-live", "polite");
 
     memberRow = page.locator("tbody tr").filter({ hasText: originalCredentials.email });
     await memberRow.getByRole("button", { name: "分配角色" }).click();
@@ -1338,6 +1340,8 @@ test("@enterprise knowledge grants are visible then fail closed immediately afte
     await page.getByRole("button", { name: "保存访问等级" }).click();
     assertStatus((await grantResponse).status(), 200, "grant knowledge access through the admin UI");
     await expect(accessSelect).toHaveValue("reader");
+    await expect(page.locator(".action-feedback.success")).toContainText("访问等级已保存");
+    await expect(page.locator("[data-action-feedback-announcer]")).toHaveAttribute("aria-atomic", "true");
 
     const memberPage = await quality.newIsolatedPage(enterprise.baseUrl);
     await loginAs(memberPage, created.credentials);
@@ -1356,6 +1360,7 @@ test("@enterprise knowledge grants are visible then fail closed immediately afte
     await page.getByRole("button", { name: "保存访问等级" }).click();
     assertStatus((await revokeResponse).status(), 200, "revoke knowledge access through the admin UI");
     await expect(accessSelect).toHaveValue("none");
+    await expect(page.locator(".action-feedback.success")).toContainText("访问等级已保存");
     assertStatus(
       (await bffRequest(memberPage, `/api/v1/knowledge-bases/${String(knowledgeBase.id)}`)).status,
       404,
