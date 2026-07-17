@@ -98,7 +98,7 @@ sudo sh "$RELEASE_ENTRY/deploy/tencent/verify-offline-images.sh" verify \
   --contract-sha256 "$CONTRACT_SHA256"
 ```
 
-`BUNDLE_ROOT` 必须指向与本次 `RELEASE_ID` 和签名供应链证据相同的只读运输 bundle；`RELEASE_ENTRY` 提供已签名发布控制面，`RELEASE_ENV` 及其 `.images` 文件来自同一 bundle。`create-offline-contract.sh` 会输出 `CONTRACT_DIR CONTRACT_SHA256`；示例的退出 trap 只会在重新核验摘要后删除该临时 contract。上面的手工 `verify-offline-images.sh verify` **只验证镜像清单、Compose 渲染与本机镜像身份，不读取 Registry 导入收据，也不读取 `highest-release.json`**。清单缺失、与 `docker compose config --images` 不一致，或任一精确 RepoDigest/config image ID/`linux/amd64` 平台无法由本机 `docker image inspect` 证明时，该手工镜像检查失败。
+`BUNDLE_ROOT` 必须指向与本次 `RELEASE_ID` 和签名供应链证据相同的只读运输 bundle；`RELEASE_ENTRY` 提供已签名发布控制面，`RELEASE_ENV` 及其 `.images` 文件来自同一 bundle。`create-offline-contract.sh` 会输出 `CONTRACT_DIR CONTRACT_SHA256`；示例的退出 trap 只会在重新核验摘要后删除该临时 contract。上面的手工 `verify-offline-images.sh verify` **只验证镜像清单、Compose 渲染与本机镜像身份，不读取 Registry 导入收据，也不读取 `highest-release.json`**。清单缺失、与 `docker compose config --images` 不一致，或任一精确 RepoDigest、签名 manifest/config digest 兼容关系、`linux/amd64` 平台无法由本机 Docker 证明时，该手工镜像检查失败。真实 config digest 的权威字节级验证发生在签名 Registry 导入阶段，并由导入收据与完整清单摘要绑定；不能用 `.Id` 单独代替，因为 Docker 29 与旧 image store 的 `.Id` 语义不同。
 
 完整 `final` 必须先通过 `OFFLINE-P0-001`：以 root 对同一 canonical contract 执行 `preflight-offline.sh`，由预检校验签名 Registry 导入收据、最高已接受发布状态、目标发布与签名资产摘要；随后 `OFFLINE-IMAGES-P0-001` 才执行上述镜像身份检查。`install-offline.sh` 与 `deploy-offline.sh` 已按该顺序调用预检与镜像验证。签名收据缺失、不安全、与目标发布不匹配或不是最高已接受发布时，由完整预检记为 `blocked`；不能用手工 `verify-offline-images.sh` 的成功替代该门禁。classic `docker load` 成功本身也不是通过条件；`local`/`ci` 的 Compose 解析只属于开发 Smoke。
 

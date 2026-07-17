@@ -7,6 +7,10 @@
 
 离线企业方案必须先阅读[通用 Linux 8 核 16G 离线企业部署](../../docs/TENCENT_OFFLINE_ENTERPRISE_DEPLOYMENT.zh-CN.md)。它使用独立项目名 `heyi-kb-offline`、独立端口 `19443/19444` 和独立数据目录，不会修改当前 `heyi-kb-prod` 或其他应用。固定发布公钥、Registry 回执、最高发布序列、纳管 plan 与备份授权的交叉绑定见[离线发布信任链](../../docs/OFFLINE_RELEASE_TRUST_CHAIN.zh-CN.md)；终端信任、根证书分发、严格验收和轮换操作见[内网 TLS 与 Caddy 内部 CA 运维手册](../../docs/TLS_INTERNAL_CA_OPERATIONS.zh-CN.md)。
 
+镜像身份采用双摘要合同：镜像引用固定 Registry manifest digest，清单第二列固定真实 config digest。导入器在 pull 前复算回环 Registry 的 manifest/config 原始字节，并兼容 Docker 29 containerd image store 与旧 image store 不同的 `.Id` 表示；不得把 `.Id`、可变标签或 classic `docker save/load` 单独当作发布信任依据。
+
+运输层还必须按[构建说明中的 Linux 目标机导入顺序](../../docs/OFFLINE_REGISTRY_BUNDLE_BUILD.zh-CN.md#linux-目标机导入顺序)，使用固定路径及固定指纹的企业发布公钥，分别验证 Bootstrap tar 与主 bundle tar 的外层 `.sha256.sig`，并分别执行 `sha256sum --check --strict`。`import-offline-registry-bundle.sh` 只复核主 bundle 内部签名合同，不能替代这两组外层验签；任一步缺失均为 **FAIL / NO-GO**。
+
 > [!IMPORTANT]
 > 目标发布的安装清理、升级和维护切换对业务写入者使用 150 秒优雅停机预算；旧栈 `prepare`、`retire` 与恢复使用 140 秒。两者都覆盖单次 45 秒模型调用及 95/105 秒端到端清算链，避免正常变更过早发送 `SIGKILL`，从而留下无法判定的模型用量。运维时不得使用 `docker kill`、`docker rm -f` 或缩短预算。
 

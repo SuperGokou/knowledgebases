@@ -131,6 +131,15 @@ def _write_bound_image_evidence(fixture: Path) -> Path:
     )
     scanner = fixture / "test-syft"
     scanner.write_bytes(b"pinned-test-scanner\n")
+    local_image_map = fixture.parent / "local-image-map.tsv"
+    local_image_map.write_text(
+        "\n".join(
+            f"{line.split(chr(9), 1)[0]}\t{line.split(chr(9), 1)[0].rsplit('@', 1)[1]}"
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+        )
+        + "\n",
+        encoding="ascii",
+    )
 
     def fake_runner(command: Sequence[str], _environment: dict[str, str], _timeout: int) -> None:
         output = Path(command[-1].removeprefix("cyclonedx-json="))
@@ -150,6 +159,7 @@ def _write_bound_image_evidence(fixture: Path) -> Path:
     generate_image_sboms(
         artifact_root=fixture,
         image_manifest=manifest,
+        local_image_map=local_image_map,
         output_dir=fixture / "sbom",
         scanner=scanner.resolve(),
         scanner_sha256=_sha256(scanner),
@@ -273,6 +283,92 @@ def test_release_image_sbom_index_accepts_an_exact_fully_bound_manifest_set(
     )
 
     assert not {code for code in _finding_codes(report) if code.startswith("IMAGE_SBOM_")}
+
+
+def test_release_image_sbom_index_rejects_a_coordinated_third_scan_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _copy_gate_fixture(tmp_path)
+    attestation_path = _write_bound_image_evidence(fixture)
+    index_path = fixture / "sbom" / "image-sbom-index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    record = index["images"][0]
+    third_identity = f"sha256:{'f' * 64}"
+    assert third_identity not in {record["manifest_digest"], record["config_id"]}
+    record["scan_identity"] = third_identity
+
+    sbom_path = fixture / record["sbom_path"]
+    sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+    scan_property = next(
+        item
+        for item in sbom["metadata"]["properties"]
+        if item["name"] == "io.heyi.image.scan_identity"
+    )
+    scan_property["value"] = third_identity
+    sbom_path.write_text(
+        json.dumps(sbom, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    record["sbom_sha256"] = _sha256(sbom_path)
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _rebind_image_evidence(fixture)
+
+    report = run_gate(
+        fixture,
+        mode="release",
+        attestation_path=attestation_path,
+        artifact_root=fixture,
+        expected_release_id="a" * 40,
+    )
+
+    assert "IMAGE_SBOM_BINDING_INVALID" in _finding_codes(report)
+
+
+def test_release_image_sbom_index_rejects_scan_identity_property_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _copy_gate_fixture(tmp_path)
+    attestation_path = _write_bound_image_evidence(fixture)
+    index_path = fixture / "sbom" / "image-sbom-index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    record = index["images"][0]
+    alternate_identity = (
+        record["config_id"]
+        if record["scan_identity"] != record["config_id"]
+        else record["manifest_digest"]
+    )
+
+    sbom_path = fixture / record["sbom_path"]
+    sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+    scan_property = next(
+        item
+        for item in sbom["metadata"]["properties"]
+        if item["name"] == "io.heyi.image.scan_identity"
+    )
+    scan_property["value"] = alternate_identity
+    sbom_path.write_text(
+        json.dumps(sbom, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    record["sbom_sha256"] = _sha256(sbom_path)
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _rebind_image_evidence(fixture)
+
+    report = run_gate(
+        fixture,
+        mode="release",
+        attestation_path=attestation_path,
+        artifact_root=fixture,
+        expected_release_id="a" * 40,
+    )
+
+    assert "IMAGE_SBOM_BINDING_INVALID" in _finding_codes(report)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])

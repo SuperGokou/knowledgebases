@@ -11,6 +11,7 @@ from scripts.generate_offline_image_sboms import (
     ImageSbomContractError,
     generate_image_sboms,
     parse_image_manifest,
+    parse_local_image_map,
 )
 
 RELEASE_GIT_SHA = "a" * 40
@@ -49,6 +50,17 @@ def _write_manifest(root: Path, rows: list[str] | None = None) -> Path:
     manifest = root / "release.env.images"
     manifest.write_text("\n".join(rows or _manifest_rows()) + "\n", encoding="utf-8")
     return manifest
+
+
+def _write_local_image_map(root: Path, manifest: Path, *, use_config_ids: bool = False) -> Path:
+    rows = []
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        reference, config_id, _operating_system, _architecture = line.split("\t")
+        local_id = config_id if use_config_ids else reference.rsplit("@", 1)[1]
+        rows.append(f"{reference}\t{local_id}")
+    path = root.parent / f"{root.name}-local-image-map.tsv"
+    path.write_text("\n".join(rows) + "\n", encoding="ascii")
+    return path
 
 
 def _write_scanner(parent: Path) -> tuple[Path, str]:
@@ -94,9 +106,11 @@ def _fake_runner(command: Sequence[str], environment: dict[str, str], timeout: i
 
 
 def _generate(root: Path, scanner: Path, scanner_sha256: str) -> dict[str, object]:
+    manifest = _write_manifest(root)
     return generate_image_sboms(
         artifact_root=root,
-        image_manifest=_write_manifest(root),
+        image_manifest=manifest,
+        local_image_map=_write_local_image_map(root, manifest),
         output_dir=root / "sbom",
         scanner=scanner,
         scanner_sha256=scanner_sha256,
@@ -119,6 +133,58 @@ def test_manifest_contract_covers_the_complete_nine_image_release_set(tmp_path: 
     assert len({image.reference for image in images}) == 9
     assert len({image.manifest_digest for image in images}) == 9
     assert len({image.config_id for image in images}) == 9
+
+
+def test_local_image_map_must_match_the_manifest_exactly(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    images = parse_image_manifest(manifest)
+    mapping_path = _write_local_image_map(tmp_path, manifest)
+
+    mapping = parse_local_image_map(mapping_path, images)
+    assert list(mapping) == [image.reference for image in images]
+    assert all(mapping[image.reference] == image.manifest_digest for image in images)
+
+    rows = mapping_path.read_text(encoding="ascii").splitlines()
+    rows[0] = f"{images[0].reference}\t{images[0].config_id}"
+    mapping_path.write_text("\n".join(rows) + "\n", encoding="ascii")
+    mapping = parse_local_image_map(mapping_path, images)
+    assert mapping[images[0].reference] == images[0].config_id
+
+    rows[0] = f"{images[0].reference}\tsha256:{'0' * 64}"
+    mapping_path.write_text("\n".join(rows) + "\n", encoding="ascii")
+    with pytest.raises(
+        ImageSbomContractError,
+        match="must equal its signed manifest digest or config digest",
+    ):
+        parse_local_image_map(mapping_path, images)
+
+    rows = mapping_path.read_text(encoding="ascii").splitlines()
+    reference, _local_id = rows[0].split("\t")
+    rows[0] = f"{reference}\tsha256:{'0' * 63}"
+    mapping_path.write_text("\n".join(rows) + "\n", encoding="ascii")
+    with pytest.raises(ImageSbomContractError, match="invalid Docker image identity"):
+        parse_local_image_map(mapping_path, images)
+
+
+def test_local_image_map_cannot_be_embedded_in_the_signed_artifact(tmp_path: Path) -> None:
+    scanner, scanner_sha256 = _write_scanner(tmp_path.parent)
+    manifest = _write_manifest(tmp_path)
+    embedded_map = tmp_path / "forbidden-local-image-map.tsv"
+    external_map = _write_local_image_map(tmp_path, manifest)
+    embedded_map.write_bytes(external_map.read_bytes())
+
+    with pytest.raises(ImageSbomContractError, match="outside artifact_root"):
+        generate_image_sboms(
+            artifact_root=tmp_path,
+            image_manifest=manifest,
+            local_image_map=embedded_map,
+            output_dir=tmp_path / "sbom",
+            scanner=scanner,
+            scanner_sha256=scanner_sha256,
+            release_id=RELEASE_ID,
+            release_git_sha=RELEASE_GIT_SHA,
+            dry_run=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -186,18 +252,69 @@ def test_generation_binds_every_manifest_image_and_is_byte_stable(tmp_path: Path
         assert properties["io.heyi.image.reference"] == record["reference"]
         assert properties["io.heyi.image.manifest_digest"] == record["manifest_digest"]
         assert properties["io.heyi.image.config_id"] == record["config_id"]
+        assert properties["io.heyi.image.scan_identity"] == record["scan_identity"]
+        assert record["scan_identity"] in {
+            record["manifest_digest"],
+            record["config_id"],
+        }
         assert properties["io.heyi.release.git_sha"] == RELEASE_GIT_SHA
         assert properties["io.heyi.source_manifest.sha256"] == index["source_manifest_sha256"]
+
+    signed_evidence = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((first_root / "sbom").iterdir())
+    )
+    local_map_path = first_root.parent / f"{first_root.name}-local-image-map.tsv"
+    assert str(local_map_path) not in signed_evidence
+    assert local_map_path.as_posix() not in signed_evidence
+
+
+def test_generation_scans_and_persists_the_same_signed_config_identity(
+    tmp_path: Path,
+) -> None:
+    scanner, scanner_sha256 = _write_scanner(tmp_path)
+    artifact_root = tmp_path / "artifact"
+    artifact_root.mkdir()
+    manifest = _write_manifest(artifact_root)
+    images = parse_image_manifest(manifest)
+    local_image_map = _write_local_image_map(artifact_root, manifest, use_config_ids=True)
+    scanned_identities: list[str] = []
+
+    def capture_runner(command: Sequence[str], environment: dict[str, str], timeout: int) -> None:
+        scanned_identities.append(command[2].removeprefix("docker:"))
+        _fake_runner(command, environment, timeout)
+
+    generate_image_sboms(
+        artifact_root=artifact_root,
+        image_manifest=manifest,
+        local_image_map=local_image_map,
+        output_dir=artifact_root / "sbom",
+        scanner=scanner,
+        scanner_sha256=scanner_sha256,
+        release_id=RELEASE_ID,
+        release_git_sha=RELEASE_GIT_SHA,
+        runner=capture_runner,
+    )
+
+    index = json.loads((artifact_root / "sbom/image-sbom-index.json").read_text())
+    expected_config_ids = [image.config_id for image in images]
+    assert scanned_identities == expected_config_ids
+    assert [record["scan_identity"] for record in index["images"]] == expected_config_ids
+    for record in index["images"]:
+        sbom = json.loads((artifact_root / record["sbom_path"]).read_text())
+        properties = {item["name"]: item["value"] for item in sbom["metadata"]["properties"]}
+        assert properties["io.heyi.image.scan_identity"] == record["config_id"]
 
 
 def test_scanner_hash_mismatch_fails_before_creating_output(tmp_path: Path) -> None:
     scanner, _ = _write_scanner(tmp_path)
     manifest = _write_manifest(tmp_path)
+    local_image_map = _write_local_image_map(tmp_path, manifest)
 
     with pytest.raises(ImageSbomContractError, match="does not match"):
         generate_image_sboms(
             artifact_root=tmp_path,
             image_manifest=manifest,
+            local_image_map=local_image_map,
             output_dir=tmp_path / "sbom",
             scanner=scanner,
             scanner_sha256="0" * 64,
@@ -211,6 +328,7 @@ def test_scanner_hash_mismatch_fails_before_creating_output(tmp_path: Path) -> N
 def test_scan_failure_removes_all_staging_output(tmp_path: Path) -> None:
     scanner, scanner_sha256 = _write_scanner(tmp_path)
     manifest = _write_manifest(tmp_path)
+    local_image_map = _write_local_image_map(tmp_path, manifest)
 
     def fail_runner(_command: Sequence[str], _env: dict[str, str], _timeout: int) -> None:
         raise ImageSbomContractError("simulated scan failure")
@@ -219,6 +337,7 @@ def test_scan_failure_removes_all_staging_output(tmp_path: Path) -> None:
         generate_image_sboms(
             artifact_root=tmp_path,
             image_manifest=manifest,
+            local_image_map=local_image_map,
             output_dir=tmp_path / "sbom",
             scanner=scanner,
             scanner_sha256=scanner_sha256,
@@ -234,6 +353,7 @@ def test_scan_failure_removes_all_staging_output(tmp_path: Path) -> None:
 def test_dry_run_is_non_mutating_and_does_not_execute_scanner(tmp_path: Path) -> None:
     scanner, scanner_sha256 = _write_scanner(tmp_path)
     manifest = _write_manifest(tmp_path)
+    local_image_map = _write_local_image_map(tmp_path, manifest)
 
     def unexpected_runner(_command: Sequence[str], _env: dict[str, str], _timeout: int) -> None:
         raise AssertionError("dry-run must not execute the scanner")
@@ -241,6 +361,7 @@ def test_dry_run_is_non_mutating_and_does_not_execute_scanner(tmp_path: Path) ->
     report = generate_image_sboms(
         artifact_root=tmp_path,
         image_manifest=manifest,
+        local_image_map=local_image_map,
         output_dir=tmp_path / "sbom",
         scanner=scanner,
         scanner_sha256=scanner_sha256,

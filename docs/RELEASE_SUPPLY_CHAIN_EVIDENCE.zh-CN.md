@@ -22,9 +22,9 @@ sbom/image-<manifest-digest>.cdx.json
 sbom/image-sbom-index.json
 ```
 
-索引绑定 clean Git HEAD、Release ID、`release.env.images` 摘要、扫描器摘要、镜像 manifest digest 和 config ID。`sbom/` 下全部文件与 `release/`、`registry/`、control 文件一起进入精确 `SHA256SUMS`，再由发布私钥签名；因此不能在签名后替换、增加或删除 SBOM。
+索引绑定 clean Git HEAD、Release ID、`release.env.images` 摘要、扫描器摘要、镜像 manifest digest 和真实 config digest。构建器会额外生成一个仅位于临时工作区的本机扫描映射：它把签名引用映射到当前 Docker 后端可寻址的内容 ID，供 Syft 在 Registry 停止后扫描；该映射不得进入 bundle、SBOM 元数据或校验清单。这样 Docker 29 的 manifest 型 `.Id` 与旧 image store 的 config 型 `.Id` 都不会污染签名身份。`sbom/` 下全部文件与 `release/`、`registry/`、control 文件一起进入精确 `SHA256SUMS`，再由发布私钥签名；因此不能在签名后替换、增加或删除 SBOM。
 
-Linux 导入器会先验证 `SHA256SUMS.sig` 和每个对象摘要，再要求索引与 9 行镜像清单、`bundle.control` 的 Git SHA/Release ID 以及每个 SBOM 摘要一致。缺失、重复、额外、路径漂移或摘要漂移均阻断导入。
+Linux 导入器会先验证 `SHA256SUMS.sig` 和每个对象摘要，再要求索引与 9 行镜像清单、`bundle.control` 的 Git SHA/Release ID 以及每个 SBOM 摘要一致。随后逐镜像从回环 Registry 读取并复算 manifest/config 原始字节，验证其两级内容地址、描述符大小和 `linux/amd64`，最后才允许 pull。缺失、重复、额外、路径漂移、摘要漂移或 Docker 后端身份歧义均阻断导入。
 
 ## 法务与权利边界
 

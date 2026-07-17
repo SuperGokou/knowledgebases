@@ -288,18 +288,22 @@ record_by_reference = {
 }
 if len(record_by_reference) != 9 or set(record_by_reference) != {item[0] for item in images}:
     raise SystemExit(1)
+scan_identities = []
 for reference, manifest_digest, config_id, operating_system, architecture in images:
     record = record_by_reference[reference]
     sbom_relative = record.get("sbom_path")
+    scan_identity = record.get("scan_identity")
     expected_relative = "sbom/image-{}.cdx.json".format(manifest_digest[7:])
     if (
         record.get("manifest_digest") != manifest_digest
         or record.get("config_id") != config_id
+        or scan_identity not in {manifest_digest, config_id}
         or record.get("os") != operating_system
         or record.get("architecture") != architecture
         or sbom_relative != expected_relative
     ):
         raise SystemExit(1)
+    scan_identities.append(scan_identity)
     sbom_path = root / expected_relative
     if hashlib.sha256(sbom_path.read_bytes()).hexdigest() != record.get("sbom_sha256"):
         raise SystemExit(1)
@@ -326,6 +330,7 @@ for reference, manifest_digest, config_id, operating_system, architecture in ima
         "io.heyi.image.manifest_digest": manifest_digest,
         "io.heyi.image.os": operating_system,
         "io.heyi.image.reference": reference,
+        "io.heyi.image.scan_identity": scan_identity,
         "io.heyi.release.git_sha": control.get("RELEASE_GIT_SHA"),
         "io.heyi.release.id": control.get("RELEASE_ID"),
         "io.heyi.scanner.sha256": scanner.get("sha256"),
@@ -335,6 +340,8 @@ for reference, manifest_digest, config_id, operating_system, architecture in ima
         properties.get(key) != value for key, value in expected_properties.items()
     ):
         raise SystemExit(1)
+if len(set(scan_identities)) != len(images):
+    raise SystemExit(1)
 ' "$bundle_root"; then
   offline_fail registry-import \
     "image SBOM evidence does not match the signed nine-image manifest" 65
@@ -600,6 +607,154 @@ if not valid:
 validate_expected_trust_documents
 
 tab=$(printf '\t')
+verify_registry_manifest_and_config() {
+  image=$1
+  expected_config_id=$2
+  python3 -I - "$image" "$expected_config_id" <<'PY'
+import hashlib
+import http.client
+import json
+import re
+import sys
+import urllib.parse
+
+REFERENCE = re.compile(
+    r"^127\.0\.0\.1:5000/"
+    r"(?P<repository>[a-z0-9][a-z0-9._/-]*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?)"
+    r"@(?P<digest>sha256:[0-9a-f]{64})$"
+)
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+MANIFEST_TYPES = {
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+}
+CONFIG_TYPES = {
+    "application/vnd.docker.container.image.v1+json",
+    "application/vnd.oci.image.config.v1+json",
+}
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_CONFIG_BYTES = 16 * 1024 * 1024
+
+
+def fail(message):
+    raise SystemExit(f"registry-byte-verifier: {message}")
+
+
+def reject_constant(value):
+    fail(f"JSON contains a non-finite number: {value}")
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("JSON contains a duplicate object key")
+        value[key] = item
+    return value
+
+
+def load_object(data, label):
+    try:
+        value = json.loads(
+            data,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail(f"{label} is not valid UTF-8 JSON")
+    if not isinstance(value, dict):
+        fail(f"{label} must be a JSON object")
+    return value
+
+
+def read_exact_response(connection, path, *, accept, maximum, label):
+    headers = {"Accept": accept} if accept else {}
+    connection.request("GET", path, headers=headers)
+    response = connection.getresponse()
+    if response.status != 200:
+        fail(f"{label} returned HTTP {response.status}")
+    data = response.read(maximum + 1)
+    if len(data) > maximum:
+        fail(f"{label} exceeds the approved size")
+    return response, data
+
+
+image, expected_config = sys.argv[1:]
+match = REFERENCE.fullmatch(image)
+if match is None or DIGEST.fullmatch(expected_config) is None:
+    fail("signed image identity is invalid")
+repository_and_tag = match.group("repository")
+repository = repository_and_tag.rsplit(":", 1)[0]
+if any(part in {"", ".", ".."} for part in repository.split("/")):
+    fail("repository path is unsafe")
+manifest_digest = match.group("digest")
+repository_path = urllib.parse.quote(repository, safe="/._-")
+connection = http.client.HTTPConnection("127.0.0.1", 5000, timeout=10)
+try:
+    manifest_response, manifest_bytes = read_exact_response(
+        connection,
+        f"/v2/{repository_path}/manifests/{manifest_digest}",
+        accept=", ".join(sorted(MANIFEST_TYPES)),
+        maximum=MAX_MANIFEST_BYTES,
+        label="manifest",
+    )
+    response_digest = manifest_response.getheader("Docker-Content-Digest")
+    if response_digest != manifest_digest:
+        fail("manifest response content digest differs from the signed reference")
+    if f"sha256:{hashlib.sha256(manifest_bytes).hexdigest()}" != manifest_digest:
+        fail("manifest bytes differ from the signed content address")
+    manifest = load_object(manifest_bytes, "manifest")
+    if type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 2:
+        fail("manifest schemaVersion must be 2")
+    if manifest.get("mediaType") not in MANIFEST_TYPES:
+        fail("manifest is not an approved single-image media type")
+    config_descriptor = manifest.get("config")
+    if not isinstance(config_descriptor, dict):
+        fail("manifest config descriptor is missing")
+    config_digest = config_descriptor.get("digest")
+    config_size = config_descriptor.get("size")
+    if (
+        config_descriptor.get("mediaType") not in CONFIG_TYPES
+        or config_digest != expected_config
+        or type(config_size) is not int
+        or not 0 < config_size <= MAX_CONFIG_BYTES
+    ):
+        fail("manifest config descriptor differs from the signed contract")
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or not layers:
+        fail("manifest layer descriptor set is empty")
+    for layer in layers:
+        if (
+            not isinstance(layer, dict)
+            or DIGEST.fullmatch(str(layer.get("digest", ""))) is None
+            or type(layer.get("size")) is not int
+            or layer["size"] <= 0
+        ):
+            fail("manifest contains an invalid layer descriptor")
+
+    config_response, config_bytes = read_exact_response(
+        connection,
+        f"/v2/{repository_path}/blobs/{config_digest}",
+        accept="application/octet-stream",
+        maximum=MAX_CONFIG_BYTES,
+        label="config blob",
+    )
+    content_length = config_response.getheader("Content-Length")
+    if content_length is not None and content_length != str(config_size):
+        fail("config blob Content-Length differs from its descriptor")
+    if len(config_bytes) != config_size:
+        fail("config blob size differs from its descriptor")
+    if f"sha256:{hashlib.sha256(config_bytes).hexdigest()}" != config_digest:
+        fail("config blob bytes differ from their content address")
+    config = load_object(config_bytes, "config blob")
+    if config.get("os") != "linux" or config.get("architecture") != "amd64":
+        fail("config blob platform must be linux/amd64")
+finally:
+    connection.close()
+PY
+}
+
 verify_local_signed_images() {
   while IFS="$tab" read -r image expected_id expected_os expected_arch extra || \
     [ -n "${image:-}" ]; do
@@ -611,6 +766,8 @@ verify_local_signed_images() {
     fi
     observed_id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) || \
       offline_fail registry-import "previously imported image is missing" 65
+    observed_config_id=$(offline_local_image_config_id registry-import "$image") || \
+      offline_fail registry-import "previously imported image config is unavailable" 65
     observed_os=$(docker image inspect --format '{{.Os}}' "$image") || exit 66
     observed_arch=$(docker image inspect --format '{{.Architecture}}' "$image") || exit 66
     observed_repo_digests=$(docker image inspect \
@@ -622,8 +779,11 @@ verify_local_signed_images() {
       *:*) repository=${reference_without_digest%:*} ;;
       *) repository=$reference_without_digest ;;
     esac
-    if [ "$observed_id" != "$expected_id" ] || [ "$observed_os" != linux ] || \
-      [ "$observed_arch" != amd64 ] || \
+    signed_manifest_id=sha256:${image##*@sha256:}
+    if [ "$observed_config_id" != "$expected_id" ] || \
+      { [ "$observed_id" != "$expected_id" ] && \
+      [ "$observed_id" != "$signed_manifest_id" ]; } || \
+      [ "$observed_os" != linux ] || [ "$observed_arch" != amd64 ] || \
       ! printf '%s\n' "$observed_repo_digests" | grep -Fqx "$repository@$digest"; then
       offline_fail registry-import \
         "previously imported image identity, platform or RepoDigest differs" 65
@@ -798,12 +958,16 @@ if [ "$docker_available_inodes" -lt "$required_docker_inodes" ]; then
     "DockerRootDir lacks signed unpacked-image inodes plus the rollback reserve" 69
 fi
 
+observed_registry_config_id=$(offline_local_image_config_id \
+  registry-import "$registry_image") || \
+  offline_fail registry-import "bootstrap registry config identity is unavailable" 65
 observed_registry_id=$(docker image inspect --format '{{.Id}}' "$registry_image" 2>/dev/null) || \
   offline_fail registry-import "bootstrap registry image is not loaded" 66
 observed_registry_os=$(docker image inspect --format '{{.Os}}' "$registry_image") || exit 66
 observed_registry_arch=$(docker image inspect --format '{{.Architecture}}' "$registry_image") || \
   exit 66
-if [ "$observed_registry_id" != "$registry_image_id" ] || \
+if ! printf '%s\n' "$observed_registry_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || \
+  [ "$observed_registry_config_id" != "$registry_image_id" ] || \
   [ "$observed_registry_os" != linux ] || [ "$observed_registry_arch" != amd64 ]; then
   offline_fail registry-import "bootstrap registry image identity or platform differs" 65
 fi
@@ -866,14 +1030,25 @@ cleanup_registry() {
       "$registry_network_id" 2>/dev/null || true)
     observed_network_internal=$(docker network inspect --format '{{.Internal}}' \
       "$registry_network_id" 2>/dev/null || true)
+    observed_network_ipv6=$(docker network inspect --format '{{.EnableIPv6}}' \
+      "$registry_network_id" 2>/dev/null || true)
+    observed_network_masquerade=$(docker network inspect --format \
+      '{{ index .Options "com.docker.network.bridge.enable_ip_masquerade" }}' \
+      "$registry_network_id" 2>/dev/null || true)
+    observed_network_icc=$(docker network inspect --format \
+      '{{ index .Options "com.docker.network.bridge.enable_icc" }}' \
+      "$registry_network_id" 2>/dev/null || true)
     if [ "$observed_network_name" != "$network_name" ] || \
       [ "$observed_network_owner" != jiangsu-heyi-knowledgebases ] || \
       [ "$observed_network_purpose" != offline-registry-import ] || \
-      [ "$observed_network_internal" != true ]; then
-      echo "registry-import: CLEANUP_FAILED exact internal network identity changed" >&2
+      [ "$observed_network_internal" != false ] || \
+      [ "$observed_network_ipv6" != false ] || \
+      [ "$observed_network_masquerade" != false ] || \
+      [ "$observed_network_icc" != false ]; then
+      echo "registry-import: CLEANUP_FAILED exact isolated network identity changed" >&2
       cleanup_failed=true
     elif ! docker network rm "$registry_network_id" >/dev/null; then
-      echo "registry-import: CLEANUP_FAILED exact internal network could not be removed" >&2
+      echo "registry-import: CLEANUP_FAILED exact isolated network could not be removed" >&2
       cleanup_failed=true
     else
       registry_network_id=
@@ -894,30 +1069,124 @@ handle_exit() {
 trap 'handle_exit $?' EXIT
 trap 'exit 130' HUP INT TERM
 
-registry_network_id=$(docker network create --internal --driver bridge \
+registry_network_id=$(docker network create --driver bridge --ipv6=false \
+  --opt com.docker.network.bridge.enable_ip_masquerade=false \
+  --opt com.docker.network.bridge.enable_icc=false \
   --label io.heyi.knowledgebases.owner=jiangsu-heyi-knowledgebases \
   --label io.heyi.knowledgebases.purpose=offline-registry-import \
   "$network_name")
 if ! printf '%s\n' "$registry_network_id" | grep -Eq '^[0-9a-f]{64}$'; then
-  offline_fail registry-import "registry internal network ID is invalid" 69
+  offline_fail registry-import "registry isolated network ID is invalid" 69
 fi
-if [ "$(docker network inspect --format '{{.Internal}}' "$registry_network_id")" != true ]; then
-  offline_fail registry-import "registry import network is not internal" 69
+if [ "$(docker network inspect --format '{{.Internal}}' "$registry_network_id")" != false ] || \
+  [ "$(docker network inspect --format '{{.EnableIPv6}}' \
+    "$registry_network_id")" != false ] || \
+  [ "$(docker network inspect --format \
+    '{{ index .Options "com.docker.network.bridge.enable_ip_masquerade" }}' \
+    "$registry_network_id")" != false ] || \
+  [ "$(docker network inspect --format \
+    '{{ index .Options "com.docker.network.bridge.enable_icc" }}' \
+    "$registry_network_id")" != false ]; then
+  offline_fail registry-import "registry import network isolation options are invalid" 69
 fi
 
+registry_startup_command='while [ ! -f /tmp/heyi-network-ready ]; do sleep 0.1; done; exec /entrypoint.sh /etc/docker/registry/config.yml'
 registry_container_id=$(docker run -d --pull never \
   --name "$container_name" \
   --label io.heyi.knowledgebases.owner=jiangsu-heyi-knowledgebases \
   --label io.heyi.knowledgebases.purpose=offline-registry-import \
   --network "$registry_network_id" \
+  --dns 127.0.0.1 --dns-search . \
+  --dns-opt timeout:1 --dns-opt attempts:1 \
+  --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+  --sysctl net.ipv6.conf.default.disable_ipv6=1 \
   --publish 127.0.0.1:5000:5000 \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
   --tmpfs /tmp:size=32m,mode=1777 \
   --memory 256m --cpus 0.50 --pids-limit 128 \
   --volume "$registry_data:/var/lib/registry:ro" \
-  "$registry_image_id")
+  --entrypoint /bin/sh \
+  "$observed_registry_id" -ceu "$registry_startup_command")
 if ! printf '%s\n' "$registry_container_id" | grep -Eq '^[0-9a-f]{64}$'; then
   offline_fail registry-import "registry container ID is invalid" 69
+fi
+
+registry_dns=$(docker inspect --format '{{json .HostConfig.Dns}}' \
+  "$registry_container_id") || \
+  offline_fail registry-import "cannot inspect the temporary Registry DNS policy" 69
+registry_dns_search=$(docker inspect --format '{{json .HostConfig.DnsSearch}}' \
+  "$registry_container_id") || \
+  offline_fail registry-import "cannot inspect the temporary Registry DNS search policy" 69
+registry_dns_options=$(docker inspect --format '{{json .HostConfig.DnsOptions}}' \
+  "$registry_container_id") || \
+  offline_fail registry-import "cannot inspect the temporary Registry DNS options" 69
+registry_ipv6_all=$(docker inspect --format \
+  '{{ index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6" }}' \
+  "$registry_container_id") || \
+  offline_fail registry-import "cannot inspect the temporary Registry IPv6 policy" 69
+registry_ipv6_default=$(docker inspect --format \
+  '{{ index .HostConfig.Sysctls "net.ipv6.conf.default.disable_ipv6" }}' \
+  "$registry_container_id") || \
+  offline_fail registry-import "cannot inspect the temporary Registry IPv6 policy" 69
+if [ "$registry_dns" != '["127.0.0.1"]' ] || \
+  [ "$registry_dns_search" != '["."]' ] || \
+  [ "$registry_dns_options" != '["timeout:1","attempts:1"]' ] || \
+  [ "$registry_ipv6_all" != 1 ] || [ "$registry_ipv6_default" != 1 ]; then
+  offline_fail registry-import \
+    "temporary Registry DNS or IPv6 isolation differs from the sealed policy" 69
+fi
+
+network_seal_command='/sbin/ip route del default; /sbin/ip route add blackhole 127.0.0.11/32 table local'
+if ! docker run --rm --pull never \
+  --label io.heyi.knowledgebases.owner=jiangsu-heyi-knowledgebases \
+  --label io.heyi.knowledgebases.purpose=offline-registry-import-route-seal \
+  --network "container:$registry_container_id" \
+  --cap-drop ALL --cap-add NET_ADMIN \
+  --security-opt no-new-privileges:true \
+  --entrypoint /bin/sh \
+  "$observed_registry_id" -ceu "$network_seal_command" >/dev/null; then
+  offline_fail registry-import "cannot seal the temporary Registry network namespace" 69
+fi
+sealed_routes=$(docker exec "$registry_container_id" /sbin/ip route show) || \
+  offline_fail registry-import "cannot inspect the sealed Registry routes" 69
+sealed_route_count=$(printf '%s\n' "$sealed_routes" | sed '/^$/d' | wc -l | tr -d ' ')
+if [ "$sealed_route_count" != 1 ] || \
+  ! printf '%s\n' "$sealed_routes" | \
+    grep -Eq '^[0-9.]+/[0-9]+ dev eth0 scope link( |$)' || \
+  printf '%s\n' "$sealed_routes" | grep -Eq '(^default | via )'; then
+  offline_fail registry-import "temporary Registry retained a non-local network route" 69
+fi
+sealed_local_routes=$(docker exec \
+  "$registry_container_id" /sbin/ip route show table local) || \
+  offline_fail registry-import "cannot inspect the sealed Registry local routes" 69
+if ! printf '%s\n' "$sealed_local_routes" | \
+  grep -Eq '^blackhole 127\.0\.0\.11( |$)' || \
+  docker exec "$registry_container_id" \
+    /sbin/ip route get 127.0.0.11 >/dev/null 2>&1; then
+  offline_fail registry-import \
+    "Docker embedded DNS remained reachable after the network seal" 69
+fi
+sealed_ipv6_all=$(docker exec "$registry_container_id" \
+  /bin/cat /proc/sys/net/ipv6/conf/all/disable_ipv6) || \
+  offline_fail registry-import "cannot inspect the sealed Registry IPv6 state" 69
+sealed_ipv6_default=$(docker exec "$registry_container_id" \
+  /bin/cat /proc/sys/net/ipv6/conf/default/disable_ipv6) || \
+  offline_fail registry-import "cannot inspect the sealed Registry IPv6 state" 69
+sealed_ipv6_addresses=$(docker exec \
+  "$registry_container_id" /sbin/ip -6 address show) || \
+  offline_fail registry-import "cannot inspect the sealed Registry IPv6 addresses" 69
+sealed_ipv6_routes=$(docker exec \
+  "$registry_container_id" /sbin/ip -6 route show table all) || \
+  offline_fail registry-import "cannot inspect the sealed Registry IPv6 routes" 69
+if [ "$sealed_ipv6_all" != 1 ] || [ "$sealed_ipv6_default" != 1 ] || \
+  [ -n "$(printf '%s\n' "$sealed_ipv6_addresses" | sed '/^$/d')" ] || \
+  [ -n "$(printf '%s\n' "$sealed_ipv6_routes" | sed '/^$/d')" ]; then
+  offline_fail registry-import \
+    "temporary Registry retained an IPv6 address or route" 69
+fi
+if ! docker exec "$registry_container_id" /bin/sh -ceu \
+  ': > /tmp/heyi-network-ready'; then
+  offline_fail registry-import "cannot open the sealed Registry startup gate" 69
 fi
 
 ready=false
@@ -940,8 +1209,14 @@ while IFS="$tab" read -r image expected_id expected_os expected_arch extra || \
     [ "$expected_os" != linux ] || [ "$expected_arch" != amd64 ]; then
     offline_fail registry-import "signed image manifest entry is invalid" 65
   fi
+  if ! verify_registry_manifest_and_config "$image" "$expected_id"; then
+    offline_fail registry-import \
+      "Registry manifest/config bytes differ from the signed image contract" 65
+  fi
   docker pull --platform linux/amd64 "$image" >/dev/null
   observed_id=$(docker image inspect --format '{{.Id}}' "$image") || exit 66
+  observed_config_id=$(offline_local_image_config_id registry-import "$image") || \
+    offline_fail registry-import "imported image config is unavailable" 65
   observed_os=$(docker image inspect --format '{{.Os}}' "$image") || exit 66
   observed_arch=$(docker image inspect --format '{{.Architecture}}' "$image") || exit 66
   observed_repo_digests=$(docker image inspect \
@@ -953,8 +1228,11 @@ while IFS="$tab" read -r image expected_id expected_os expected_arch extra || \
     *:*) repository=${reference_without_digest%:*} ;;
     *) repository=$reference_without_digest ;;
   esac
-  if [ "$observed_id" != "$expected_id" ] || [ "$observed_os" != linux ] || \
-    [ "$observed_arch" != amd64 ] || \
+  signed_manifest_id=sha256:${image##*@sha256:}
+  if [ "$observed_config_id" != "$expected_id" ] || \
+    { [ "$observed_id" != "$expected_id" ] && \
+    [ "$observed_id" != "$signed_manifest_id" ]; } || \
+    [ "$observed_os" != linux ] || [ "$observed_arch" != amd64 ] || \
     ! printf '%s\n' "$observed_repo_digests" | grep -Fqx "$repository@$digest"; then
     offline_fail registry-import "imported image identity, platform or RepoDigest differs" 65
   fi
