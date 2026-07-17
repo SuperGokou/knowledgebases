@@ -72,6 +72,24 @@ def test_builder_exposes_help_and_a_non_mutating_dry_run() -> None:
     assert "REGISTRY_UNPACKED_INODES=MEASURED_DURING_FORMAL_BUILD" in dry_run_block
 
 
+def test_native_tool_wrappers_trust_exit_codes_not_powershell_stderr_records() -> None:
+    script = builder_text()
+
+    captured = script.split("function Invoke-Captured(", maxsplit=1)[1].split(
+        "function Invoke-Quiet(", maxsplit=1
+    )[0]
+    quiet = script.split("function Invoke-Quiet(", maxsplit=1)[1].split(
+        "function Read-DockerLabels(", maxsplit=1
+    )[0]
+    for wrapper in (captured, quiet):
+        assert "$previousErrorActionPreference = $ErrorActionPreference" in wrapper
+        assert "$ErrorActionPreference = 'Continue'" in wrapper
+        assert "$exitCode = $LASTEXITCODE" in wrapper
+        assert "$ErrorActionPreference = $previousErrorActionPreference" in wrapper
+        assert "if ($exitCode -ne 0)" in wrapper
+        assert "if ($LASTEXITCODE -ne 0)" not in wrapper
+
+
 def test_builder_uses_canonical_release_sequence_and_safe_release_id_contracts() -> None:
     script = builder_text()
 

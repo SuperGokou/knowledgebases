@@ -69,8 +69,20 @@ function Invoke-Captured(
     [string[]]$Arguments,
     [string]$FailureMessage
 ) {
-    $output = @(& $Tool @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $exitCode = $null
+    try {
+        # Windows PowerShell 5.1 converts native stderr into ErrorRecord
+        # instances. Tools such as Buildx legitimately emit progress there, so
+        # their process exit code—not stderr presence—is authoritative.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $Tool @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
         Fail $FailureMessage
     }
     return @($output | ForEach-Object { $_.ToString() })
@@ -81,8 +93,17 @@ function Invoke-Quiet(
     [string[]]$Arguments,
     [string]$FailureMessage
 ) {
-    & $Tool @Arguments 1>$null 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $exitCode = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Tool @Arguments 1>$null 2>$null
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
         Fail $FailureMessage
     }
 }
