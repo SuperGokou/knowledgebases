@@ -72,6 +72,10 @@ export function readableError(error: unknown): string {
   return error instanceof Error ? error.message : "发生未知错误。";
 }
 
+export function mutationOutcomeMayBeUncertain(error: unknown): boolean {
+  return !(error instanceof ApiClientError) || error.status === 408 || error.status >= 500;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];

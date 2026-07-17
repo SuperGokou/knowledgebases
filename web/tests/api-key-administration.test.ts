@@ -82,6 +82,10 @@ describe("API key administration pagination", () => {
     expect(apiKeysPanel).toContain("/api/v1/api-keys/${key.id}/rotate");
     expect(apiKeysPanel).toContain("我已保存，关闭明文");
     expect(apiKeysPanel).toContain('data-sensitive="true"');
+    expect(apiKeysPanel).toContain("生成结果无法确认");
+    expect(apiKeysPanel).toContain("轮换结果无法确认");
+    expect(apiKeysPanel).toContain("请勿重复生成");
+    expect(apiKeysPanel).toContain("请勿重复轮换");
     expect(apiKeysPanel).toContain("加载更多 API Key");
     expect(apiKeysPanel).toContain("搜索知识库");
     expect(apiKeysPanel).toContain("加载更多知识库");

@@ -3,8 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../src/lib/api-client";
 import {
   openKnowledgeGrantEditor,
+  SAVED_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE,
   saveKnowledgeGrantAssignment,
   STALE_KNOWLEDGE_GRANTS_MESSAGE,
+  STALE_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE,
 } from "../src/lib/knowledge-grant-assignment";
 import type { KnowledgeBase, KnowledgeBaseRoleGrant } from "../src/lib/types";
 
@@ -84,6 +86,44 @@ describe("knowledge grant CAS", () => {
     expect(reloadLatest).toHaveBeenCalledWith("stale");
     expect(STALE_KNOWLEDGE_GRANTS_MESSAGE).toContain("已被其他管理员更新");
     expect(STALE_KNOWLEDGE_GRANTS_MESSAGE).toContain("旧草稿已关闭");
+  });
+
+  it("reports a committed save separately when the post-save refresh fails", async () => {
+    const refreshError = new Error("refresh unavailable");
+    const request = vi.fn().mockResolvedValue(grants);
+
+    const result = await saveKnowledgeGrantAssignment(
+      openKnowledgeGrantEditor(knowledgeBase),
+      [],
+      { request, reloadLatest: vi.fn().mockRejectedValue(refreshError) },
+    );
+
+    expect(result).toEqual({
+      status: "saved_refresh_failed",
+      grants,
+      error: refreshError,
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(SAVED_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE).toContain("请勿重复提交");
+  });
+
+  it("closes the stale draft and reports refresh failure without replaying the write", async () => {
+    const refreshError = new Error("refresh unavailable");
+    const request = vi.fn().mockRejectedValue(new ApiClientError(
+      "stale",
+      409,
+      "stale_knowledge_grants",
+    ));
+
+    const result = await saveKnowledgeGrantAssignment(
+      openKnowledgeGrantEditor(knowledgeBase),
+      [],
+      { request, reloadLatest: vi.fn().mockRejectedValue(refreshError) },
+    );
+
+    expect(result).toEqual({ status: "stale_refresh_failed", error: refreshError });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(STALE_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE).toContain("旧草稿已关闭");
   });
 
   it("does not disguise an unrelated conflict as a stale grant snapshot", async () => {

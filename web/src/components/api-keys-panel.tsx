@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import {
   apiKeyPagePath,
   knowledgeBasePagePath,
@@ -12,7 +14,7 @@ import {
   replaceRotatedApiKey,
   splitAdminPage,
 } from "@/lib/api-key-administration";
-import { apiRequest, readableError } from "@/lib/api-client";
+import { apiRequest, mutationOutcomeMayBeUncertain, readableError } from "@/lib/api-client";
 import type { KnowledgeBase, ManagedApiKey } from "@/lib/types";
 
 type ApiKeyListResponse = ManagedApiKey[] | { items: ManagedApiKey[] };
@@ -71,6 +73,8 @@ function displayDate(value: string | null): string {
 
 export function ApiKeysPanel() {
   const { can, canAny, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useMemo(() => createActionLock(), []);
   const [keys, setKeys] = useState<ManagedApiKey[] | null>(null);
   const [keysHasMore, setKeysHasMore] = useState(false);
   const [keysLoading, setKeysLoading] = useState(false);
@@ -92,6 +96,8 @@ export function ApiKeysPanel() {
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const keysRequestId = useRef(0);
   const knowledgeRequestId = useRef(0);
+  const apiKeyHeadingRef = useRef<HTMLHeadingElement>(null);
+  const issuedCredentialRef = useRef<HTMLDivElement>(null);
 
   const loadKeys = useCallback(async (offset: number, replace: boolean) => {
     if (accessLoading) return;
@@ -188,9 +194,12 @@ export function ApiKeysPanel() {
       setActionError("请先安全保存并关闭当前明文，再生成新凭证。");
       return;
     }
+    if (!actionLock.acquire()) return;
     setPendingAction("create");
     setActionError("");
     setCopyState("idle");
+    feedback.dismiss();
+    let creationCommitted = false;
     try {
       const created = await apiRequest<ApiKeyCreationResponse>("/api/v1/api-keys", {
         method: "POST",
@@ -202,20 +211,39 @@ export function ApiKeysPanel() {
           expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
         }),
       });
+      creationCommitted = true;
       const secret = createdSecret(created);
       const item = createdItem(created);
       if (!secret) {
         void loadKeys(0, true);
-        throw new Error("后台没有返回一次性 API Key，请立即刷新列表并撤销该凭证。");
+        const message = "API Key 已生成，但后台没有返回一次性明文。请立即刷新列表并撤销该凭证，请勿重复生成。";
+        setActionError(message);
+        feedback.error(message, "已生成，但未返回明文");
+        return;
       }
       setIssuedCredential({ keyId: item.id, name: item.name, operation: "created", secret });
       setName("");
       setKnowledgeBaseIds([]);
       setExpiresAt("");
       setKeys((current) => replaceRotatedApiKey(current ?? [], item.id, item));
+      feedback.success(`API Key“${item.name}”已生成。请立即复制并安全保存；明文只展示一次。`, "API Key 已生成");
+      window.requestAnimationFrame(() => issuedCredentialRef.current?.focus());
     } catch (reason) {
-      setActionError(readableError(reason));
+      const detail = readableError(reason);
+      const outcomeUncertain = !creationCommitted && mutationOutcomeMayBeUncertain(reason);
+      if (outcomeUncertain) void loadKeys(0, true);
+      const message = creationCommitted
+        ? `API Key 已生成，但后台返回数据异常，无法安全展示一次性明文。请刷新列表并撤销新凭证，请勿重复生成。错误详情：${detail}`
+        : outcomeUncertain
+          ? `API Key 的生成结果无法确认。请先刷新列表核验；若出现新凭证，请立即撤销，请勿重复生成。错误详情：${detail}`
+        : detail;
+      setActionError(message);
+      feedback.error(
+        message,
+        creationCommitted ? "已生成，但响应异常" : outcomeUncertain ? "生成结果无法确认" : "API Key 生成失败",
+      );
     } finally {
+      actionLock.release();
       setPendingAction(null);
     }
   }
@@ -240,42 +268,75 @@ export function ApiKeysPanel() {
       return;
     }
     if (!window.confirm(`确定轮换“${key.name}”吗？旧 Key 将立即失效。`)) return;
+    if (!actionLock.acquire()) return;
     setPendingAction(`rotate:${key.id}`);
     setActionError("");
+    feedback.dismiss();
+    let rotationCommitted = false;
     try {
       const created = await apiRequest<ApiKeyCreationResponse>(
         `/api/v1/api-keys/${key.id}/rotate`,
         { method: "POST" },
       );
+      rotationCommitted = true;
       const secret = createdSecret(created);
       const item = createdItem(created);
       if (!secret) {
         void loadKeys(0, true);
-        throw new Error("轮换已提交，但后台未返回一次性明文。请立即刷新列表并撤销新凭证。");
+        const message = "API Key 已轮换且旧凭证已失效，但后台没有返回一次性明文。请立即刷新列表并撤销新凭证，请勿重复轮换。";
+        setActionError(message);
+        feedback.error(message, "已轮换，但未返回明文");
+        return;
       }
       setIssuedCredential({ keyId: item.id, name: item.name, operation: "rotated", secret });
       setCopyState("idle");
       setKeys((current) => replaceRotatedApiKey(current ?? [], key.id, item));
+      feedback.success(`API Key“${item.name}”已轮换，旧凭证已失效。请立即保存新的明文 Key。`, "API Key 已轮换");
+      window.requestAnimationFrame(() => issuedCredentialRef.current?.focus());
     } catch (reason) {
-      setActionError(readableError(reason));
+      const detail = readableError(reason);
+      const outcomeUncertain = !rotationCommitted && mutationOutcomeMayBeUncertain(reason);
+      if (outcomeUncertain) void loadKeys(0, true);
+      const message = rotationCommitted
+        ? `API Key 已轮换且旧凭证已失效，但后台返回数据异常，无法安全展示新明文。请刷新列表并撤销新凭证，请勿重复轮换。错误详情：${detail}`
+        : outcomeUncertain
+          ? `API Key 的轮换结果无法确认，旧凭证可能已失效。请先刷新列表核验并撤销无法取得明文的新凭证，请勿重复轮换。错误详情：${detail}`
+        : detail;
+      setActionError(message);
+      feedback.error(
+        message,
+        rotationCommitted ? "已轮换，但响应异常" : outcomeUncertain ? "轮换结果无法确认" : "API Key 轮换失败",
+      );
     } finally {
+      actionLock.release();
       setPendingAction(null);
     }
   }
 
   async function revokeKey(key: ManagedApiKey) {
     if (!window.confirm(`确定撤销“${key.name}”吗？使用该 Key 的系统将立即无法调用 API。`)) return;
+    if (!actionLock.acquire()) return;
     setPendingAction(`revoke:${key.id}`);
     setActionError("");
+    feedback.dismiss();
+    let revokeCommitted = false;
     try {
       await apiRequest<null>(`/api/v1/api-keys/${key.id}`, { method: "DELETE" });
+      revokeCommitted = true;
       if (issuedCredential?.keyId === key.id) clearIssuedCredential();
       setKeys((current) => current?.filter((item) => item.id !== key.id) ?? current);
       void loadKeys(0, true);
+      feedback.success(`API Key“${key.name}”已撤销，后续调用将被拒绝。`, "API Key 已撤销");
     } catch (reason) {
-      setActionError(readableError(reason));
+      const message = readableError(reason);
+      setActionError(message);
+      feedback.error(message, "API Key 撤销失败");
     } finally {
+      actionLock.release();
       setPendingAction(null);
+      if (revokeCommitted) {
+        window.requestAnimationFrame(() => apiKeyHeadingRef.current?.focus());
+      }
     }
   }
 
@@ -290,7 +351,7 @@ export function ApiKeysPanel() {
   return (
     <section className="panel api-keys-panel">
       <div className="panel-header">
-        <div><h2>API Key</h2><p>为内部系统生成独立凭证，并按应用执行撤销和轮换</p></div>
+        <div><h2 ref={apiKeyHeadingRef} tabIndex={-1}>API Key</h2><p>为内部系统生成独立凭证，并按应用执行撤销和轮换</p></div>
         <button
           className="button ghost small"
           type="button"
@@ -330,12 +391,12 @@ export function ApiKeysPanel() {
         </div>
         <div className="api-key-create-footer">
           <p>按“系统 + 环境”隔离凭证，并只勾选业务必需的知识库与接口。</p>
-          <button className="button primary" type="submit" disabled={mutationPending || Boolean(issuedCredential) || !name.trim() || permissionCodes.length === 0 || knowledgeBaseIds.length === 0}><Icon name="plus" />{pendingAction === "create" ? "正在生成…" : "生成 API Key"}</button>
+          <button className="button primary" type="submit" disabled={mutationPending || Boolean(issuedCredential) || !name.trim() || permissionCodes.length === 0 || knowledgeBaseIds.length === 0} aria-busy={pendingAction === "create"}>{pendingAction === "create" ? <><span className="spinner" />正在生成…</> : <><Icon name="plus" />生成 API Key</>}</button>
         </div>
       </form>
 
       {issuedCredential ? (
-        <div className="issued-key" role="status" aria-live="polite" data-sensitive="true">
+        <div ref={issuedCredentialRef} className="issued-key" role="region" aria-label="一次性 API Key" tabIndex={-1} data-sensitive="true">
           <div className="issued-key-heading">
             <span><Icon name="warning" /></span>
             <div><strong>{issuedCredential.operation === "rotated" ? "轮换完成，请立即保存新 Key" : "请立即复制并安全保存"}</strong><p>“{issuedCredential.name}”的 API Key 只有这一次明文展示。关闭后无法恢复，只能再次轮换或撤销。</p></div>
@@ -364,8 +425,8 @@ export function ApiKeysPanel() {
                   <td>{displayDate(key.created_at)}</td>
                   <td>
                     <div className="form-actions">
-                      <button className="button secondary small" type="button" aria-label={`轮换 ${key.name}`} disabled={mutationPending || Boolean(issuedCredential)} onClick={() => void rotateKey(key)}>{pendingAction === `rotate:${key.id}` ? "轮换中…" : "轮换"}</button>
-                      <button className="button danger small" type="button" aria-label={`撤销 ${key.name}`} disabled={mutationPending} onClick={() => void revokeKey(key)}>{pendingAction === `revoke:${key.id}` ? "撤销中…" : "撤销"}</button>
+                      <button className="button secondary small" type="button" aria-label={`轮换 ${key.name}`} disabled={mutationPending || Boolean(issuedCredential)} aria-busy={pendingAction === `rotate:${key.id}`} onClick={() => void rotateKey(key)}>{pendingAction === `rotate:${key.id}` ? <><span className="spinner" />轮换中…</> : "轮换"}</button>
+                      <button className="button danger small" type="button" aria-label={`撤销 ${key.name}`} disabled={mutationPending} aria-busy={pendingAction === `revoke:${key.id}`} onClick={() => void revokeKey(key)}>{pendingAction === `revoke:${key.id}` ? <><span className="spinner" />撤销中…</> : "撤销"}</button>
                     </div>
                   </td>
                 </tr>

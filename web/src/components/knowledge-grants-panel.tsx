@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { EmptyState, ErrorState, LoadingRows } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, readableError } from "@/lib/api-client";
 import {
   candidatesWithSelection,
@@ -13,8 +15,10 @@ import {
 } from "@/lib/knowledge-base-catalog";
 import {
   openKnowledgeGrantEditor,
+  SAVED_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE,
   saveKnowledgeGrantAssignment,
   STALE_KNOWLEDGE_GRANTS_MESSAGE,
+  STALE_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE,
   type KnowledgeGrantEditor,
   type KnowledgeGrantReloadReason,
 } from "@/lib/knowledge-grant-assignment";
@@ -29,6 +33,8 @@ type GrantChoice = KnowledgeAccessLevel | "none";
 
 export function KnowledgeGrantsPanel() {
   const { can, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useMemo(() => createActionLock(), []);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [roles, setRoles] = useState<Role[]>([]);
   const [knowledgeBaseId, setKnowledgeBaseId] = useState("");
@@ -48,12 +54,14 @@ export function KnowledgeGrantsPanel() {
   const [grantsReady, setGrantsReady] = useState(false);
   const [grantsRevision, setGrantsRevision] = useState(0);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [pending, setPending] = useState(false);
   const [editor, setEditor] = useState<KnowledgeGrantEditor | null>(null);
   const grantsRequestId = useRef(0);
   const knowledgeCatalogRequestId = useRef(0);
   const roleCatalogRequestId = useRef(0);
   const selectedSnapshot = useRef<KnowledgeBase | null>(null);
+  const knowledgeSelectorRef = useRef<HTMLSelectElement>(null);
 
   const selectKnowledgeBase = useCallback((next: KnowledgeBase | null) => {
     grantsRequestId.current += 1;
@@ -63,6 +71,7 @@ export function KnowledgeGrantsPanel() {
     setEditor(null);
     setGrantsReady(false);
     setError("");
+    setNotice("");
     setGrantsLoading(Boolean(next));
     setKnowledgeBaseId(next?.id ?? "");
     setGrantsRevision((current) => current + 1);
@@ -236,9 +245,13 @@ export function KnowledgeGrantsPanel() {
       || editor.knowledgeBaseId !== knowledgeBaseId
       || grantsLoading
       || !grantsReady
+      || !actionLock.acquire()
     ) return;
+    let restoreWorkspaceFocus = false;
     setPending(true);
     setError("");
+    setNotice("");
+    feedback.dismiss();
     try {
       const result = await saveKnowledgeGrantAssignment(
         editor,
@@ -247,13 +260,32 @@ export function KnowledgeGrantsPanel() {
           .map(([role_id, access_level]) => ({ role_id, access_level })),
         { reloadLatest: reloadSelectedSnapshot },
       );
+      restoreWorkspaceFocus = true;
       if (result.status === "stale") {
-        setError(STALE_KNOWLEDGE_GRANTS_MESSAGE);
+        setNotice(STALE_KNOWLEDGE_GRANTS_MESSAGE);
+        feedback.info(STALE_KNOWLEDGE_GRANTS_MESSAGE, "授权数据已更新");
+      } else if (result.status === "stale_refresh_failed") {
+        const message = `${STALE_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE} 错误详情：${readableError(result.error)}`;
+        setError(message);
+        feedback.error(message, "授权数据刷新失败");
+      } else if (result.status === "saved_refresh_failed") {
+        const message = `${SAVED_KNOWLEDGE_GRANTS_REFRESH_FAILED_MESSAGE} 错误详情：${readableError(result.error)}`;
+        setError(message);
+        feedback.error(message, "已保存，但刷新失败");
+      } else {
+        feedback.success(`知识库“${selectedName ?? knowledgeBaseId}”的角色访问等级已保存并生效。`, "访问等级已保存");
       }
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setNotice("");
+      setError(message);
+      feedback.error(message, "访问等级保存失败");
     } finally {
+      actionLock.release();
       setPending(false);
+      if (restoreWorkspaceFocus) {
+        window.requestAnimationFrame(() => knowledgeSelectorRef.current?.focus());
+      }
     }
   }
 
@@ -270,7 +302,7 @@ export function KnowledgeGrantsPanel() {
           <label>搜索可管理知识库
             <input type="search" maxLength={200} value={knowledgeQuery} onChange={(event) => setKnowledgeQuery(event.target.value)} placeholder="输入知识库名称" />
           </label>
-          <select aria-label="选择要授权的知识库" value={knowledgeBaseId} onChange={(event) => selectKnowledgeBase(selectableKnowledgeBases.find((item) => item.id === event.target.value) ?? null)} disabled={!selectableKnowledgeBases.length || pending}>
+          <select ref={knowledgeSelectorRef} aria-label="选择要授权的知识库" value={knowledgeBaseId} onChange={(event) => selectKnowledgeBase(selectableKnowledgeBases.find((item) => item.id === event.target.value) ?? null)} disabled={!selectableKnowledgeBases.length || pending}>
             {!selectableKnowledgeBases.length ? <option value="">没有可管理的知识库</option> : null}
             {selectableKnowledgeBases.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
           </select>
@@ -279,6 +311,7 @@ export function KnowledgeGrantsPanel() {
       </div>
       {knowledgeCatalogError ? <div className="panel-body"><ErrorState message={knowledgeCatalogError} onRetry={() => void loadKnowledgeCatalog(debouncedKnowledgeQuery, 0, true)} /></div> : null}
       {roleCatalogError ? <div className="panel-body"><ErrorState message={roleCatalogError} onRetry={() => void loadRoleCatalog(debouncedRoleQuery, 0, true)} /></div> : null}
+      {notice ? <div className="panel-body"><div className="notice info-notice"><div><strong>授权数据已同步</strong><p>{notice}</p></div></div></div> : null}
       {error ? <div className="panel-body"><ErrorState message={error} /></div> : null}
       {knowledgeBases === null && knowledgeCatalogLoading ? <LoadingRows count={3} /> : null}
       {knowledgeBases?.length === 0 && !selectableKnowledgeBases.length ? <EmptyState compact icon="layers" title="没有 Manager 级知识库" description="只有知识库 Manager 可以修改角色授权。" /> : null}
@@ -330,7 +363,7 @@ export function KnowledgeGrantsPanel() {
                 重新编辑授权
               </button>
             ) : (
-              <button className="button primary" type="button" disabled={pending || grantsLoading || !grantsReady || !editor} onClick={() => void save()}>{pending ? "正在保存…" : grantsLoading ? "正在载入…" : "保存访问等级"}</button>
+              <button className="button primary" type="button" disabled={pending || grantsLoading || !grantsReady || !editor} aria-busy={pending} onClick={() => void save()}>{pending ? <><span className="spinner" />正在保存…</> : grantsLoading ? "正在载入…" : "保存访问等级"}</button>
             )}
           </div>
         </div>

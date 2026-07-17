@@ -63,6 +63,11 @@ test("文件审批只放行安全且草稿就绪的文件，并友好呈现 409"
   await mockCurrentUser(page, "p1-files-access", ["file:read", "file:approve"]);
   const ready = fileRecord("00000000-0000-4000-8000-000000000201", "可审批.txt");
   const conflict = fileRecord("00000000-0000-4000-8000-000000000202", "状态冲突.txt");
+  let readyApprovalRequests = 0;
+  let releaseReadyApproval = () => {};
+  const readyApprovalGate = new Promise<void>((resolve) => {
+    releaseReadyApproval = resolve;
+  });
   const files = [
     ready,
     conflict,
@@ -87,6 +92,8 @@ test("文件审批只放行安全且草稿就绪的文件，并友好呈现 409"
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
     if (request.method() === "POST" && pathname.endsWith(`/${String(ready.id)}/approve`)) {
+      readyApprovalRequests += 1;
+      await readyApprovalGate;
       Object.assign(ready, {
         status: "available",
         knowledge_status: "indexed",
@@ -131,15 +138,62 @@ test("文件审批只放行安全且草稿就绪的文件，并友好呈现 409"
   }
 
   const readyRow = fileCenter.locator("tbody tr").filter({ hasText: "可审批.txt" });
-  await readyRow.getByRole("button", { name: "审批文件：可审批.txt" }).click();
+  const readyApprovalButton = readyRow.getByRole("button", { name: "审批文件：可审批.txt" });
+  await readyApprovalButton.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect.poll(() => readyApprovalRequests).toBe(1);
+  await expect(readyApprovalButton).toBeDisabled();
+  await expect(readyApprovalButton).toHaveAttribute("aria-busy", "true");
+  await expect(readyApprovalButton).toContainText("审批中");
+  releaseReadyApproval();
   await expect(readyRow).toContainText("已入知识库");
   await expect(readyRow.getByRole("button", { name: "审批文件：可审批.txt" })).toHaveCount(0);
+  await expect(page.locator(".action-feedback.success")).toBeVisible();
+  await expect(page.locator("[data-action-feedback-announcer]")).toContainText("文件审批成功");
 
   const conflictRow = fileCenter.locator("tbody tr").filter({ hasText: "状态冲突.txt" });
   await conflictRow.getByRole("button", { name: "审批文件：状态冲突.txt" }).click();
   await expect(page.locator(".notice.error-notice")).toContainText(
     "知识转换尚未完成，请等待转换完成并刷新后再审批。",
   );
+  await expect(page.locator(".action-feedback.error")).toContainText("文件审批失败");
+});
+
+test("操作结果在减少动态效果模式下仍清晰可见", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await mockCurrentUser(page, "p1-files-access", ["file:read", "file:approve"]);
+  const ready = fileRecord("00000000-0000-4000-8000-000000000207", "减少动画验收.txt");
+
+  await page.route("**/api/backend/api/v1/files**", async (route) => {
+    const request = route.request();
+    if (request.method() === "POST") {
+      Object.assign(ready, {
+        status: "available",
+        knowledge_status: "indexed",
+        searchable: true,
+        available_at: NOW,
+      });
+      await fulfillJson(route, ready);
+      return;
+    }
+    await fulfillJson(route, [ready]);
+  });
+
+  await page.goto("/admin/files");
+  await page.getByRole("button", { name: "审批文件：减少动画验收.txt" }).click();
+  const toast = page.locator(".action-feedback.success");
+  await expect(toast).toBeVisible();
+  await expect(toast).toContainText("文件审批成功");
+
+  const animationSeconds = await toast.evaluate((element) => {
+    const values = getComputedStyle(element).animationDuration.split(",");
+    return values.map((value) => value.trim().endsWith("ms")
+      ? Number.parseFloat(value) / 1_000
+      : Number.parseFloat(value));
+  });
+  expect(Math.max(...animationSeconds)).toBeLessThanOrEqual(0.001);
 });
 
 test("知识连接灯不会被失败刷新或过期请求错误恢复为绿色", async ({ page }) => {
