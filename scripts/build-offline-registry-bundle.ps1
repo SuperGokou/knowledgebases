@@ -1587,12 +1587,20 @@ try {
     }
     $registryNetworkId = $networkOutput[0]
     $networkPolicy = @(Invoke-Captured $docker @(
-        'network', 'inspect', '--format',
-        '{{.Internal}}|{{.EnableIPv6}}|{{ index .Options "com.docker.network.bridge.enable_ip_masquerade" }}|{{ index .Options "com.docker.network.bridge.enable_icc" }}',
-        $registryNetworkId
+        'network', 'inspect', '--format', '{{json .}}', $registryNetworkId
     ) 'cannot inspect the temporary Registry network policy')
-    if ($networkPolicy.Count -ne 1 -or
-        $networkPolicy[0] -ne 'false|false|false|false') {
+    try {
+        $networkPolicyDocument = @($networkPolicy[0] | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        Fail 'temporary Registry network policy is not valid Docker JSON'
+    }
+    if ($networkPolicy.Count -ne 1 -or $networkPolicyDocument.Count -ne 1 -or
+        $networkPolicyDocument[0].Internal -ne $false -or
+        $networkPolicyDocument[0].EnableIPv6 -ne $false -or
+        $networkPolicyDocument[0].Options.'com.docker.network.bridge.enable_ip_masquerade' -ne
+            'false' -or
+        $networkPolicyDocument[0].Options.'com.docker.network.bridge.enable_icc' -ne 'false') {
         Fail 'temporary Registry network isolation options are invalid'
     }
     $containerName = "heyi-bundle-$($runId.Substring(0, 20))"
