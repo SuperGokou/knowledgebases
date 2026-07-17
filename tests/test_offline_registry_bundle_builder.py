@@ -934,6 +934,12 @@ def test_builder_creates_a_deterministic_root_owned_posix_tar() -> None:
     assert "info.mtime = epoch" in script
     assert "info.mode = 0o750 if path.is_dir() else 0o444" in script
     assert 'sorted(source.rglob("*")' in script
+    tar_function = script.split("function New-DeterministicTar(", maxsplit=1)[1].split(
+        "if (-not $OutputDirectory", maxsplit=1
+    )[0]
+    assert "Invoke-Captured $Python" in tar_function
+    assert "Invoke-Quiet $Python" not in tar_function
+    assert "deterministic POSIX tar creator returned unexpected output" in tar_function
 
 
 def test_bundle_build_documentation_covers_verification_and_import_order() -> None:

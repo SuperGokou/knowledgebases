@@ -1325,8 +1325,12 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
         else:
             archive.addfile(info)
 '@
-    Invoke-Quiet $Python @('-I', '-c', $program, $InputDirectory, $OutputTar, "$Epoch") `
-        'deterministic POSIX tar creation failed'
+    $tarOutput = @(Invoke-Captured $Python @(
+        '-I', '-c', $program, $InputDirectory, $OutputTar, "$Epoch"
+    ) 'deterministic POSIX tar creation failed')
+    if ($tarOutput.Count -ne 0) {
+        Fail 'deterministic POSIX tar creator returned unexpected output'
+    }
 }
 
 if (-not $OutputDirectory -or -not $SigningPrivateKey -or
