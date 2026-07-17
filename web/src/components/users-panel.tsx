@@ -1,22 +1,32 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, readableError } from "@/lib/api-client";
 import type { Role, User, UserStatus } from "@/lib/types";
 
 const statusLabel: Record<UserStatus, string> = { active: "正常", disabled: "已停用", locked: "已锁定" };
 const statusTone: Record<UserStatus, "success" | "neutral" | "danger"> = { active: "success", disabled: "neutral", locked: "danger" };
+type PendingAction =
+  | { type: "create" }
+  | { type: "status"; userId: string; status: UserStatus }
+  | { type: "roles"; userId: string }
+  | null;
 
 export function UsersPanel() {
   const { can, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useRef(createActionLock()).current;
   const [users, setUsers] = useState<User[] | null>(null);
   const [roles, setRoles] = useState<Role[]>([]);
   const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
+  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const pending = pendingAction !== null;
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
@@ -56,10 +66,12 @@ export function UsersPanel() {
 
   async function createUser(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "create" });
     setError("");
     try {
-      await apiRequest<User>("/api/v1/users", {
+      const created = await apiRequest<User>("/api/v1/users", {
         method: "POST",
         body: JSON.stringify({
           email: email.trim(),
@@ -73,37 +85,57 @@ export function UsersPanel() {
       setDisplayName("");
       setNewRoleIds([]);
       await load();
+      feedback.success(`成员“${created.display_name || created.email}”已创建并可使用已分配的角色登录。`, "成员账号已创建");
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "成员账号创建失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
   async function setStatus(user: User, status: UserStatus) {
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "status", userId: user.id, status });
     setError("");
     try {
       await apiRequest<User>(`/api/v1/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ status }) });
       await load();
+      const actionLabel = status === "active" ? "启用" : "停用";
+      feedback.success(`成员“${user.display_name || user.email}”已${actionLabel}。`, `账号已${actionLabel}`);
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, status === "active" ? "账号启用失败" : "账号停用失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
   async function saveRoles(userId: string) {
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "roles", userId });
     setError("");
     try {
       await apiRequest<User>(`/api/v1/users/${userId}/roles`, { method: "PUT", body: JSON.stringify({ role_ids: editingRoleIds }) });
+      const userName = users?.find((user) => user.id === userId)?.display_name
+        || users?.find((user) => user.id === userId)?.email
+        || "当前成员";
       setEditingUserId("");
       await load();
+      feedback.success(`成员“${userName}”的角色与对应权限已更新。`, "成员角色已保存");
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "成员角色保存失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
@@ -117,7 +149,7 @@ export function UsersPanel() {
       <section className="panel">
         <div className="panel-header">
           <div><h2>成员账号</h2><p>创建账号、调整状态，并按角色授予能力</p></div>
-          <button className="button ghost small" type="button" onClick={() => void load()}><Icon name="refresh" />刷新</button>
+          <button className="button ghost small" type="button" disabled={pending} onClick={() => void load()}><Icon name="refresh" />刷新</button>
         </div>
         {users === null && !error ? <LoadingRows count={5} /> : null}
         {users?.length === 0 ? <EmptyState compact icon="users" title="还没有成员" description="创建第一个成员账号并分配最小必要角色。" /> : null}
@@ -133,8 +165,12 @@ export function UsersPanel() {
                     <td><StatusBadge tone={statusTone[user.status]}>{statusLabel[user.status]}</StatusBadge></td>
                     <td>{new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(new Date(user.created_at))}</td>
                     <td><div className="button-row">
-                      <button className="button ghost small" type="button" disabled={pending} onClick={() => void setStatus(user, user.status === "active" ? "disabled" : "active")}>{user.status === "active" ? "停用" : "启用"}</button>
-                      {can("role:assign") && roles.length ? <button className="button secondary small" type="button" onClick={() => { setEditingUserId(user.id); setEditingRoleIds(user.role_ids); }}>分配角色</button> : null}
+                      <button className="button ghost small" type="button" disabled={pending} aria-busy={pendingAction?.type === "status" && pendingAction.userId === user.id} onClick={() => void setStatus(user, user.status === "active" ? "disabled" : "active")}>
+                        {pendingAction?.type === "status" && pendingAction.userId === user.id
+                          ? <><span className="spinner" />{pendingAction.status === "active" ? "正在启用…" : "正在停用…"}</>
+                          : user.status === "active" ? "停用" : "启用"}
+                      </button>
+                      {can("role:assign") && roles.length ? <button className="button secondary small" type="button" disabled={pending} onClick={() => { setEditingUserId(user.id); setEditingRoleIds(user.role_ids); }}>分配角色</button> : null}
                     </div></td>
                   </tr>
                 ))}
@@ -153,7 +189,7 @@ export function UsersPanel() {
                 </label>
               ))}
             </div>
-            <div className="form-actions"><button className="button ghost" type="button" onClick={() => setEditingUserId("")}>取消</button><button className="button primary" type="button" disabled={pending} onClick={() => void saveRoles(editingUserId)}>保存角色</button></div>
+            <div className="form-actions"><button className="button ghost" type="button" disabled={pending} onClick={() => setEditingUserId("")}>取消</button><button className="button primary" type="button" disabled={pending} aria-busy={pendingAction?.type === "roles" && pendingAction.userId === editingUserId} onClick={() => void saveRoles(editingUserId)}>{pendingAction?.type === "roles" && pendingAction.userId === editingUserId ? <><span className="spinner" />正在保存角色…</> : "保存角色"}</button></div>
           </div>
         ) : null}
         <details className="drawer-form">
@@ -163,7 +199,7 @@ export function UsersPanel() {
             <label>显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
             <label className="full">初始密码<input type="password" minLength={12} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="至少 12 位" required /></label>
             {can("role:assign") && roles.length ? <fieldset className="full fieldset"><legend>初始角色</legend><div className="checkbox-grid">{roles.map((role) => <label className="check-option" key={role.id}><input type="checkbox" checked={newRoleIds.includes(role.id)} onChange={() => toggleRole(role.id, newRoleIds, setNewRoleIds)} /><span>{role.name}<small>{role.code}</small></span></label>)}</div></fieldset> : null}
-            <div className="form-actions full"><button className="button primary" type="submit" disabled={pending}>{pending ? "正在创建…" : "创建账号"}</button></div>
+            <div className="form-actions full"><button className="button primary" type="submit" disabled={pending} aria-busy={pendingAction?.type === "create"}>{pendingAction?.type === "create" ? <><span className="spinner" />正在创建账号…</> : "创建账号"}</button></div>
           </form>
         </details>
       </section>

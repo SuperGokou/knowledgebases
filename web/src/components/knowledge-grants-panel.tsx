@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { EmptyState, ErrorState, LoadingRows } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, readableError } from "@/lib/api-client";
 import type { KnowledgeAccessLevel, KnowledgeBase, KnowledgeBaseRoleGrant, Role } from "@/lib/types";
 
@@ -11,6 +13,8 @@ type GrantChoice = KnowledgeAccessLevel | "none";
 
 export function KnowledgeGrantsPanel() {
   const { can, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useRef(createActionLock()).current;
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [roles, setRoles] = useState<Role[]>([]);
   const [knowledgeBaseId, setKnowledgeBaseId] = useState("");
@@ -79,7 +83,8 @@ export function KnowledgeGrantsPanel() {
   const selectedName = useMemo(() => knowledgeBases?.find((item) => item.id === knowledgeBaseId)?.name, [knowledgeBaseId, knowledgeBases]);
 
   async function save() {
-    if (!knowledgeBaseId || grantsLoading || !grantsReady) return;
+    if (!knowledgeBaseId || grantsLoading || !grantsReady || pending || !actionLock.acquire()) return;
+    feedback.dismiss();
     setPending(true);
     setError("");
     try {
@@ -91,9 +96,13 @@ export function KnowledgeGrantsPanel() {
             .map(([role_id, access_level]) => ({ role_id, access_level })),
         }),
       });
+      feedback.success(`知识库“${selectedName ?? "当前知识库"}”的角色访问等级已保存。`, "访问等级已保存");
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "访问等级保存失败");
     } finally {
+      actionLock.release();
       setPending(false);
     }
   }
@@ -137,7 +146,7 @@ export function KnowledgeGrantsPanel() {
               ))}
             </tbody>
           </table>
-          <div className="panel-footer"><button className="button primary" type="button" disabled={pending || grantsLoading || !grantsReady} onClick={() => void save()}>{pending ? "正在保存…" : grantsLoading ? "正在载入…" : "保存访问等级"}</button></div>
+          <div className="panel-footer"><button className="button primary" type="button" disabled={pending || grantsLoading || !grantsReady} aria-busy={pending} onClick={() => void save()}>{pending ? <><span className="spinner" />正在保存…</> : grantsLoading ? "正在载入…" : "保存访问等级"}</button></div>
         </div>
       ) : null}
     </section>

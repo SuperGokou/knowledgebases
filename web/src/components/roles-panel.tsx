@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import {
   displayLimit,
@@ -36,6 +38,8 @@ function roleCreateError(error: unknown): string {
 
 export function RolesPanel() {
   const { can, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useRef(createActionLock()).current;
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   const [definitions, setDefinitions] = useState<LimitDefinition[]>([]);
@@ -45,8 +49,8 @@ export function RolesPanel() {
   const [policyLoading, setPolicyLoading] = useState(false);
   const [policyReady, setPolicyReady] = useState(false);
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
-  const [pending, setPending] = useState(false);
+  const [pendingAction, setPendingAction] = useState<"create" | "policy" | null>(null);
+  const pending = pendingAction !== null;
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -127,25 +131,33 @@ export function RolesPanel() {
 
   async function createRole(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (pending) return;
+    feedback.dismiss();
     const roleName = name.trim();
     const normalizedCode = normalizeRoleCode(code);
     const submittedCode = normalizedCode || generateRoleCode(`${Date.now().toString(36)}${Math.random().toString(36).slice(2, 9)}`);
     const parsedPriority = Number(priority);
     if (!roleName) {
-      setError("请输入角色名称。");
+      const message = "请输入角色名称。";
+      setError(message);
+      feedback.error(message, "角色创建失败");
       return;
     }
     if (!isValidRoleCode(submittedCode)) {
-      setError("角色标识格式不正确。请使用英文字母开头，并仅包含字母、数字、下划线或短横线。");
+      const message = "角色标识格式不正确。请使用英文字母开头，并仅包含字母、数字、下划线或短横线。";
+      setError(message);
+      feedback.error(message, "角色创建失败");
       return;
     }
     if (!Number.isInteger(parsedPriority) || parsedPriority < -10_000 || parsedPriority > 10_000) {
-      setError("优先级必须是 -10000 到 10000 之间的整数。");
+      const message = "优先级必须是 -10000 到 10000 之间的整数。";
+      setError(message);
+      feedback.error(message, "角色创建失败");
       return;
     }
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    setPendingAction("create");
     setError("");
-    setSuccess("");
     try {
       const created = await apiRequest<Role>("/api/v1/roles", {
         method: "POST",
@@ -157,16 +169,20 @@ export function RolesPanel() {
       setPriority("0");
       await load();
       selectRole(created.id);
-      setSuccess(`角色“${created.name}”已创建，接下来可以配置权限能力和资源限额。`);
+      feedback.success(`角色“${created.name}”已创建，接下来可以配置权限能力和资源限额。`, "角色创建成功");
     } catch (reason) {
-      setError(roleCreateError(reason));
+      const message = roleCreateError(reason);
+      setError(message);
+      feedback.error(message, "角色创建失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
   async function savePolicy() {
-    if (!selected || !mutable || !policyReady || policyLoading) return;
+    if (!selected || !mutable || !policyReady || policyLoading || pending) return;
+    feedback.dismiss();
     const limits: Record<string, number | null> = {};
     for (const definition of definitions) {
       const raw = limitValues[definition.key]?.trim().toLowerCase();
@@ -175,15 +191,17 @@ export function RolesPanel() {
       else {
         const value = Number(raw);
         if (!Number.isSafeInteger(value) || value < 0) {
-          setError(`${definition.name} 必须是 0 到 ${Number.MAX_SAFE_INTEGER} 之间的安全整数，或填写 unlimited。`);
+          const message = `${definition.name} 必须是 0 到 ${Number.MAX_SAFE_INTEGER} 之间的安全整数，或填写 unlimited。`;
+          setError(message);
+          feedback.error(message, "角色策略保存失败");
           return;
         }
         limits[definition.key] = value;
       }
     }
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    setPendingAction("policy");
     setError("");
-    setSuccess("");
     try {
       const updated = await apiRequest<Role>(`/api/v1/roles/${selected.id}/policy`, {
         method: "PUT",
@@ -192,11 +210,14 @@ export function RolesPanel() {
       setRoles((current) => current?.map((item) => item.id === updated.id ? updated : item) ?? current);
       setPermissionCodes(updated.permission_codes);
       setLimitValues(Object.fromEntries(Object.entries(updated.limits).map(([key, value]) => [key, value === null ? "unlimited" : String(value)])));
-      setSuccess(`角色“${updated.name}”的权限与限额已保存。`);
+      feedback.success(`角色“${updated.name}”的权限与限额已保存。`, "权限与限额已保存");
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "角色策略保存失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
@@ -207,7 +228,6 @@ export function RolesPanel() {
   return (
     <div className="page-stack">
       {error ? <ErrorState title="操作未完成" message={error} onRetry={() => void load()} /> : null}
-      {success ? <div className="notice role-success" role="status"><Icon name="check" /><div><strong>设置已生效</strong><p>{success}</p></div></div> : null}
       <section className="panel">
         {roles === null && !error ? <LoadingRows count={5} /> : null}
         {roles?.length === 0 ? <EmptyState compact icon="shield" title="还没有角色" description="创建第一个自定义角色，再配置权限与资源限额。" /> : null}
@@ -291,7 +311,7 @@ export function RolesPanel() {
                     {mutable ? <p className="field-hint">容量类限额请输入原始字节数，保存后会自动换算为 KB、MB、GB 或 TB 显示。非超级管理员不能授予高于自身的额度。</p> : null}
                   </div>
                 </details>
-                {mutable ? <div className="form-actions"><button className="button primary" type="button" disabled={pending || policyLoading || !policyReady} onClick={() => void savePolicy()}>{pending ? "正在保存…" : policyLoading ? "正在载入…" : "保存权限与限额"}</button></div> : <p className="field-hint">系统角色始终只读；其他角色也不能被授予高于当前管理员自身的权限或额度。</p>}
+                {mutable ? <div className="form-actions"><button className="button primary" type="button" disabled={pending || policyLoading || !policyReady} aria-busy={pendingAction === "policy"} onClick={() => void savePolicy()}>{pendingAction === "policy" ? <><span className="spinner" />正在保存…</> : policyLoading ? "正在载入…" : "保存权限与限额"}</button></div> : <p className="field-hint">系统角色始终只读；其他角色也不能被授予高于当前管理员自身的权限或额度。</p>}
               </div>
             ) : null}
           </div>
@@ -304,7 +324,7 @@ export function RolesPanel() {
               <label>角色名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder="知识编辑" maxLength={200} required /></label>
               <label>优先级<input type="number" min={-10000} max={10000} value={priority} onChange={(event) => setPriority(event.target.value)} required /></label>
               <label>描述<input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
-              <div className="form-actions full"><button className="button primary" type="submit" disabled={pending}>{pending ? "正在创建…" : "创建角色"}</button></div>
+              <div className="form-actions full"><button className="button primary" type="submit" disabled={pending} aria-busy={pendingAction === "create"}>{pendingAction === "create" ? <><span className="spinner" />正在创建…</> : "创建角色"}</button></div>
             </form>
           </details>
         ) : null}

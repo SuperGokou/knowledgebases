@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAccess } from "@/components/access-provider";
+import { useActionFeedback } from "@/components/action-feedback";
 import { Icon } from "@/components/icon";
 import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/ui";
+import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, readableError } from "@/lib/api-client";
 import type { KnowledgeBase, ManagedApiKey } from "@/lib/types";
 
@@ -16,6 +18,7 @@ type ApiKeyCreationResponse = ManagedApiKey & {
   plaintext_key?: string;
   item?: ManagedApiKey;
 };
+type PendingAction = { type: "create" } | { type: "revoke"; keyId: string } | null;
 
 function listItems(response: ApiKeyListResponse): ManagedApiKey[] {
   return Array.isArray(response) ? response : response.items;
@@ -56,6 +59,8 @@ function displayDate(value: string | null): string {
 
 export function ApiKeysPanel() {
   const { can, canAny, loading: accessLoading } = useAccess();
+  const feedback = useActionFeedback();
+  const actionLock = useRef(createActionLock()).current;
   const [keys, setKeys] = useState<ManagedApiKey[] | null>(null);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[] | null>(null);
   const [name, setName] = useState("");
@@ -66,7 +71,8 @@ export function ApiKeysPanel() {
   const [issuedKey, setIssuedKey] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
+  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const pending = pendingAction !== null;
 
   const load = useCallback(async () => {
     if (accessLoading) return;
@@ -102,7 +108,9 @@ export function ApiKeysPanel() {
 
   async function generateKey(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "create" });
     setError("");
     setCopyState("idle");
     try {
@@ -124,10 +132,14 @@ export function ApiKeysPanel() {
       setKnowledgeBaseIds([]);
       setExpiresAt("");
       setKeys((current) => current ? [item, ...current.filter((key) => key.id !== item.id)] : [item]);
+      feedback.success(`凭证“${item.name}”已生成。请立即复制并安全保存一次性明文。`, "API Key 已生成");
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "API Key 生成失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
@@ -145,16 +157,23 @@ export function ApiKeysPanel() {
   }
 
   async function revokeKey(key: ManagedApiKey) {
+    if (actionLock.isLocked()) return;
     if (!window.confirm(`确定撤销“${key.name}”吗？使用该 Key 的系统将立即无法调用 API。`)) return;
-    setPending(true);
+    if (!actionLock.acquire()) return;
+    feedback.dismiss();
+    setPendingAction({ type: "revoke", keyId: key.id });
     setError("");
     try {
       await apiRequest<null>(`/api/v1/api-keys/${key.id}`, { method: "DELETE" });
       setKeys((current) => current?.filter((item) => item.id !== key.id) ?? current);
+      feedback.success(`凭证“${key.name}”已撤销，现有调用将立即失效。`, "API Key 已撤销");
     } catch (reason) {
-      setError(readableError(reason));
+      const message = readableError(reason);
+      setError(message);
+      feedback.error(message, "API Key 撤销失败");
     } finally {
-      setPending(false);
+      actionLock.release();
+      setPendingAction(null);
     }
   }
 
@@ -190,7 +209,7 @@ export function ApiKeysPanel() {
         </div>
         <div className="api-key-create-footer">
           <p>按“系统 + 环境”隔离凭证，并只勾选业务必需的知识库与接口。</p>
-          <button className="button primary" type="submit" disabled={pending || !name.trim() || permissionCodes.length === 0 || knowledgeBaseIds.length === 0}><Icon name="plus" />{pending ? "正在生成…" : "生成 API Key"}</button>
+          <button className="button primary" type="submit" disabled={pending || !name.trim() || permissionCodes.length === 0 || knowledgeBaseIds.length === 0} aria-busy={pendingAction?.type === "create"}>{pendingAction?.type === "create" ? <><span className="spinner" />正在生成 API Key…</> : <><Icon name="plus" />生成 API Key</>}</button>
         </div>
       </form>
 
@@ -222,7 +241,7 @@ export function ApiKeysPanel() {
                   <td>{key.expires_at && new Date(key.expires_at) <= new Date() ? <StatusBadge tone="danger">已过期</StatusBadge> : <StatusBadge tone="success">有效 · {key.requests_per_minute}/min</StatusBadge>}</td>
                   <td>{displayDate(key.last_used_at)}</td>
                   <td>{displayDate(key.created_at)}</td>
-                  <td><button className="button danger small" type="button" disabled={pending} onClick={() => void revokeKey(key)}>撤销</button></td>
+                  <td><button className="button danger small" type="button" disabled={pending} aria-busy={pendingAction?.type === "revoke" && pendingAction.keyId === key.id} onClick={() => void revokeKey(key)}>{pendingAction?.type === "revoke" && pendingAction.keyId === key.id ? <><span className="spinner" />正在撤销…</> : "撤销"}</button></td>
                 </tr>
               ))}
             </tbody>
