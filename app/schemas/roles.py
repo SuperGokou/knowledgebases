@@ -47,6 +47,7 @@ class RoleRead(BaseModel):
     updated_at: datetime
     permission_codes: list[str] = Field(default_factory=list)
     limits: dict[str, RoleLimitValue] = Field(default_factory=dict)
+    policy_etag: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class PermissionRead(BaseModel):

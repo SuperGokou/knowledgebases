@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.api.v1.routes.knowledge_bases as knowledge_base_routes
+import app.api.v1.routes.roles as role_routes
 import app.api.v1.routes.users as user_routes
 from app.api.errors import ApiError
 from app.db.models import (
@@ -44,6 +45,17 @@ class _Scenario:
     target_user_id: UUID
     delegated_role_id: UUID
     actor_role_id: UUID
+    knowledge_base_id: UUID
+
+
+@dataclass(frozen=True)
+class _RoleDeleteScenario:
+    factory: async_sessionmaker[AsyncSession]
+    actor_access: AccessContext
+    target_user_id: UUID
+    role_id: UUID
+    role_name: str
+    policy_etag: str
     knowledge_base_id: UUID
 
 
@@ -131,6 +143,49 @@ async def _prepare_scenario() -> _Scenario:
             target_user_id=target.id,
             delegated_role_id=delegated_role.id,
             actor_role_id=actor_role.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+
+
+async def _prepare_role_delete_scenario() -> _RoleDeleteScenario:
+    assert _POSTGRES_URL is not None
+    engine = create_async_engine(_POSTGRES_URL, pool_size=6, max_overflow=0)
+    async with engine.begin() as connection:
+        await assert_acceptance_database(connection)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    unique = uuid4().hex[:12]
+    async with factory() as session:
+        actor = User(
+            email=f"role-delete-actor-{unique}@example.com",
+            password_hash="unused",
+            is_superuser=True,
+        )
+        target_user = User(
+            email=f"role-delete-target-{unique}@example.com",
+            password_hash="unused",
+        )
+        role = Role(code=f"role_delete_{unique}", name=f"并发删除角色 {unique}", priority=10)
+        session.add_all([actor, target_user, role])
+        await session.flush()
+        knowledge_base = KnowledgeBase(owner_id=actor.id, name=f"Role delete race {unique}")
+        session.add(knowledge_base)
+        await session.commit()
+        role_read = await role_routes._role_read(session, role)
+        actor_access = AccessContext(
+            user=actor,
+            permissions=frozenset({"*"}),
+            limits={},
+            role_ids=frozenset(),
+            max_role_priority=10_000,
+        )
+        return _RoleDeleteScenario(
+            factory=factory,
+            actor_access=actor_access,
+            target_user_id=target_user.id,
+            role_id=role.id,
+            role_name=role.name,
+            policy_etag=role_read.policy_etag,
             knowledge_base_id=knowledge_base.id,
         )
 
@@ -300,3 +355,155 @@ async def test_postgres_role_delegation_wins_before_acl_revocation(
 
 async def _no_egress(*_args: object, **_kwargs: object) -> None:
     return None
+
+
+async def _delete_role(scenario: _RoleDeleteScenario) -> str:
+    async with scenario.factory() as session:
+        try:
+            await role_routes.delete_role(
+                role_id=scenario.role_id,
+                request=_request(f"/api/v1/roles/{scenario.role_id}"),
+                session=session,
+                access=scenario.actor_access,
+                expected_name=scenario.role_name,
+                expected_policy_etag=scenario.policy_etag,
+            )
+            return "deleted"
+        except ApiError as exc:
+            await session.rollback()
+            return exc.code
+
+
+async def _grant_deleted_role(scenario: _RoleDeleteScenario) -> str:
+    async with scenario.factory() as session:
+        try:
+            await knowledge_base_routes.replace_role_grants(
+                knowledge_base_id=scenario.knowledge_base_id,
+                payload=KnowledgeBaseRoleGrantSet(
+                    grants=[
+                        KnowledgeBaseRoleGrantInput(
+                            role_id=scenario.role_id,
+                            access_level=KnowledgeBaseAccessLevel.READER,
+                        )
+                    ]
+                ),
+                request=_request(
+                    f"/api/v1/knowledge-bases/{scenario.knowledge_base_id}/role-grants"
+                ),
+                session=session,
+                access=scenario.actor_access,
+            )
+            return "granted"
+        except ApiError as exc:
+            await session.rollback()
+            return exc.code
+
+
+async def _assign_deleted_role(scenario: _RoleDeleteScenario) -> str:
+    async with scenario.factory() as session:
+        try:
+            await user_routes.replace_user_roles(
+                user_id=scenario.target_user_id,
+                payload=RoleAssignmentUpdate(role_ids=[scenario.role_id]),
+                request=_request(f"/api/v1/users/{scenario.target_user_id}/roles"),
+                session=session,
+                access=scenario.actor_access,
+            )
+            return "assigned"
+        except ApiError as exc:
+            await session.rollback()
+            return exc.code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["grant", "assignment"])
+async def test_postgres_role_delete_wins_without_fk_500_or_silent_cascade(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    scenario = await _prepare_role_delete_scenario()
+    delete_holds_role_lock = asyncio.Event()
+    release_delete = asyncio.Event()
+    original_role_read = role_routes._role_read
+
+    async def hold_delete(session: AsyncSession, role: Role):
+        result = await original_role_read(session, role)
+        if role.id == scenario.role_id:
+            delete_holds_role_lock.set()
+            await release_delete.wait()
+        return result
+
+    monkeypatch.setattr(role_routes, "_role_read", hold_delete)
+    monkeypatch.setattr(role_routes, "deny_if_active_external_llm_egress", _no_egress)
+    monkeypatch.setattr(knowledge_base_routes, "deny_if_active_external_llm_egress", _no_egress)
+    monkeypatch.setattr(user_routes, "deny_if_active_external_llm_egress", _no_egress)
+
+    delete_task = asyncio.create_task(_delete_role(scenario))
+    await asyncio.wait_for(delete_holds_role_lock.wait(), timeout=5)
+    writer_task = asyncio.create_task(
+        _grant_deleted_role(scenario) if writer == "grant" else _assign_deleted_role(scenario)
+    )
+    await asyncio.sleep(0)
+    release_delete.set()
+
+    assert await asyncio.wait_for(delete_task, timeout=5) == "deleted"
+    assert await asyncio.wait_for(writer_task, timeout=5) == "unknown_role"
+    async with scenario.factory() as session:
+        assert await session.get(Role, scenario.role_id) is None
+        assert (
+            await session.scalar(
+                select(UserRole.id).where(
+                    UserRole.user_id == scenario.target_user_id,
+                    UserRole.role_id == scenario.role_id,
+                )
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(KnowledgeBaseRoleGrant.id).where(
+                    KnowledgeBaseRoleGrant.knowledge_base_id == scenario.knowledge_base_id,
+                    KnowledgeBaseRoleGrant.role_id == scenario.role_id,
+                )
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["grant", "assignment"])
+async def test_postgres_role_reference_wins_and_delete_reports_role_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    scenario = await _prepare_role_delete_scenario()
+    writer_holds_role_lock = asyncio.Event()
+    release_writer = asyncio.Event()
+
+    async def hold_writer(*_args: object, **_kwargs: object) -> None:
+        writer_holds_role_lock.set()
+        await release_writer.wait()
+
+    monkeypatch.setattr(role_routes, "deny_if_active_external_llm_egress", _no_egress)
+    if writer == "grant":
+        monkeypatch.setattr(
+            knowledge_base_routes,
+            "deny_if_active_external_llm_egress",
+            hold_writer,
+        )
+        writer_task = asyncio.create_task(_grant_deleted_role(scenario))
+    else:
+        monkeypatch.setattr(user_routes, "deny_if_active_external_llm_egress", hold_writer)
+        writer_task = asyncio.create_task(_assign_deleted_role(scenario))
+
+    await asyncio.wait_for(writer_holds_role_lock.wait(), timeout=5)
+    delete_task = asyncio.create_task(_delete_role(scenario))
+    await asyncio.sleep(0)
+    release_writer.set()
+
+    assert await asyncio.wait_for(writer_task, timeout=5) == (
+        "granted" if writer == "grant" else "assigned"
+    )
+    assert await asyncio.wait_for(delete_task, timeout=5) == "role_in_use"
+    async with scenario.factory() as session:
+        assert await session.get(Role, scenario.role_id) is not None

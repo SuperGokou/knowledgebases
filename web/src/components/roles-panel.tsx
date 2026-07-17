@@ -9,6 +9,11 @@ import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/u
 import { createActionLock } from "@/lib/action-lock";
 import { ApiClientError, apiRequest, readableError } from "@/lib/api-client";
 import {
+  deleteRole,
+  openRoleDeleteEditor,
+  type RoleDeleteEditor,
+} from "@/lib/role-deletion";
+import {
   displayLimit,
   generateRoleCode,
   isValidRoleCode,
@@ -36,6 +41,26 @@ function roleCreateError(error: unknown): string {
   return readableError(error);
 }
 
+function roleDeletionError(error: unknown): string {
+  if (error instanceof ApiClientError) {
+    if (error.code === "role_in_use") {
+      const details = error.details && typeof error.details === "object"
+        ? error.details as { references?: unknown }
+        : null;
+      const references = details?.references && typeof details.references === "object"
+        ? details.references as { user_assignments?: unknown; knowledge_base_grants?: unknown }
+        : null;
+      const users = typeof references?.user_assignments === "number" ? references.user_assignments : 0;
+      const grants = typeof references?.knowledge_base_grants === "number" ? references.knowledge_base_grants : 0;
+      return `该角色仍被 ${users} 个成员账号和 ${grants} 项知识库授权引用。请先解除全部引用，再删除角色。`;
+    }
+    if (error.code === "role_changed") return "角色名称已被其他管理员修改。页面已刷新，请重新核对并确认删除。";
+    if (error.code === "stale_role_policy") return "角色权限或限额已被其他管理员修改。页面已刷新，请重新核对并确认删除。";
+    if (error.code === "system_role") return "系统角色受平台保护，不能删除。";
+  }
+  return readableError(error);
+}
+
 export function RolesPanel() {
   const { can, loading: accessLoading } = useAccess();
   const feedback = useActionFeedback();
@@ -49,12 +74,15 @@ export function RolesPanel() {
   const [policyLoading, setPolicyLoading] = useState(false);
   const [policyReady, setPolicyReady] = useState(false);
   const [error, setError] = useState("");
-  const [pendingAction, setPendingAction] = useState<"create" | "policy" | null>(null);
+  const [pendingAction, setPendingAction] = useState<"create" | "policy" | "delete" | null>(null);
   const pending = pendingAction !== null;
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("0");
+  const [deleteEditor, setDeleteEditor] = useState<RoleDeleteEditor | null>(null);
+  const deleteButtonRef = useRef<HTMLButtonElement | null>(null);
+  const roleButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const selectedIdRef = useRef("");
   const policyRequestId = useRef(0);
 
@@ -62,6 +90,7 @@ export function RolesPanel() {
     selectedIdRef.current = roleId;
     const requestId = ++policyRequestId.current;
     setSelectedId(roleId);
+    setDeleteEditor(null);
     setPermissionCodes([]);
     setLimitValues({});
     setPolicyReady(false);
@@ -84,11 +113,11 @@ export function RolesPanel() {
     })();
   }, []);
 
-  const load = useCallback(async () => {
-    if (accessLoading) return;
+  const load = useCallback(async (): Promise<boolean> => {
+    if (accessLoading) return false;
     if (!can("role:read")) {
       setRoles([]);
-      return;
+      return true;
     }
     setError("");
     try {
@@ -102,8 +131,10 @@ export function RolesPanel() {
       setDefinitions(limitItems);
       const currentId = selectedIdRef.current;
       selectRole(roleItems.some((item) => item.id === currentId) ? currentId : roleItems[0]?.id || "");
+      return true;
     } catch (reason) {
       setError(readableError(reason));
+      return false;
     }
   }, [accessLoading, can, selectRole]);
 
@@ -116,6 +147,11 @@ export function RolesPanel() {
   const selectedCopy = selected ? roleCopy(selected) : null;
 
   const mutable = Boolean(selected && can("role:manage") && !selected.is_system);
+
+  function closeDeleteEditor() {
+    setDeleteEditor(null);
+    window.setTimeout(() => deleteButtonRef.current?.focus(), 0);
+  }
 
   function togglePermission(permissionCode: string) {
     setPermissionCodes((current) => current.includes(permissionCode) ? current.filter((item) => item !== permissionCode) : [...current, permissionCode]);
@@ -221,6 +257,47 @@ export function RolesPanel() {
     }
   }
 
+  async function deleteSelectedRole() {
+    if (!selected || !deleteEditor || !mutable || !policyReady || pending || policyLoading || !actionLock.acquire()) return;
+    const editorSnapshot = { ...deleteEditor };
+    const currentRoles = roles ?? [];
+    const deletedIndex = currentRoles.findIndex((role) => role.id === editorSnapshot.roleId);
+    feedback.dismiss();
+    setPendingAction("delete");
+    setError("");
+    try {
+      await deleteRole(editorSnapshot);
+      const remaining = currentRoles.filter((role) => role.id !== editorSnapshot.roleId);
+      const nextRole = remaining[Math.min(Math.max(deletedIndex, 0), remaining.length - 1)];
+      setRoles(remaining);
+      setDeleteEditor(null);
+      selectRole(nextRole?.id ?? "");
+      window.setTimeout(() => {
+        if (nextRole) roleButtonRefs.current.get(nextRole.id)?.focus();
+        else document.querySelector<HTMLElement>(".role-create-drawer > summary")?.focus();
+      }, 0);
+      feedback.success(`角色“${editorSnapshot.roleName}”已永久删除，成员与知识库授权未发生级联变更。`, "角色已删除");
+    } catch (reason) {
+      const isStaleConflict =
+        reason instanceof ApiClientError
+        && ["role_changed", "stale_role_policy"].includes(reason.code ?? "");
+      let refreshed = false;
+      if (isStaleConflict) {
+        setDeleteEditor(null);
+        refreshed = await load();
+        window.setTimeout(() => deleteButtonRef.current?.focus(), 0);
+      }
+      const message = isStaleConflict && !refreshed
+        ? "删除已安全阻止，但未能刷新最新角色数据。请检查网络后点击重试，再重新确认。"
+        : roleDeletionError(reason);
+      setError(message);
+      feedback.error(message, "角色删除失败");
+    } finally {
+      actionLock.release();
+      setPendingAction(null);
+    }
+  }
+
   if (!accessLoading && !can("role:read")) {
     return <EmptyState icon="lock" title="没有角色查看权限" description="当前角色不包含 role:read。角色菜单已隐藏，直接访问也会由 FastAPI 拒绝。" />;
   }
@@ -237,7 +314,17 @@ export function RolesPanel() {
               {roles.map((role) => {
                 const copy = roleCopy(role);
                 return (
-                  <button className={`role-item${role.id === selectedId ? " active" : ""}`} type="button" onClick={() => selectRole(role.id)} disabled={pending} key={role.id}>
+                  <button
+                    className={`role-item${role.id === selectedId ? " active" : ""}`}
+                    type="button"
+                    onClick={() => selectRole(role.id)}
+                    disabled={pending}
+                    ref={(node) => {
+                      if (node) roleButtonRefs.current.set(role.id, node);
+                      else roleButtonRefs.current.delete(role.id);
+                    }}
+                    key={role.id}
+                  >
                     <span className="role-symbol">{copy.name.slice(0, 1).toUpperCase()}</span>
                     <span><strong>{copy.name}</strong><small>{role.code}{role.is_system ? " · 系统" : ""}</small></span>
                     <span className="role-priority">P{role.priority}</span>
@@ -249,8 +336,62 @@ export function RolesPanel() {
               <div className="role-detail" aria-busy={policyLoading}>
                 <div className="detail-heading">
                   <div><h2>{selectedCopy?.name}</h2><p>{selectedCopy?.description}</p></div>
-                  <StatusBadge tone={selected.is_system ? "info" : "neutral"}>{selected.is_system ? "系统角色" : `优先级 ${selected.priority}`}</StatusBadge>
+                  <div className="button-row">
+                    <StatusBadge tone={selected.is_system ? "info" : "neutral"}>{selected.is_system ? "系统角色" : `优先级 ${selected.priority}`}</StatusBadge>
+                    {mutable && policyReady ? (
+                      <button
+                        className="button danger small role-delete-trigger"
+                        type="button"
+                        ref={deleteButtonRef}
+                        aria-haspopup="dialog"
+                        aria-controls="role-delete-editor"
+                        aria-expanded={Boolean(deleteEditor)}
+                        disabled={pending || policyLoading}
+                        onClick={() => setDeleteEditor(openRoleDeleteEditor(selected))}
+                      >
+                        删除角色
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
+                {deleteEditor ? (
+                  <form
+                    id="role-delete-editor"
+                    className="inline-editor role-delete-editor"
+                    role="dialog"
+                    aria-modal="false"
+                    aria-labelledby="role-delete-editor-title"
+                    aria-describedby="role-delete-editor-description"
+                    onSubmit={(event) => { event.preventDefault(); void deleteSelectedRole(); }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape" && !pending) {
+                        event.preventDefault();
+                        closeDeleteEditor();
+                      }
+                    }}
+                  >
+                    <div>
+                      <strong id="role-delete-editor-title">永久删除自定义角色</strong>
+                      <p id="role-delete-editor-description">仅未分配给成员、且未用于知识库授权的角色可以删除。删除后无法恢复，操作会写入审计日志。</p>
+                    </div>
+                    <label className="full">
+                      请输入角色名称“{deleteEditor.roleName}”确认
+                      <input
+                        value={deleteEditor.confirmation}
+                        autoComplete="off"
+                        autoFocus
+                        disabled={pending}
+                        onChange={(event) => setDeleteEditor((current) => current ? { ...current, confirmation: event.target.value } : current)}
+                      />
+                    </label>
+                    <div className="form-actions">
+                      <button className="button ghost" type="button" disabled={pending} onClick={closeDeleteEditor}>取消</button>
+                      <button className="button danger" type="submit" disabled={pending || deleteEditor.confirmation !== deleteEditor.roleName} aria-busy={pendingAction === "delete"}>
+                        {pendingAction === "delete" ? <><span className="spinner" />正在删除…</> : "永久删除角色"}
+                      </button>
+                    </div>
+                  </form>
+                ) : null}
                 <details className="detail-section policy-disclosure" key={`permissions-${selected.id}`}>
                   <summary className="policy-disclosure-summary">
                     <span className="policy-disclosure-title"><strong>权限能力</strong><small>{policyLoading ? "正在载入角色策略…" : `${permissionCodes.length} 项已启用 · 共 ${permissions.length} 项`}</small></span>
@@ -264,7 +405,7 @@ export function RolesPanel() {
                         const copy = permissionCopy(permission);
                         return (
                           <label className="check-option" key={permission.code}>
-                            <input type="checkbox" disabled={!mutable || pending || policyLoading || !policyReady} checked={permissionCodes.includes(permission.code)} onChange={() => togglePermission(permission.code)} />
+                            <input type="checkbox" disabled={!mutable || pending || policyLoading || !policyReady || Boolean(deleteEditor)} checked={permissionCodes.includes(permission.code)} onChange={() => togglePermission(permission.code)} />
                             <span><strong>{copy.name}</strong><small>{copy.description}</small><code>技术标识：{permission.code}</code></span>
                           </label>
                         );
@@ -293,12 +434,12 @@ export function RolesPanel() {
                             <div className="limit-copy"><strong>{copy.name}</strong><p>{copy.description}</p><small>{copy.window} · {copy.unit}</small></div>
                             {mutable ? (
                               <div className="limit-editor">
-                                <select aria-label={`${copy.name}设置方式`} value={mode} onChange={(event) => changeLimitMode(definition.key, event.target.value as LimitMode)} disabled={pending || policyLoading || !policyReady}>
+                                <select aria-label={`${copy.name}设置方式`} value={mode} onChange={(event) => changeLimitMode(definition.key, event.target.value as LimitMode)} disabled={pending || policyLoading || !policyReady || Boolean(deleteEditor)}>
                                   <option value="unset">未设置</option>
                                   <option value="limited">有限制</option>
                                   <option value="unlimited">无限制</option>
                                 </select>
-                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "不设角色额度，仍受平台安全限制" : "不参与角色额度合并"}</small>}
+                                {mode === "limited" ? <input aria-label={`${copy.name}数值`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" value={limitValues[definition.key] ?? ""} onChange={(event) => setLimitValues((current) => ({ ...current, [definition.key]: event.target.value }))} disabled={pending || policyLoading || !policyReady || Boolean(deleteEditor)} /> : <small className={`limit-mode-note ${mode}`}>{mode === "unlimited" ? "不设角色额度，仍受平台安全限制" : "不参与角色额度合并"}</small>}
                               </div>
                             ) : (
                               <div className="limit-readout"><strong>{displayLimit(definition, storedValue)}</strong><small>{storedValue === undefined ? "该角色未配置" : storedValue === null ? "此角色不设置上限" : "该角色的数值上限"}</small></div>
@@ -311,7 +452,7 @@ export function RolesPanel() {
                     {mutable ? <p className="field-hint">容量类限额请输入原始字节数，保存后会自动换算为 KB、MB、GB 或 TB 显示。非超级管理员不能授予高于自身的额度。</p> : null}
                   </div>
                 </details>
-                {mutable ? <div className="form-actions"><button className="button primary" type="button" disabled={pending || policyLoading || !policyReady} aria-busy={pendingAction === "policy"} onClick={() => void savePolicy()}>{pendingAction === "policy" ? <><span className="spinner" />正在保存…</> : policyLoading ? "正在载入…" : "保存权限与限额"}</button></div> : <p className="field-hint">系统角色始终只读；其他角色也不能被授予高于当前管理员自身的权限或额度。</p>}
+                {mutable ? <div className="form-actions"><button className="button primary" type="button" disabled={pending || policyLoading || !policyReady || Boolean(deleteEditor)} aria-busy={pendingAction === "policy"} onClick={() => void savePolicy()}>{pendingAction === "policy" ? <><span className="spinner" />正在保存…</> : policyLoading ? "正在载入…" : "保存权限与限额"}</button></div> : <p className="field-hint">系统角色始终只读；其他角色也不能被授予高于当前管理员自身的权限或额度。</p>}
               </div>
             ) : null}
           </div>

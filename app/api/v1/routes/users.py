@@ -25,35 +25,30 @@ from app.db.models import (
     UserStatus,
 )
 from app.schemas.users import RoleAssignmentUpdate, UserCreate, UserRead, UserUpdate
-from app.services.access import AccessContext, AccessService
+from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
+from app.services.rbac_mutations import (
+    lock_and_refresh_actor_access,
+    locked_actor_roles_statement,
+    locked_actor_user_statement,
+    locked_roles_statement,
+    refresh_locked_actor_access,
+)
 
 router = APIRouter()
 
 
 def _locked_roles_statement(role_ids: set[UUID]) -> Select[tuple[Role]]:
-    # PostgreSQL FK checks take KEY SHARE on Role. NO KEY UPDATE still serializes
-    # policy mutation/deletion but stays compatible with ACL grant replacement,
-    # whose global order is KnowledgeBase -> Role FK check.
-    return select(Role).where(Role.id.in_(role_ids)).with_for_update(key_share=True)
+    return locked_roles_statement(role_ids)
 
 
 def _locked_actor_user_statement(user_id: UUID) -> Select[tuple[User]]:
-    return select(User).where(User.id == user_id).with_for_update()
+    return locked_actor_user_statement(user_id)
 
 
 def _locked_actor_roles_statement(user_id: UUID) -> Select[tuple[Role]]:
-    now = datetime.now(UTC)
-    return (
-        select(Role)
-        .join(UserRole, UserRole.role_id == Role.id)
-        .where(
-            UserRole.user_id == user_id,
-            or_(UserRole.expires_at.is_(None), UserRole.expires_at > now),
-        )
-        .with_for_update(of=Role, key_share=True)
-    )
+    return locked_actor_roles_statement(user_id)
 
 
 async def _refresh_locked_actor_access(
@@ -61,20 +56,7 @@ async def _refresh_locked_actor_access(
     actor: User,
     required_permissions: set[str],
 ) -> AccessContext:
-    if actor.status is not UserStatus.ACTIVE:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    # Lock every active role before re-resolving mutable permissions and limits.
-    # Policy mutation endpoints coordinate on these same Role rows.
-    list((await session.scalars(_locked_actor_roles_statement(actor.id))).all())
-    current = await AccessService().resolve(session, actor)
-    missing = sorted(code for code in required_permissions if not current.allows(code))
-    if missing:
-        raise ApiError(
-            status_code=403,
-            code="permission_denied",
-            message=f"Permissions required: {', '.join(missing)}",
-        )
-    return current
+    return await refresh_locked_actor_access(session, actor, required_permissions)
 
 
 async def _lock_and_refresh_actor_access(
@@ -82,10 +64,7 @@ async def _lock_and_refresh_actor_access(
     access: AccessContext,
     required_permissions: set[str],
 ) -> AccessContext:
-    actor = await session.scalar(_locked_actor_user_statement(access.user.id))
-    if actor is None:
-        raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
-    return await _refresh_locked_actor_access(session, actor, required_permissions)
+    return await lock_and_refresh_actor_access(session, access, required_permissions)
 
 
 async def _ensure_kb_grants_delegable(

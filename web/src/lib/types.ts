@@ -48,6 +48,7 @@ export type Role = {
   updated_at: string;
   permission_codes: string[];
   limits: Record<string, number | null>;
+  policy_etag: string;
 };
 
 export type Permission = {

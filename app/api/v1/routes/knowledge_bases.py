@@ -5,7 +5,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from sqlalchemy import delete, func, select
+from sqlalchemy import Select, delete, func, select
 
 from app.api.dependencies import DatabaseSession, require_any_permission, require_permission
 from app.api.egress_leases import deny_if_active_external_llm_egress
@@ -43,6 +43,17 @@ from app.services.knowledge_bases import (
 )
 
 router = APIRouter()
+
+
+def _locked_roles_for_grants_statement(role_ids: set[UUID]) -> Select[tuple[Role]]:
+    # Grant replacement locks KnowledgeBase first, then roles. KEY SHARE blocks
+    # role deletion's FOR UPDATE while remaining compatible with assignment's
+    # NO KEY UPDATE lock, avoiding a KnowledgeBase/Role lock-order deadlock.
+    return (
+        select(Role)
+        .where(Role.id.in_(role_ids))
+        .with_for_update(read=True, key_share=True)
+    )
 
 
 def _ensure_metadata_size(value: dict[str, object]) -> None:
@@ -276,13 +287,10 @@ async def replace_role_grants(
     )
     role_ids = {item.role_id for item in payload.grants}
     if role_ids:
-        existing = set(
-            (
-                await session.scalars(
-                    select(Role.id).where(Role.id.in_(role_ids))
-                )
-            ).all()
+        locked_roles = list(
+            (await session.scalars(_locked_roles_for_grants_statement(role_ids))).all()
         )
+        existing = {role.id for role in locked_roles}
         if existing != role_ids:
             raise ApiError(
                 status_code=422,

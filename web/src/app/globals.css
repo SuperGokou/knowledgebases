@@ -468,6 +468,12 @@ tbody tr:hover { background: #fbfbfd; }
 .role-create-drawer > summary { min-height: 44px; display: flex; align-items: center; margin-block: -10px; font-size: 14px; }.role-create-drawer[open] > summary { margin-bottom: 17px; }
 .inline-editor { display: grid; gap: 14px; margin: 18px 20px; padding: 18px; background: #fafbfc; border: 1px solid var(--line); border-radius: 12px; }
 .inline-editor strong { font-size: 11px; }.inline-editor p,.field-hint { margin: 4px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.role-delete-editor { border-color: #f2c9ce; background: #fff8f8; box-shadow: 0 12px 28px rgba(177,54,67,.08); }
+.role-delete-editor strong { color: #942f3b; font-size: 14px; }
+.role-delete-editor p { max-width: 760px; color: #6f5960; font-size: 12px; line-height: 1.65; }
+.role-delete-editor label { color: #493f43; font-size: 12px; font-weight: 700; }
+.role-delete-editor input { margin-top: 8px; background: #fff; border-color: #e8b8bf; }
+.role-delete-trigger.button.small { min-height: 38px; padding-inline: 14px; font-size: 12px; }
 .input-help { color: var(--muted); font-size: 8px; font-weight: 450; line-height: 1.45; }
 .fieldset { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }.fieldset legend { padding: 0 6px; color: #404657; font-size: 10px; font-weight: 700; }
 .form-actions { display: flex; justify-content: flex-end; gap: 8px; }
