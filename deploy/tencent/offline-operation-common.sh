@@ -45,6 +45,8 @@ offline_local_image_config_id() (
   prefix=$1
   image=$2
   archive=
+  # Invoked indirectly by the EXIT trap below.
+  # shellcheck disable=SC2329
   cleanup_local_image_identity() {
     if [ -n "$archive" ]; then
       rm -f -- "$archive"

@@ -956,8 +956,11 @@ def test_builder_creates_a_deterministic_root_owned_posix_tar(tmp_path: Path) ->
     assert "'-I', '-c', $program" not in tar_function
     assert "Remove-Item -LiteralPath $programPath -Force" in tar_function
     assert "deterministic POSIX tar creator returned unexpected output" in tar_function
+    assert "$workspace 'offline-registry-bundle'" in script
 
-    source = tmp_path / "offline-registry-bundle"
+    # The on-disk workspace intentionally uses the Windows-safe short name.
+    # The signed transport contract must still expose the canonical root.
+    source = tmp_path / "b"
     nested = source / "release"
     nested.mkdir(parents=True)
     (nested / "contract.txt").write_bytes(b"signed-contract\n")
@@ -967,7 +970,15 @@ def test_builder_creates_a_deterministic_root_owned_posix_tar(tmp_path: Path) ->
     epoch = 1_700_000_000
 
     subprocess.run(  # noqa: S603
-        [sys.executable, "-I", str(program), str(source), str(output), str(epoch)],
+        [
+            sys.executable,
+            "-I",
+            str(program),
+            str(source),
+            str(output),
+            str(epoch),
+            "offline-registry-bundle",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -984,6 +995,25 @@ def test_builder_creates_a_deterministic_root_owned_posix_tar(tmp_path: Path) ->
     assert all(member.uname == "root" and member.gname == "root" for member in members)
     assert all(member.mtime == epoch for member in members)
     assert [member.mode for member in members] == [0o750, 0o750, 0o444]
+
+    unsafe_output = tmp_path / "unsafe.tar"
+    unsafe = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            str(program),
+            str(source),
+            str(unsafe_output),
+            str(epoch),
+            "../escape",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert unsafe.returncode != 0
+    assert "archive root name is invalid" in unsafe.stderr
+    assert not unsafe_output.exists()
 
 
 def test_bundle_build_documentation_covers_verification_and_import_order() -> None:

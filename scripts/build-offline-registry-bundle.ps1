@@ -1294,18 +1294,22 @@ function New-DeterministicTar(
     [string]$InputDirectory,
     [string]$OutputTar,
     [long]$Epoch,
-    [string]$Workspace
+    [string]$Workspace,
+    [string]$ArchiveRootName
 ) {
     $programPath = Join-Path $Workspace 'create-deterministic-tar.py'
     if (Test-Path -LiteralPath $programPath) {
         Fail 'deterministic tar program path already exists'
     }
     $program = @'
-import pathlib, sys, tarfile
+import pathlib, re, sys, tarfile
 
 source = pathlib.Path(sys.argv[1]).resolve(strict=True)
 destination = pathlib.Path(sys.argv[2])
 epoch = int(sys.argv[3])
+archive_root = sys.argv[4]
+if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", archive_root) is None:
+    raise SystemExit("archive root name is invalid")
 if destination.exists():
     raise SystemExit("destination already exists")
 entries = [source, *sorted(source.rglob("*"), key=lambda p: p.relative_to(source).as_posix())]
@@ -1313,7 +1317,7 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
     for path in entries:
         if path.is_symlink() or not (path.is_dir() or path.is_file()):
             raise SystemExit("unsupported filesystem object")
-        relative = pathlib.PurePosixPath(source.name)
+        relative = pathlib.PurePosixPath(archive_root)
         if path != source:
             relative /= pathlib.PurePosixPath(path.relative_to(source).as_posix())
         info = archive.gettarinfo(str(path), arcname=str(relative))
@@ -1333,7 +1337,7 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
     try {
         Write-AsciiFile $programPath @($program -split '\r?\n')
         $tarOutput = @(Invoke-Captured $Python @(
-            '-I', $programPath, $InputDirectory, $OutputTar, "$Epoch"
+            '-I', $programPath, $InputDirectory, $OutputTar, "$Epoch", $ArchiveRootName
         ) 'deterministic POSIX tar creation failed')
     }
     finally {
@@ -1988,7 +1992,8 @@ try {
 
     $bundleTarName = "$artifactStem-offline-registry-bundle.tar"
     $bundleTar = Join-Path $publish $bundleTarName
-    New-DeterministicTar $python $bundleRoot $bundleTar $sourceDateEpoch $workspace
+    New-DeterministicTar $python $bundleRoot $bundleTar $sourceDateEpoch `
+        $workspace 'offline-registry-bundle'
     $bundleChecksum = "$bundleTar.sha256"
     Write-AsciiFile $bundleChecksum @("$(Get-Sha256 $bundleTar)  $bundleTarName")
     Sign-And-Verify $openssl $key $publicKey $bundleChecksum "$bundleChecksum.sig"
