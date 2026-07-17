@@ -135,7 +135,7 @@ describe("authoritative workspace proxy guard", () => {
     expect(response.headers.get("x-middleware-next")).toBeNull();
   });
 
-  it("serializes concurrent refreshes without fanning one rotated credential pair to both responses", async () => {
+  it("recovers concurrent refresh followers without exposing the rotated credential pair", async () => {
     let oldMeCalls = 0;
     let refreshCalls = 0;
     let releaseRefresh: ((response: Response) => void) | undefined;
@@ -176,13 +176,16 @@ describe("authoritative workspace proxy guard", () => {
     expect(oldMeCalls).toBe(2);
     expect(refreshCalls).toBe(1);
     expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect([first.status, second.status].sort()).toEqual([200, 502]);
+    expect([first.status, second.status].sort()).toEqual([200, 307]);
     const successful = first.status === 200 ? first : second;
-    const rejected = first.status === 502 ? first : second;
+    const recovering = first.status === 307 ? first : second;
     expect(successful.headers.get("x-middleware-next")).toBe("1");
     expect(setCookieHeader(successful)).toContain("kb_access=replacement-access-token");
     expect(setCookieHeader(successful)).toContain("kb_refresh=replacement-refresh-token");
-    expect(setCookieHeader(rejected)).toBe("");
+    const recoveryLocation = new URL(recovering.headers.get("location")!);
+    expect(recoveryLocation.pathname).toBe("/session-recovery");
+    expect(recoveryLocation.searchParams.get("next")).toBe("/chat");
+    expect(setCookieHeader(recovering)).toBe("");
     // Refresh persistence must never clear a newer logout fence. Only a fresh
     // successful login is allowed to reset that generation barrier.
     expect(setCookieHeader(successful)).not.toContain("kb_session_fence=;");

@@ -34,10 +34,21 @@ function unavailableResponse(status: 502 | 503): NextResponse {
   );
 }
 
+function sessionRecoveryResponse(request: NextRequest): NextResponse {
+  const recovery = new URL("/session-recovery", request.url);
+  recovery.searchParams.set("next", requestedPath(request));
+  const response = NextResponse.redirect(recovery);
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const session = await resolveWorkspaceSession(request);
   if (session.kind === "unauthenticated") return redirectToLogin(request);
   if (session.kind === "unavailable") {
+    if (session.reason === "refresh_in_progress") {
+      return sessionRecoveryResponse(request);
+    }
     const response = unavailableResponse(session.status);
     persistReplacementSession(response, session);
     return response;

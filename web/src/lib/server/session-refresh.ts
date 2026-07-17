@@ -9,7 +9,11 @@ import type { TokenPair } from "@/lib/server/session";
 export type RefreshOutcome =
   | { kind: "refreshed"; pair: TokenPair }
   | { kind: "expired" }
-  | { kind: "unavailable"; status: number };
+  | {
+    kind: "unavailable";
+    status: number;
+    reason?: "refresh_in_progress";
+  };
 
 const refreshFlights = new Set<string>();
 
@@ -67,7 +71,7 @@ export async function refreshSessionOnce(
   // the sole recipient of the backend rotation result.
   const fingerprint = createHash("sha256").update(refreshToken).digest("hex");
   if (refreshFlights.has(fingerprint)) {
-    return { kind: "unavailable", status: 409 };
+    return { kind: "unavailable", status: 409, reason: "refresh_in_progress" };
   }
   refreshFlights.add(fingerprint);
   try {

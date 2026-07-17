@@ -28,6 +28,7 @@ type UnauthenticatedWorkspaceSession = {
 type UnavailableWorkspaceSession = {
   kind: "unavailable";
   status: 502 | 503;
+  reason?: "refresh_in_progress";
   replacement?: TokenPair;
 };
 
@@ -120,6 +121,9 @@ async function refreshSession(
   const outcome = await refreshSessionOnce(refreshToken, request);
   if (outcome.kind === "expired") return { kind: "unauthenticated" };
   if (outcome.kind === "unavailable") {
+    if (outcome.reason === "refresh_in_progress") {
+      return { kind: "unavailable", status: 503, reason: "refresh_in_progress" };
+    }
     return { kind: "unavailable", status: outcome.status >= 500 ? 503 : 502 };
   }
   if (!isTokenPair(outcome.pair)) return { kind: "unavailable", status: 502 };
