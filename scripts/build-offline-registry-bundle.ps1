@@ -87,6 +87,69 @@ function Invoke-Quiet(
     }
 }
 
+function Read-DockerLabels(
+    [string]$Docker,
+    [ValidateSet('container', 'network')]
+    [string]$ResourceKind,
+    [string]$ResourceId
+) {
+    $arguments = if ($ResourceKind -eq 'container') {
+        @('inspect', '--format', '{{json .Config.Labels}}', $ResourceId)
+    }
+    else {
+        @('network', 'inspect', '--format', '{{json .Labels}}', $ResourceId)
+    }
+    try {
+        $output = @(& $Docker @arguments 2>$null)
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        return [PSCustomObject]@{ Succeeded = $false; Labels = $null }
+    }
+    if ($exitCode -ne 0 -or $output.Count -ne 1) {
+        return [PSCustomObject]@{ Succeeded = $false; Labels = $null }
+    }
+    try {
+        $labels = $output[0].ToString() | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return [PSCustomObject]@{ Succeeded = $false; Labels = $null }
+    }
+    if ($null -eq $labels) {
+        return [PSCustomObject]@{ Succeeded = $false; Labels = $null }
+    }
+    return [PSCustomObject]@{ Succeeded = $true; Labels = $labels }
+}
+
+function Resolve-LoopbackPublishedPort(
+    [string]$Docker,
+    [string]$ContainerId
+) {
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        try {
+            $output = @(& $Docker inspect --format `
+                '{{json .NetworkSettings.Ports}}' $ContainerId 2>$null)
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0 -and $output.Count -eq 1) {
+                $ports = $output[0].ToString() | ConvertFrom-Json -ErrorAction Stop
+                $properties = @($ports.PSObject.Properties.Name)
+                $bindings = @($ports.'5000/tcp')
+                if ($properties.Count -eq 1 -and $properties[0] -eq '5000/tcp' -and
+                    $bindings.Count -eq 1 -and $bindings[0].HostIp -eq '127.0.0.1' -and
+                    $bindings[0].HostPort -match '^[1-9][0-9]{0,4}$' -and
+                    [int]$bindings[0].HostPort -le 65535) {
+                    return "127.0.0.1:$($bindings[0].HostPort)"
+                }
+            }
+        }
+        catch {
+            # Docker 29 may publish the random host port asynchronously.
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    return $null
+}
+
 function Test-IsWithin([string]$Candidate, [string]$Parent) {
     $candidateFull = [IO.Path]::GetFullPath($Candidate).TrimEnd('\', '/')
     $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd('\', '/')
@@ -547,12 +610,11 @@ function Stop-OwnedRegistry(
     if (-not $ContainerId) {
         return
     }
-    $label = @(& $Docker inspect --format `
-        '{{ index .Config.Labels "io.heyi.bundle-builder.run" }}' $ContainerId 2>$null)
-    if ($LASTEXITCODE -ne 0) {
-        return
+    $inspection = Read-DockerLabels $Docker 'container' $ContainerId
+    if (-not $inspection.Succeeded) {
+        Fail 'temporary Registry could not be inspected safely'
     }
-    if ($label.Count -ne 1 -or $label[0].ToString() -ne $RunId) {
+    if ($inspection.Labels.'io.heyi.bundle-builder.run' -ne $RunId) {
         Fail 'temporary Registry ownership changed; manual cleanup is required'
     }
     & $Docker stop --time 30 $ContainerId 1>$null 2>$null
@@ -573,12 +635,11 @@ function Remove-OwnedRegistryIfPresent(
     if (-not $ContainerId) {
         return $null
     }
-    $label = @(& $Docker inspect --format `
-        '{{ index .Config.Labels "io.heyi.bundle-builder.run" }}' $ContainerId 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $inspection = Read-DockerLabels $Docker 'container' $ContainerId
+    if (-not $inspection.Succeeded) {
         return 'cannot inspect the tracked temporary Registry during cleanup'
     }
-    if ($label.Count -ne 1 -or $label[0].ToString() -ne $RunId) {
+    if ($inspection.Labels.'io.heyi.bundle-builder.run' -ne $RunId) {
         return 'temporary Registry ownership changed; manual cleanup is required'
     }
     & $Docker rm --force $ContainerId 1>$null 2>$null
@@ -596,12 +657,11 @@ function Remove-OwnedNetworkIfPresent(
     if (-not $NetworkId) {
         return $null
     }
-    $label = @(& $Docker network inspect --format `
-        '{{ index .Labels "io.heyi.bundle-builder.run" }}' $NetworkId 2>$null)
-    if ($LASTEXITCODE -ne 0) {
+    $inspection = Read-DockerLabels $Docker 'network' $NetworkId
+    if (-not $inspection.Succeeded) {
         return 'cannot inspect the tracked temporary network during cleanup'
     }
-    if ($label.Count -ne 1 -or $label[0].ToString() -ne $RunId) {
+    if ($inspection.Labels.'io.heyi.bundle-builder.run' -ne $RunId) {
         return 'temporary network ownership changed; manual cleanup is required'
     }
     & $Docker network rm $NetworkId 1>$null 2>$null
@@ -886,8 +946,14 @@ try {
     }
 
     $networkName = "heyi-bundle-$($runId.Substring(0, 20))"
+    # Docker 29 suppresses published ports on --internal networks. The Registry
+    # starts behind a gate; a one-shot helper removes its default route before
+    # that gate opens. Disabling masquerade and ICC adds defense in depth while
+    # retaining one random, loopback-only host port.
     $networkOutput = @(Invoke-Captured $docker @(
-        'network', 'create', '--internal', '--driver', 'bridge',
+        'network', 'create', '--driver', 'bridge',
+        '--opt', 'com.docker.network.bridge.enable_ip_masquerade=false',
+        '--opt', 'com.docker.network.bridge.enable_icc=false',
         '--label', "io.heyi.bundle-builder.run=$runId", $networkName
     ) 'cannot create the isolated temporary Registry network')
     if ($networkOutput.Count -ne 1 -or $networkOutput[0] -notmatch '^[0-9a-f]{64}$') {
@@ -900,25 +966,51 @@ try {
         '--name', $containerName,
         '--label', "io.heyi.bundle-builder.run=$runId",
         '--network', $registryNetworkId,
-        '--publish', '127.0.0.1::5000',
+        '--publish', '127.0.0.1:0:5000/tcp',
+        '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges=true',
         '--mount', "type=bind,source=$registryData,target=/var/lib/registry",
-        $bootstrapId
+        '--entrypoint', '/bin/sh',
+        $bootstrapId,
+        '-ceu',
+        'while [ ! -f /tmp/heyi-network-ready ]; do sleep 0.1; done; ' +
+            'exec /entrypoint.sh /etc/docker/registry/config.yml'
     ) 'cannot start the isolated temporary Registry')
     if ($containerOutput.Count -ne 1 -or $containerOutput[0] -notmatch '^[0-9a-f]{64}$') {
         Fail 'temporary Registry returned an invalid container identity'
     }
     $registryContainerId = $containerOutput[0]
-    $portOutput = @(Invoke-Captured $docker @(
-        'port', $registryContainerId, '5000/tcp'
-    ) 'cannot resolve the temporary Registry loopback port')
-    $loopbackPorts = @($portOutput | Where-Object { $_ -match '^127\.0\.0\.1:(\d+)$' })
-    if ($loopbackPorts.Count -ne 1) {
+    $loopbackPort = Resolve-LoopbackPublishedPort $docker $registryContainerId
+    if (-not $loopbackPort -or $loopbackPort -notmatch '^127\.0\.0\.1:(\d+)$') {
         Fail 'temporary Registry is not bound to exactly one IPv4 loopback port'
     }
     $registryPort = [Text.RegularExpressions.Regex]::Match(
-        $loopbackPorts[0], ':(\d+)$'
+        $loopbackPort, ':(\d+)$'
     ).Groups[1].Value
     $registryEndpoint = "127.0.0.1:$registryPort"
+
+    Invoke-Quiet $docker @(
+        'run', '--rm', '--pull', 'never', '--platform', 'linux/amd64',
+        '--label', "io.heyi.bundle-builder.run=$runId",
+        '--network', "container:$registryContainerId",
+        '--cap-drop', 'ALL', '--cap-add', 'NET_ADMIN',
+        '--security-opt', 'no-new-privileges=true',
+        '--entrypoint', '/sbin/ip',
+        $bootstrapId, 'route', 'del', 'default'
+    ) 'cannot seal the temporary Registry network namespace'
+    $sealedRoutes = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', 'route', 'show'
+    ) 'cannot inspect the sealed temporary Registry routes')
+    if ($sealedRoutes.Count -ne 1 -or
+        $sealedRoutes[0] -notmatch '^[0-9.]+/[0-9]+ dev eth0 scope link(?:\s|$)' -or
+        $sealedRoutes[0] -match '(^default\s|\svia\s)') {
+        Fail 'temporary Registry retained a non-local network route'
+    }
+    Invoke-Quiet $docker @(
+        'exec', $registryContainerId, '/bin/sh', '-ceu',
+        ': > /tmp/heyi-network-ready'
+    ) 'cannot open the sealed temporary Registry startup gate'
+
     $registryReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
@@ -935,6 +1027,12 @@ try {
     }
     if (-not $registryReady) {
         Fail 'temporary Registry did not become ready'
+    }
+    $routesAfterStartup = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', 'route', 'show'
+    ) 'cannot re-check the temporary Registry routes')
+    if (($routesAfterStartup -join "`n") -ne ($sealedRoutes -join "`n")) {
+        Fail 'temporary Registry routes changed after startup'
     }
 
     $imageRecords = New-Object 'System.Collections.Generic.List[object]'
