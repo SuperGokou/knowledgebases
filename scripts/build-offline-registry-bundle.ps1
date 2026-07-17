@@ -961,6 +961,10 @@ try {
     }
     $registryNetworkId = $networkOutput[0]
     $containerName = "heyi-bundle-$($runId.Substring(0, 20))"
+    $registryStartupCommand = (
+        'while [ ! -f /tmp/heyi-network-ready ]; do sleep 0.1; done; ' +
+        'exec /entrypoint.sh /etc/docker/registry/config.yml'
+    )
     $containerOutput = @(Invoke-Captured $docker @(
         'run', '-d', '--pull', 'never', '--platform', 'linux/amd64',
         '--name', $containerName,
@@ -973,8 +977,7 @@ try {
         '--entrypoint', '/bin/sh',
         $bootstrapId,
         '-ceu',
-        'while [ ! -f /tmp/heyi-network-ready ]; do sleep 0.1; done; ' +
-            'exec /entrypoint.sh /etc/docker/registry/config.yml'
+        $registryStartupCommand
     ) 'cannot start the isolated temporary Registry')
     if ($containerOutput.Count -ne 1 -or $containerOutput[0] -notmatch '^[0-9a-f]{64}$') {
         Fail 'temporary Registry returned an invalid container identity'

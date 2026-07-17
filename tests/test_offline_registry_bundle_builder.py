@@ -478,6 +478,8 @@ def test_builder_uses_atomic_publish_lock_and_owned_failure_cleanup() -> None:
     assert "'--cap-drop', 'ALL', '--cap-add', 'NET_ADMIN'" in script
     assert "'route', 'del', 'default'" in script
     assert "temporary Registry retained a non-local network route" in script
+    assert "$registryStartupCommand = (" in script
+    assert "$bootstrapId,\n        '-ceu',\n        $registryStartupCommand" in script
     assert ": > /tmp/heyi-network-ready" in script
     assert "temporary Registry routes changed after startup" in script
     assert "'{{json .Config.Labels}}'" in script
