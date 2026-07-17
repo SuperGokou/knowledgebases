@@ -849,7 +849,8 @@ def test_builder_uses_atomic_publish_lock_and_owned_failure_cleanup() -> None:
     assert "'com.docker.network.bridge.enable_ip_masquerade=false'" in script
     assert "'com.docker.network.bridge.enable_icc=false'" in script
     assert "'network', 'inspect', '--format', '{{json .}}'" in script
-    assert "{{ index .Options" not in script
+    assert "'inspect', '--format', '{{json .HostConfig}}'" in script
+    assert "{{ index " not in script
     assert "'--dns', '127.0.0.1'" in script
     assert "'--dns-search', '.'" in script
     assert "'--dns-opt', 'timeout:1'" in script

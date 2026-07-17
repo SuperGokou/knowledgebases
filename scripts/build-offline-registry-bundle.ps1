@@ -1633,13 +1633,32 @@ try {
     }
     $registryContainerId = $containerOutput[0]
     $containerNetworkPolicy = @(Invoke-Captured $docker @(
-        'inspect', '--format',
-        '{{json .HostConfig.Dns}}|{{json .HostConfig.DnsSearch}}|{{json .HostConfig.DnsOptions}}|{{ index .HostConfig.Sysctls "net.ipv6.conf.all.disable_ipv6" }}|{{ index .HostConfig.Sysctls "net.ipv6.conf.default.disable_ipv6" }}',
-        $registryContainerId
+        'inspect', '--format', '{{json .HostConfig}}', $registryContainerId
     ) 'cannot inspect the temporary Registry DNS and IPv6 policy')
+    try {
+        $containerNetworkPolicyDocument = @(
+            $containerNetworkPolicy[0] | ConvertFrom-Json -ErrorAction Stop
+        )
+    }
+    catch {
+        Fail 'temporary Registry DNS and IPv6 policy is not valid Docker JSON'
+    }
     if ($containerNetworkPolicy.Count -ne 1 -or
-        $containerNetworkPolicy[0] -ne
-            '["127.0.0.1"]|["."]|["timeout:1","attempts:1"]|1|1') {
+        $containerNetworkPolicyDocument.Count -ne 1) {
+        Fail 'temporary Registry DNS and IPv6 policy is not a single Docker object'
+    }
+    $dnsPolicy = @($containerNetworkPolicyDocument[0].Dns)
+    $dnsSearchPolicy = @($containerNetworkPolicyDocument[0].DnsSearch)
+    $dnsOptionsPolicy = @($containerNetworkPolicyDocument[0].DnsOptions)
+    if ($dnsPolicy.Count -ne 1 -or $dnsPolicy[0] -ne '127.0.0.1' -or
+        $dnsSearchPolicy.Count -ne 1 -or $dnsSearchPolicy[0] -ne '.' -or
+        $dnsOptionsPolicy.Count -ne 2 -or
+        $dnsOptionsPolicy[0] -ne 'timeout:1' -or
+        $dnsOptionsPolicy[1] -ne 'attempts:1' -or
+        $containerNetworkPolicyDocument[0].Sysctls.'net.ipv6.conf.all.disable_ipv6' -ne
+            '1' -or
+        $containerNetworkPolicyDocument[0].Sysctls.'net.ipv6.conf.default.disable_ipv6' -ne
+            '1') {
         Fail 'temporary Registry DNS or IPv6 isolation differs from the sealed policy'
     }
     $loopbackPort = Resolve-LoopbackPublishedPort $docker $registryContainerId
