@@ -20,6 +20,7 @@ OFFLINE_PROJECT_NAME=heyi-kb-offline
 OFFLINE_RUNTIME_ROOT=/run/heyi-kb-offline
 OFFLINE_CONTRACT_ROOT=$OFFLINE_RUNTIME_ROOT/contracts
 OFFLINE_TMPDIR=$OFFLINE_RUNTIME_ROOT/tmp
+OFFLINE_IMAGE_ARCHIVE_TMPDIR=/var/tmp
 OFFLINE_HOME=$OFFLINE_RUNTIME_ROOT/home
 OFFLINE_DOCKER_CONFIG=$OFFLINE_RUNTIME_ROOT/docker-config
 OFFLINE_LOCK_DIRECTORY=$OFFLINE_RUNTIME_ROOT
@@ -39,6 +40,113 @@ offline_fail() {
   echo "$prefix: $message" >&2
   exit "$code"
 }
+
+offline_local_image_config_id() (
+  prefix=$1
+  image=$2
+  archive=
+  # Invoked indirectly by the EXIT trap below.
+  # shellcheck disable=SC2329
+  cleanup_local_image_identity() {
+    # ShellCheck cannot follow function calls made indirectly by an EXIT trap.
+    # shellcheck disable=SC2317
+    if [ -n "$archive" ]; then
+      rm -f -- "$archive"
+    fi
+  }
+  trap cleanup_local_image_identity EXIT
+  trap 'exit 130' HUP INT TERM
+  # Docker inspection metadata is not a content-verification boundary.  In
+  # particular, Descriptor annotations such as config.digest can be supplied
+  # by the image store and must never substitute for hashing the config bytes.
+  if [ -L "$OFFLINE_IMAGE_ARCHIVE_TMPDIR" ] || \
+    [ ! -d "$OFFLINE_IMAGE_ARCHIVE_TMPDIR" ] || \
+    [ "$(stat -c %u -- "$OFFLINE_IMAGE_ARCHIVE_TMPDIR")" -ne 0 ] || \
+    [ "$(stat -c %a -- "$OFFLINE_IMAGE_ARCHIVE_TMPDIR")" != 1777 ]; then
+    echo "$prefix: protected image archive temporary directory is invalid" >&2
+    exit 73
+  fi
+  archive=$(mktemp \
+    "$OFFLINE_IMAGE_ARCHIVE_TMPDIR/heyi-local-image-archive.XXXXXXXXXX") || exit 73
+  if ! docker image save --output "$archive" "$image" >/dev/null; then
+    echo "$prefix: cannot save the local image for config verification: $image" >&2
+    exit 66
+  fi
+  python3 -I - "$archive" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import tarfile
+
+CONFIG_PATH = re.compile(
+    r"^(?:(?P<legacy>[0-9a-f]{64})\.json|blobs/sha256/(?P<oci>[0-9a-f]{64}))$"
+)
+MAX_CONFIG_BYTES = 16 * 1024 * 1024
+
+
+def fail(message):
+    raise SystemExit(f"offline-image-config: {message}")
+
+
+archive_path = pathlib.Path(sys.argv[1]).resolve(strict=True)
+with tarfile.open(archive_path, "r:*") as archive:
+    members = {}
+    for member in archive.getmembers():
+        if member.name in members:
+            fail("Docker archive contains duplicate paths")
+        members[member.name] = member
+    manifest_member = members.get("manifest.json")
+    if (
+        manifest_member is None
+        or not manifest_member.isfile()
+        or manifest_member.issym()
+        or manifest_member.islnk()
+    ):
+        fail("Docker archive manifest is missing or unsafe")
+    manifest_stream = archive.extractfile(manifest_member)
+    if manifest_stream is None:
+        fail("Docker archive manifest cannot be read")
+    try:
+        manifest = json.load(manifest_stream)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("Docker archive manifest is invalid JSON")
+    if not isinstance(manifest, list) or len(manifest) != 1:
+        fail("Docker archive must contain exactly one image")
+    config_path = manifest[0].get("Config") if isinstance(manifest[0], dict) else None
+    match = CONFIG_PATH.fullmatch(config_path or "")
+    if match is None:
+        fail("Docker archive config path is not content addressed")
+    config_digest = match.group("legacy") or match.group("oci")
+    config_member = members.get(config_path)
+    if (
+        config_member is None
+        or not config_member.isfile()
+        or config_member.issym()
+        or config_member.islnk()
+        or not 0 < config_member.size <= MAX_CONFIG_BYTES
+    ):
+        fail("Docker archive config is missing, unsafe or oversized")
+    config_stream = archive.extractfile(config_member)
+    if config_stream is None:
+        fail("Docker archive config cannot be read")
+    config_bytes = config_stream.read(MAX_CONFIG_BYTES + 1)
+    if len(config_bytes) != config_member.size:
+        fail("Docker archive config size differs from its header")
+    if hashlib.sha256(config_bytes).hexdigest() != config_digest:
+        fail("Docker archive config bytes do not match their content address")
+    try:
+        config = json.loads(config_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("Docker archive config is invalid JSON")
+    if not isinstance(config, dict):
+        fail("Docker archive config must be an object")
+    if config.get("os") != "linux" or config.get("architecture") != "amd64":
+        fail("Docker archive config platform must be linux/amd64")
+print(f"sha256:{config_digest}")
+PY
+)
 
 offline_require_no_chat_safety_poison() {
   prefix=$1

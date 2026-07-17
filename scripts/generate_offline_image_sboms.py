@@ -158,6 +158,54 @@ def parse_image_manifest(path: Path) -> list[ImageIdentity]:
     return images
 
 
+def parse_local_image_map(path: Path, images: Sequence[ImageIdentity]) -> dict[str, str]:
+    if not path.is_file() or path.is_symlink():
+        raise ImageSbomContractError("local image map must be a regular, non-symlink file")
+    try:
+        content = path.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise ImageSbomContractError(f"cannot read local image map: {exc}") from exc
+    lines = content.splitlines()
+    if not lines or any(not line for line in lines):
+        raise ImageSbomContractError("local image map must contain non-empty rows")
+
+    signed_images = {image.reference: image for image in images}
+    mapping: dict[str, str] = {}
+    for line_number, line in enumerate(lines, start=1):
+        fields = line.split("\t")
+        if len(fields) != 2 or any(not field for field in fields):
+            raise ImageSbomContractError(
+                f"local image map row {line_number} must contain exactly two tab-separated fields"
+            )
+        reference, local_id = fields
+        _validate_reference(reference)
+        if DIGEST_PATTERN.fullmatch(local_id) is None:
+            raise ImageSbomContractError(
+                f"local image map row {line_number} has an invalid Docker image identity"
+            )
+        if reference in mapping:
+            raise ImageSbomContractError("local image map contains a duplicate reference")
+        signed_image = signed_images.get(reference)
+        if signed_image is None:
+            raise ImageSbomContractError("local image map differs from the signed image manifest")
+        if local_id not in {signed_image.manifest_digest, signed_image.config_id}:
+            raise ImageSbomContractError(
+                f"local image map row {line_number} must equal its signed manifest digest "
+                "or config digest"
+            )
+        mapping[reference] = local_id
+
+    references = list(mapping)
+    expected_references = [image.reference for image in images]
+    if references != sorted(references):
+        raise ImageSbomContractError("local image map rows must be sorted by reference")
+    if references != expected_references:
+        raise ImageSbomContractError("local image map differs from the signed image manifest")
+    if len(set(mapping.values())) != len(mapping):
+        raise ImageSbomContractError("local image map contains a duplicate Docker image identity")
+    return mapping
+
+
 def _default_runner(command: Sequence[str], environment: dict[str, str], timeout: int) -> None:
     try:
         subprocess.run(
@@ -193,6 +241,7 @@ def _normalise_cyclonedx(
     document: dict[str, Any],
     *,
     image: ImageIdentity,
+    scan_identity: str,
     release_id: str,
     release_git_sha: str,
     source_manifest_sha256: str,
@@ -219,6 +268,7 @@ def _normalise_cyclonedx(
         "io.heyi.image.manifest_digest": image.manifest_digest,
         "io.heyi.image.os": image.os,
         "io.heyi.image.reference": image.reference,
+        "io.heyi.image.scan_identity": scan_identity,
         "io.heyi.release.git_sha": release_git_sha,
         "io.heyi.release.id": release_id,
         "io.heyi.scanner.sha256": scanner_sha256,
@@ -252,6 +302,7 @@ def generate_image_sboms(
     *,
     artifact_root: Path,
     image_manifest: Path,
+    local_image_map: Path,
     output_dir: Path,
     scanner: Path,
     scanner_sha256: str,
@@ -263,9 +314,16 @@ def generate_image_sboms(
 ) -> dict[str, Any]:
     artifact_root = artifact_root.resolve()
     image_manifest = image_manifest.resolve()
+    local_image_map = local_image_map.resolve()
     output_dir = output_dir.resolve()
     if not artifact_root.is_dir():
         raise ImageSbomContractError("artifact_root must be an existing directory")
+    try:
+        local_image_map.relative_to(artifact_root)
+    except ValueError:
+        pass
+    else:
+        raise ImageSbomContractError("local image map must remain outside artifact_root")
     manifest_relative = _relative_to(artifact_root, image_manifest, "image_manifest")
     output_relative = _relative_to(artifact_root, output_dir, "output_dir")
     if output_dir == artifact_root or output_relative == ".":
@@ -281,6 +339,7 @@ def generate_image_sboms(
 
     scanner_path, actual_scanner_sha256 = _validate_scanner(scanner, scanner_sha256)
     images = parse_image_manifest(image_manifest)
+    local_images = parse_local_image_map(local_image_map, images)
     source_manifest_sha256 = _sha256_file(image_manifest)
     plan = {
         "status": "DRY_RUN" if dry_run else "PASS",
@@ -299,13 +358,22 @@ def generate_image_sboms(
         records: list[dict[str, Any]] = []
         environment = _scanner_environment()
         for image in images:
+            scan_identity = local_images[image.reference]
             digest_hex = image.manifest_digest.removeprefix("sha256:")
             raw_path = staging / f".raw-{digest_hex}.cdx.json"
             final_name = f"image-{digest_hex}.cdx.json"
             command = [
                 str(scanner_path),
                 "scan",
-                image.reference,
+                # The release reference names the target host's loopback
+                # Registry and is intentionally unavailable after the isolated
+                # build Registry stops. Scan the already verified local Docker
+                # image by the Docker backend's exact local content identity to
+                # prevent network fallback. Docker 29 containerd stores expose
+                # a manifest digest as .Id, while legacy stores expose the
+                # config digest. The signed evidence still binds the separately
+                # verified manifest, true config digest and final reference.
+                f"docker:{scan_identity}",
                 "-o",
                 f"cyclonedx-json={raw_path}",
             ]
@@ -314,6 +382,7 @@ def generate_image_sboms(
             document = _normalise_cyclonedx(
                 raw_document,
                 image=image,
+                scan_identity=scan_identity,
                 release_id=release_id,
                 release_git_sha=release_git_sha,
                 source_manifest_sha256=source_manifest_sha256,
@@ -331,6 +400,7 @@ def generate_image_sboms(
                     "manifest_digest": image.manifest_digest,
                     "os": image.os,
                     "reference": image.reference,
+                    "scan_identity": scan_identity,
                     "sbom_path": relative_sbom,
                     "sbom_sha256": _sha256_file(final_path),
                 }
@@ -370,6 +440,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--image-manifest", type=Path, required=True)
+    parser.add_argument("--local-image-map", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--scanner", type=Path, required=True)
     parser.add_argument("--scanner-sha256", required=True)
@@ -386,6 +457,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = generate_image_sboms(
             artifact_root=arguments.artifact_root,
             image_manifest=arguments.image_manifest,
+            local_image_map=arguments.local_image_map,
             output_dir=arguments.output_dir,
             scanner=arguments.scanner,
             scanner_sha256=arguments.scanner_sha256,

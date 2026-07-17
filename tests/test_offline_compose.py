@@ -415,11 +415,20 @@ def test_offline_application_images_are_preloaded_and_never_built_or_pulled() ->
 
 def test_offline_image_verifier_rejects_mutable_manifest_entries() -> None:
     script = (REPOSITORY / "deploy/tencent/verify-offline-images.sh").read_text(encoding="utf-8")
+    common = (REPOSITORY / "deploy/tencent/offline-operation-common.sh").read_text(encoding="utf-8")
 
     assert "image must be pinned by sha256 digest" in script
     assert "RepoDigests" in script
     assert "local image RepoDigest does not match manifest" in script
-    assert "local image ID differs from the signed manifest" in script
+    assert "local Docker identity matches neither signed manifest nor config digest" in script
+    assert '[ "$image_id" != "$expected_manifest_id" ]' in script
+    assert "offline_local_image_config_id" in script
+    assert "local image config digest differs from the signed manifest" in script
+    assert "config.digest" in common
+    assert "docker image save --output" in common
+    assert "OFFLINE_IMAGE_ARCHIVE_TMPDIR=/var/tmp" in common
+    assert "!= 1777" in common
+    assert "Docker archive config bytes do not match their content address" in common
     assert "local image platform must be linux/amd64" in script
     assert "classic docker save/load does not preserve RepoDigests" in script
 
@@ -1034,3 +1043,48 @@ def test_offline_public_api_trusts_only_the_fixed_internal_proxy_network() -> No
     assert config["services"]["api"]["environment"]["KB_TRUSTED_PROXY_CIDRS"] == (
         '["172.30.240.0/24"]'
     )
+
+
+def test_registry_import_seals_docker_dns_and_ipv6_before_startup() -> None:
+    script = (REPOSITORY / "deploy/tencent/import-offline-registry-bundle.sh").read_text(
+        encoding="utf-8"
+    )
+    network_block = script[
+        script.index("registry_network_id=$(docker network create") : script.index("ready=false")
+    ]
+
+    assert "docker network create --driver bridge --ipv6=false" in network_block
+    for expected in (
+        "--dns 127.0.0.1 --dns-search .",
+        "--dns-opt timeout:1 --dns-opt attempts:1",
+        "--sysctl net.ipv6.conf.all.disable_ipv6=1",
+        "--sysctl net.ipv6.conf.default.disable_ipv6=1",
+        "/sbin/ip route add blackhole 127.0.0.11/32 table local",
+        "/sbin/ip route get 127.0.0.11",
+        "/proc/sys/net/ipv6/conf/all/disable_ipv6",
+        "/proc/sys/net/ipv6/conf/default/disable_ipv6",
+        "/sbin/ip -6 address show",
+        "/sbin/ip -6 route show table all",
+    ):
+        assert expected in network_block
+
+    dns_policy_check = network_block.index(
+        "temporary Registry DNS or IPv6 isolation differs from the sealed policy"
+    )
+    route_seal = network_block.index("network_seal_command=")
+    embedded_dns_check = network_block.index(
+        "Docker embedded DNS remained reachable after the network seal"
+    )
+    ipv6_check = network_block.index("temporary Registry retained an IPv6 address or route")
+    startup_gate = network_block.index(": > /tmp/heyi-network-ready")
+    assert dns_policy_check < route_seal < embedded_dns_check < ipv6_check < startup_gate
+
+
+def test_registry_import_cleanup_revalidates_ipv6_disabled() -> None:
+    script = (REPOSITORY / "deploy/tencent/import-offline-registry-bundle.sh").read_text(
+        encoding="utf-8"
+    )
+    cleanup = script[script.index("cleanup_registry() {") : script.index("handle_exit() {")]
+
+    assert "observed_network_ipv6=" in cleanup
+    assert '[ "$observed_network_ipv6" != false ]' in cleanup

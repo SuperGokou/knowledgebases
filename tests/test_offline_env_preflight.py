@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import http.client
 import importlib.util
+import io
 import json
+import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from types import ModuleType
 
@@ -31,6 +36,219 @@ def _network_validator() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _registry_byte_verifier_program() -> str:
+    script = (DEPLOY / "import-offline-registry-bundle.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"(?ms)^verify_registry_manifest_and_config\(\) \{.*?"
+        r"<<'PY'\n(?P<body>.*?)\nPY\n\}",
+        script,
+    )
+    assert match is not None
+    return match.group("body")
+
+
+def _local_image_archive_verifier_program() -> str:
+    script = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"(?ms)^offline_local_image_config_id\(\) \(.*?"
+        r"python3 -I - \"\$archive\" <<'PY'\n(?P<body>.*?)\nPY\n\)",
+        script,
+    )
+    assert match is not None
+    return match.group("body")
+
+
+def _write_single_image_archive(
+    path: Path,
+    config: bytes,
+    *,
+    claimed_config_digest: str | None = None,
+) -> str:
+    actual_config_digest = hashlib.sha256(config).hexdigest()
+    config_digest = claimed_config_digest or actual_config_digest
+    config_path = f"{config_digest}.json"
+    manifest = json.dumps(
+        [
+            {
+                "Config": config_path,
+                "Layers": [],
+                "RepoTags": ["heyi-bootstrap/registry:tested"],
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    with tarfile.open(path, mode="w") as archive:
+        for name, data in (("manifest.json", manifest), (config_path, config)):
+            member = tarfile.TarInfo(name)
+            member.mode = 0o644
+            member.mtime = 0
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return "sha256:" + actual_config_digest
+
+
+class _RegistryResponse:
+    def __init__(self, data: bytes, *, content_digest: str | None = None) -> None:
+        self.status = 200
+        self._data = data
+        self._headers = {"Content-Length": str(len(data))}
+        if content_digest is not None:
+            self._headers["Docker-Content-Digest"] = content_digest
+
+    def read(self, amount: int) -> bytes:
+        return self._data[:amount]
+
+    def getheader(self, name: str) -> str | None:
+        return self._headers.get(name)
+
+
+class _RegistryConnection:
+    responses: list[_RegistryResponse] = []
+    paths: list[str] = []
+
+    def __init__(self, host: str, port: int, timeout: int) -> None:
+        assert (host, port, timeout) == ("127.0.0.1", 5000, 10)
+        self._responses = list(type(self).responses)
+
+    def request(self, method: str, path: str, *, headers: dict[str, str]) -> None:
+        assert method == "GET"
+        assert headers["Accept"]
+        type(self).paths.append(path)
+
+    def getresponse(self) -> _RegistryResponse:
+        return self._responses.pop(0)
+
+    def close(self) -> None:
+        return None
+
+
+def _registry_identity_fixture() -> tuple[str, str, list[_RegistryResponse]]:
+    config = json.dumps(
+        {"architecture": "amd64", "os": "linux", "rootfs": {"diff_ids": ["sha256:" + "3" * 64]}},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    config_id = "sha256:" + hashlib.sha256(config).hexdigest()
+    manifest = json.dumps(
+        {
+            "config": {
+                "digest": config_id,
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": len(config),
+            },
+            "layers": [
+                {
+                    "digest": "sha256:" + "4" * 64,
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 123,
+                }
+            ],
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "schemaVersion": 2,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    manifest_id = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    image = f"127.0.0.1:5000/heyi-release/api@{manifest_id}"
+    return (
+        image,
+        config_id,
+        [
+            _RegistryResponse(manifest, content_digest=manifest_id),
+            _RegistryResponse(config),
+        ],
+    )
+
+
+def test_registry_byte_verifier_binds_manifest_config_and_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image, config_id, responses = _registry_identity_fixture()
+    _RegistryConnection.responses = responses
+    _RegistryConnection.paths = []
+    monkeypatch.setattr(http.client, "HTTPConnection", _RegistryConnection)
+    monkeypatch.setattr(sys, "argv", ["registry-byte-verifier", image, config_id])
+
+    exec(compile(_registry_byte_verifier_program(), "<registry-byte-verifier>", "exec"), {})
+
+    assert _RegistryConnection.paths == [
+        f"/v2/heyi-release/api/manifests/{image.rsplit('@', 1)[1]}",
+        f"/v2/heyi-release/api/blobs/{config_id}",
+    ]
+
+
+def test_registry_byte_verifier_rejects_a_signed_config_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image, _config_id, responses = _registry_identity_fixture()
+    _RegistryConnection.responses = responses
+    _RegistryConnection.paths = []
+    monkeypatch.setattr(http.client, "HTTPConnection", _RegistryConnection)
+    monkeypatch.setattr(sys, "argv", ["registry-byte-verifier", image, "sha256:" + "9" * 64])
+
+    with pytest.raises(SystemExit, match="config descriptor differs"):
+        exec(compile(_registry_byte_verifier_program(), "<registry-byte-verifier>", "exec"), {})
+
+
+def test_local_image_config_identity_is_always_recomputed_from_archive_bytes(
+    tmp_path: Path,
+) -> None:
+    common = (DEPLOY / "offline-operation-common.sh").read_text(encoding="utf-8")
+    helper = common.split("offline_local_image_config_id() (", 1)[1].split(
+        "\noffline_require_no_chat_safety_poison()", 1
+    )[0]
+    config = json.dumps(
+        {"architecture": "amd64", "os": "linux", "rootfs": {"diff_ids": []}},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    archive = tmp_path / "single-image.tar"
+    expected = _write_single_image_archive(archive, config)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _local_image_archive_verifier_program(), str(archive)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+    assert "docker image inspect" not in helper
+    assert "archive-required" not in helper
+    assert 'image.get("Descriptor")' not in helper
+    assert "annotations.get" not in helper
+    assert helper.count('docker image save --output "$archive" "$image"') == 1
+    assert "hashlib.sha256(config_bytes).hexdigest() != config_digest" in helper
+
+
+def test_local_image_config_identity_rejects_config_bytes_under_a_false_digest(
+    tmp_path: Path,
+) -> None:
+    config = json.dumps(
+        {"architecture": "amd64", "os": "linux", "rootfs": {"diff_ids": []}},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    archive = tmp_path / "false-config-address.tar"
+    _write_single_image_archive(archive, config, claimed_config_digest="f" * 64)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _local_image_archive_verifier_program(), str(archive)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode != 0
+    assert "config bytes do not match their content address" in result.stderr
 
 
 def _valid_runtime() -> str:
@@ -585,7 +803,26 @@ def test_registry_import_uses_signed_loopback_bundle_not_classic_save_load() -> 
     assert 'docker pull --platform linux/amd64 "$image"' in script
     assert "RepoDigest differs" in script
     assert "stat.S_ISREG(info.st_mode) and info.st_nlink != 1" in script
-    assert "docker network create --internal --driver bridge" in script
+    assert "docker network create --driver bridge --ipv6=false" in script
+    assert "docker network create --internal --driver bridge" not in script
+    assert "com.docker.network.bridge.enable_ip_masquerade=false" in script
+    assert "com.docker.network.bridge.enable_icc=false" in script
+    assert '--network "container:$registry_container_id"' in script
+    assert "--cap-drop ALL --cap-add NET_ADMIN" in script
+    assert "/sbin/ip route del default;" in script
+    assert "/sbin/ip route add blackhole 127.0.0.11/32 table local" in script
+    assert "temporary Registry retained a non-local network route" in script
+    assert "registry_startup_command=" in script
+    assert "heyi-network-ready" in script
+    assert "verify_registry_manifest_and_config" in script
+    assert script.count("offline_local_image_config_id registry-import") == 2
+    assert "offline_local_image_config_id \\\n  registry-import" in script
+    assert '[ "$observed_config_id" != "$expected_id" ]' in script
+    assert "manifest bytes differ from the signed content address" in script
+    assert "config blob bytes differ from their content address" in script
+    assert script.index('verify_registry_manifest_and_config "$image" "$expected_id"') < (
+        script.index('docker pull --platform linux/amd64 "$image"')
+    )
     assert '--network "$registry_network_id"' in script
     assert 'docker network rm "$registry_network_id"' in script
     assert "docker save" not in script
@@ -595,6 +832,10 @@ def test_registry_import_uses_signed_loopback_bundle_not_classic_save_load() -> 
     assert "image SBOM evidence does not match the signed nine-image manifest" in script
     assert "len(images) != 9" in script
     assert '"https://knowledgebases.local/schemas/image-sbom-index-v1.schema.json"' in script
+    assert 'scan_identity = record.get("scan_identity")' in script
+    assert "scan_identity not in {manifest_digest, config_id}" in script
+    assert '"io.heyi.image.scan_identity": scan_identity' in script
+    assert "len(set(scan_identities)) != len(images)" in script
     assert "signed release asset inventory differs" in script
     assert "RELEASE_SEQUENCE" in script
     assert "signed release sequence is replayed or downgraded" in script

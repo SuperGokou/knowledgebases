@@ -1260,11 +1260,13 @@ def _check_image_sbom_index(
     record_references = [record.get("reference") for record in records]
     record_digests = [record.get("manifest_digest") for record in records]
     record_config_ids = [record.get("config_id") for record in records]
+    record_scan_identities = [record.get("scan_identity") for record in records]
     record_sbom_paths = [record.get("sbom_path") for record in records]
     identity_columns = (
         record_references,
         record_digests,
         record_config_ids,
+        record_scan_identities,
         record_sbom_paths,
     )
     duplicate_or_malformed = len(records) != len(raw_records) or any(
@@ -1302,6 +1304,7 @@ def _check_image_sbom_index(
         valid = (
             record.get("manifest_digest") == identity.manifest_digest
             and record.get("config_id") == identity.config_id
+            and record.get("scan_identity") in {identity.manifest_digest, identity.config_id}
             and record.get("os") == identity.os
             and record.get("architecture") == identity.architecture
             and isinstance(sbom_relative, str)
@@ -1334,6 +1337,7 @@ def _check_image_sbom_index(
                     "io.heyi.image.manifest_digest": identity.manifest_digest,
                     "io.heyi.image.os": identity.os,
                     "io.heyi.image.reference": identity.reference,
+                    "io.heyi.image.scan_identity": str(record["scan_identity"]),
                     "io.heyi.release.git_sha": str(attested_release_id),
                     "io.heyi.release.id": str(index["release_id"]),
                     "io.heyi.scanner.sha256": str(scanner["sha256"]),

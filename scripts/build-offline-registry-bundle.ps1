@@ -20,12 +20,12 @@ Build a signed, content-addressed offline Registry bundle from a clean Git HEAD.
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-offline-registry-bundle.ps1 `
-    -OutputDirectory C:\release\heyi-kb-2026.07.14 `
+    -OutputDirectory C:\release\heyi-kb-2026.07.16.1 `
     -SigningPrivateKey D:\release-keys\heyi-release-rsa.pem `
     -ImageSbomScanner D:\release-tools\syft.exe `
     -ImageSbomScannerSha256 <approved-lowercase-sha256> `
-    -ReleaseSequence 202607140001 `
-    -ReleaseId 2026.07.14
+    -ReleaseSequence 202607160001 `
+    -ReleaseId 2026.07.16.1
 
 Options:
   -DryRun   Validate the clean-HEAD, tools, key, image and release contracts
@@ -69,8 +69,33 @@ function Invoke-Captured(
     [string[]]$Arguments,
     [string]$FailureMessage
 ) {
-    $output = @(& $Tool @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $exitCode = $null
+    try {
+        # Windows PowerShell 5.1 converts native stderr into ErrorRecord
+        # instances. Tools such as Buildx legitimately emit progress there, so
+        # their process exit code—not stderr presence—is authoritative.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $Tool @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        $diagnostic = @(
+            $output |
+                ForEach-Object { $_.ToString().Trim() } |
+                Where-Object { $_ } |
+                Select-Object -Last 1
+        )
+        if ($diagnostic.Count -eq 1) {
+            $diagnosticText = $diagnostic[0] -replace '[\r\n]+', ' '
+            if ($diagnosticText.Length -gt 1024) {
+                $diagnosticText = $diagnosticText.Substring(0, 1024) + '...'
+            }
+            Fail "$FailureMessage; native diagnostic: $diagnosticText"
+        }
         Fail $FailureMessage
     }
     return @($output | ForEach-Object { $_.ToString() })
@@ -81,8 +106,17 @@ function Invoke-Quiet(
     [string[]]$Arguments,
     [string]$FailureMessage
 ) {
-    & $Tool @Arguments 1>$null 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $exitCode = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Tool @Arguments 1>$null 2>$null
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
         Fail $FailureMessage
     }
 }
@@ -328,6 +362,490 @@ function Get-DigestFromReference([string]$Reference) {
     return $Reference.Substring($separator + 1)
 }
 
+function Read-BoundedResponseBytes(
+    [IO.Stream]$Stream,
+    [long]$MaximumBytes,
+    [string]$BoundaryMessage
+) {
+    if ($null -eq $Stream -or $MaximumBytes -le 0 -or
+        $MaximumBytes -ge [int]::MaxValue -or -not $BoundaryMessage) {
+        Fail 'bounded response reader received an invalid contract'
+    }
+    $memory = New-Object IO.MemoryStream
+    $buffer = New-Object byte[] 65536
+    $maximumPlusOne = $MaximumBytes + 1
+    try {
+        while ($memory.Length -lt $maximumPlusOne) {
+            $remaining = $maximumPlusOne - $memory.Length
+            $requested = [int][Math]::Min([long]$buffer.Length, $remaining)
+            $read = $Stream.Read($buffer, 0, $requested)
+            if ($read -eq 0) {
+                break
+            }
+            if ($read -lt 0 -or $read -gt $requested) {
+                Fail 'response stream returned an invalid byte count'
+            }
+            $memory.Write($buffer, 0, $read)
+        }
+        if ($memory.Length -gt $MaximumBytes) {
+            Fail $BoundaryMessage
+        }
+        if ($memory.Length -eq 0) {
+            Fail 'temporary Registry returned an empty response body'
+        }
+        $bytes = $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+    }
+    # Prevent PowerShell from unrolling byte[] into one pipeline object per byte.
+    return ,$bytes
+}
+
+function Invoke-StrictRegistryJsonInspection(
+    [string]$Python,
+    [string]$Workspace,
+    [byte[]]$JsonBytes,
+    [ValidateSet('manifest', 'config')]
+    [string]$Mode
+) {
+    if (-not $Python -or -not $Workspace -or $null -eq $JsonBytes -or
+        $JsonBytes.Length -eq 0) {
+        Fail 'strict Registry JSON inspector received an invalid contract'
+    }
+    $inspectionId = [Guid]::NewGuid().ToString('N')
+    $programPath = Join-Path $Workspace "registry-json-$inspectionId.py"
+    $documentPath = Join-Path $Workspace "registry-json-$inspectionId.bin"
+    if ((Test-Path -LiteralPath $programPath) -or
+        (Test-Path -LiteralPath $documentPath)) {
+        Fail 'strict Registry JSON inspection path already exists'
+    }
+    $program = @'
+import json
+import pathlib
+import re
+import sys
+
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+MANIFEST_TYPES = {
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+}
+CONFIG_TYPES = {
+    "application/vnd.docker.container.image.v1+json",
+    "application/vnd.oci.image.config.v1+json",
+}
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_CONFIG_BYTES = 16 * 1024 * 1024
+
+
+def fail(message):
+    raise SystemExit(f"registry-json-inspector: {message}")
+
+
+def reject_constant(value):
+    fail(f"JSON contains a non-finite number: {value}")
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("JSON contains a duplicate object key")
+        value[key] = item
+    return value
+
+
+def load_object(path, maximum, label):
+    candidate = pathlib.Path(path)
+    if not candidate.is_file() or candidate.is_symlink():
+        fail(f"{label} input is not a regular file")
+    with candidate.open("rb") as stream:
+        data = stream.read(maximum + 1)
+    if not data or len(data) > maximum:
+        fail(f"{label} input size is outside the approved boundary")
+    try:
+        text = data.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        fail(f"{label} is not valid UTF-8 JSON")
+    if type(value) is not dict:
+        fail(f"{label} must be a JSON object")
+    return value
+
+
+def inspect_manifest(path):
+    manifest = load_object(path, MAX_MANIFEST_BYTES, "manifest")
+    if type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 2:
+        fail("manifest schemaVersion must be the integer 2")
+    media_type = manifest.get("mediaType")
+    if type(media_type) is not str or media_type not in MANIFEST_TYPES:
+        fail("manifest is not an approved single-image media type")
+    descriptor = manifest.get("config")
+    if type(descriptor) is not dict:
+        fail("manifest config descriptor must be an object")
+    config_media_type = descriptor.get("mediaType")
+    digest = descriptor.get("digest")
+    size = descriptor.get("size")
+    if (
+        type(config_media_type) is not str
+        or config_media_type not in CONFIG_TYPES
+        or type(digest) is not str
+        or DIGEST.fullmatch(digest) is None
+        or type(size) is not int
+        or not 0 < size <= MAX_CONFIG_BYTES
+    ):
+        fail("manifest config descriptor is invalid")
+    layers = manifest.get("layers")
+    if type(layers) is not list or not layers:
+        fail("manifest layer descriptor set must be a non-empty array")
+    for layer in layers:
+        if type(layer) is not dict:
+            fail("manifest layer descriptor must be an object")
+        layer_digest = layer.get("digest")
+        layer_size = layer.get("size")
+        if (
+            type(layer_digest) is not str
+            or DIGEST.fullmatch(layer_digest) is None
+            or type(layer_size) is not int
+            or layer_size <= 0
+        ):
+            fail("manifest contains an invalid layer descriptor")
+    print(f"{digest}\t{size}")
+
+
+def inspect_config(path):
+    config = load_object(path, MAX_CONFIG_BYTES, "config blob")
+    if type(config.get("os")) is not str or config["os"] != "linux":
+        fail("config blob operating system must be linux")
+    if type(config.get("architecture")) is not str or config["architecture"] != "amd64":
+        fail("config blob architecture must be amd64")
+    print("PASS")
+
+
+if len(sys.argv) != 3 or sys.argv[1] not in {"manifest", "config"}:
+    fail("usage: registry-json-inspector.py <manifest|config> <document>")
+if sys.argv[1] == "manifest":
+    inspect_manifest(sys.argv[2])
+else:
+    inspect_config(sys.argv[2])
+'@
+    try {
+        Write-AsciiFile $programPath @($program -split '\r?\n')
+        [IO.File]::WriteAllBytes($documentPath, $JsonBytes)
+        return @(Invoke-Captured $Python @('-I', $programPath, $Mode, $documentPath) `
+            'strict Registry JSON inspection failed')
+    }
+    finally {
+        foreach ($temporaryInspectionFile in @($documentPath, $programPath)) {
+            if (Test-Path -LiteralPath $temporaryInspectionFile) {
+                Remove-Item -LiteralPath $temporaryInspectionFile -Force
+            }
+        }
+    }
+}
+
+function Get-RegistryManifestConfigId(
+    [string]$Python,
+    [string]$Workspace,
+    [string]$TemporaryTaggedImage,
+    [string]$ExpectedManifestDigest
+) {
+    $match = [Text.RegularExpressions.Regex]::Match(
+        $TemporaryTaggedImage,
+        '^(?<endpoint>127\.0\.0\.1:[1-9][0-9]{0,4})/(?<repository>[a-z0-9][a-z0-9._/-]*):(?<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$'
+    )
+    if (-not $match.Success -or
+        $ExpectedManifestDigest -notmatch '^sha256:[0-9a-f]{64}$') {
+        Fail 'cannot derive a safe temporary Registry manifest URL'
+    }
+    $endpoint = $match.Groups['endpoint'].Value
+    $repository = $match.Groups['repository'].Value
+    if ($repository.Contains('//') -or $repository.Contains('/../') -or
+        $repository.EndsWith('/..')) {
+        Fail 'temporary Registry repository path is unsafe'
+    }
+    $uri = "http://$endpoint/v2/$repository/manifests/$ExpectedManifestDigest"
+    $request = [Net.HttpWebRequest]::Create($uri)
+    $request.Method = 'GET'
+    $request.Proxy = $null
+    $request.Timeout = 10000
+    $request.ReadWriteTimeout = 10000
+    $request.Accept = (
+        'application/vnd.docker.distribution.manifest.v2+json, ' +
+        'application/vnd.oci.image.manifest.v1+json'
+    )
+    $response = $null
+    try {
+        $response = [Net.HttpWebResponse]$request.GetResponse()
+        if ([int]$response.StatusCode -ne 200) {
+            Fail 'temporary Registry returned a non-success manifest response'
+        }
+        if ($response.Headers['Docker-Content-Digest'] -ne $ExpectedManifestDigest) {
+            Fail 'temporary Registry manifest response changed its content digest'
+        }
+        if ($response.ContentLength -eq 0 -or $response.ContentLength -gt 4194304) {
+            Fail 'temporary Registry manifest size is outside the approved boundary'
+        }
+        $stream = $response.GetResponseStream()
+        try {
+            $bytes = Read-BoundedResponseBytes $stream 4194304 `
+                'temporary Registry manifest size is outside the approved boundary'
+        }
+        finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+    catch {
+        if ($_.Exception.Message -like 'offline-bundle-builder:*') {
+            throw
+        }
+        Fail 'cannot read the exact manifest from the temporary Registry'
+    }
+    finally {
+        if ($null -ne $response) {
+            $response.Dispose()
+        }
+    }
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bodyDigest = 'sha256:' + (
+            [BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+        )
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    if ($bodyDigest -ne $ExpectedManifestDigest) {
+        Fail 'temporary Registry manifest bytes do not match their content address'
+    }
+    $manifestInspection = @(Invoke-StrictRegistryJsonInspection `
+        $Python $Workspace $bytes 'manifest')
+    if ($manifestInspection.Count -ne 1) {
+        Fail 'temporary Registry manifest inspection returned a malformed result'
+    }
+    $manifestResult = [Text.RegularExpressions.Regex]::Match(
+        $manifestInspection[0],
+        '^(sha256:[0-9a-f]{64})\t([1-9][0-9]{0,7})$'
+    )
+    if (-not $manifestResult.Success) {
+        Fail 'temporary Registry manifest inspection returned an invalid config descriptor'
+    }
+    $configId = $manifestResult.Groups[1].Value
+    $configSize = [long]$manifestResult.Groups[2].Value
+    if ($configSize -le 0 -or $configSize -gt 16777216) {
+        Fail 'temporary Registry image config exceeds the approved size'
+    }
+    $configRequest = [Net.HttpWebRequest]::Create(
+        "http://$endpoint/v2/$repository/blobs/$configId"
+    )
+    $configRequest.Method = 'GET'
+    $configRequest.Proxy = $null
+    $configRequest.Timeout = 10000
+    $configRequest.ReadWriteTimeout = 10000
+    $configRequest.Accept = 'application/octet-stream'
+    $configResponse = $null
+    try {
+        $configResponse = [Net.HttpWebResponse]$configRequest.GetResponse()
+        if ([int]$configResponse.StatusCode -ne 200 -or
+            ($configResponse.ContentLength -ge 0 -and
+                $configResponse.ContentLength -ne $configSize)) {
+            Fail 'temporary Registry config blob response is invalid'
+        }
+        $configStream = $configResponse.GetResponseStream()
+        try {
+            $configBytes = Read-BoundedResponseBytes $configStream $configSize `
+                'temporary Registry config blob exceeds its descriptor size'
+        }
+        finally {
+            if ($null -ne $configStream) {
+                $configStream.Dispose()
+            }
+        }
+    }
+    catch {
+        if ($_.Exception.Message -like 'offline-bundle-builder:*') {
+            throw
+        }
+        Fail 'cannot read the image config from the temporary Registry'
+    }
+    finally {
+        if ($null -ne $configResponse) {
+            $configResponse.Dispose()
+        }
+    }
+    if ($configBytes.Length -ne $configSize) {
+        Fail 'temporary Registry config blob size differs from its descriptor'
+    }
+    $configSha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $observedConfigId = 'sha256:' + (
+            [BitConverter]::ToString(
+                $configSha256.ComputeHash($configBytes)
+            ).Replace('-', '').ToLowerInvariant()
+        )
+    }
+    finally {
+        $configSha256.Dispose()
+    }
+    if ($observedConfigId -ne $configId) {
+        Fail 'temporary Registry config bytes do not match their content address'
+    }
+    $configInspection = @(Invoke-StrictRegistryJsonInspection `
+        $Python $Workspace $configBytes 'config')
+    if ($configInspection.Count -ne 1 -or $configInspection[0] -ne 'PASS') {
+        Fail 'temporary Registry image config platform is not linux/amd64'
+    }
+    return $configId
+}
+
+function Get-DockerArchiveSingleConfigId(
+    [string]$Python,
+    [string]$Archive,
+    [string]$Workspace,
+    [string]$ExpectedTag
+) {
+    $programPath = Join-Path $Workspace 'inspect-bootstrap-config.py'
+    if (Test-Path -LiteralPath $programPath) {
+        Fail 'bootstrap config inspection program already exists'
+    }
+    $program = @'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import tarfile
+
+CONFIG_PATH = re.compile(
+    r"^(?:(?P<legacy>[0-9a-f]{64})\.json|blobs/sha256/(?P<oci>[0-9a-f]{64}))$"
+)
+BOOTSTRAP_TAG = re.compile(
+    r"^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+)
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_CONFIG_BYTES = 16 * 1024 * 1024
+
+
+def fail(message):
+    raise SystemExit(f"bootstrap-config: {message}")
+
+
+def reject_constant(value):
+    fail(f"JSON contains a non-finite number: {value}")
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("JSON contains a duplicate object key")
+        value[key] = item
+    return value
+
+
+if len(sys.argv) != 3 or BOOTSTRAP_TAG.fullmatch(sys.argv[2]) is None:
+    fail("usage: inspect-bootstrap-config.py <archive> <expected-tag>")
+archive_path = pathlib.Path(sys.argv[1]).resolve(strict=True)
+expected_tag = sys.argv[2]
+with tarfile.open(archive_path, "r:*") as archive:
+    members = {}
+    for member in archive.getmembers():
+        if member.name in members:
+            fail("Docker archive contains duplicate paths")
+        members[member.name] = member
+    manifest_member = members.get("manifest.json")
+    if (
+        manifest_member is None
+        or not manifest_member.isfile()
+        or manifest_member.issym()
+        or manifest_member.islnk()
+        or not 0 < manifest_member.size <= MAX_MANIFEST_BYTES
+    ):
+        fail("Docker archive manifest is missing or unsafe")
+    manifest_stream = archive.extractfile(manifest_member)
+    if manifest_stream is None:
+        fail("Docker archive manifest cannot be read")
+    try:
+        manifest_bytes = manifest_stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(manifest_bytes) != manifest_member.size:
+            fail("Docker archive manifest size differs from its header")
+        manifest = json.loads(
+            manifest_bytes,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        fail("Docker archive manifest is invalid JSON")
+    if not isinstance(manifest, list) or len(manifest) != 1:
+        fail("Docker archive must contain exactly one bootstrap image")
+    entry = manifest[0]
+    if not isinstance(entry, dict):
+        fail("Docker archive manifest entry must be an object")
+    repo_tags = entry.get("RepoTags")
+    if repo_tags != [expected_tag]:
+        fail("Docker archive RepoTags must contain exactly the signed bootstrap tag")
+    config_path = entry.get("Config")
+    match = CONFIG_PATH.fullmatch(config_path or "")
+    if match is None:
+        fail("Docker archive config path is not content addressed")
+    config_digest = match.group("legacy") or match.group("oci")
+    config_member = members.get(config_path)
+    if (
+        config_member is None
+        or not config_member.isfile()
+        or config_member.issym()
+        or config_member.islnk()
+        or not 0 < config_member.size <= MAX_CONFIG_BYTES
+    ):
+        fail("Docker archive config is missing or unsafe")
+    config_stream = archive.extractfile(config_member)
+    if config_stream is None:
+        fail("Docker archive config cannot be read")
+    config_bytes = config_stream.read(MAX_CONFIG_BYTES + 1)
+    if len(config_bytes) != config_member.size:
+        fail("Docker archive config size differs from its header")
+    if hashlib.sha256(config_bytes).hexdigest() != config_digest:
+        fail("Docker archive config bytes do not match their content address")
+    try:
+        config = json.loads(
+            config_bytes,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        fail("Docker archive config is invalid JSON")
+    if not isinstance(config, dict):
+        fail("Docker archive config must be an object")
+    if config.get("os") != "linux" or config.get("architecture") != "amd64":
+        fail("Docker archive config platform must be linux/amd64")
+print(f"sha256:{config_digest}")
+'@
+    Write-AsciiFile $programPath @($program -split '\r?\n')
+    try {
+        $output = @(Invoke-Captured $Python @(
+            '-I', $programPath, $Archive, $ExpectedTag
+        ) `
+            'cannot determine the bootstrap image config digest')
+    }
+    finally {
+        if (Test-Path -LiteralPath $programPath) {
+            Remove-Item -LiteralPath $programPath -Force
+        }
+    }
+    if ($output.Count -ne 1 -or $output[0] -notmatch '^sha256:[0-9a-f]{64}$') {
+        Fail 'bootstrap image config inspection returned an invalid identity'
+    }
+    return $output[0]
+}
+
 function Get-DeduplicatedUnpackedCapacity(
     [string]$Docker,
     [string]$Python,
@@ -341,15 +859,15 @@ function Get-DeduplicatedUnpackedCapacity(
             '@(sha256:[0-9a-f]{64})$'
         )
         if (-not $manifestMatch.Success -or
-            $record.Id -notmatch '^sha256:[0-9a-f]{64}$') {
+            $record.ConfigId -notmatch '^sha256:[0-9a-f]{64}$') {
             Fail 'capacity measurement received an invalid final image identity'
         }
         $manifestDigest = $manifestMatch.Groups[1].Value
         if ($digestToConfigId.ContainsKey($manifestDigest) -and
-            $digestToConfigId[$manifestDigest] -ne $record.Id) {
+            $digestToConfigId[$manifestDigest] -ne $record.ConfigId) {
             Fail 'one final manifest digest resolves to multiple image configs'
         }
-        $digestToConfigId[$manifestDigest] = $record.Id
+        $digestToConfigId[$manifestDigest] = $record.ConfigId
     }
     if ($digestToConfigId.Count -eq 0) {
         Fail 'capacity measurement requires at least one final image digest'
@@ -360,14 +878,25 @@ function Get-DeduplicatedUnpackedCapacity(
     # unique path once measures uncompressed layers instead of multiplying the
     # compressed Registry directory by an empirical factor.
     $configIds = @($digestToConfigId.Values | Sort-Object -Unique)
+    $localImageIds = @(
+        $ImageRecords |
+            Select-Object -ExpandProperty LocalScanId |
+            Sort-Object -Unique
+    )
+    if ($localImageIds.Count -ne $configIds.Count -or
+        @($localImageIds | Where-Object { $_ -notmatch '^sha256:[0-9a-f]{64}$' }).Count -ne 0) {
+        Fail 'capacity measurement received an invalid local image identity set'
+    }
     $measurementArchive = Join-Path $Workspace 'unpacked-image-capacity.tar'
     if (Test-Path -LiteralPath $measurementArchive) {
         Fail 'capacity measurement archive already exists'
     }
-    $saveArguments = @('image', 'save', '--output', $measurementArchive) + $configIds
+    $saveArguments = @('image', 'save', '--output', $measurementArchive) + $localImageIds
 
     $program = @'
+import gzip
 import hashlib
+import io
 import json
 import pathlib
 import posixpath
@@ -376,7 +905,10 @@ import sys
 import tarfile
 
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-CONFIG_PATH = re.compile(r"^(?P<digest>[0-9a-f]{64})\.json$")
+CONFIG_PATH = re.compile(
+    r"^(?:(?P<legacy>[0-9a-f]{64})\.json|blobs/sha256/(?P<oci>[0-9a-f]{64}))$"
+)
+BLOB_PATH = re.compile(r"^blobs/sha256/(?P<digest>[0-9a-f]{64})$")
 
 
 def fail(message):
@@ -391,6 +923,44 @@ def archive_member(archive, members, name):
     if stream is None:
         fail("Docker archive member cannot be read")
     return stream
+
+
+def sha256_stream(stream):
+    digest = hashlib.sha256()
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def open_uncompressed_layer(stream):
+    header = stream.peek(6)[:6]
+    if header.startswith(b"\x1f\x8b"):
+        return gzip.GzipFile(fileobj=stream, mode="rb")
+    if (
+        header.startswith(b"BZh")
+        or header.startswith(b"\xfd7zXZ\x00")
+        or header.startswith(b"\x28\xb5\x2f\xfd")
+    ):
+        fail("Docker archive uses an unsupported layer compression")
+    return stream
+
+
+class DigestingReader(io.RawIOBase):
+    def __init__(self, stream, digest):
+        super().__init__()
+        self.stream = stream
+        self.digest = digest
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        chunk = self.stream.read(len(buffer))
+        if not chunk:
+            return 0
+        buffer[: len(chunk)] = chunk
+        self.digest.update(chunk)
+        return len(chunk)
 
 
 def safe_relative_path(value, *, allow_root=False):
@@ -437,12 +1007,19 @@ with tarfile.open(archive_path, "r:*") as outer:
         config_match = CONFIG_PATH.fullmatch(config_path)
         if config_match is None:
             fail("Docker archive config path is not content addressed")
-        config_id = f"sha256:{config_match.group('digest')}"
+        config_digest = config_match.group("legacy") or config_match.group("oci")
+        config_id = f"sha256:{config_digest}"
         if config_id in observed_configs:
             fail("Docker archive contains a duplicate image config")
         observed_configs.add(config_id)
         with archive_member(outer, members, config_path) as stream:
-            config = json.load(stream)
+            config_bytes = stream.read()
+        if hashlib.sha256(config_bytes).hexdigest() != config_digest:
+            fail("Docker archive config bytes do not match their content address")
+        try:
+            config = json.loads(config_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            fail("Docker archive image config is invalid JSON")
         rootfs = config.get("rootfs") if isinstance(config, dict) else None
         diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
         layers = image.get("Layers")
@@ -468,56 +1045,77 @@ with tarfile.open(archive_path, "r:*") as outer:
     total_inodes = 0
     for layer_name in sorted(layer_diff_ids):
         expected_diff_id = layer_diff_ids[layer_name]
-        digest = hashlib.sha256()
+        blob_match = BLOB_PATH.fullmatch(layer_name)
+        expected_archive_digest = (
+            f"sha256:{blob_match.group('digest')}" if blob_match else expected_diff_id
+        )
         with archive_member(outer, members, layer_name) as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        if f"sha256:{digest.hexdigest()}" != expected_diff_id:
-            fail("Docker archive layer bytes do not match the image DiffID")
+            archive_digest = f"sha256:{sha256_stream(stream)}"
+        if archive_digest != expected_archive_digest:
+            fail("Docker archive layer bytes do not match their content address")
 
         # Count the layer root and every explicit or implicit path. Repeated
         # paths inside one layer are counted once; the same path in different
         # chain layers is counted independently because Docker stores both.
         layer_paths = {"."}
         with archive_member(outer, members, layer_name) as stream:
-            with tarfile.open(fileobj=stream, mode="r|*") as layer:
-                for entry in layer:
-                    path = safe_relative_path(entry.name, allow_root=True)
-                    if path == ".":
-                        continue
-                    if not any(
-                        (
-                            entry.isfile(),
-                            entry.isdir(),
-                            entry.issym(),
-                            entry.islnk(),
-                            entry.ischr(),
-                            entry.isblk(),
-                            entry.isfifo(),
-                        )
-                    ):
-                        fail("image layer contains an unsupported filesystem object")
-                    parts = pathlib.PurePosixPath(path).parts
-                    for index in range(1, len(parts) + 1):
-                        layer_paths.add(pathlib.PurePosixPath(*parts[:index]).as_posix())
-                    if entry.isfile():
-                        total_bytes += entry.size
+            unpacked_digest = hashlib.sha256()
+            digesting_stream = DigestingReader(open_uncompressed_layer(stream), unpacked_digest)
+            with io.BufferedReader(digesting_stream, buffer_size=1024 * 1024) as checked_stream:
+                try:
+                    with tarfile.open(fileobj=checked_stream, mode="r|") as layer:
+                        for entry in layer:
+                            path = safe_relative_path(entry.name, allow_root=True)
+                            if path == ".":
+                                continue
+                            if not any(
+                                (
+                                    entry.isfile(),
+                                    entry.isdir(),
+                                    entry.issym(),
+                                    entry.islnk(),
+                                    entry.ischr(),
+                                    entry.isblk(),
+                                    entry.isfifo(),
+                                )
+                            ):
+                                fail("image layer contains an unsupported filesystem object")
+                            parts = pathlib.PurePosixPath(path).parts
+                            for index in range(1, len(parts) + 1):
+                                layer_paths.add(
+                                    pathlib.PurePosixPath(*parts[:index]).as_posix()
+                                )
+                            if entry.isfile():
+                                total_bytes += entry.size
+                    while checked_stream.read(1024 * 1024):
+                        pass
+                except (OSError, EOFError, tarfile.TarError):
+                    fail("Docker archive layer cannot be decompressed or parsed")
+        if f"sha256:{unpacked_digest.hexdigest()}" != expected_diff_id:
+            fail("Docker archive unpacked layer bytes do not match the image DiffID")
         total_inodes += len(layer_paths)
 
 if total_bytes <= 0 or total_inodes <= 0:
     fail("measured unpacked capacity must be positive")
 print(f"{total_bytes}\t{total_inodes}")
 '@
+    $measurementProgram = Join-Path $Workspace 'measure-unpacked-capacity.py'
+    if (Test-Path -LiteralPath $measurementProgram) {
+        Fail 'capacity measurement program already exists'
+    }
+    Write-AsciiFile $measurementProgram @($program -split '\r?\n')
 
     try {
         Invoke-Quiet $Docker $saveArguments 'cannot save the final image set for capacity measurement'
-        $measurementArguments = @('-I', '-c', $program, $measurementArchive) + $configIds
+        $measurementArguments = @('-I', $measurementProgram, $measurementArchive) + $configIds
         $measurement = @(Invoke-Captured $Python $measurementArguments `
             'cannot measure the final unpacked image set')
     }
     finally {
-        if (Test-Path -LiteralPath $measurementArchive) {
-            Remove-Item -LiteralPath $measurementArchive -Force
+        foreach ($temporaryMeasurementFile in @($measurementArchive, $measurementProgram)) {
+            if (Test-Path -LiteralPath $temporaryMeasurementFile) {
+                Remove-Item -LiteralPath $temporaryMeasurementFile -Force
+            }
         }
     }
 
@@ -560,6 +1158,8 @@ function Assert-ImagePlatform(
 
 function Push-And-VerifyImage(
     [string]$Docker,
+    [string]$Python,
+    [string]$Workspace,
     [string]$LocalImage,
     [string]$TemporaryTaggedImage,
     [string]$ExpectedDigest,
@@ -583,6 +1183,8 @@ function Push-And-VerifyImage(
     if ($ExpectedDigest -and $observedDigest -ne $ExpectedDigest) {
         Fail 'controlled Registry changed a trusted Compose digest; refusing to rewrite trust'
     }
+    $configId = Get-RegistryManifestConfigId `
+        $Python $Workspace $TemporaryTaggedImage $observedDigest
     $temporaryRepository = $TemporaryTaggedImage.Substring(0, $TemporaryTaggedImage.LastIndexOf(':'))
     $exactTemporary = "$temporaryRepository@$observedDigest"
     Invoke-Quiet $Docker @('pull', '--platform', 'linux/amd64', $exactTemporary) `
@@ -596,7 +1198,8 @@ function Push-And-VerifyImage(
     }
     return [PSCustomObject]@{
         Reference = "$FinalReference@$observedDigest"
-        Id = $observedId
+        ConfigId = $configId
+        LocalScanId = $observedId
         Os = 'linux'
         Architecture = 'amd64'
     }
@@ -690,14 +1293,23 @@ function New-DeterministicTar(
     [string]$Python,
     [string]$InputDirectory,
     [string]$OutputTar,
-    [long]$Epoch
+    [long]$Epoch,
+    [string]$Workspace,
+    [string]$ArchiveRootName
 ) {
+    $programPath = Join-Path $Workspace 'create-deterministic-tar.py'
+    if (Test-Path -LiteralPath $programPath) {
+        Fail 'deterministic tar program path already exists'
+    }
     $program = @'
-import pathlib, sys, tarfile
+import pathlib, re, sys, tarfile
 
 source = pathlib.Path(sys.argv[1]).resolve(strict=True)
 destination = pathlib.Path(sys.argv[2])
 epoch = int(sys.argv[3])
+archive_root = sys.argv[4]
+if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", archive_root) is None:
+    raise SystemExit("archive root name is invalid")
 if destination.exists():
     raise SystemExit("destination already exists")
 entries = [source, *sorted(source.rglob("*"), key=lambda p: p.relative_to(source).as_posix())]
@@ -705,7 +1317,7 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
     for path in entries:
         if path.is_symlink() or not (path.is_dir() or path.is_file()):
             raise SystemExit("unsupported filesystem object")
-        relative = pathlib.PurePosixPath(source.name)
+        relative = pathlib.PurePosixPath(archive_root)
         if path != source:
             relative /= pathlib.PurePosixPath(path.relative_to(source).as_posix())
         info = archive.gettarinfo(str(path), arcname=str(relative))
@@ -722,8 +1334,20 @@ with tarfile.open(destination, "x", format=tarfile.PAX_FORMAT) as archive:
         else:
             archive.addfile(info)
 '@
-    Invoke-Quiet $Python @('-I', '-c', $program, $InputDirectory, $OutputTar, "$Epoch") `
-        'deterministic POSIX tar creation failed'
+    try {
+        Write-AsciiFile $programPath @($program -split '\r?\n')
+        $tarOutput = @(Invoke-Captured $Python @(
+            '-I', $programPath, $InputDirectory, $OutputTar, "$Epoch", $ArchiveRootName
+        ) 'deterministic POSIX tar creation failed')
+    }
+    finally {
+        if (Test-Path -LiteralPath $programPath) {
+            Remove-Item -LiteralPath $programPath -Force
+        }
+    }
+    if ($tarOutput.Count -ne 0) {
+        Fail 'deterministic POSIX tar creator returned unexpected output'
+    }
 }
 
 if (-not $OutputDirectory -or -not $SigningPrivateKey -or
@@ -817,12 +1441,21 @@ Invoke-Quiet $tar @('--version') 'POSIX tar support is unavailable'
 $leaf = Split-Path -Leaf $output
 $runId = [Guid]::NewGuid().ToString('N')
 $lockPath = Join-Path $outputParent ".$leaf.lock"
-$workspace = Join-Path $outputParent ".$leaf.work.$runId"
+$outputVolumeRoot = [IO.Path]::GetPathRoot($output)
+if (-not $outputVolumeRoot -or $outputVolumeRoot -notmatch '^[A-Za-z]:\\$') {
+    Fail 'output directory must be on a local Windows volume'
+}
+# Registry v2 paths can exceed the legacy Windows MAX_PATH limit when they
+# inherit a user-profile/output prefix. Keep the ephemeral build workspace
+# unique and at the output volume root; only the flat publish directory stays
+# beside the requested output for the final atomic rename.
+$workspace = Join-Path $outputVolumeRoot ".hkb-$runId"
 $publish = Join-Path $outputParent ".$leaf.publish.$runId"
 $lockStream = $null
 $registryContainerId = ''
 $registryNetworkId = ''
 $published = $false
+$primaryFailure = $null
 
 try {
     try {
@@ -841,10 +1474,20 @@ try {
     $lockStream.Write($lockBytes, 0, $lockBytes.Length)
     $lockStream.Flush($true)
 
+    if (Test-Path -LiteralPath $workspace) {
+        Fail 'temporary workspace identity collided with an existing path'
+    }
+    if (Test-IsWithin $workspace $repository) {
+        Fail 'temporary workspace must remain outside the Git repository'
+    }
     [void][IO.Directory]::CreateDirectory($workspace)
+    $workspaceItem = Get-Item -LiteralPath $workspace -Force
+    if (($workspaceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail 'temporary workspace must not be a symbolic link or reparse point'
+    }
     [void][IO.Directory]::CreateDirectory($publish)
-    $snapshotTar = Join-Path $workspace 'source.tar'
-    $sourceRoot = Join-Path $workspace 'source'
+    $snapshotTar = Join-Path $workspace 's.tar'
+    $sourceRoot = Join-Path $workspace 's'
     [void][IO.Directory]::CreateDirectory($sourceRoot)
     Invoke-Quiet $git @(
         '-C', $repository, 'archive', '--format=tar', "--output=$snapshotTar", $gitHead
@@ -877,7 +1520,7 @@ try {
         }
     }
 
-    $publicKey = Join-Path $workspace 'release-public.pem'
+    $publicKey = Join-Path $workspace 'pub.pem'
     Invoke-Quiet $openssl @('pkey', '-in', $key, '-pubout', '-out', $publicKey) `
         'signing key cannot produce a public key'
     $publicDescription = @(Invoke-Captured $openssl @(
@@ -916,8 +1559,8 @@ try {
     Write-Output 'offline-bundle-builder: loading pinned linux/amd64 bootstrap Registry image'
     Invoke-Quiet $docker @('pull', '--platform', 'linux/amd64', $RegistryBootstrapSource) `
         'cannot pull the pinned bootstrap Registry image'
-    $bootstrapId = Assert-ImagePlatform $docker $RegistryBootstrapSource ''
-    $bootstrapTag = "heyi-bootstrap/registry:2.8.3-amd64-$($bootstrapId.Substring(7, 12))"
+    $bootstrapLocalId = Assert-ImagePlatform $docker $RegistryBootstrapSource ''
+    $bootstrapTag = "heyi-bootstrap/registry:2.8.3-amd64-$($bootstrapLocalId.Substring(7, 12))"
     Invoke-Quiet $docker @('tag', $RegistryBootstrapSource, $bootstrapTag) `
         'cannot create the bootstrap Registry transport tag'
 
@@ -926,11 +1569,14 @@ try {
     $bootstrapTar = Join-Path $publish $bootstrapTarName
     Invoke-Quiet $docker @('save', '--output', $bootstrapTar, $bootstrapTag) `
         'cannot save the bootstrap Registry transport image'
+    $bootstrapConfigId = Get-DockerArchiveSingleConfigId `
+        -Python $python -Archive $bootstrapTar -Workspace $workspace `
+        -ExpectedTag $bootstrapTag
     $bootstrapChecksum = "$bootstrapTar.sha256"
     Write-AsciiFile $bootstrapChecksum @("$(Get-Sha256 $bootstrapTar)  $bootstrapTarName")
     Sign-And-Verify $openssl $key $publicKey $bootstrapChecksum "$bootstrapChecksum.sig"
 
-    $bundleRoot = Join-Path $workspace 'offline-registry-bundle'
+    $bundleRoot = Join-Path $workspace 'b'
     $registryData = Join-Path $bundleRoot 'registry'
     $releaseRoot = Join-Path $bundleRoot 'release'
     [void][IO.Directory]::CreateDirectory($registryData)
@@ -947,11 +1593,12 @@ try {
 
     $networkName = "heyi-bundle-$($runId.Substring(0, 20))"
     # Docker 29 suppresses published ports on --internal networks. The Registry
-    # starts behind a gate; a one-shot helper removes its default route before
-    # that gate opens. Disabling masquerade and ICC adds defense in depth while
-    # retaining one random, loopback-only host port.
+    # starts behind a gate; a one-shot helper removes its default route and
+    # blackholes Docker's embedded DNS listener before that gate opens. IPv6 is
+    # disabled at both network and namespace scope. Disabling masquerade and ICC
+    # adds defense in depth while retaining one random, loopback-only host port.
     $networkOutput = @(Invoke-Captured $docker @(
-        'network', 'create', '--driver', 'bridge',
+        'network', 'create', '--driver', 'bridge', '--ipv6=false',
         '--opt', 'com.docker.network.bridge.enable_ip_masquerade=false',
         '--opt', 'com.docker.network.bridge.enable_icc=false',
         '--label', "io.heyi.bundle-builder.run=$runId", $networkName
@@ -960,6 +1607,23 @@ try {
         Fail 'temporary Registry network returned an invalid identity'
     }
     $registryNetworkId = $networkOutput[0]
+    $networkPolicy = @(Invoke-Captured $docker @(
+        'network', 'inspect', '--format', '{{json .}}', $registryNetworkId
+    ) 'cannot inspect the temporary Registry network policy')
+    try {
+        $networkPolicyDocument = @($networkPolicy[0] | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        Fail 'temporary Registry network policy is not valid Docker JSON'
+    }
+    if ($networkPolicy.Count -ne 1 -or $networkPolicyDocument.Count -ne 1 -or
+        $networkPolicyDocument[0].Internal -ne $false -or
+        $networkPolicyDocument[0].EnableIPv6 -ne $false -or
+        $networkPolicyDocument[0].Options.'com.docker.network.bridge.enable_ip_masquerade' -ne
+            'false' -or
+        $networkPolicyDocument[0].Options.'com.docker.network.bridge.enable_icc' -ne 'false') {
+        Fail 'temporary Registry network isolation options are invalid'
+    }
     $containerName = "heyi-bundle-$($runId.Substring(0, 20))"
     $registryStartupCommand = (
         'while [ ! -f /tmp/heyi-network-ready ]; do sleep 0.1; done; ' +
@@ -970,12 +1634,18 @@ try {
         '--name', $containerName,
         '--label', "io.heyi.bundle-builder.run=$runId",
         '--network', $registryNetworkId,
+        '--dns', '127.0.0.1',
+        '--dns-search', '.',
+        '--dns-opt', 'timeout:1',
+        '--dns-opt', 'attempts:1',
+        '--sysctl', 'net.ipv6.conf.all.disable_ipv6=1',
+        '--sysctl', 'net.ipv6.conf.default.disable_ipv6=1',
         '--publish', '127.0.0.1:0:5000/tcp',
         '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges=true',
         '--mount', "type=bind,source=$registryData,target=/var/lib/registry",
         '--entrypoint', '/bin/sh',
-        $bootstrapId,
+        $bootstrapLocalId,
         '-ceu',
         $registryStartupCommand
     ) 'cannot start the isolated temporary Registry')
@@ -983,6 +1653,35 @@ try {
         Fail 'temporary Registry returned an invalid container identity'
     }
     $registryContainerId = $containerOutput[0]
+    $containerNetworkPolicy = @(Invoke-Captured $docker @(
+        'inspect', '--format', '{{json .HostConfig}}', $registryContainerId
+    ) 'cannot inspect the temporary Registry DNS and IPv6 policy')
+    try {
+        $containerNetworkPolicyDocument = @(
+            $containerNetworkPolicy[0] | ConvertFrom-Json -ErrorAction Stop
+        )
+    }
+    catch {
+        Fail 'temporary Registry DNS and IPv6 policy is not valid Docker JSON'
+    }
+    if ($containerNetworkPolicy.Count -ne 1 -or
+        $containerNetworkPolicyDocument.Count -ne 1) {
+        Fail 'temporary Registry DNS and IPv6 policy is not a single Docker object'
+    }
+    $dnsPolicy = @($containerNetworkPolicyDocument[0].Dns)
+    $dnsSearchPolicy = @($containerNetworkPolicyDocument[0].DnsSearch)
+    $dnsOptionsPolicy = @($containerNetworkPolicyDocument[0].DnsOptions)
+    if ($dnsPolicy.Count -ne 1 -or $dnsPolicy[0] -ne '127.0.0.1' -or
+        $dnsSearchPolicy.Count -ne 1 -or $dnsSearchPolicy[0] -ne '.' -or
+        $dnsOptionsPolicy.Count -ne 2 -or
+        $dnsOptionsPolicy[0] -ne 'timeout:1' -or
+        $dnsOptionsPolicy[1] -ne 'attempts:1' -or
+        $containerNetworkPolicyDocument[0].Sysctls.'net.ipv6.conf.all.disable_ipv6' -ne
+            '1' -or
+        $containerNetworkPolicyDocument[0].Sysctls.'net.ipv6.conf.default.disable_ipv6' -ne
+            '1') {
+        Fail 'temporary Registry DNS or IPv6 isolation differs from the sealed policy'
+    }
     $loopbackPort = Resolve-LoopbackPublishedPort $docker $registryContainerId
     if (-not $loopbackPort -or $loopbackPort -notmatch '^127\.0\.0\.1:(\d+)$') {
         Fail 'temporary Registry is not bound to exactly one IPv4 loopback port'
@@ -998,8 +1697,9 @@ try {
         '--network', "container:$registryContainerId",
         '--cap-drop', 'ALL', '--cap-add', 'NET_ADMIN',
         '--security-opt', 'no-new-privileges=true',
-        '--entrypoint', '/sbin/ip',
-        $bootstrapId, 'route', 'del', 'default'
+        '--entrypoint', '/bin/sh',
+        $bootstrapLocalId, '-ceu',
+        '/sbin/ip route del default; /sbin/ip route add blackhole 127.0.0.11/32 table local'
     ) 'cannot seal the temporary Registry network namespace'
     $sealedRoutes = @(Invoke-Captured $docker @(
         'exec', $registryContainerId, '/sbin/ip', 'route', 'show'
@@ -1008,6 +1708,44 @@ try {
         $sealedRoutes[0] -notmatch '^[0-9.]+/[0-9]+ dev eth0 scope link(?:\s|$)' -or
         $sealedRoutes[0] -match '(^default\s|\svia\s)') {
         Fail 'temporary Registry retained a non-local network route'
+    }
+    $sealedLocalRoutes = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', 'route', 'show', 'table', 'local'
+    ) 'cannot inspect the sealed temporary Registry local routes')
+    if (($sealedLocalRoutes -join "`n") -notmatch
+        '(?m)^blackhole 127\.0\.0\.11(?:\s|$)') {
+        Fail 'temporary Registry did not blackhole Docker embedded DNS'
+    }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $docker exec $registryContainerId /sbin/ip route get 127.0.0.11 1>$null 2>$null
+        $embeddedDnsExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($embeddedDnsExitCode -eq 0) {
+        Fail 'Docker embedded DNS remained reachable after the network seal'
+    }
+    $sealedIpv6All = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/bin/cat',
+        '/proc/sys/net/ipv6/conf/all/disable_ipv6'
+    ) 'cannot inspect the sealed Registry IPv6 state')
+    $sealedIpv6Default = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/bin/cat',
+        '/proc/sys/net/ipv6/conf/default/disable_ipv6'
+    ) 'cannot inspect the sealed Registry IPv6 state')
+    $sealedIpv6Addresses = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', '-6', 'address', 'show'
+    ) 'cannot inspect the sealed Registry IPv6 addresses')
+    $sealedIpv6Routes = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', '-6', 'route', 'show', 'table', 'all'
+    ) 'cannot inspect the sealed Registry IPv6 routes')
+    if (($sealedIpv6All -join "`n") -ne '1' -or
+        ($sealedIpv6Default -join "`n") -ne '1' -or
+        $sealedIpv6Addresses.Count -ne 0 -or $sealedIpv6Routes.Count -ne 0) {
+        Fail 'temporary Registry retained an IPv6 address or route'
     }
     Invoke-Quiet $docker @(
         'exec', $registryContainerId, '/bin/sh', '-ceu',
@@ -1037,6 +1775,20 @@ try {
     if (($routesAfterStartup -join "`n") -ne ($sealedRoutes -join "`n")) {
         Fail 'temporary Registry routes changed after startup'
     }
+    $localRoutesAfterStartup = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', 'route', 'show', 'table', 'local'
+    ) 'cannot re-check the temporary Registry local routes')
+    $ipv6AddressesAfterStartup = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', '-6', 'address', 'show'
+    ) 'cannot re-check the temporary Registry IPv6 addresses')
+    $ipv6RoutesAfterStartup = @(Invoke-Captured $docker @(
+        'exec', $registryContainerId, '/sbin/ip', '-6', 'route', 'show', 'table', 'all'
+    ) 'cannot re-check the temporary Registry IPv6 routes')
+    if (($localRoutesAfterStartup -join "`n") -ne ($sealedLocalRoutes -join "`n") -or
+        $ipv6AddressesAfterStartup.Count -ne 0 -or
+        $ipv6RoutesAfterStartup.Count -ne 0) {
+        Fail 'temporary Registry DNS or IPv6 isolation changed after startup'
+    }
 
     $imageRecords = New-Object 'System.Collections.Generic.List[object]'
     foreach ($fixedReference in $fixedImages) {
@@ -1050,7 +1802,8 @@ try {
         $finalRepositoryAndTag = $finalReference.Substring('127.0.0.1:5000/'.Length)
         $temporaryTag = "$registryEndpoint/$finalRepositoryAndTag"
         [void]$imageRecords.Add((Push-And-VerifyImage `
-            $docker $sourceReference $temporaryTag $expectedDigest $finalReference))
+            $docker $python $workspace $sourceReference $temporaryTag `
+            $expectedDigest $finalReference))
     }
 
     $releaseTag = $gitHead.Substring(0, 12)
@@ -1076,7 +1829,8 @@ try {
         [void](Assert-ImagePlatform $docker $localTag '')
         $temporaryTag = "$registryEndpoint/heyi-release/$($component.Name):$releaseTag"
         $finalRepository = "127.0.0.1:5000/heyi-release/$($component.Name)"
-        $record = Push-And-VerifyImage $docker $localTag $temporaryTag '' $finalRepository
+        $record = Push-And-VerifyImage `
+            $docker $python $workspace $localTag $temporaryTag '' $finalRepository
         [void]$imageRecords.Add($record)
         $releaseReferences[$component.Name] = $record.Reference
     }
@@ -1099,7 +1853,9 @@ try {
     $manifestRows = @(
         $imageRecords |
             Sort-Object -Property Reference -Unique |
-            ForEach-Object { "$($_.Reference)`t$($_.Id)`t$($_.Os)`t$($_.Architecture)" }
+            ForEach-Object {
+                "$($_.Reference)`t$($_.ConfigId)`t$($_.Os)`t$($_.Architecture)"
+            }
     )
     if ($manifestRows.Count -ne @($imageRecords | Select-Object -ExpandProperty Reference -Unique).Count) {
         Fail 'image manifest contains duplicate or ambiguous references'
@@ -1134,17 +1890,48 @@ try {
         Fail 'release image manifest differs from docker compose config --images'
     }
 
+    # Validate the Docker archive/config identity and signed capacity before
+    # running nine comparatively expensive SBOM scans.
+    # Windows PowerShell 5.1 cannot reliably bind @($genericList) to an
+    # [object[]] parameter and may throw "Argument types do not match".
+    $imageRecordArray = $imageRecords.ToArray()
+    $unpackedCapacity = Get-DeduplicatedUnpackedCapacity `
+        -Docker $docker `
+        -Python $python `
+        -ImageRecords $imageRecordArray `
+        -Workspace $workspace
+    $registryUnpackedBytes = $unpackedCapacity.Bytes
+    $registryUnpackedInodes = $unpackedCapacity.Inodes
+
+    $localImageMap = Join-Path $workspace 'local-scan-images.tsv'
+    $localImageRows = @(
+        $imageRecords |
+            Sort-Object -Property Reference -Unique |
+            ForEach-Object { "$($_.Reference)`t$($_.LocalScanId)" }
+    )
+    if ($localImageRows.Count -ne $manifestRows.Count) {
+        Fail 'local image scan map differs from the signed image manifest'
+    }
+    Write-AsciiFile $localImageMap $localImageRows
     $sbomGenerator = Join-Path $sourceRoot 'scripts/generate_offline_image_sboms.py'
-    $sbomOutput = @(Invoke-Captured $python @(
-        '-I', $sbomGenerator,
-        '--artifact-root', $bundleRoot,
-        '--image-manifest', (Join-Path $bundleRoot 'release.env.images'),
-        '--output-dir', (Join-Path $bundleRoot 'sbom'),
-        '--scanner', $imageSbomScannerPath,
-        '--scanner-sha256', $ImageSbomScannerSha256,
-        '--release-id', $ReleaseId,
-        '--release-git-sha', $gitHead
-    ) 'cannot generate the final image SBOM set')
+    try {
+        $sbomOutput = @(Invoke-Captured $python @(
+            '-I', $sbomGenerator,
+            '--artifact-root', $bundleRoot,
+            '--image-manifest', (Join-Path $bundleRoot 'release.env.images'),
+            '--local-image-map', $localImageMap,
+            '--output-dir', (Join-Path $bundleRoot 'sbom'),
+            '--scanner', $imageSbomScannerPath,
+            '--scanner-sha256', $ImageSbomScannerSha256,
+            '--release-id', $ReleaseId,
+            '--release-git-sha', $gitHead
+        ) 'cannot generate the final image SBOM set')
+    }
+    finally {
+        if (Test-Path -LiteralPath $localImageMap) {
+            Remove-Item -LiteralPath $localImageMap -Force
+        }
+    }
     if ($sbomOutput.Count -ne 1) {
         Fail 'image SBOM generator returned a malformed report'
     }
@@ -1159,18 +1946,10 @@ try {
         Fail 'image SBOM generator did not bind the exact nine-image release set'
     }
 
-    $unpackedCapacity = Get-DeduplicatedUnpackedCapacity `
-        -Docker $docker `
-        -Python $python `
-        -ImageRecords @($imageRecords) `
-        -Workspace $workspace
-    $registryUnpackedBytes = $unpackedCapacity.Bytes
-    $registryUnpackedInodes = $unpackedCapacity.Inodes
-
     $control = Join-Path $bundleRoot 'bundle.control'
     Write-AsciiFile $control @(
         "REGISTRY_BOOTSTRAP_IMAGE=$bootstrapTag",
-        "REGISTRY_BOOTSTRAP_IMAGE_ID=$bootstrapId",
+        "REGISTRY_BOOTSTRAP_IMAGE_ID=$bootstrapConfigId",
         "RELEASE_SEQUENCE=$ReleaseSequence",
         "RELEASE_ID=$ReleaseId",
         "RELEASE_GIT_SHA=$gitHead",
@@ -1213,7 +1992,8 @@ try {
 
     $bundleTarName = "$artifactStem-offline-registry-bundle.tar"
     $bundleTar = Join-Path $publish $bundleTarName
-    New-DeterministicTar $python $bundleRoot $bundleTar $sourceDateEpoch
+    New-DeterministicTar $python $bundleRoot $bundleTar $sourceDateEpoch `
+        $workspace 'offline-registry-bundle'
     $bundleChecksum = "$bundleTar.sha256"
     Write-AsciiFile $bundleChecksum @("$(Get-Sha256 $bundleTar)  $bundleTarName")
     Sign-And-Verify $openssl $key $publicKey $bundleChecksum "$bundleChecksum.sig"
@@ -1238,6 +2018,9 @@ try {
     Write-Output 'platform=linux/amd64'
     Write-Output "REGISTRY_UNPACKED_BYTES=$registryUnpackedBytes"
     Write-Output "REGISTRY_UNPACKED_INODES=$registryUnpackedInodes"
+}
+catch {
+    $primaryFailure = $_
 }
 finally {
     $cleanupFailures = New-Object 'System.Collections.Generic.List[string]'
@@ -1289,6 +2072,14 @@ finally {
         }
     }
     if ($cleanupFailures.Count -ne 0) {
+        if ($null -ne $primaryFailure) {
+            throw ("offline-bundle-builder: build failed: " +
+                "$($primaryFailure.Exception.Message); cleanup incomplete: " +
+                "$($cleanupFailures -join '; ')")
+        }
         throw "offline-bundle-builder: cleanup incomplete: $($cleanupFailures -join '; ')"
     }
+}
+if ($null -ne $primaryFailure) {
+    throw $primaryFailure
 }

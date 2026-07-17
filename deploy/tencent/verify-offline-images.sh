@@ -36,6 +36,7 @@ inspect_image() {
   expected_arch=${4:-amd64}
   validate_pinned_image "$image"
   expected_repo_digest=$(expected_repo_digest_for "$image")
+  expected_manifest_id=sha256:${image##*@sha256:}
 
   if ! image_id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null); then
     echo "offline-images: exact digest reference is unavailable in the local image store" >&2
@@ -46,9 +47,11 @@ inspect_image() {
   image_arch=$(docker image inspect --format '{{.Architecture}}' "$image") || return 66
   repo_digests=$(docker image inspect \
     --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image") || return 66
+  observed_config_id=$(offline_local_image_config_id offline-images "$image") || \
+    offline_fail offline-images "cannot derive the local image config digest: $image" 65
 
   if ! printf '%s\n' "$image_id" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
-    offline_fail offline-images "local image ID is not a sha256 config digest: $image" 65
+    offline_fail offline-images "local Docker image identity is not a sha256 digest: $image" 65
   fi
   if [ "$image_os" != linux ] || [ "$image_arch" != amd64 ]; then
     offline_fail offline-images "local image platform must be linux/amd64: $image" 65
@@ -56,13 +59,27 @@ inspect_image() {
   if [ "$image_os" != "$expected_os" ] || [ "$image_arch" != "$expected_arch" ]; then
     offline_fail offline-images "local image platform differs from the signed manifest: $image" 65
   fi
-  if [ -n "$expected_id" ] && [ "$image_id" != "$expected_id" ]; then
-    offline_fail offline-images "local image ID differs from the signed manifest: $image" 65
+  if [ -n "$expected_id" ]; then
+    if ! printf '%s\n' "$expected_id" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+      offline_fail offline-images "signed config digest is invalid: $image" 65
+    fi
+    if [ "$observed_config_id" != "$expected_id" ]; then
+      offline_fail offline-images \
+        "local image config digest differs from the signed manifest: $image" 65
+    fi
+    if [ "$image_id" != "$expected_id" ] && \
+      [ "$image_id" != "$expected_manifest_id" ]; then
+      offline_fail offline-images \
+        "local Docker identity matches neither signed manifest nor config digest: $image" 65
+    fi
+    config_id=$observed_config_id
+  else
+    config_id=$observed_config_id
   fi
   if ! printf '%s\n' "$repo_digests" | grep -Fqx "$expected_repo_digest"; then
     offline_fail offline-images "local image RepoDigest does not match manifest: $image" 65
   fi
-  printf '%s\t%s\t%s\t%s\n' "$image" "$image_id" "$image_os" "$image_arch"
+  printf '%s\t%s\t%s\t%s\n' "$image" "$config_id" "$image_os" "$image_arch"
 }
 
 case "$action" in
@@ -101,7 +118,7 @@ case "$action" in
     LC_ALL=C sort -t "$(printf '\t')" -k1,1 \
       "$raw_generated_manifest" > "$generated_manifest"
     install -o root -g root -m 0444 "$generated_manifest" "$manifest"
-    echo "offline-images: generated linux/amd64 RepoDigest+ID manifest at <release.env>.images"
+    echo "offline-images: generated linux/amd64 manifest+config digest contract at <release.env>.images"
     ;;
   verify)
     if [ "$#" -ne 5 ] || [ "$2" != "--contract-dir" ] || \
@@ -144,7 +161,7 @@ case "$action" in
     if ! cmp -s "$image_list" "$manifest_image_list"; then
       offline_fail offline-images "manifest does not match docker compose config --images" 65
     fi
-    echo "offline-images: manifest, RepoDigest, image ID and linux/amd64 platform match; contract_sha256=$contract_sha256"
+    echo "offline-images: manifest digest, config digest and linux/amd64 platform match; contract_sha256=$contract_sha256"
     ;;
   *)
     echo "offline-images: action must be generate or verify" >&2
