@@ -26,6 +26,38 @@ pytest_plugins = ("test_integration_api",)
 
 
 @pytest.mark.asyncio
+async def test_refresh_inserts_successor_before_linking_predecessor(api_harness) -> None:
+    tokens = await api_harness.login()
+    engine = api_harness.session_factory.kw["bind"].sync_engine
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(str(statement).lower())
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        response = await api_harness.client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": tokens["refresh_token"]},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert response.status_code == 200, response.text
+    successor_insert = next(
+        index
+        for index, statement in enumerate(statements)
+        if "insert into refresh_tokens" in statement
+    )
+    predecessor_link = next(
+        index
+        for index, statement in enumerate(statements)
+        if "update refresh_tokens" in statement and "replaced_by_id" in statement
+    )
+    assert successor_insert < predecessor_link
+
+
+@pytest.mark.asyncio
 async def test_invalid_api_keys_are_source_limited_before_database_lookup(api_harness) -> None:
     settings = get_settings().model_copy(update={"api_key_auth_attempts_per_minute": 2})
     app.dependency_overrides[get_settings] = lambda: settings

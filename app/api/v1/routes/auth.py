@@ -265,8 +265,12 @@ async def refresh_tokens(
         family_id=record.family_id,
         parent_id=record.id,
     )
-    record.replaced_by_id = replacement.id
     session.add(replacement)
+    # PostgreSQL enforces this self-referential foreign key immediately. Flush
+    # the successor row before linking the predecessor to it; otherwise the
+    # unit of work may emit the UPDATE before the INSERT.
+    await session.flush()
+    record.replaced_by_id = replacement.id
     add_audit_event(
         session,
         action="auth.token.refreshed",
