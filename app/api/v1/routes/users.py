@@ -29,6 +29,7 @@ from app.services.access import AccessContext
 from app.services.audit import AuditResult, add_audit_event
 from app.services.knowledge_bases import require_knowledge_base_access
 from app.services.rbac_mutations import (
+    acquire_rbac_mutation_lock,
     lock_and_refresh_actor_access,
     locked_actor_roles_statement,
     locked_actor_user_statement,
@@ -277,6 +278,7 @@ async def update_user(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("user:manage"))],
 ) -> UserRead:
+    await acquire_rbac_mutation_lock(session)
     locked_users = list(
         (
             await session.scalars(
@@ -365,6 +367,7 @@ async def replace_user_roles(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:assign"))],
 ) -> UserRead:
+    await acquire_rbac_mutation_lock(session)
     locked_users = list(
         (
             await session.scalars(

@@ -507,3 +507,109 @@ async def test_postgres_role_reference_wins_and_delete_reports_role_in_use(
     assert await asyncio.wait_for(delete_task, timeout=5) == "role_in_use"
     async with scenario.factory() as session:
         assert await session.get(Role, scenario.role_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_postgres_rbac_advisory_lock_prevents_cross_role_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _POSTGRES_URL is not None
+    engine = create_async_engine(_POSTGRES_URL, pool_size=6, max_overflow=0)
+    async with engine.begin() as connection:
+        await assert_acceptance_database(connection)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    unique = uuid4().hex[:12]
+
+    async with factory() as session:
+        actor_a = User(
+            email=f"rbac-deadlock-a-{unique}@example.com",
+            password_hash="unused",
+            is_superuser=True,
+        )
+        actor_b = User(
+            email=f"rbac-deadlock-b-{unique}@example.com",
+            password_hash="unused",
+            is_superuser=True,
+        )
+        target = User(
+            email=f"rbac-deadlock-target-{unique}@example.com",
+            password_hash="unused",
+        )
+        role_a = Role(code=f"rbac_deadlock_a_{unique}", name="交叉锁角色 A", priority=20)
+        role_b = Role(code=f"rbac_deadlock_b_{unique}", name="交叉锁角色 B", priority=10)
+        session.add_all([actor_a, actor_b, target, role_a, role_b])
+        await session.flush()
+        session.add_all(
+            [
+                UserRole(user_id=actor_a.id, role_id=role_a.id),
+                UserRole(user_id=actor_b.id, role_id=role_b.id),
+            ]
+        )
+        await session.commit()
+        role_b_read = await role_routes._role_read(session, role_b)
+        access_a = AccessContext(
+            user=actor_a,
+            permissions=frozenset({"*"}),
+            limits={},
+            role_ids=frozenset({role_a.id}),
+            max_role_priority=role_a.priority,
+        )
+        access_b = AccessContext(
+            user=actor_b,
+            permissions=frozenset({"*"}),
+            limits={},
+            role_ids=frozenset({role_b.id}),
+            max_role_priority=role_b.priority,
+        )
+
+    delete_scenario = _RoleDeleteScenario(
+        factory=factory,
+        actor_access=access_a,
+        target_user_id=target.id,
+        role_id=role_b.id,
+        role_name=role_b.name,
+        policy_etag=role_b_read.policy_etag,
+        knowledge_base_id=uuid4(),
+    )
+    assignment_scenario = _RoleDeleteScenario(
+        factory=factory,
+        actor_access=access_b,
+        target_user_id=target.id,
+        role_id=role_a.id,
+        role_name=role_a.name,
+        policy_etag="0" * 64,
+        knowledge_base_id=uuid4(),
+    )
+
+    actor_a_holds_global_lock = asyncio.Event()
+    release_actor_a = asyncio.Event()
+    original_refresh = role_routes.lock_and_refresh_actor_access
+
+    async def hold_after_actor_role_lock(
+        session: AsyncSession,
+        access: AccessContext,
+        required_permissions: set[str],
+    ) -> AccessContext:
+        current = await original_refresh(session, access, required_permissions)
+        if access.user.id == actor_a.id:
+            actor_a_holds_global_lock.set()
+            await release_actor_a.wait()
+        return current
+
+    monkeypatch.setattr(
+        role_routes,
+        "lock_and_refresh_actor_access",
+        hold_after_actor_role_lock,
+    )
+    monkeypatch.setattr(role_routes, "deny_if_active_external_llm_egress", _no_egress)
+    monkeypatch.setattr(user_routes, "deny_if_active_external_llm_egress", _no_egress)
+
+    delete_task = asyncio.create_task(_delete_role(delete_scenario))
+    await asyncio.wait_for(actor_a_holds_global_lock.wait(), timeout=5)
+    assignment_task = asyncio.create_task(_assign_deleted_role(assignment_scenario))
+    await asyncio.sleep(0.1)
+    assert assignment_task.done() is False
+    release_actor_a.set()
+
+    assert await asyncio.wait_for(delete_task, timeout=5) == "role_in_use"
+    assert await asyncio.wait_for(assignment_task, timeout=5) == "assigned"

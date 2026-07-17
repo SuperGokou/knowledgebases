@@ -220,6 +220,7 @@ async def create_role(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:manage"))],
 ) -> RoleRead:
+    access = await lock_and_refresh_actor_access(session, access, {"role:manage"})
     if not access.user.is_superuser and payload.priority > access.max_role_priority:
         raise ApiError(
             status_code=403,
@@ -275,6 +276,7 @@ async def update_role(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:manage"))],
 ) -> RoleRead:
+    access = await lock_and_refresh_actor_access(session, access, {"role:manage"})
     role = await session.scalar(select(Role).where(Role.id == role_id).with_for_update())
     if role is None:
         raise ApiError(status_code=404, code="role_not_found", message="Role not found")
@@ -408,6 +410,7 @@ async def replace_permissions(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:manage"))],
 ) -> RoleRead:
+    access = await lock_and_refresh_actor_access(session, access, {"role:manage"})
     role = await session.scalar(select(Role).where(Role.id == role_id).with_for_update())
     if role is None:
         raise ApiError(status_code=404, code="role_not_found", message="Role not found")
@@ -450,6 +453,7 @@ async def replace_limits(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:manage"))],
 ) -> RoleRead:
+    access = await lock_and_refresh_actor_access(session, access, {"role:manage"})
     role = await session.scalar(select(Role).where(Role.id == role_id).with_for_update())
     if role is None:
         raise ApiError(status_code=404, code="role_not_found", message="Role not found")
@@ -486,6 +490,7 @@ async def replace_policy(
     session: DatabaseSession,
     access: Annotated[AccessContext, Depends(require_permission("role:manage"))],
 ) -> RoleRead:
+    access = await lock_and_refresh_actor_access(session, access, {"role:manage"})
     role = await session.scalar(select(Role).where(Role.id == role_id).with_for_update())
     if role is None:
         raise ApiError(status_code=404, code="role_not_found", message="Role not found")

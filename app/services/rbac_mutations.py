@@ -3,12 +3,24 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import ApiError
 from app.db.models import Role, User, UserRole, UserStatus
 from app.services.access import AccessContext, AccessService
+
+_RBAC_MUTATION_LOCK_KEY = 5_207_666_715_571_405_123  # ASCII namespace: HEYIRBAC
+
+
+async def acquire_rbac_mutation_lock(session: AsyncSession) -> None:
+    """Serialize infrequent RBAC writes before any user or role row lock."""
+
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": _RBAC_MUTATION_LOCK_KEY},
+        )
 
 
 def locked_roles_statement(role_ids: set[UUID]) -> Select[tuple[Role]]:
@@ -63,6 +75,7 @@ async def lock_and_refresh_actor_access(
     access: AccessContext,
     required_permissions: set[str],
 ) -> AccessContext:
+    await acquire_rbac_mutation_lock(session)
     actor = await session.scalar(locked_actor_user_statement(access.user.id))
     if actor is None:
         raise ApiError(status_code=401, code="inactive_user", message="The user is not active")
