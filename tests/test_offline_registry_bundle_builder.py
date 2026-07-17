@@ -76,6 +76,19 @@ def bootstrap_archive_config_program() -> str:
     return program.group("body")
 
 
+def deterministic_tar_program() -> str:
+    script = builder_text()
+    function = re.search(
+        r"(?ms)^function New-DeterministicTar\(.*?^\}\r?\n\r?\n"
+        r"if \(-not \$OutputDirectory",
+        script,
+    )
+    assert function is not None
+    program = re.search(r"(?ms)\$program = @'\r?\n(?P<body>.*?)\r?\n'@", function.group())
+    assert program is not None
+    return program.group("body")
+
+
 def write_bootstrap_archive(
     path: Path,
     *,
@@ -923,7 +936,7 @@ def test_builder_bounds_fixed_registry_paths_below_legacy_windows_max_path() -> 
     assert max(candidate_lengths) > 200
 
 
-def test_builder_creates_a_deterministic_root_owned_posix_tar() -> None:
+def test_builder_creates_a_deterministic_root_owned_posix_tar(tmp_path: Path) -> None:
     script = builder_text()
 
     assert 'tarfile.open(destination, "x", format=tarfile.PAX_FORMAT)' in script
@@ -939,7 +952,38 @@ def test_builder_creates_a_deterministic_root_owned_posix_tar() -> None:
     )[0]
     assert "Invoke-Captured $Python" in tar_function
     assert "Invoke-Quiet $Python" not in tar_function
+    assert "'-I', $programPath, $InputDirectory" in tar_function
+    assert "'-I', '-c', $program" not in tar_function
+    assert "Remove-Item -LiteralPath $programPath -Force" in tar_function
     assert "deterministic POSIX tar creator returned unexpected output" in tar_function
+
+    source = tmp_path / "offline-registry-bundle"
+    nested = source / "release"
+    nested.mkdir(parents=True)
+    (nested / "contract.txt").write_bytes(b"signed-contract\n")
+    program = tmp_path / "create-deterministic-tar.py"
+    program.write_text(deterministic_tar_program(), encoding="ascii")
+    output = tmp_path / "bundle.tar"
+    epoch = 1_700_000_000
+
+    subprocess.run(  # noqa: S603
+        [sys.executable, "-I", str(program), str(source), str(output), str(epoch)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with tarfile.open(output, mode="r:") as archive:
+        members = archive.getmembers()
+    assert [member.name for member in members] == [
+        "offline-registry-bundle",
+        "offline-registry-bundle/release",
+        "offline-registry-bundle/release/contract.txt",
+    ]
+    assert all(member.uid == 0 and member.gid == 0 for member in members)
+    assert all(member.uname == "root" and member.gname == "root" for member in members)
+    assert all(member.mtime == epoch for member in members)
+    assert [member.mode for member in members] == [0o750, 0o750, 0o444]
 
 
 def test_bundle_build_documentation_covers_verification_and_import_order() -> None:
