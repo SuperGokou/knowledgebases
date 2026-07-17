@@ -1199,10 +1199,13 @@ try {
         Fail 'image SBOM generator did not bind the exact nine-image release set'
     }
 
+    # Windows PowerShell 5.1 cannot reliably bind @($genericList) to an
+    # [object[]] parameter and may throw "Argument types do not match".
+    $imageRecordArray = $imageRecords.ToArray()
     $unpackedCapacity = Get-DeduplicatedUnpackedCapacity `
         -Docker $docker `
         -Python $python `
-        -ImageRecords @($imageRecords) `
+        -ImageRecords $imageRecordArray `
         -Workspace $workspace
     $registryUnpackedBytes = $unpackedCapacity.Bytes
     $registryUnpackedInodes = $unpackedCapacity.Inodes

@@ -358,6 +358,9 @@ def test_builder_measures_the_final_deduplicated_unpacked_layer_set() -> None:
         "function Assert-ImagePlatform", maxsplit=1
     )[0]
 
+    assert "$imageRecordArray = $imageRecords.ToArray()" in script
+    assert "-ImageRecords $imageRecordArray" in script
+    assert "-ImageRecords @($imageRecords)" not in script
     assert "@(sha256:[0-9a-f]{64})$" in measurement
     assert "'image', 'save', '--output'" in measurement
     assert 'archive_member(outer, members, "manifest.json")' in measurement
