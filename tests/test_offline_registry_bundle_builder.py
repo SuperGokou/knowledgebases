@@ -464,6 +464,26 @@ def test_builder_uses_atomic_publish_lock_and_owned_failure_cleanup() -> None:
     assert "cleanup incomplete" in script
     assert "temporary Registry ownership changed; manual cleanup is required" in script
     assert "temporary network ownership changed; manual cleanup is required" in script
+    assert "'--publish', '127.0.0.1:0:5000/tcp'" in script
+    assert "'com.docker.network.bridge.enable_ip_masquerade=false'" in script
+    assert "'com.docker.network.bridge.enable_icc=false'" in script
+    assert "'network', 'create', '--internal'" not in script
+    assert "Resolve-LoopbackPublishedPort $docker $registryContainerId" in script
+    assert "'{{json .NetworkSettings.Ports}}'" in script
+    assert "$properties.Count -eq 1" in script
+    assert "$bindings[0].HostIp -eq '127.0.0.1'" in script
+    assert "'--cap-drop', 'ALL'" in script
+    assert "'--security-opt', 'no-new-privileges=true'" in script
+    assert "'--network', \"container:$registryContainerId\"" in script
+    assert "'--cap-drop', 'ALL', '--cap-add', 'NET_ADMIN'" in script
+    assert "'route', 'del', 'default'" in script
+    assert "temporary Registry retained a non-local network route" in script
+    assert ": > /tmp/heyi-network-ready" in script
+    assert "temporary Registry routes changed after startup" in script
+    assert "'{{json .Config.Labels}}'" in script
+    assert "'{{json .Labels}}'" in script
+    assert '{{ index .Config.Labels "io.heyi.bundle-builder.run" }}' not in script
+    assert '{{ index .Labels "io.heyi.bundle-builder.run" }}' not in script
 
 
 def test_builder_creates_a_deterministic_root_owned_posix_tar() -> None:
