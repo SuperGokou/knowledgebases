@@ -164,7 +164,7 @@ export function ApiKeysPanel() {
     setPendingAction({ type: "revoke", keyId: key.id });
     setError("");
     try {
-      await apiRequest<null>(`/api/v1/api-keys/${key.id}`, { method: "DELETE" });
+      await apiRequest<void>(`/api/v1/api-keys/${key.id}`, { method: "DELETE" });
       setKeys((current) => current?.filter((item) => item.id !== key.id) ?? current);
       feedback.success(`凭证“${key.name}”已撤销，现有调用将立即失效。`, "API Key 已撤销");
     } catch (reason) {

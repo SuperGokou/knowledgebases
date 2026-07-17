@@ -27,6 +27,12 @@ export class ApiClientError extends Error {
   }
 }
 
+function isJsonMediaType(contentType: string): boolean {
+  const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return mediaType === "application/json"
+    || (mediaType.startsWith("application/") && mediaType.endsWith("+json"));
+}
+
 export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/backend${path}`, {
     ...init,
@@ -38,14 +44,38 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
     },
   });
 
+  const headerRequestId = response.headers.get("x-request-id")?.trim() || undefined;
+  const noContent = response.status === 204 || response.status === 205;
+  if (noContent) return undefined as T;
+
   const contentType = response.headers.get("content-type") ?? "";
-  const payload = contentType.includes("application/json")
-    ? ((await response.json()) as T | ApiProblem)
-    : null;
+  let payload: T | ApiProblem | null = null;
+  if (isJsonMediaType(contentType)) {
+    try {
+      const body = await response.text();
+      if (!body.trim()) throw new SyntaxError("empty JSON response");
+      payload = JSON.parse(body) as T | ApiProblem;
+    } catch {
+      throw new ApiClientError(
+        response.ok ? "后台服务返回了无效响应，请稍后重试。" : "请求未能完成，请稍后再试。",
+        response.ok ? 502 : response.status,
+        "invalid_response",
+        undefined,
+        headerRequestId,
+      );
+    }
+  } else if (response.ok) {
+    throw new ApiClientError(
+      "后台服务返回了无效响应，请稍后重试。",
+      502,
+      "invalid_response",
+      undefined,
+      headerRequestId,
+    );
+  }
 
   if (!response.ok) {
     const problem = payload as ApiProblem | null;
-    const headerRequestId = response.headers.get("x-request-id")?.trim() || undefined;
     const payloadRequestId = typeof problem?.request_id === "string"
       ? problem.request_id.trim() || undefined
       : undefined;
