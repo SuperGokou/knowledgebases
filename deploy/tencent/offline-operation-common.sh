@@ -48,6 +48,8 @@ offline_local_image_config_id() (
   # Invoked indirectly by the EXIT trap below.
   # shellcheck disable=SC2329
   cleanup_local_image_identity() {
+    # ShellCheck cannot follow function calls made indirectly by an EXIT trap.
+    # shellcheck disable=SC2317
     if [ -n "$archive" ]; then
       rm -f -- "$archive"
     fi
