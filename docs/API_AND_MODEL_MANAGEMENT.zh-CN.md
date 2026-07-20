@@ -171,6 +171,7 @@ console.log(await response.json());
 |---|---|
 | `llm_generated` | 模型回答通过服务端引用结构校验 |
 | `external_processing_disabled` | 知识库未授权外部模型，直接返回本地检索回答 |
+| `deployment_external_llm_disabled` | 当前部署策略未启用外部模型出口，已安全降级到本地检索 |
 | `provider_unconfigured` | 当前供应商未配置，已降级到本地检索 |
 | `provider_configuration_error` | 供应商配置不可用，已降级到本地检索 |
 | `provider_unavailable` | 上游模型调用失败，已降级到本地检索 |
@@ -224,7 +225,9 @@ POST /api/v1/public/knowledge-bases/{knowledge_base_id}/search
 |---|---|---|---|
 | DeepSeek | `https://api.deepseek.com` | `deepseek-v4-flash` / `deepseek-v4-pro` | `KB_DEEPSEEK_API_KEY` |
 | Qwen（中国北京） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` | `KB_QWEN_API_KEY` |
-| Qwen（其他区域） | 工作空间专属 `https://{workspace}.{region}.maas.aliyuncs.com/compatible-mode/v1` | 以该区域模型列表为准 | `KB_QWEN_API_KEY` |
+| Qwen（美国公共端点） | `https://dashscope-us.aliyuncs.com/compatible-mode/v1` | 以该区域模型列表为准 | `KB_QWEN_API_KEY` |
+| Qwen（国际公共端点） | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | 以该区域模型列表为准 | `KB_QWEN_API_KEY` |
+| Qwen（专属工作空间） | `https://{workspace}.{region}.maas.aliyuncs.com/compatible-mode/v1` | 以该区域模型列表为准 | `KB_QWEN_API_KEY` |
 | MiniMax | `https://api.minimax.io/v1` | `MiniMax-M2.7` | `KB_MINIMAX_API_KEY` |
 
 三家均通过 OpenAI-compatible Chat Completions 接口接入，但平台会按供应商处理不兼容的扩展字段，避免把 DeepSeek 专属参数发送给 Qwen 或 MiniMax。

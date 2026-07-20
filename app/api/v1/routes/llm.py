@@ -126,7 +126,7 @@ async def update_llm_provider(
             price.active = True
             price.updated_by = access.user.id
 
-    if (row.is_default or payload.make_default) and credential_source(row, settings) == "none":
+    if payload.make_default and credential_source(row, settings) == "none":
         raise ApiError(
             status_code=422,
             code="llm_provider_not_configured",
@@ -170,6 +170,11 @@ def _response(
     default = next((row.provider for row in rows if row.is_default), settings.llm_default_provider)
     return LlmProvidersResponse(
         default_provider=cast(LlmProviderName, default),
+        runtime_enabled=settings.external_llm_enabled,
+        runtime_profile=settings.deployment_profile,
+        runtime_reason=(
+            "enabled" if settings.external_llm_enabled else "deployment_external_llm_disabled"
+        ),
         providers=[
             _read(
                 row,

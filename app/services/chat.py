@@ -89,6 +89,7 @@ _LOGGER = logging.getLogger(__name__)
 
 FallbackReason = Literal[
     "external_processing_disabled",
+    "deployment_external_llm_disabled",
     "provider_unconfigured",
     "provider_configuration_error",
     "provider_unavailable",
@@ -661,6 +662,18 @@ async def answer_knowledge_query(
             question=message,
         )
 
+    # Provider credentials may be stored while deployment policy keeps all model
+    # egress disabled. Report that policy state explicitly instead of presenting it
+    # as a malformed API key or provider configuration.
+    if not settings.external_llm_enabled:
+        return _retrieval_response(
+            knowledge_base_id=knowledge_base_id,
+            citations=citations,
+            strategy="retrieval_fallback",
+            reason="deployment_external_llm_disabled",
+            question=message,
+        )
+
     try:
         client = await resolve_provider_client(session, settings)
     except (LlmConfigurationError, ValueError) as error:
@@ -673,7 +686,12 @@ async def answer_knowledge_query(
             knowledge_base_id=knowledge_base_id,
             citations=citations,
             strategy="retrieval_fallback",
-            reason="provider_configuration_error",
+            reason=(
+                "deployment_external_llm_disabled"
+                if isinstance(error, LlmConfigurationError)
+                and str(error) == "external_llm_disabled"
+                else "provider_configuration_error"
+            ),
             question=message,
         )
     if not client.configured:

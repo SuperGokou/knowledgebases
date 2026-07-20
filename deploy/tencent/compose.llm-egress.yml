@@ -1,0 +1,95 @@
+services:
+  api:
+    environment:
+      KB_DEPLOYMENT_PROFILE: private_connected
+      KB_EXTERNAL_LLM_ENABLED: "true"
+      KB_LLM_DEFAULT_PROVIDER: ${KB_LLM_DEFAULT_PROVIDER:?required}
+      KB_DEEPSEEK_API_KEY: ${KB_DEEPSEEK_API_KEY:-}
+      KB_QWEN_API_KEY: ${KB_QWEN_API_KEY:-}
+      KB_MINIMAX_API_KEY: ${KB_MINIMAX_API_KEY:-}
+      KB_LLM_HTTPS_PROXY: http://llm-egress-proxy:8080
+    depends_on:
+      llm-egress-proxy:
+        condition: service_healthy
+    networks:
+      - backend
+      - frontend
+      - llm-client
+
+  maintenance:
+    environment:
+      KB_DEPLOYMENT_PROFILE: private_connected
+      KB_EXTERNAL_LLM_ENABLED: "true"
+      KB_LLM_DEFAULT_PROVIDER: ${KB_LLM_DEFAULT_PROVIDER:?required}
+      KB_DEEPSEEK_API_KEY: ${KB_DEEPSEEK_API_KEY:-}
+      KB_QWEN_API_KEY: ${KB_QWEN_API_KEY:-}
+      KB_MINIMAX_API_KEY: ${KB_MINIMAX_API_KEY:-}
+      KB_LLM_HTTPS_PROXY: http://llm-egress-proxy:8080
+    depends_on:
+      llm-egress-proxy:
+        condition: service_healthy
+    networks:
+      - backend
+      - llm-client
+
+  llm-egress-proxy:
+    image: ${KB_API_IMAGE:?required}
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "app.llm_egress_proxy"]
+    environment:
+      KB_LLM_EGRESS_PROXY_BIND_HOST: 0.0.0.0
+      KB_LLM_EGRESS_PROXY_BIND_PORT: "8080"
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    cpus: 0.15
+    stop_grace_period: 15s
+    pids_limit: 64
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; connection = socket.create_connection(('127.0.0.1', 8080), 2); connection.close()
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: local
+      options:
+        max-size: 20m
+        max-file: "5"
+    networks:
+      - llm-client
+      - llm-egress
+
+networks:
+  llm-client:
+    driver: bridge
+    internal: true
+    attachable: false
+    driver_opts:
+      com.docker.network.bridge.name: br-kb-llmc
+    ipam:
+      config:
+        - subnet: 172.30.243.0/28
+
+  llm-egress:
+    driver: bridge
+    internal: false
+    attachable: false
+    driver_opts:
+      com.docker.network.bridge.name: br-kb-llme
+    ipam:
+      config:
+        - subnet: 172.30.244.0/28

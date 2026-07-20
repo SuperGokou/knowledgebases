@@ -157,6 +157,7 @@ export type ChatSourceStatus = {
     | "structured_query"
     | "llm_generated"
     | "external_processing_disabled"
+    | "deployment_external_llm_disabled"
     | "provider_unconfigured"
     | "provider_configuration_error"
     | "provider_unavailable"
@@ -237,6 +238,10 @@ export type ManagedApiKey = {
 
 export type LlmProviderName = "deepseek" | "qwen" | "minimax";
 
+export type LlmRuntimeProfile = "standard" | "isolated" | "private_connected";
+
+export type LlmRuntimeReason = "enabled" | "deployment_external_llm_disabled";
+
 export type LlmProviderSettings = {
   provider: LlmProviderName;
   model: string;
@@ -252,5 +257,8 @@ export type LlmProviderSettings = {
 
 export type LlmProvidersResponse = {
   default_provider: LlmProviderName;
+  runtime_enabled: boolean;
+  runtime_profile: LlmRuntimeProfile;
+  runtime_reason: LlmRuntimeReason;
   providers: LlmProviderSettings[];
 };

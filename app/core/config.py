@@ -27,7 +27,7 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("KB_SERVERLESS", "VERCEL"),
     )
-    deployment_profile: Literal["standard", "isolated"] = "standard"
+    deployment_profile: Literal["standard", "isolated", "private_connected"] = "standard"
     external_llm_enabled: bool = True
     api_prefix: str = "/api/v1"
     database_url: str = Field(
@@ -193,6 +193,7 @@ class Settings(BaseSettings):
             "KB_LLM_CREDENTIALS_ENCRYPTION_KEY",
         ),
     )
+    llm_https_proxy: str | None = None
     deepseek_timeout_seconds: float = Field(default=45, ge=5, le=120)
     deepseek_max_tokens: int = Field(default=4_096, ge=256, le=32_768)
     okf_source_max_bytes: int = Field(default=1_000_000, ge=1_024, le=5_000_000)
@@ -328,7 +329,7 @@ class Settings(BaseSettings):
                     )
             if self.debug:
                 raise ValueError("KB_DEBUG must be false in production")
-            if self.deployment_profile == "isolated":
+            if self.deployment_profile in {"isolated", "private_connected"}:
                 expected_storage_policy = {
                     "storage_warning_percent": 70,
                     "storage_bulk_stop_percent": 80,
@@ -366,9 +367,21 @@ class Settings(BaseSettings):
                         "KB_MALWARE_SCAN_HOST must reference the isolated Compose service "
                         "'clamd'"
                     )
-                if self.external_llm_enabled:
+                if self.deployment_profile == "isolated" and self.external_llm_enabled:
                     raise ValueError(
                         "KB_EXTERNAL_LLM_ENABLED must be false in isolated deployments"
+                    )
+                if self.deployment_profile == "isolated" and self.llm_https_proxy is not None:
+                    raise ValueError(
+                        "KB_LLM_HTTPS_PROXY must be unset in isolated deployments"
+                    )
+                if (
+                    self.deployment_profile == "private_connected"
+                    and self.llm_https_proxy != "http://llm-egress-proxy:8080"
+                ):
+                    raise ValueError(
+                        "KB_LLM_HTTPS_PROXY must be exactly "
+                        "http://llm-egress-proxy:8080 in private_connected deployments"
                     )
             else:
                 for variable, endpoint in (
@@ -400,6 +413,26 @@ class Settings(BaseSettings):
                     )
                 if urlparse(self.redis_url).scheme != "rediss":
                     raise ValueError("KB_REDIS_URL must use TLS (rediss://) in production")
+                if self.llm_https_proxy is not None:
+                    parsed_proxy = urlparse(self.llm_https_proxy)
+                    try:
+                        _ = parsed_proxy.port
+                    except ValueError as error:
+                        raise ValueError(
+                            "KB_LLM_HTTPS_PROXY must contain a valid proxy port"
+                        ) from error
+                    if (
+                        parsed_proxy.scheme not in {"http", "https"}
+                        or not parsed_proxy.hostname
+                        or parsed_proxy.username is not None
+                        or parsed_proxy.password is not None
+                        or parsed_proxy.query
+                        or parsed_proxy.fragment
+                    ):
+                        raise ValueError(
+                            "KB_LLM_HTTPS_PROXY must be an absolute HTTP(S) proxy URL "
+                            "without credentials, query, or fragment"
+                        )
             if "*" in self.cors_origins or "null" in {
                 origin.strip().lower() for origin in self.cors_origins
             }:
@@ -412,7 +445,7 @@ class Settings(BaseSettings):
             ):
                 raise ValueError("S3 example credentials must be changed in production")
             if (
-                self.deployment_profile != "isolated"
+                self.deployment_profile not in {"isolated", "private_connected"}
                 and not self.s3_endpoint_url.lower().startswith("https://")
             ):
                 raise ValueError("KB_S3_ENDPOINT_URL must use HTTPS in production")
