@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 LlmProviderName = Literal["deepseek", "qwen", "minimax"]
+LlmRuntimeProfile = Literal["standard", "isolated", "private_connected"]
+LlmRuntimeReason = Literal["enabled", "deployment_external_llm_disabled"]
 
 
 class LlmProviderUpdate(BaseModel):
@@ -65,4 +67,12 @@ class LlmProviderRead(BaseModel):
 
 class LlmProvidersResponse(BaseModel):
     default_provider: LlmProviderName
+    runtime_enabled: bool = Field(
+        description=(
+            "Deployment-level external LLM egress gate; this is not end-to-end "
+            "provider readiness"
+        )
+    )
+    runtime_profile: LlmRuntimeProfile
+    runtime_reason: LlmRuntimeReason
     providers: list[LlmProviderRead]

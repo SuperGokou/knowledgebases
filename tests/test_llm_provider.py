@@ -153,9 +153,46 @@ async def test_openai_adapter_retries_json_mode_without_provider_specific_fields
     assert "user" not in calls[0][2]
     assert len(constructor_options) == 1
     assert all(item["follow_redirects"] is False for item in constructor_options)
+    assert all(item["trust_env"] is False for item in constructor_options)
+    assert all(item["proxy"] is None for item in constructor_options)
     assert all(item["timeout"].connect == 10 for item in constructor_options)
     await client.aclose()
     assert created_clients[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_uses_only_the_explicit_https_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_options: list[dict[str, Any]] = []
+
+    def client_factory(**kwargs: Any) -> StubAsyncClient:
+        constructor_options.append(kwargs)
+        return StubAsyncClient([], [])
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.invalid:8080")
+    monkeypatch.setattr("app.services.llm_provider.httpx.AsyncClient", client_factory)
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="qwen-plus",
+            timeout_seconds=10,
+            max_tokens=1000,
+            https_proxy="http://llm-egress-proxy:3128",
+        )
+    )
+
+    assert constructor_options == [
+        {
+            "timeout": httpx.Timeout(10),
+            "follow_redirects": False,
+            "trust_env": False,
+            "proxy": "http://llm-egress-proxy:3128",
+        }
+    ]
+    await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -431,6 +468,35 @@ async def test_provider_resolution_without_rows_is_read_only() -> None:
         assert client.model == settings.qwen_model
         assert client.configured is True
         assert await session.scalar(select(func.count()).select_from(LlmProviderConfig)) == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_resolution_propagates_the_explicit_https_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    settings = Settings(
+        environment="test",
+        llm_default_provider="qwen",
+        qwen_api_key=SecretStr("qwen-environment-secret"),
+        llm_https_proxy="http://llm-egress-proxy:3128",
+    )
+    captured_configs: list[OpenAICompatibleConfig] = []
+
+    def client_factory(config: OpenAICompatibleConfig) -> OpenAICompatibleClient:
+        captured_configs.append(config)
+        return OpenAICompatibleClient(config)
+
+    monkeypatch.setattr("app.services.llm_settings.OpenAICompatibleClient", client_factory)
+    async with factory() as session:
+        client = await resolve_provider_client(session, settings)
+        assert client.provider == "qwen"
+        assert captured_configs[0].https_proxy == "http://llm-egress-proxy:3128"
+        await client.aclose()
     await engine.dispose()
 
 

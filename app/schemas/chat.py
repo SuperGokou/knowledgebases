@@ -38,6 +38,7 @@ class ChatSourceStatus(BaseModel):
         "structured_query",
         "llm_generated",
         "external_processing_disabled",
+        "deployment_external_llm_disabled",
         "provider_unconfigured",
         "provider_configuration_error",
         "provider_unavailable",

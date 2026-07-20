@@ -88,6 +88,7 @@ describe("parseChatReply", () => {
     "usage_metering_unavailable",
     "duplicate_request",
     "independent_reviewer_unavailable",
+    "deployment_external_llm_disabled",
   ] as const)("accepts the documented safe fallback reason %s", (reason) => {
     const fallbackReply = {
       ...validReply,

@@ -137,6 +137,108 @@ def test_isolated_production_accepts_only_compose_local_data_services() -> None:
     assert settings.external_llm_enabled is False
 
 
+def test_private_connected_production_keeps_data_local_and_allows_llm_egress() -> None:
+    settings = production_settings(
+        deployment_profile="private_connected",
+        external_llm_enabled=True,
+        database_url=("postgresql+asyncpg://knowledge:password@postgres:5432/knowledge"),
+        redis_url="redis://:password@redis:6379/0",
+        s3_endpoint_url="http://minio:9000",
+        s3_public_endpoint_url="https://knowledge.internal:19444",
+        malware_scan_host="clamd",
+        storage_capacity_probe_path="/var/lib/kb-capacity",
+        llm_https_proxy="http://llm-egress-proxy:8080",
+    )
+
+    assert settings.deployment_profile == "private_connected"
+    assert settings.external_llm_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("database_url", "postgresql+asyncpg://user:pass@db.example.com/knowledge"),
+        ("redis_url", "redis://:pass@cache.example.com:6379/0"),
+        ("s3_endpoint_url", "http://objects.example.com:9000"),
+    ],
+)
+def test_private_connected_production_rejects_external_data_services(
+    field: str,
+    value: str,
+) -> None:
+    overrides: dict[str, object] = {
+        "deployment_profile": "private_connected",
+        "external_llm_enabled": True,
+        "database_url": "postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+        "redis_url": "redis://:pass@redis:6379/0",
+        "s3_endpoint_url": "http://minio:9000",
+        "s3_public_endpoint_url": "https://knowledge.internal:19444",
+        "malware_scan_host": "clamd",
+        "storage_capacity_probe_path": "/var/lib/kb-capacity",
+        "llm_https_proxy": "http://llm-egress-proxy:8080",
+        field: value,
+    }
+
+    with pytest.raises(ValidationError):
+        production_settings(**overrides)
+
+
+@pytest.mark.parametrize(
+    "llm_https_proxy",
+    [None, "http://proxy:8080", "https://llm-egress-proxy:8080"],
+)
+def test_private_connected_production_requires_fixed_llm_proxy(
+    llm_https_proxy: str | None,
+) -> None:
+    with pytest.raises(ValidationError, match="KB_LLM_HTTPS_PROXY"):
+        production_settings(
+            deployment_profile="private_connected",
+            external_llm_enabled=True,
+            database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+            redis_url="redis://:pass@redis:6379/0",
+            s3_endpoint_url="http://minio:9000",
+            s3_public_endpoint_url="https://knowledge.internal:19444",
+            malware_scan_host="clamd",
+            storage_capacity_probe_path="/var/lib/kb-capacity",
+            llm_https_proxy=llm_https_proxy,
+        )
+
+
+def test_isolated_production_rejects_llm_proxy() -> None:
+    with pytest.raises(ValidationError, match="must be unset"):
+        production_settings(
+            deployment_profile="isolated",
+            external_llm_enabled=False,
+            database_url="postgresql+asyncpg://knowledge:pass@postgres:5432/knowledge",
+            redis_url="redis://:pass@redis:6379/0",
+            s3_endpoint_url="http://minio:9000",
+            s3_public_endpoint_url="https://knowledge.internal:19444",
+            malware_scan_host="clamd",
+            storage_capacity_probe_path="/var/lib/kb-capacity",
+            llm_https_proxy="http://llm-egress-proxy:8080",
+        )
+
+
+@pytest.mark.parametrize(
+    "llm_https_proxy",
+    ["llm-egress-proxy:8080", "ftp://proxy.example.com", "https://user@proxy.example.com"],
+)
+def test_standard_production_rejects_invalid_llm_proxy(llm_https_proxy: str) -> None:
+    with pytest.raises(ValidationError, match="absolute HTTP\\(S\\) proxy URL"):
+        production_settings(llm_https_proxy=llm_https_proxy)
+
+
+def test_standard_production_rejects_invalid_llm_proxy_port() -> None:
+    with pytest.raises(ValidationError, match="valid proxy port"):
+        production_settings(llm_https_proxy="https://proxy.example.com:not-a-port")
+
+
+def test_standard_production_accepts_absolute_llm_proxy() -> None:
+    settings = production_settings(llm_https_proxy="https://proxy.example.com:8443")
+
+    assert settings.llm_https_proxy == "https://proxy.example.com:8443"
+
+
 def test_isolated_production_requires_the_private_clamd_service() -> None:
     with pytest.raises(ValidationError):
         production_settings(

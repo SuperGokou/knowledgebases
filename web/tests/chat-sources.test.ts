@@ -83,6 +83,19 @@ describe("chat answer sources", () => {
     ).toBe(explanation);
   });
 
+  it("explains when the deployment-level model egress is disabled", () => {
+    const disabledStatus: ChatSourceStatus = {
+      status: "grounded",
+      strategy: "retrieval_fallback",
+      reason: "deployment_external_llm_disabled",
+      citation_count: 1,
+    };
+
+    expect(sourceSummary([citation], disabledStatus).detail).toBe(
+      "当前部署未启用外部模型出口，回答已安全回退到本地检索。",
+    );
+  });
+
   it("reports whether a citation has an associated source file", () => {
     expect(citationTraceLabel(citation)).toBe("源文件已关联");
     expect(citationTraceLabel({ ...citation, source_file_id: null })).toBe("知识条目可追溯");

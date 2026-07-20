@@ -2646,12 +2646,68 @@ async def test_llm_provider_settings_are_allowlisted_encrypted_and_never_echoed(
 
     providers = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
     assert providers.status_code == 200, providers.text
-    assert {item["provider"] for item in providers.json()["providers"]} == {
+    provider_payload = providers.json()
+    assert provider_payload["runtime_enabled"] is True
+    assert provider_payload["runtime_profile"] == "standard"
+    assert provider_payload["runtime_reason"] == "enabled"
+    assert {item["provider"] for item in provider_payload["providers"]} == {
         "deepseek",
         "qwen",
         "minimax",
     }
-    assert all("api_key" not in item for item in providers.json()["providers"])
+    assert all("api_key" not in item for item in provider_payload["providers"])
+
+    disabled_settings = get_settings().model_copy(
+        update={"deployment_profile": "isolated", "external_llm_enabled": False}
+    )
+    app.dependency_overrides[get_settings] = lambda: disabled_settings
+    try:
+        disabled_runtime = await api_harness.client.get("/api/v1/llm/providers", headers=headers)
+        assert disabled_runtime.status_code == 200, disabled_runtime.text
+        assert disabled_runtime.json()["runtime_enabled"] is False
+        assert disabled_runtime.json()["runtime_profile"] == "isolated"
+        assert disabled_runtime.json()["runtime_reason"] == "deployment_external_llm_disabled"
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    private_connected_settings = get_settings().model_copy(
+        update={
+            "deployment_profile": "private_connected",
+            "external_llm_enabled": True,
+            "llm_https_proxy": "http://llm-egress-proxy:8080",
+        }
+    )
+    app.dependency_overrides[get_settings] = lambda: private_connected_settings
+    try:
+        private_connected_runtime = await api_harness.client.get(
+            "/api/v1/llm/providers", headers=headers
+        )
+        assert private_connected_runtime.status_code == 200, private_connected_runtime.text
+        assert private_connected_runtime.json()["runtime_enabled"] is True
+        assert private_connected_runtime.json()["runtime_profile"] == "private_connected"
+        assert private_connected_runtime.json()["runtime_reason"] == "enabled"
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    unconfigured_default_settings = get_settings().model_copy(
+        update={"deepseek_api_key": None}
+    )
+    app.dependency_overrides[get_settings] = lambda: unconfigured_default_settings
+    try:
+        price_only = await api_harness.client.patch(
+            "/api/v1/llm/providers/deepseek",
+            headers=headers,
+            json={
+                "input_micro_usd_per_million_tokens": 100_000,
+                "output_micro_usd_per_million_tokens": 200_000,
+            },
+        )
+        assert price_only.status_code == 200, price_only.text
+        assert price_only.json()["is_default"] is True
+        assert price_only.json()["configured"] is False
+        assert price_only.json()["pricing_configured"] is True
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
 
     blocked = await api_harness.client.patch(
         "/api/v1/llm/providers/qwen",
@@ -2789,6 +2845,8 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
 
     calls: list[list[dict[str, str]]] = []
     model_answer = "Manager approval is required [1]."
+    review_answer = '{"verdict":"pass","unsupported_claims":[]}'
+    review_provider_failure = False
 
     class FakeClient:
         configured = True
@@ -2806,11 +2864,15 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         ) -> LlmChatResult:
             del temperature, max_tokens
             calls.append(messages)
-            content = (
-                '{"verdict":"pass","unsupported_claims":[]}'
-                if "strict grounding auditor" in messages[0]["content"]
-                else model_answer
-            )
+            is_review = "strict grounding auditor" in messages[0]["content"]
+            if is_review and review_provider_failure:
+                raise LlmProviderError(
+                    "llm_upstream_error",
+                    provider=self.provider,
+                    retryable=True,
+                    upstream_status=503,
+                )
+            content = review_answer if is_review else model_answer
             return LlmChatResult(
                 content=content,
                 provider=self.provider,
@@ -2844,6 +2906,28 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         json={"external_llm_processing_enabled": True},
     )
     assert opted_in.status_code == 200
+
+    disabled_settings = get_settings().model_copy(
+        update={"deployment_profile": "isolated", "external_llm_enabled": False}
+    )
+    app.dependency_overrides[get_settings] = lambda: disabled_settings
+    try:
+        disabled_by_deployment = await api_harness.client.post(
+            "/api/v1/chat/query",
+            headers={**headers, "Idempotency-Key": "deployment-disabled-e2e"},
+            json=payload,
+        )
+        assert disabled_by_deployment.status_code == 200, disabled_by_deployment.text
+        assert disabled_by_deployment.json()["source_status"] == {
+            "status": "grounded",
+            "strategy": "retrieval_fallback",
+            "reason": "deployment_external_llm_disabled",
+            "citation_count": 1,
+        }
+        assert calls == []
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
     generated = await api_harness.client.post(
         "/api/v1/chat/query",
         headers={**headers, "Idempotency-Key": "grounded-generation-e2e"},
@@ -2894,6 +2978,44 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         ],
     }
     assert "KNOWLEDGE_CONTEXT_START" not in calls[0][1]["content"]
+
+    model_answer = "CONFIDENTIAL_GENERATED_DRAFT must never be returned [1]."
+    review_cases = (
+        (
+            "review-rejected-e2e",
+            '{"verdict":"fail","unsupported_claims":["unsupported"]}',
+            False,
+            "answer_review_rejected",
+        ),
+        ("review-invalid-e2e", "not-json", False, "answer_review_invalid"),
+        (
+            "review-provider-failure-e2e",
+            '{"verdict":"pass","unsupported_claims":[]}',
+            True,
+            "answer_review_unavailable",
+        ),
+    )
+    for idempotency_key, review_payload, provider_failure, expected_reason in review_cases:
+        review_answer = review_payload
+        review_provider_failure = provider_failure
+        rejected = await api_harness.client.post(
+            "/api/v1/chat/query",
+            headers={**headers, "Idempotency-Key": idempotency_key},
+            json=payload,
+        )
+        assert rejected.status_code == 200, rejected.text
+        assert rejected.json()["mode"] == "retrieval"
+        assert rejected.json()["answer_review"]["status"] == "fallback"
+        assert rejected.json()["source_status"] == {
+            "status": "grounded",
+            "strategy": "retrieval_fallback",
+            "reason": expected_reason,
+            "citation_count": 1,
+        }
+        assert "CONFIDENTIAL_GENERATED_DRAFT" not in rejected.json()["answer"]
+
+    review_answer = '{"verdict":"pass","unsupported_claims":[]}'
+    review_provider_failure = False
 
     model_answer = "This answer cites a source that was never retrieved [99]."
     invalid_citation = await api_harness.client.post(

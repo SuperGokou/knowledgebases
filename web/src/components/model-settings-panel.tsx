@@ -9,7 +9,13 @@ import { EmptyState, ErrorState, LoadingRows, StatusBadge } from "@/components/u
 import { createActionLock } from "@/lib/action-lock";
 import { apiRequest, readableError } from "@/lib/api-client";
 import { buildProviderUpdate, microUsdToUsd } from "@/lib/model-settings";
-import type { LlmProviderName, LlmProviderSettings, LlmProvidersResponse } from "@/lib/types";
+import type {
+  LlmProviderName,
+  LlmProviderSettings,
+  LlmProvidersResponse,
+  LlmRuntimeProfile,
+  LlmRuntimeReason,
+} from "@/lib/types";
 
 const providerMeta: Record<LlmProviderName, { label: string; short: string; description: string }> = {
   deepseek: { label: "DeepSeek", short: "DS", description: "通用问答与知识内容转换" },
@@ -17,11 +23,33 @@ const providerMeta: Record<LlmProviderName, { label: string; short: string; desc
   minimax: { label: "MiniMax", short: "MM", description: "企业级文本生成模型服务" },
 };
 
+const runtimeProfileLabels: Record<LlmRuntimeProfile, string> = {
+  standard: "标准联网运行配置",
+  isolated: "隔离运行配置",
+  private_connected: "受控联网运行配置",
+};
+
+type RuntimeState = {
+  enabled: boolean;
+  profile: LlmRuntimeProfile;
+  reason: LlmRuntimeReason;
+};
+
+function modelRuntimeStatus(runtimeEnabled: boolean, defaultConfigured: boolean): {
+  label: string;
+  tone: "info" | "warning";
+} {
+  if (!runtimeEnabled) return { label: "模型外呼未开启", tone: "warning" };
+  if (!defaultConfigured) return { label: "外呼已开启 · 待配置", tone: "warning" };
+  return { label: "模型外呼已开启", tone: "info" };
+}
+
 export function ModelSettingsPanel() {
   const { can, loading: accessLoading } = useAccess();
   const feedback = useActionFeedback();
   const actionLock = useRef(createActionLock()).current;
   const [providers, setProviders] = useState<LlmProviderSettings[] | null>(null);
+  const [runtime, setRuntime] = useState<RuntimeState | null>(null);
   const [selected, setSelected] = useState<LlmProviderName | null>(null);
   const [model, setModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -51,6 +79,11 @@ export function ModelSettingsPanel() {
       const response = await apiRequest<LlmProvidersResponse>("/api/v1/llm/providers");
       const items = response.providers;
       setProviders(items);
+      setRuntime({
+        enabled: response.runtime_enabled === true,
+        profile: response.runtime_profile,
+        reason: response.runtime_reason,
+      });
       const first = items.find((item) => item.provider === response.default_provider) ?? items[0];
       if (first) {
         setSelected(first.provider);
@@ -71,6 +104,7 @@ export function ModelSettingsPanel() {
   }, [load]);
 
   const current = providers?.find((provider) => provider.provider === selected) ?? null;
+  const runtimeEgressEnabled = runtime?.enabled === true && runtime.reason === "enabled";
 
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -98,7 +132,17 @@ export function ModelSettingsPanel() {
       setApiKey("");
       setInputPriceUsd(microUsdToUsd(updated.input_micro_usd_per_million_tokens));
       setOutputPriceUsd(microUsdToUsd(updated.output_micro_usd_per_million_tokens));
-      feedback.success(`已切换到 ${providerMeta[updated.provider].label}，新请求将使用 ${updated.model}。`, "模型配置已保存");
+      if (runtimeEgressEnabled) {
+        feedback.success(
+          `已将 ${providerMeta[updated.provider].label} ${updated.model} 保存为默认供应商配置。部署已开启模型外呼，实际生成仍需通过价格、预算和独立审核门槛。`,
+          "模型配置已保存",
+        );
+      } else {
+        feedback.success(
+          "供应商配置已保存；当前运行环境未启用外部模型，新请求仍使用本地检索。",
+          "配置已保存，尚未运行",
+        );
+      }
     } catch (reason) {
       const message = readableError(reason);
       setError(message);
@@ -113,13 +157,33 @@ export function ModelSettingsPanel() {
     return <EmptyState compact icon="lock" title="没有模型配置权限" description="当前角色不包含 llm:manage；模型密钥不会发送到浏览器。" />;
   }
 
+  const defaultProvider = providers?.find((provider) => provider.is_default) ?? null;
+  const runtimeStatus = modelRuntimeStatus(
+    runtimeEgressEnabled,
+    defaultProvider?.configured === true,
+  );
+
   return (
     <section className="panel model-settings-panel">
       <div className="panel-header">
         <div><h2>模型供应商</h2><p>在 DeepSeek、Qwen 和 MiniMax 之间切换企业知识处理模型</p></div>
-        {providers?.find((provider) => provider.is_default) ? <StatusBadge tone="success">正在运行</StatusBadge> : <StatusBadge tone="warning">待配置</StatusBadge>}
+        <StatusBadge tone={runtimeStatus.tone}>{runtimeStatus.label}</StatusBadge>
       </div>
       {error ? <div className="panel-inline-state"><ErrorState message={error} onRetry={() => void load()} /></div> : null}
+      {runtime && !runtimeEgressEnabled ? (
+        <div className="panel-inline-state">
+          <div className="notice info-notice" role="status" aria-live="polite">
+            <Icon name="shield" />
+            <div>
+              <strong>当前部署未开启模型外呼</strong>
+              <p>
+                {runtimeProfileLabels[runtime.profile]}已关闭模型出口。供应商配置可以预先保存，
+                但问答仍使用本地检索，不会向外部 API 发送知识内容。
+              </p>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {providers === null && !error ? <LoadingRows count={3} /> : null}
       {providers?.length === 0 && !error ? <EmptyState compact icon="spark" title="没有可用模型" description="请先在 FastAPI 后台初始化模型供应商。" /> : null}
       {providers?.length ? (
@@ -138,7 +202,9 @@ export function ModelSettingsPanel() {
                   <span className={`provider-mark provider-${provider.provider}`}>{meta.short}</span>
                   <span><strong>{meta.label}</strong><small>{meta.description}</small></span>
                   <span className="provider-state">
-                    {provider.is_default ? <StatusBadge tone="success">当前</StatusBadge> : null}
+                    {provider.is_default ? (
+                      <StatusBadge tone={runtimeEgressEnabled ? "info" : "neutral"}>默认配置</StatusBadge>
+                    ) : null}
                     <i className={provider.configured ? "configured" : ""} />
                     {provider.configured ? `已配置 · ${provider.credential_source === "environment" ? "环境变量" : "加密存储"}` : "缺少 Key"}
                   </span>
@@ -150,7 +216,7 @@ export function ModelSettingsPanel() {
           {current ? (
             <form className="provider-form" onSubmit={save}>
               <div className="provider-form-heading">
-                <div><span className={`provider-mark provider-${current.provider}`}>{providerMeta[current.provider].short}</span><div><h3>{providerMeta[current.provider].label}</h3><p>配置采用 OpenAI 兼容接口，保存后立即切换。</p></div></div>
+                <div><span className={`provider-mark provider-${current.provider}`}>{providerMeta[current.provider].short}</span><div><h3>{providerMeta[current.provider].label}</h3><p>{runtimeEgressEnabled ? "保存后将成为默认供应商配置；实际调用仍受价格、预算和独立审核门槛约束。" : "配置可以预先保存；当前运行环境不会调用外部模型。"}</p></div></div>
                 <StatusBadge tone={current.configured ? "success" : "warning"}>{current.configured ? "API Key 已配置" : "需要 API Key"}</StatusBadge>
               </div>
               <div className="form-grid">
@@ -170,8 +236,8 @@ export function ModelSettingsPanel() {
                 </label>
               </div>
               <div className="provider-form-footer">
-                <div><Icon name="shield" /><span><strong>切换影响范围</strong><small>新发起的聊天、检索增强和 OKF 转换任务</small></span></div>
-                <button className="button primary" type="submit" disabled={pending || !model.trim() || !baseUrl.trim()} aria-busy={pending}>{pending ? <><span className="spinner" />正在保存并切换…</> : `保存并切换到 ${providerMeta[current.provider].label}`}</button>
+                <div><Icon name="shield" /><span><strong>{runtimeEgressEnabled ? "默认供应商范围" : "当前仅保存配置"}</strong><small>{runtimeEgressEnabled ? "新聊天、检索增强和 OKF 任务会优先评估此配置" : "启用受控模型外呼后，新请求才会评估此配置"}</small></span></div>
+                <button className="button primary" type="submit" disabled={pending || !model.trim() || !baseUrl.trim()} aria-busy={pending}>{pending ? <><span className="spinner" />正在保存…</> : runtimeEgressEnabled ? `保存并设 ${providerMeta[current.provider].label} 为默认` : `保存 ${providerMeta[current.provider].label} 配置`}</button>
               </div>
             </form>
           ) : null}

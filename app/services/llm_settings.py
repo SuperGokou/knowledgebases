@@ -203,6 +203,7 @@ async def resolve_provider_client(
             model=model,
             timeout_seconds=settings.deepseek_timeout_seconds,
             max_tokens=settings.deepseek_max_tokens,
+            https_proxy=settings.llm_https_proxy,
         )
     )
 
