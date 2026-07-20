@@ -1130,9 +1130,14 @@ async def test_department_summary_counts_and_lists_all_departments_with_full_col
         _content(
             (
                 (2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),
-                (3, _record("研发部", "E002", "乙", "2", "2026-07-17 08:05:00", "西门")),
-                (4, _record("工程部", "E003", "丙", "3", "2026-07-17 08:10:00", "东门")),
-                (5, _record("生产部", "E004", "丁", "4", "2026-07-17 08:15:00", "南门")),
+                (3, _record("生产部", "E002", "乙", "2", "2026-07-17 08:05:00", "西门")),
+                (4, _record("前工程科", "E003", "丙", "3", "2026-07-17 08:10:00", "东门")),
+                (5, _record("整合部", "E004", "丁", "4", "2026-07-17 08:15:00", "南门")),
+                (6, _record("研发部", "E005", "戊", "5", "2026-07-17 08:20:00", "北门")),
+                (7, _record("电子工程科", "E006", "己", "6", "2026-07-17 08:25:00", "东门")),
+                (8, _record("后工程科", "E007", "庚", "7", "2026-07-17 08:30:00", "西门")),
+                (9, _record("品质部", "E008", "辛", "8", "2026-07-17 08:35:00", "南门")),
+                (10, _record("工程部", "E009", "壬", "9", "2026-07-17 08:40:00", "东门")),
             )
         ),
         title="测试.xlsx",
@@ -1142,23 +1147,33 @@ async def test_department_summary_counts_and_lists_all_departments_with_full_col
     result = await evaluate_spreadsheet_query(
         session,
         knowledge_base_id,
-        "这份考勤记录中，一共包含了多少个不同的部门？请列出名称。",
+        "这份考勤记录中，一共包含了多少个不同的部门？请列出这些部门的名称。",
     )
 
     assert result.status is SpreadsheetQueryStatus.ANSWERED
     assert result.answer is not None and result.answer.table is not None
     assert result.answer.answer == (
-        "在《测试.xlsx》中已完整扫描 4 条考勤记录，共包含 3 个不同部门：工程部、研发部、生产部。[1]"
+        "在《测试.xlsx》中已完整扫描 9 条考勤记录，共包含 8 个不同部门："
+        "工程部、生产部、前工程科、整合部、研发部、电子工程科、后工程科、品质部。[1]"
     )
     assert result.answer.table.title == "考勤部门统计"
     assert result.answer.table.columns == ("部门名称",)
-    assert result.answer.table.rows == (("工程部",), ("研发部",), ("生产部",))
-    assert "完整扫描 4 条考勤记录" in result.answer.hits[0].excerpt
-    assert "3 个不同部门" in result.answer.hits[0].excerpt
+    assert result.answer.table.rows == (
+        ("工程部",),
+        ("生产部",),
+        ("前工程科",),
+        ("整合部",),
+        ("研发部",),
+        ("电子工程科",),
+        ("后工程科",),
+        ("品质部",),
+    )
+    assert "完整扫描 9 条考勤记录" in result.answer.hits[0].excerpt
+    assert "8 个不同部门" in result.answer.hits[0].excerpt
     assert "E001" not in result.answer.hits[0].excerpt
     assert "甲" not in result.answer.hits[0].excerpt
     assert result.answer.hits[0].source_path is not None
-    assert result.answer.hits[0].source_path.endswith("#worksheet:Sheet1!B2:B5")
+    assert result.answer.hits[0].source_path.endswith("#worksheet:Sheet1!B2:B10")
 
 
 @pytest.mark.asyncio
@@ -1413,6 +1428,9 @@ def test_department_summary_recognizes_supported_variants(question: str) -> None
         "排除研发部后，考勤记录中有哪些部门？",
         "东门设备的考勤记录涉及哪些部门？",
         "请统计这份考勤记录的部门分布。",
+        "2026年7月17日的考勤记录包含多少个不同部门？请列出这些部门的名称。",
+        "这份考勤记录包含多少个不同部门？请列出这些部门的名称，但排除研发部。",
+        "东门设备的考勤记录包含多少个不同部门？请列出这些部门的名称。",
     ),
 )
 @pytest.mark.asyncio
