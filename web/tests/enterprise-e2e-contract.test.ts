@@ -67,6 +67,7 @@ describe("enterprise Playwright profile", () => {
   });
 
   test("blocks a topology without an explicit bounded multipart payload", () => {
+    const trustRoot = path.join(path.parse(path.resolve()).root, "trust");
     const base = {
       KB_E2E_BASE_URL: "https://web.invalid",
       KB_E2E_PUBLIC_API_ORIGIN: "https://api.invalid",
@@ -76,8 +77,8 @@ describe("enterprise Playwright profile", () => {
       KB_E2E_FAULT_CONTROL_TOKEN: "not-a-real-token",
       KB_E2E_SEEDED_KNOWLEDGE_BASE_ID: "seeded",
       KB_E2E_UNSCOPED_KNOWLEDGE_BASE_ID: "unscoped",
-      KB_E2E_SIGNING_KEY_PATH: "C:/trust/browser-e2e.pem",
-      KB_E2E_CHALLENGE_PATH: "C:/trust/browser-challenge.json",
+      KB_E2E_SIGNING_KEY_PATH: path.join(trustRoot, "browser-e2e.pem"),
+      KB_E2E_CHALLENGE_PATH: path.join(trustRoot, "browser-challenge.json"),
       KB_E2E_DOCUMENT_FIXTURE_ROOT: "C:/trust/document-fixtures",
       KB_E2E_DOCUMENT_FIXTURE_MANIFEST: "C:/trust/document-fixtures/document-fixtures-v1.json",
     };
