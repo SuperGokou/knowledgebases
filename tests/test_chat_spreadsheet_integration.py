@@ -1,0 +1,488 @@
+from __future__ import annotations
+
+import re
+from hashlib import sha256
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
+from app.core.config import Settings
+from app.db.base import Base
+from app.db.models import (
+    KnowledgeBase,
+    KnowledgeBaseAccessLevel,
+    KnowledgeEntry,
+    KnowledgeEntryPublicationStatus,
+    User,
+)
+from app.schemas.chat import ChatQueryResponse
+from app.schemas.knowledge_bases import KnowledgeSearchHit
+from app.services import chat as chat_service
+from app.services.access import AccessContext
+from app.services.knowledge_bases import KnowledgeBaseAccess
+from app.services.spreadsheet_query import (
+    SpreadsheetAnswer,
+    SpreadsheetQueryResult,
+    SpreadsheetQueryStatus,
+    SpreadsheetTable,
+)
+
+
+def _context() -> tuple[KnowledgeBase, AccessContext]:
+    user = User(id=uuid4(), email=f"reader-{uuid4()}@example.com", password_hash="hash")
+    knowledge_base = KnowledgeBase(
+        id=uuid4(),
+        owner_id=user.id,
+        name="Infra",
+        external_llm_processing_enabled=False,
+    )
+    access = AccessContext(
+        user=user,
+        permissions=frozenset({"chat:query"}),
+        limits={},
+        role_ids=frozenset(),
+        max_role_priority=0,
+    )
+    return knowledge_base, access
+
+
+def _trusted_spreadsheet_metadata(content: str) -> dict[str, object]:
+    cell_locations = re.findall(r"\[(worksheet:[^\]\r\n]+![A-Za-z]{1,3}[1-9]\d*)\]", content)
+    locations: list[str] = []
+    seen_sheets: set[str] = set()
+    for location in cell_locations:
+        sheet_location = location.rsplit("!", maxsplit=1)[0]
+        if sheet_location not in seen_sheets:
+            locations.append(sheet_location)
+            seen_sheets.add(sheet_location)
+        locations.append(location)
+    return {
+        "source_parser": "ooxml-xlsx",
+        "generator": {
+            "provider": "local",
+            "model": "local-deterministic-v1",
+        },
+        "source_locations": locations,
+        "source_location_count": len(locations),
+        "source_locations_truncated": False,
+        "source_text_length": len(content),
+        "source_text_sha256": sha256(content.encode("utf-8")).hexdigest(),
+        "source_locations_sha256": sha256("\n".join(locations).encode("utf-8")).hexdigest(),
+    }
+
+
+async def _query(
+    knowledge_base: KnowledgeBase,
+    access: AccessContext,
+    session: object,
+    *,
+    message: str = "员工熊小强的人员工号是多少？",
+) -> ChatQueryResponse:
+    return await chat_service.answer_knowledge_query(
+        session,  # type: ignore[arg-type]
+        Settings(environment="test"),
+        access,
+        knowledge_base_id=knowledge_base.id,
+        message=message,
+        limit=5,
+        idempotency_key="spreadsheet-structured-test",
+        api_key_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_spreadsheet_query_runs_only_after_knowledge_base_access_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_base, access = _context()
+    structured_called = False
+
+    async def deny_access(*_args: object, **_kwargs: object) -> KnowledgeBaseAccess:
+        raise PermissionError("denied")
+
+    async def structured(*_args: object, **_kwargs: object) -> SpreadsheetQueryResult:
+        nonlocal structured_called
+        structured_called = True
+        return SpreadsheetQueryResult(
+            status=SpreadsheetQueryStatus.NOT_APPLICABLE,
+            answer=None,
+        )
+
+    monkeypatch.setattr(chat_service, "require_knowledge_base_access", deny_access)
+    monkeypatch.setattr(chat_service, "evaluate_spreadsheet_query", structured)
+
+    with pytest.raises(PermissionError, match="denied"):
+        await _query(knowledge_base, access, object())
+
+    assert structured_called is False
+
+
+@pytest.mark.asyncio
+async def test_structured_spreadsheet_answer_short_circuits_search_and_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_base, access = _context()
+    entry_id = uuid4()
+    file_id = uuid4()
+    events: list[str] = []
+    hit = KnowledgeSearchHit(
+        entry_id=entry_id,
+        source_file_id=file_id,
+        title="10级以上考勤.xlsx · Sheet1 第5行",
+        excerpt="姓名=熊小强 | 人员工号=EFD2410053",
+        source_path="worksheet:Sheet1!C5:D5",
+        format_version="okf/0.1",
+    )
+    result = SpreadsheetAnswer(
+        answer="员工“熊小强”的人员工号是 EFD2410053 [1]。",
+        hits=(hit,),
+        table=SpreadsheetTable(
+            title="员工工号查询",
+            columns=("姓名", "人员工号"),
+            rows=(("熊小强", "EFD2410053"),),
+            citation_numbers=(1,),
+        ),
+    )
+
+    async def require_access(*_args: object, **_kwargs: object) -> KnowledgeBaseAccess:
+        events.append("access")
+        return KnowledgeBaseAccess(knowledge_base, KnowledgeBaseAccessLevel.READER)
+
+    async def structured(
+        _session: object,
+        *,
+        knowledge_base_id: object,
+        question: str,
+    ) -> SpreadsheetQueryResult:
+        assert knowledge_base_id == knowledge_base.id
+        assert question == "员工熊小强的人员工号是多少？"
+        events.append("structured")
+        return SpreadsheetQueryResult(
+            status=SpreadsheetQueryStatus.ANSWERED,
+            answer=result,
+        )
+
+    async def must_not_run(*_args: object, **_kwargs: object) -> list[KnowledgeSearchHit]:
+        raise AssertionError("ordinary retrieval must not run after a structured hit")
+
+    async def must_not_resolve(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("LLM resolution must not run after a structured hit")
+
+    monkeypatch.setattr(chat_service, "require_knowledge_base_access", require_access)
+    monkeypatch.setattr(chat_service, "evaluate_spreadsheet_query", structured)
+    monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+    monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_resolve)
+
+    response = await _query(knowledge_base, access, object())
+
+    assert events == ["access", "structured"]
+    assert response.mode == "structured"
+    assert response.provider is None and response.model is None
+    assert response.answer_review.model_dump() == {
+        "status": "passed",
+        "reason": "deterministic_verified",
+    }
+    assert response.source_status.model_dump() == {
+        "status": "grounded",
+        "strategy": "structured",
+        "reason": "structured_query",
+        "citation_count": 1,
+    }
+    assert response.citations[0].model_dump() == {
+        **hit.model_dump(),
+        "citation_number": 1,
+        "marker": "[1]",
+    }
+    assert response.table is not None
+    assert response.table.model_dump() == {
+        "title": "员工工号查询",
+        "columns": ["姓名", "人员工号"],
+        "rows": [["熊小强", "EFD2410053"]],
+        "citation_numbers": [1],
+    }
+    assert response.answer.endswith(
+        f"答案来源（知识库）：\n[1] {hit.title}（entry:{entry_id} · path:{hit.source_path}）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_spreadsheet_question_keeps_the_existing_retrieval_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_base, access = _context()
+    events: list[str] = []
+
+    async def require_access(*_args: object, **_kwargs: object) -> KnowledgeBaseAccess:
+        events.append("access")
+        return KnowledgeBaseAccess(knowledge_base, KnowledgeBaseAccessLevel.READER)
+
+    async def structured(*_args: object, **_kwargs: object) -> SpreadsheetQueryResult:
+        events.append("structured")
+        return SpreadsheetQueryResult(
+            status=SpreadsheetQueryStatus.NOT_APPLICABLE,
+            answer=None,
+        )
+
+    async def search(*_args: object, **_kwargs: object) -> list[KnowledgeSearchHit]:
+        events.append("search")
+        return []
+
+    monkeypatch.setattr(chat_service, "require_knowledge_base_access", require_access)
+    monkeypatch.setattr(chat_service, "evaluate_spreadsheet_query", structured)
+    monkeypatch.setattr(chat_service, "search_knowledge_entries", search)
+
+    response = await _query(
+        knowledge_base,
+        access,
+        object(),
+        message="公司安全制度是什么？",
+    )
+
+    assert events == ["access", "structured", "search"]
+    assert response.mode == "retrieval"
+    assert response.source_status.reason == "no_matching_content"
+    assert response.answer_review.model_dump() == {
+        "status": "fallback",
+        "reason": "retrieval_only",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unsafe_spreadsheet_query_is_rejected_without_fuzzy_search_or_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_base, access = _context()
+    events: list[str] = []
+
+    async def require_access(*_args: object, **_kwargs: object) -> KnowledgeBaseAccess:
+        events.append("access")
+        return KnowledgeBaseAccess(knowledge_base, KnowledgeBaseAccessLevel.READER)
+
+    async def structured(*_args: object, **_kwargs: object) -> SpreadsheetQueryResult:
+        events.append("structured")
+        return SpreadsheetQueryResult(
+            status=SpreadsheetQueryStatus.REJECTED,
+            answer=None,
+            rejection_message="当前表格证据存在歧义，无法安全计算答案。",
+        )
+
+    async def must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsafe spreadsheet evidence must not reach search or an LLM")
+
+    monkeypatch.setattr(chat_service, "require_knowledge_base_access", require_access)
+    monkeypatch.setattr(chat_service, "evaluate_spreadsheet_query", structured)
+    monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+    monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+    response = await _query(knowledge_base, access, object())
+
+    assert events == ["access", "structured"]
+    assert response.mode == "structured"
+    assert response.provider is None and response.model is None
+    assert response.table is None and response.citations == []
+    assert response.source_status.model_dump() == {
+        "status": "no_results",
+        "strategy": "structured",
+        "reason": "structured_query",
+        "citation_count": 0,
+    }
+    assert response.answer_review.model_dump() == {
+        "status": "passed",
+        "reason": "deterministic_verified",
+    }
+    assert response.answer.startswith("当前表格证据存在歧义，无法安全计算答案。")
+    assert response.answer.endswith("答案来源：当前知识库未检索到可引用内容。")
+
+
+@pytest.mark.asyncio
+async def test_malformed_answered_result_fails_closed_without_search_or_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_base, access = _context()
+
+    async def require_access(*_args: object, **_kwargs: object) -> KnowledgeBaseAccess:
+        return KnowledgeBaseAccess(knowledge_base, KnowledgeBaseAccessLevel.READER)
+
+    async def malformed(*_args: object, **_kwargs: object) -> SpreadsheetQueryResult:
+        return SpreadsheetQueryResult(
+            status=SpreadsheetQueryStatus.ANSWERED,
+            answer=None,
+        )
+
+    async def must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("malformed structured results must fail closed")
+
+    monkeypatch.setattr(chat_service, "require_knowledge_base_access", require_access)
+    monkeypatch.setattr(chat_service, "evaluate_spreadsheet_query", malformed)
+    monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+    monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+    response = await _query(knowledge_base, access, object())
+
+    assert response.mode == "structured"
+    assert response.citations == [] and response.table is None
+    assert response.source_status.status == "no_results"
+    assert response.answer.startswith("当前表格证据不足")
+
+
+def test_invalid_structured_table_is_rejected_without_crashing_chat() -> None:
+    knowledge_base_id = uuid4()
+    hit = KnowledgeSearchHit(
+        entry_id=uuid4(),
+        source_file_id=uuid4(),
+        title="超限考勤.xlsx",
+        excerpt="[worksheet:Sheet1!A2] 研发部",
+        source_path="worksheet:Sheet1!A2:K2",
+        format_version="okf/0.1",
+    )
+    result = SpreadsheetAnswer(
+        answer="研发部员工如下 [1]。",
+        hits=(hit,),
+        table=SpreadsheetTable(
+            title="研发部员工",
+            columns=("员工姓名",),
+            rows=tuple((f"员工{index}",) for index in range(51)),
+            citation_numbers=(1,),
+        ),
+    )
+
+    assert chat_service._structured_spreadsheet_response(knowledge_base_id, result) is None
+
+
+@pytest.mark.asyncio
+async def test_published_spreadsheet_flows_through_real_acl_query_and_chat_contract() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            content = "\n\n".join(
+                (
+                    "[worksheet:Sheet1!A1] 部门",
+                    "[worksheet:Sheet1!B1] 人员工号",
+                    "[worksheet:Sheet1!C1] 姓名",
+                    "[worksheet:Sheet1!A2] 生产部",
+                    "[worksheet:Sheet1!B2] EFD2410053",
+                    "[worksheet:Sheet1!C2] 熊小强",
+                )
+            )
+            session.add(
+                KnowledgeEntry(
+                    knowledge_base_id=knowledge_base.id,
+                    entry_type="document",
+                    title="10级以上考勤.xlsx",
+                    content=content,
+                    source_path="generated/attendance.md",
+                    format_version="okf/0.1",
+                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+                    custom_metadata=_trusted_spreadsheet_metadata(content),
+                )
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            response = await _query(knowledge_base, access, session)
+
+            assert response.mode == "structured"
+            assert response.answer.startswith("员工“熊小强”的人员工号是 EFD2410053。[1]")
+            assert response.citations[0].source_path == (
+                "generated/attendance.md#worksheet:Sheet1!A2:C2"
+            )
+            assert response.source_status.reason == "structured_query"
+            assert response.answer_review.reason == "deterministic_verified"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_conflicting_published_workbooks_reject_without_search_or_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+
+            for title, employee_id in (
+                ("六月考勤.xlsx", "EFD-JUNE"),
+                ("七月考勤.xlsx", "EFD-JULY"),
+            ):
+                content = "\n\n".join(
+                    (
+                        "[worksheet:Sheet1!A1] 部门",
+                        "[worksheet:Sheet1!B1] 人员工号",
+                        "[worksheet:Sheet1!C1] 姓名",
+                        "[worksheet:Sheet1!A2] 生产部",
+                        f"[worksheet:Sheet1!B2] {employee_id}",
+                        "[worksheet:Sheet1!C2] 熊小强",
+                    )
+                )
+                session.add(
+                    KnowledgeEntry(
+                        knowledge_base_id=knowledge_base.id,
+                        entry_type="document",
+                        title=title,
+                        content=content,
+                        source_path=f"generated/{title}.md",
+                        format_version="okf/0.1",
+                        publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+                        custom_metadata=_trusted_spreadsheet_metadata(content),
+                    )
+                )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("ambiguous spreadsheet evidence must fail closed")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(knowledge_base, access, session)
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert response.table is None and response.citations == []
+            assert response.source_status.model_dump() == {
+                "status": "no_results",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 0,
+            }
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.answer.startswith("当前表格证据不足或存在歧义")
+            assert response.answer.endswith("答案来源：当前知识库未检索到可引用内容。")
+    finally:
+        await engine.dispose()

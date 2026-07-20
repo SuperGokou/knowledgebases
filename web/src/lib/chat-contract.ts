@@ -3,11 +3,13 @@ import type { ChatCitation, ChatReply, ChatSourceStatus } from "./types";
 
 const SOURCE_STATUSES = new Set<ChatSourceStatus["status"]>(["grounded", "no_results"]);
 const SOURCE_STRATEGIES = new Set<ChatSourceStatus["strategy"]>([
+  "structured",
   "rag",
   "retrieval",
   "retrieval_fallback",
 ]);
 const SOURCE_REASONS = new Set<ChatSourceStatus["reason"]>([
+  "structured_query",
   "llm_generated",
   "external_processing_disabled",
   "provider_unconfigured",
@@ -77,7 +79,9 @@ function isChatTable(value: unknown, citationNumbers: Set<number>): boolean {
 
 function isAnswerReview(value: unknown): boolean {
   if (!isRecord(value)) return false;
-  if (value.status === "passed") return value.reason === "semantic_verified";
+  if (value.status === "passed") {
+    return new Set(["deterministic_verified", "semantic_verified"]).has(String(value.reason));
+  }
   if (value.status !== "fallback") return false;
   return new Set([
     "retrieval_only",
@@ -97,7 +101,9 @@ export function parseChatReply(value: unknown): ChatReply {
     !isRecord(value) ||
     typeof value.knowledge_base_id !== "string" ||
     typeof value.answer !== "string" ||
-    typeof value.mode !== "string" ||
+    !new Set<ChatReply["mode"]>(["structured", "rag", "retrieval"]).has(
+      value.mode as ChatReply["mode"],
+    ) ||
     !(value.provider === undefined || isNullableString(value.provider)) ||
     !(value.model === undefined || isNullableString(value.model)) ||
     !Array.isArray(value.citations) ||

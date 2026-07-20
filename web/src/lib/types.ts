@@ -152,8 +152,9 @@ export type ChatCitation = {
 
 export type ChatSourceStatus = {
   status: "grounded" | "no_results";
-  strategy: "rag" | "retrieval" | "retrieval_fallback";
+  strategy: "structured" | "rag" | "retrieval" | "retrieval_fallback";
   reason:
+    | "structured_query"
     | "llm_generated"
     | "external_processing_disabled"
     | "provider_unconfigured"
@@ -177,6 +178,7 @@ export type ChatSourceStatus = {
 export type ChatAnswerReview = {
   status: "passed" | "fallback";
   reason:
+    | "deterministic_verified"
     | "semantic_verified"
     | "retrieval_only"
     | "answer_review_rejected"
@@ -194,7 +196,7 @@ export type ChatDataTable = {
 export type ChatReply = {
   knowledge_base_id: string;
   answer: string;
-  mode: string;
+  mode: "structured" | "rag" | "retrieval";
   provider?: string | null;
   model?: string | null;
   table?: ChatDataTable | null;

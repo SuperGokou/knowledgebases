@@ -44,6 +44,44 @@ describe("parseChatReply", () => {
     expect(parseChatReply(validReply)).toEqual(validReply);
   });
 
+  it("accepts a deterministically verified structured spreadsheet response", () => {
+    const structuredReply = {
+      ...validReply,
+      mode: "structured",
+      provider: null,
+      model: null,
+      answer_review: { status: "passed", reason: "deterministic_verified" },
+      source_status: {
+        ...validReply.source_status,
+        strategy: "structured",
+        reason: "structured_query",
+      },
+    };
+
+    expect(parseChatReply(structuredReply)).toEqual(structuredReply);
+  });
+
+  it("accepts a fail-closed structured rejection without citations", () => {
+    const rejectedReply = {
+      ...validReply,
+      answer: "当前表格证据不足或存在歧义，无法安全计算答案。",
+      mode: "structured",
+      provider: null,
+      model: null,
+      table: null,
+      citations: [],
+      answer_review: { status: "passed", reason: "deterministic_verified" },
+      source_status: {
+        status: "no_results",
+        strategy: "structured",
+        reason: "structured_query",
+        citation_count: 0,
+      },
+    };
+
+    expect(parseChatReply(rejectedReply)).toEqual(rejectedReply);
+  });
+
   it.each([
     "usage_governance_unavailable",
     "usage_budget_exceeded",

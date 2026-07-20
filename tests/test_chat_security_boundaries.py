@@ -27,6 +27,7 @@ from app.services.access import AccessContext
 from app.services.knowledge_bases import KnowledgeBaseAccess
 from app.services.llm_provider import LlmChatResult
 from app.services.llm_usage import GovernedLlmExecutor, LlmUsageDimensions
+from app.services.spreadsheet_query import SpreadsheetQueryResult, SpreadsheetQueryStatus
 
 
 class ConsentSession:
@@ -138,12 +139,19 @@ async def _install_chat_fakes(
     async def search(*_args: object, **_kwargs: object) -> list[KnowledgeSearchHit]:
         return [hit]
 
+    async def structured(*_args: object, **_kwargs: object) -> SpreadsheetQueryResult:
+        return SpreadsheetQueryResult(
+            status=SpreadsheetQueryStatus.NOT_APPLICABLE,
+            answer=None,
+        )
+
     async def egress_allowed(session: ConsentSession, **_kwargs: object) -> bool:
         allowed = await session.scalar(object())
         await session.commit()
         return allowed
 
     monkeypatch.setattr(chat_service, "require_knowledge_base_access", require_access)
+    monkeypatch.setattr(chat_service, "evaluate_spreadsheet_query", structured)
     monkeypatch.setattr(chat_service, "search_knowledge_entries", search)
     monkeypatch.setattr(chat_service, "resolve_provider_client", resolve)
     monkeypatch.setattr(chat_service, "external_llm_egress_allowed", egress_allowed)
