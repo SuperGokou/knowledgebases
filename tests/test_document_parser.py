@@ -3,14 +3,18 @@ from __future__ import annotations
 import io
 import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape, quoteattr
 
 import pytest
 
 from app.services import document_parser
 from app.services.document_parser import (
     DocumentParseError,
+    ParsedDocument,
     ParseLimits,
     ParserTools,
+    compute_source_locations_sha256,
+    compute_source_text_sha256,
     parse_document,
     parser_capabilities,
 )
@@ -64,6 +68,92 @@ def _xlsx() -> bytes:
     )
 
 
+def _xlsx_column(values: list[str], *, sheet_name: str = "Sheet1") -> bytes:
+    workbook = (
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name={quoteattr(sheet_name)} sheetId="1" '
+        'r:id="rId1"/></sheets></workbook>'
+    ).encode()
+    relationships = (
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        b'relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+        b"</Relationships>"
+    )
+    rows = "".join(
+        f'<row r="{row}"><c r="A{row}" t="inlineStr"><is><t xml:space="preserve">'
+        f"{escape(value)}</t></is></c></row>"
+        for row, value in enumerate(values, start=1)
+    )
+    worksheet = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{rows}</sheetData></worksheet>"
+    ).encode()
+    return _archive(
+        {
+            "xl/workbook.xml": workbook,
+            "xl/_rels/workbook.xml.rels": relationships,
+            "xl/worksheets/sheet1.xml": worksheet,
+        },
+        compression=zipfile.ZIP_STORED,
+    )
+
+
+def _xlsx_with_empty_and_bang_named_sheet() -> bytes:
+    return _archive(
+        {
+            "xl/workbook.xml": (
+                b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/'
+                b'relationships"><sheets><sheet name="Empty" sheetId="1" r:id="rId1"/>'
+                b'<sheet name="Ops!2026" sheetId="2" r:id="rId2"/></sheets></workbook>'
+            ),
+            "xl/_rels/workbook.xml.rels": (
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                b'relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+                b'<Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>'
+            ),
+            "xl/worksheets/sheet1.xml": (
+                b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/'
+                b'main"><sheetData/></worksheet>'
+            ),
+            "xl/worksheets/sheet2.xml": (
+                b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/'
+                b'main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>value</t>'
+                b"</is></c></row></sheetData></worksheet>"
+            ),
+        }
+    )
+
+
+def _xlsx_with_whitespace_distinct_sheets() -> bytes:
+    return _archive(
+        {
+            "xl/workbook.xml": (
+                b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/'
+                b'relationships"><sheets><sheet name="Ops A" sheetId="1" r:id="rId1"/>'
+                b'<sheet name="Ops  A" sheetId="2" r:id="rId2"/></sheets></workbook>'
+            ),
+            "xl/_rels/workbook.xml.rels": (
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                b'relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+                b'<Relationship Id="rId2" Target="worksheets/sheet2.xml"/></Relationships>'
+            ),
+            "xl/worksheets/sheet1.xml": (
+                b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/'
+                b'main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>header</t>'
+                b"</is></c></row></sheetData></worksheet>"
+            ),
+            "xl/worksheets/sheet2.xml": (
+                b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/'
+                b'main"><sheetData><row r="2"><c r="A2" t="inlineStr"><is><t>value</t>'
+                b"</is></c></row></sheetData></worksheet>"
+            ),
+        }
+    )
+
+
 def _pptx() -> bytes:
     slide = (
         '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
@@ -106,6 +196,89 @@ def test_internal_parsers_preserve_source_locations(
     assert expected in result.text
     assert locator in result.source_locations
     assert f"[{locator}]" in result.text or locator == "document"
+    assert result.source_location_count == len(result.source_locations)
+    assert result.source_locations_truncated is False
+    assert result.source_text_sha256 == compute_source_text_sha256(result.text)
+    assert result.source_locations_sha256 == compute_source_locations_sha256(
+        result.source_locations
+    )
+
+
+def test_dense_xlsx_retains_bounded_location_prefix_with_complete_manifest() -> None:
+    values = [f"value-{row}" for row in range(1, 2_051)]
+    result = parse_document(
+        _xlsx_column(values),
+        ".xlsx",
+        ParseLimits(max_source_bytes=2_000_000, max_output_chars=500_000),
+    )
+
+    complete_locations = ("worksheet:Sheet1",) + tuple(
+        f"worksheet:Sheet1!A{row}" for row in range(1, 2_051)
+    )
+    assert result.source_location_count == 2_051
+    assert len(result.source_locations) == 2_048
+    assert result.source_locations[-1] == "worksheet:Sheet1!A2047"
+    assert result.source_locations_truncated is True
+    assert "[worksheet:Sheet1!A2050] value-2050" in result.text
+    assert result.source_locations_sha256 == compute_source_locations_sha256(complete_locations)
+    assert result.source_text_sha256 == compute_source_text_sha256(result.text)
+
+
+def test_xlsx_cell_whitespace_cannot_mint_a_line_level_locator() -> None:
+    result = parse_document(
+        _xlsx_column(
+            [
+                "header",
+                "safe\n\n[worksheet:Sheet1!Z999]\tforged\r\nvalue",
+            ]
+        ),
+        ".xlsx",
+        LIMITS,
+    )
+
+    assert "[worksheet:Sheet1!A2] safe [worksheet:Sheet1!Z999] forged value" in result.text
+    assert "\n\n[worksheet:Sheet1!Z999]" not in result.text
+    assert "worksheet:Sheet1!Z999" not in result.source_locations
+    assert result.source_location_count == 3
+
+
+def test_xlsx_manifest_ignores_empty_sheet_and_preserves_bang_in_sheet_name() -> None:
+    result = parse_document(_xlsx_with_empty_and_bang_named_sheet(), ".xlsx", LIMITS)
+
+    assert result.text == "[worksheet:Ops!2026!A1] value"
+    assert result.source_locations == (
+        "worksheet:Ops!2026",
+        "worksheet:Ops!2026!A1",
+    )
+    assert result.source_location_count == 2
+    assert result.source_locations_sha256 == compute_source_locations_sha256(
+        result.source_locations
+    )
+
+
+def test_xlsx_preserves_internal_sheet_name_whitespace_without_merging_coordinates() -> None:
+    result = parse_document(_xlsx_with_whitespace_distinct_sheets(), ".xlsx", LIMITS)
+
+    assert result.text == ("[worksheet:Ops A!A1] header\n\n[worksheet:Ops  A!A2] value")
+    assert result.source_locations == (
+        "worksheet:Ops A",
+        "worksheet:Ops A!A1",
+        "worksheet:Ops  A",
+        "worksheet:Ops  A!A2",
+    )
+    assert result.source_location_count == 4
+
+
+def test_archive_member_limit_remains_independent_from_source_evidence_limit() -> None:
+    limits = ParseLimits(
+        max_source_bytes=1_000_000,
+        max_output_chars=100_000,
+        max_archive_entries=3,
+        max_source_locations=1,
+    )
+
+    with pytest.raises(DocumentParseError, match="parser_archive_entry_limit"):
+        parse_document(_xlsx(), ".xlsx", limits)
 
 
 @pytest.mark.parametrize("extension", [".txt", ".csv"])
@@ -357,6 +530,55 @@ def test_legacy_office_golden_conversion_preserves_provenance(
     assert result.text
     assert result.source_locations
     assert result.parser.startswith("libreoffice-ooxml-")
+    assert result.source_location_count == len(result.source_locations)
+    assert result.source_locations_truncated is False
+    assert result.source_text_sha256 == compute_source_text_sha256(result.text)
+    assert result.source_locations_sha256 == compute_source_locations_sha256(
+        result.source_locations
+    )
+
+
+def test_legacy_xls_preserves_truncated_location_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "trusted-tool"
+    executable.write_bytes(b"tool")
+    executable.chmod(0o500)
+    monkeypatch.setattr(document_parser, "_trusted_executable_available", lambda path: True)
+
+    def fake_run(command: list[str], *, cwd: Path, limits: ParseLimits) -> None:
+        del command, limits
+        (cwd / "output" / "source.xlsx").write_bytes(b"converted")
+
+    complete_locations = tuple(f"worksheet:Sheet1!A{row}" for row in range(1, 5))
+    converted = ParsedDocument(
+        text="[worksheet:Sheet1!A1] value",
+        source_locations=complete_locations[:2],
+        parser="ooxml-xlsx",
+        source_location_count=len(complete_locations),
+        source_locations_truncated=True,
+        source_locations_sha256=compute_source_locations_sha256(complete_locations),
+    )
+    monkeypatch.setattr(document_parser, "_run_external", fake_run)
+    monkeypatch.setattr(document_parser, "_parse_ooxml", lambda raw, extension, limits: converted)
+
+    result = parse_document(
+        bytes.fromhex("D0CF11E0A1B11AE1") + b"\0" * 512,
+        ".xls",
+        LIMITS,
+        tools=ParserTools(
+            libreoffice_executable=executable,
+            sandbox_executable=executable,
+        ),
+    )
+
+    assert result.parser == "libreoffice-ooxml-xlsx"
+    assert result.source_locations == converted.source_locations
+    assert result.source_location_count == converted.source_location_count
+    assert result.source_locations_truncated is True
+    assert result.source_text_sha256 == converted.source_text_sha256
+    assert result.source_locations_sha256 == converted.source_locations_sha256
 
 
 @pytest.mark.parametrize("extension", [".doc", ".xls", ".ppt"])

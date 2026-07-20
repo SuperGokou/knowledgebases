@@ -52,7 +52,7 @@
 </p>
 
 > [!IMPORTANT]
-> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传、九类文档的失败关闭解析链、OKF 知识编译，以及基于授权文本检索的生成式问答。TXT、CSV、DOCX、XLSX、PPTX 使用内建有界解析；PDF 与 DOC/XLS/PPT 必须在包含固定版本 Poppler、LibreOffice、bubblewrap 与 `prlimit` 的 Linux 镜像中通过 `--require-all` 门禁。任一外部工具或沙箱能力缺失时均为 `BLOCKED`，不得声称全格式可用。每个成功回答都返回结构化来源并经过引用完整性与生成后语义审核；失败时丢弃模型文本并降级为确定性检索回答。
+> 当前仓库已经交付登录前端、管理控制台、知识库分级授权、文件直传、九类文档的失败关闭解析链、OKF 知识编译，以及基于授权文本检索的生成式问答。TXT、CSV、DOCX、XLSX、PPTX 使用内建有界解析；PDF 与 DOC/XLS/PPT 必须在包含固定版本 Poppler、LibreOffice、bubblewrap 与 `prlimit` 的 Linux 镜像中通过 `--require-all` 门禁。任一外部工具或沙箱能力缺失时均为 `BLOCKED`，不得声称全格式可用。考勤类 XLSX 支持本地确定性查询、聚合、可视化表格与精确行级来源，不消耗外部模型 token。每个成功回答都返回结构化来源并经过引用完整性与生成后语义审核；失败时丢弃模型文本并降级为确定性检索回答。
 
 > [!WARNING]
 > “其他云 Linux 离线部署”使用 `isolated` 配置，固定 `KB_EXTERNAL_LLM_ENABLED=false`，运行时不会调用 DeepSeek、Qwen 或 MiniMax；管理界面可以保存模型选择，但不等于离线环境已具备外部推理能力。单台 Linux 8 核 / 16 GB / 300 GB SSD 仅是当前离线部署基线，尚无证据证明它能承载“每日 50 亿 token”。正式性能结论必须以目标机上预先批准的吞吐、延迟、错误率与磁盘阈值，以及可复核的压测证据为准；在这些材料齐备前，性能验收状态为 `BLOCKED`。
@@ -182,6 +182,7 @@ sequenceDiagram
 | 动态 RBAC | 自定义角色、权限目录、角色优先级、角色分配、通配权限与最后一个超级管理员保护 |
 | 知识库 ACL | 知识库 Owner、角色级 Reader/Editor/Manager、动态撤权、隐藏未授权资源与审计 |
 | 文档解析与 OKF | TXT/CSV/OOXML 内建解析；PDF/旧版 Office 断网沙箱；来源定位、持久任务、严格 schema、租约、草稿/发布门禁 |
+| Excel 结构化问答 | 姓名查工号/卡号、部门人员去重、日期范围与最晚记录本地计算；双 SHA-256 验证整表正文和定位清单，歧义或旧版截断证据严格拒答 |
 | 数据外发策略 | 每个知识库单独显式 opt-in，默认关闭；审计只记录文档 ID、模型、策略版本与 token 用量，不记录正文 |
 | 强制来源与回答审核 | 授权检索与可选 RAG；正文来源脚注、结构化 `citations`、`source_status` 与 `answer_review`；引用或语义审核失败时自动降级 |
 | 分级限额 | 每分钟请求数、单文件大小、每日上传字节、总存储字节、每日下载凭证 |
@@ -222,6 +223,7 @@ sequenceDiagram
 | 本地编排 | Docker Compose | PostgreSQL、Redis、MinIO、ClamAV、Migration、Bootstrap、FastAPI API/Maintenance、Next.js Web 与 Caddy |
 | 可选托管演示 | Vercel Functions + Cron | 无状态控制面与周期维护；不是内网运行依赖 |
 | 文档与知识编译 | defusedxml、Poppler、LibreOffice、bubblewrap、DeepSeek/Qwen/MiniMax | 九类文档有界解析、来源定位、OKF 草稿、重试、审计与发布门禁 |
+| 表格查询 | Python 本地确定性执行器 | 授权后结构化计算、可视化结果、行级引用、证据完整性校验与失败关闭 |
 | 工程质量 | uv、pytest、Ruff、mypy strict | 可复现依赖、测试、Lint 与静态类型检查 |
 
 ## 快速开始
@@ -407,7 +409,7 @@ npm run build
 - Python 3.12 锁定依赖。
 - Dependabot 覆盖 uv、npm 与 GitHub Actions 依赖更新。
 
-本 README 更新时已完成冻结依赖、断网模式的全量本地质量门禁：**后端 532 项通过、18 项按环境条件跳过、覆盖率 85.00%（门槛 80%）；前端 195 项通过**，Ruff、mypy、ESLint、TypeScript 与 Next.js production build 全部通过。Playwright 企业档案已收集 8 项业务检查的桌面/移动场景及 2 项失败关闭预检；未在真实预生产拓扑运行前，浏览器证据与最终交付结论仍为 `BLOCKED`。
+本 README 更新时已完成冻结依赖下的全量本地质量门禁：**后端 586 项通过、23 项按环境条件跳过；前端 225 项通过**，Ruff lint、mypy strict、ESLint、TypeScript 与 Next.js production build 全部通过。本次新增/修改的 11 个 Python 文件格式门禁通过；全仓仍有 54 个既有文件的 Ruff 格式债务，不将其误报为“零债务”。Playwright 企业档案已收集 8 项业务检查的桌面/移动场景及 2 项失败关闭预检；最终交付仍以真实目标拓扑的发布后验收证据为准。
 
 > [!CAUTION]
 > 功能测试通过不等于容量认证通过。目标机性能门禁还需要项目方批准的验收阈值和同机压测产物；仓库当前不把单机 8C16G300G、1,000 人并发或每日 50 亿 token 写成已验证能力。
@@ -536,6 +538,8 @@ flowchart LR
 - [x] ClamAV 隔离扫描状态机与 Office/PDF 隔离解析代码路径
 - [ ] 在真实其他云 Linux 8C16G300G 目标机完成九类格式、ClamAV 与沙箱运行证据
 - [x] 授权全文检索、可选生成式 RAG、强制来源协议、生成后语义审核与确定性降级
+- [x] 考勤类 Excel 确定性问答、可视化表格、精确行级来源与整表完整性校验
+- [ ] 数百 MB Excel 流式解析、分批行存储、Parquet/DuckDB 查询与独立资源配额
 - [ ] 混合向量索引、重排、独立审核模型与离线引用蕴含评测
 - [ ] OKF Bundle 导入/导出、校验器与知识图谱视图
 - [ ] LLM-Wiki 多文档引用审阅、矛盾检测与增量重编译

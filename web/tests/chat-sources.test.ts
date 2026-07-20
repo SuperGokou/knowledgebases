@@ -68,6 +68,21 @@ describe("chat answer sources", () => {
     expect(sourceSummary([], undefined, true).title).toBe("请求未完成，未生成知识答案");
   });
 
+  it("explains that structured spreadsheet answers are locally and deterministically verified", () => {
+    const structuredStatus: ChatSourceStatus = {
+      status: "grounded",
+      strategy: "structured",
+      reason: "structured_query",
+      citation_count: 1,
+    };
+    const explanation = "系统已在本地执行确定性表格查询，仅返回可由原始单元格核验的结果。";
+
+    expect(sourceSummary([citation], structuredStatus).detail).toBe(explanation);
+    expect(
+      sourceSummary([], { ...structuredStatus, status: "no_results", citation_count: 0 }).detail,
+    ).toBe(explanation);
+  });
+
   it("reports whether a citation has an associated source file", () => {
     expect(citationTraceLabel(citation)).toBe("源文件已关联");
     expect(citationTraceLabel({ ...citation, source_file_id: null })).toBe("知识条目可追溯");

@@ -27,7 +27,12 @@ from app.db.models import (
     User,
 )
 from app.services.deepseek import DeepSeekClient, DeepSeekResult, OkfConceptDraft
-from app.services.document_parser import ParsedDocument, ParseLimits
+from app.services.document_parser import (
+    ParsedDocument,
+    ParseLimits,
+    compute_source_locations_sha256,
+    compute_source_text_sha256,
+)
 from app.services.knowledge_bases import search_knowledge_entries
 from app.services.llm_egress_policy import external_llm_egress_allowed
 from app.services.llm_provider import LlmProviderError, MeteringOutcome
@@ -392,16 +397,19 @@ async def test_conversion_releases_database_transaction_before_object_read(
                 assert not session.in_transaction()
                 return await super().compile_okf(source_text, user_id=user_id)
 
-        assert await process_okf_conversion_batch(
-            session,
-            TransactionObservingStorage(
-                b"Revenue policy: refunds require approval.",
+        assert (
+            await process_okf_conversion_batch(
                 session,
-            ),  # type: ignore[arg-type]
-            TransactionObservingClient(),  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+                TransactionObservingStorage(
+                    b"Revenue policy: refunds require approval.",
+                    session,
+                ),  # type: ignore[arg-type]
+                TransactionObservingClient(),  # type: ignore[arg-type]
+                Settings(environment="test"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.SUCCEEDED
@@ -430,13 +438,16 @@ async def test_replaced_lease_during_object_read_cannot_egress_or_publish() -> N
                 return await super().read_bytes(key=key, max_bytes=max_bytes)
 
         client = SequencedClient([])
-        assert await process_okf_conversion_batch(
-            session,
-            LeaseReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                LeaseReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -479,13 +490,16 @@ async def test_replaced_file_identity_during_object_read_cannot_egress_or_publis
                 return await super().read_bytes(key=key, max_bytes=max_bytes)
 
         client = SequencedClient([])
-        assert await process_okf_conversion_batch(
-            session,
-            FileReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                FileReplacingStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         assert client.calls == 0
         assert await session.scalar(select(KnowledgeEntry)) is None
@@ -535,13 +549,16 @@ async def test_lease_replaced_inside_egress_policy_cancels_provider_call(
         )
         client = SequencedClient([])
 
-        assert await process_okf_conversion_batch(
-            session,
-            TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -577,13 +594,16 @@ async def test_file_identity_changed_after_provider_cannot_publish_result() -> N
                 return result
 
         client = FileReplacingClient([])
-        assert await process_okf_conversion_batch(
-            session,
-            TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
-            client,  # type: ignore[arg-type]
-            Settings(environment="test"),
-            batch_size=1,
-        ) == 1
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                TextStorage(b"Revenue policy: refunds require approval."),  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                Settings(environment="test"),
+                batch_size=1,
+            )
+            == 1
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -627,13 +647,16 @@ async def test_active_okf_egress_lease_blocks_stale_worker_reclaim() -> None:
         )
         await session.commit()
 
-        assert await process_okf_conversion_batch(
-            session,
-            TextStorage(b"must not be read"),  # type: ignore[arg-type]
-            SuccessfulClient(),  # type: ignore[arg-type]
-            Settings(environment="test", okf_conversion_lease_seconds=60),
-            batch_size=1,
-        ) == 0
+        assert (
+            await process_okf_conversion_batch(
+                session,
+                TextStorage(b"must not be read"),  # type: ignore[arg-type]
+                SuccessfulClient(),  # type: ignore[arg-type]
+                Settings(environment="test", okf_conversion_lease_seconds=60),
+                batch_size=1,
+            )
+            == 0
+        )
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.PROCESSING
@@ -851,7 +874,16 @@ async def test_available_file_cannot_make_model_result_auto_publish() -> None:
         result = await SuccessfulClient().compile_okf(
             "Revenue policy: refunds require approval.", user_id=f"kb_{kb.id.hex}"
         )
-        await _persist_result(session, job.id, lease_id, file, result)
+        all_locations = tuple(f"worksheet:Sheet1!A{row}" for row in range(1, 2_051))
+        parsed = ParsedDocument(
+            text="[worksheet:Sheet1!A1] Revenue policy",
+            source_locations=all_locations[:2_048],
+            parser="ooxml-xlsx",
+            source_location_count=len(all_locations),
+            source_locations_truncated=True,
+            source_locations_sha256=compute_source_locations_sha256(all_locations),
+        )
+        await _persist_result(session, job.id, lease_id, file, result, parsed=parsed)
 
         await session.refresh(job)
         assert job.status is OkfConversionStatus.SUCCEEDED
@@ -859,6 +891,16 @@ async def test_available_file_cannot_make_model_result_auto_publish() -> None:
         entry = await session.get(KnowledgeEntry, job.output_entry_id)
         assert entry is not None
         assert entry.publication_status.value == "draft"
+        assert entry.custom_metadata["source_locations"] == list(all_locations[:2_048])
+        assert entry.custom_metadata["source_location_count"] == 2_050
+        assert entry.custom_metadata["source_locations_truncated"] is True
+        assert entry.custom_metadata["source_text_length"] == len(parsed.text)
+        assert entry.custom_metadata["source_text_sha256"] == compute_source_text_sha256(
+            parsed.text
+        )
+        assert entry.custom_metadata["source_locations_sha256"] == compute_source_locations_sha256(
+            all_locations
+        )
     await engine.dispose()
 
 

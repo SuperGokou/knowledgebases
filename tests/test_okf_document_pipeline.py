@@ -18,6 +18,10 @@ from app.db.models import (
     OkfConversionStatus,
     User,
 )
+from app.services.document_parser import (
+    compute_source_locations_sha256,
+    compute_source_text_sha256,
+)
 from app.services.okf_conversion import enqueue_okf_conversion, process_okf_conversion_batch
 
 
@@ -103,4 +107,15 @@ async def test_docx_runs_through_okf_and_persists_parser_provenance() -> None:
         assert "采购金额不得超过42万元" in entry.content
         assert entry.custom_metadata["source_parser"] == "ooxml-docx"
         assert entry.custom_metadata["source_locations"] == ["paragraph:1"]
+        assert entry.custom_metadata["source_location_count"] == 1
+        assert entry.custom_metadata["source_locations_truncated"] is False
+        source_text_length = entry.custom_metadata["source_text_length"]
+        assert isinstance(source_text_length, int)
+        source_text = entry.content[-source_text_length:]
+        assert entry.custom_metadata["source_text_sha256"] == compute_source_text_sha256(
+            source_text
+        )
+        assert entry.custom_metadata["source_locations_sha256"] == compute_source_locations_sha256(
+            ("paragraph:1",)
+        )
     await engine.dispose()

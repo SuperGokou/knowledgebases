@@ -6,6 +6,7 @@ const NO_RESULTS_SOURCE_FOOTER =
   /\r?\n\r?\n答案来源：当前知识库未检索到可引用内容。\s*$/u;
 
 const reasonDescriptions: Record<ChatSourceStatus["reason"], string> = {
+  structured_query: "系统已在本地执行确定性表格查询，仅返回可由原始单元格核验的结果。",
   llm_generated: "回答已由模型结合授权知识条目生成。",
   external_processing_disabled: "当前知识库未启用外部模型处理，回答来自本地检索。",
   provider_unconfigured: "模型服务尚未配置，回答来自本地检索。",

@@ -6,7 +6,9 @@ import stat
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Final
@@ -25,6 +27,9 @@ _DRAWING_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 _PRESENTATION_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 _REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 _OFFICE_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_XLSX_CELL_COORDINATE: Final = re.compile(r"(?P<column>[A-Za-z]{1,3})(?P<row>[1-9]\d{0,6})")
+_XLSX_FORBIDDEN_SHEET_NAME_CHARACTERS: Final = frozenset("[]:*?/\\")
+_SHA256_HEX: Final = re.compile(r"[0-9a-f]{64}")
 
 
 class DocumentParseError(ValueError):
@@ -40,6 +45,7 @@ class ParseLimits:
     max_source_bytes: int
     max_output_chars: int
     max_archive_entries: int = 2_048
+    max_source_locations: int = 2_048
     max_expanded_bytes: int = 16_000_000
     max_single_entry_bytes: int = 4_000_000
     max_compression_ratio: int = 100
@@ -52,6 +58,7 @@ class ParseLimits:
             self.max_source_bytes,
             self.max_output_chars,
             self.max_archive_entries,
+            self.max_source_locations,
             self.max_expanded_bytes,
             self.max_single_entry_bytes,
             self.max_compression_ratio,
@@ -68,6 +75,46 @@ class ParsedDocument:
     text: str
     source_locations: tuple[str, ...]
     parser: str
+    source_location_count: int = -1
+    source_locations_truncated: bool = False
+    source_text_sha256: str = ""
+    source_locations_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        location_count = self.source_location_count
+        if location_count == -1:
+            location_count = len(self.source_locations)
+            object.__setattr__(self, "source_location_count", location_count)
+        if location_count < len(self.source_locations):
+            raise ValueError("source location count cannot be smaller than retained evidence")
+        if self.source_locations_truncated != (location_count > len(self.source_locations)):
+            raise ValueError("source location truncation metadata is inconsistent")
+
+        text_digest = self.source_text_sha256 or compute_source_text_sha256(self.text)
+        if _SHA256_HEX.fullmatch(text_digest) is None:
+            raise ValueError("source text digest must be lowercase SHA-256 hex")
+        object.__setattr__(self, "source_text_sha256", text_digest)
+
+        locations_digest = self.source_locations_sha256
+        if not locations_digest:
+            if self.source_locations_truncated:
+                raise ValueError("truncated source locations require a complete digest")
+            locations_digest = compute_source_locations_sha256(self.source_locations)
+        if _SHA256_HEX.fullmatch(locations_digest) is None:
+            raise ValueError("source location digest must be lowercase SHA-256 hex")
+        object.__setattr__(self, "source_locations_sha256", locations_digest)
+
+
+def compute_source_text_sha256(text: str) -> str:
+    """Digest the exact normalized parser text as UTF-8 bytes."""
+
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
+def compute_source_locations_sha256(locations: Iterable[str]) -> str:
+    """Digest ordered locations joined by LF, without a trailing separator."""
+
+    return sha256("\n".join(locations).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,18 +348,41 @@ def _parse_xlsx(members: dict[str, bytes], limits: ParseLimits) -> ParsedDocumen
     sheets = list(workbook_root.iter(f"{_SHEET_NS}sheet"))
     if len(sheets) > limits.max_pages_or_sheets:
         raise DocumentParseError("parser_page_limit")
+    seen_sheet_names: set[str] = set()
     for sheet in sheets:
-        name = (sheet.attrib.get("name") or "sheet").strip()[:200]
+        name = (sheet.attrib.get("name") or "").strip()
+        if (
+            not name
+            or len(name) > 31
+            or any(
+                character in _XLSX_FORBIDDEN_SHEET_NAME_CHARACTERS
+                or ord(character) < 32
+                or 0x7F <= ord(character) <= 0x9F
+                or character in {"\u2028", "\u2029"}
+                for character in name
+            )
+            or name.casefold() in seen_sheet_names
+        ):
+            raise DocumentParseError("parser_invalid_xlsx")
+        seen_sheet_names.add(name.casefold())
         rel_id = sheet.attrib.get(f"{_OFFICE_REL_NS}id", "")
         target = rels.get(rel_id, "")
         target_path = _resolve_ooxml_target("xl", target)
         data = members.get(target_path)
         if data is None:
             raise DocumentParseError("parser_invalid_xlsx")
-        locations.append(f"worksheet:{name}")
+        sheet_location = f"worksheet:{name}"
+        sheet_location_added = False
         root = _xml(data)
         for cell in root.iter(f"{_SHEET_NS}c"):
-            coordinate = cell.attrib.get("r", "?")[:32]
+            coordinate_match = _XLSX_CELL_COORDINATE.fullmatch(cell.attrib.get("r", ""))
+            if coordinate_match is None:
+                raise DocumentParseError("parser_invalid_xlsx")
+            column = coordinate_match.group("column").upper()
+            row = int(coordinate_match.group("row"))
+            if _xlsx_column_number(column) > 16_384 or row > 1_048_576:
+                raise DocumentParseError("parser_invalid_xlsx")
+            coordinate = f"{column}{row}"
             cell_type = cell.attrib.get("t")
             value_node = cell.find(f"{_SHEET_NS}v")
             inline = cell.find(f"{_SHEET_NS}is")
@@ -326,8 +396,11 @@ def _parse_xlsx(members: dict[str, bytes], limits: ParseLimits) -> ParsedDocumen
                         value = shared_strings[int(value)]
                     except (ValueError, IndexError) as error:
                         raise DocumentParseError("parser_invalid_xlsx") from error
-            value = value.strip()
+            value = _single_line_cell_value(value)
             if value:
+                if not sheet_location_added:
+                    locations.append(sheet_location)
+                    sheet_location_added = True
                 location = f"worksheet:{name}!{coordinate}"
                 parts.append(f"[{location}] {value}")
                 locations.append(location)
@@ -492,6 +565,10 @@ def _parse_legacy(
         text=parsed.text,
         source_locations=parsed.source_locations,
         parser=f"libreoffice-{parsed.parser}",
+        source_location_count=parsed.source_location_count,
+        source_locations_truncated=parsed.source_locations_truncated,
+        source_text_sha256=parsed.source_text_sha256,
+        source_locations_sha256=parsed.source_locations_sha256,
     )
 
 
@@ -615,12 +692,33 @@ def _bounded_text(text: str, limits: ParseLimits) -> str:
     return normalized
 
 
+def _single_line_cell_value(value: str) -> str:
+    """Collapse all Unicode whitespace so a cell cannot mint a line-level locator."""
+
+    return " ".join(value.split())
+
+
+def _xlsx_column_number(column: str) -> int:
+    number = 0
+    for character in column:
+        number = number * 26 + ord(character) - ord("A") + 1
+    return number
+
+
 def _document(
     parts: list[str], locations: list[str], parser: str, limits: ParseLimits
 ) -> ParsedDocument:
     text = _bounded_text("\n\n".join(parts), limits)
-    # Location evidence is useful but must remain bounded even for dense sheets.
+    # Retain a bounded evidence prefix while authenticating the complete ordered
+    # manifest. Archive member limits remain independently enforced at ZIP intake.
     unique_locations = tuple(dict.fromkeys(locations))
-    if len(unique_locations) > limits.max_archive_entries:
-        raise DocumentParseError("parser_location_limit")
-    return ParsedDocument(text=text, source_locations=unique_locations, parser=parser)
+    retained_locations = unique_locations[: limits.max_source_locations]
+    return ParsedDocument(
+        text=text,
+        source_locations=retained_locations,
+        parser=parser,
+        source_location_count=len(unique_locations),
+        source_locations_truncated=len(retained_locations) < len(unique_locations),
+        source_text_sha256=compute_source_text_sha256(text),
+        source_locations_sha256=compute_source_locations_sha256(unique_locations),
+    )

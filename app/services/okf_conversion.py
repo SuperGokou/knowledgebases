@@ -427,9 +427,7 @@ async def _process_claimed_job(
     if not await _claim_is_current(session, claim=claim, lease_id=lease_id):
         return
 
-    external_allowed = (
-        settings.external_llm_enabled and claim.external_llm_processing_enabled
-    )
+    external_allowed = settings.external_llm_enabled and claim.external_llm_processing_enabled
     if external_allowed:
         if client is None or not client.configured:
             await _mark_failure(
@@ -564,9 +562,7 @@ async def _persist_result(
     file_conditions: tuple[ColumnElement[bool], ...] = (File.id == file.id,)
     if isinstance(file, _ClaimedFile):
         file_conditions = _claimed_file_identity_conditions(file)
-    locked_file = await session.scalar(
-        select(File).where(*file_conditions).with_for_update()
-    )
+    locked_file = await session.scalar(select(File).where(*file_conditions).with_for_update())
     if locked_file is None:
         await session.rollback()
         return
@@ -597,6 +593,15 @@ async def _persist_result(
             },
             "source_parser": parsed.parser if parsed is not None else "legacy-call",
             "source_locations": list(parsed.source_locations) if parsed is not None else [],
+            "source_location_count": parsed.source_location_count if parsed is not None else 0,
+            "source_locations_truncated": (
+                parsed.source_locations_truncated if parsed is not None else False
+            ),
+            "source_text_length": len(parsed.text) if parsed is not None else 0,
+            "source_text_sha256": parsed.source_text_sha256 if parsed is not None else None,
+            "source_locations_sha256": (
+                parsed.source_locations_sha256 if parsed is not None else None
+            ),
         },
     )
     session.add(entry)

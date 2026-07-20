@@ -33,8 +33,9 @@ class ChatSourceStatus(BaseModel):
     """Explains how an answer was grounded, including every graceful-degradation path."""
 
     status: Literal["grounded", "no_results"]
-    strategy: Literal["rag", "retrieval", "retrieval_fallback"]
+    strategy: Literal["structured", "rag", "retrieval", "retrieval_fallback"]
     reason: Literal[
+        "structured_query",
         "llm_generated",
         "external_processing_disabled",
         "provider_unconfigured",
@@ -100,6 +101,7 @@ class ChatAnswerReview(BaseModel):
 
     status: Literal["passed", "fallback"]
     reason: Literal[
+        "deterministic_verified",
         "semantic_verified",
         "retrieval_only",
         "answer_review_rejected",
@@ -109,17 +111,18 @@ class ChatAnswerReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_status_reason_pair(self) -> ChatAnswerReview:
-        if self.status == "passed" and self.reason != "semantic_verified":
-            raise ValueError("passed reviews must be semantically verified")
-        if self.status == "fallback" and self.reason == "semantic_verified":
-            raise ValueError("fallback reviews cannot be semantically verified")
+        verified_reasons = {"deterministic_verified", "semantic_verified"}
+        if self.status == "passed" and self.reason not in verified_reasons:
+            raise ValueError("passed reviews must be deterministically or semantically verified")
+        if self.status == "fallback" and self.reason in verified_reasons:
+            raise ValueError("fallback reviews cannot be verified")
         return self
 
 
 class ChatQueryResponse(BaseModel):
     knowledge_base_id: UUID
     answer: str
-    mode: str = "retrieval"
+    mode: Literal["structured", "rag", "retrieval"] = "retrieval"
     provider: str | None = None
     model: str | None = None
     table: ChatDataTable | None = None
