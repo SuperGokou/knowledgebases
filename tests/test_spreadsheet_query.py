@@ -375,6 +375,49 @@ async def test_event_result_existence_returns_grounded_zero_not_success_false_po
 
 
 @pytest.mark.asyncio
+async def test_event_detail_header_supports_production_attendance_exports(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (
+                    2,
+                    _record(
+                        "工程部",
+                        "E001",
+                        "刘春耀",
+                        "135385",
+                        "2026-07-17 08:00:00",
+                        "东门",
+                    ),
+                ),
+            ),
+            headers=(*HEADERS[:-1], "事件详情"),
+        ),
+        title="测试.xlsx",
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "这份考勤数据中，有没有‘认证失败’或‘黑名单拦截’的打卡记录？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None and result.answer.table is not None
+    assert result.answer.answer.startswith("没有。")
+    assert result.answer.table.rows == (
+        ("认证失败", "0 条", "未发现"),
+        ("黑名单拦截", "0 条", "未发现"),
+    )
+
+
+@pytest.mark.asyncio
 async def test_event_result_existence_uses_or_semantics(
     knowledge_session: tuple[AsyncSession, UUID],
 ) -> None:

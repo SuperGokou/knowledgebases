@@ -236,6 +236,7 @@ _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
     },
     "event_result": {
         "事件结果": 0,
+        "事件详情": 0,
         "认证结果": 0,
         "验证结果": 0,
         "通行结果": 0,
