@@ -224,4 +224,6 @@ jobs:
 
       - name: Publish redacted acceptance summary
         if: always() && hashFiles('artifacts/acceptance/acceptance.md') != ''
-        run: cat artifacts/acceptance/acceptance.md >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          cat artifacts/acceptance/acceptance.md
+          cat artifacts/acceptance/acceptance.md >> "$GITHUB_STEP_SUMMARY"

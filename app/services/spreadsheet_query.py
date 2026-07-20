@@ -38,6 +38,154 @@ _LOCATION_PATTERN: Final = re.compile(
 )
 _SHEET_LOCATION_PATTERN: Final = re.compile(r"worksheet:[^\]\r\n]{1,31}")
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+_QUOTED_TERM_PATTERN: Final = re.compile(r"[“\"'‘]([^”\"'’]{1,50})[”\"'’]")
+_EVENT_RESULT_QUERY_TERMS: Final = (
+    "认证失败",
+    "黑名单拦截",
+    "白名单拦截",
+    "验证失败",
+    "通行失败",
+    "刷卡失败",
+    "拒绝通行",
+    "认证异常",
+    "验证异常",
+    "认证成功",
+    "验证成功",
+    "通行成功",
+    "允许通行",
+    "黑名单",
+    "白名单",
+    "异常",
+)
+_EVENT_RESULT_TERM_MARKERS: Final = (
+    "失败",
+    "拦截",
+    "拒绝",
+    "成功",
+    "通过",
+    "允许",
+    "禁止",
+    "异常",
+    "黑名单",
+    "白名单",
+    "超时",
+)
+_EVENT_RESULT_POLICY_TERMS: Final = (
+    "制度",
+    "条款",
+    "政策",
+    "规范",
+    "流程",
+    "办法",
+    "手册",
+)
+_EVENT_RESULT_SEGMENT_PATTERN: Final = re.compile(r"[\s()（）/|,，;；:：\-]+")
+_SPREADSHEET_FILENAME_PATTERN: Final = re.compile(r"\.(?:xlsx?|csv)\Z", re.IGNORECASE)
+_SPREADSHEET_REFERENCE_PATTERN: Final = re.compile(
+    r"[^\s，。？！?\"'“”‘’]{1,200}\.(?:xlsx?|csv)", re.IGNORECASE
+)
+_SPREADSHEET_REFERENCE_PREFIXES: Final = tuple(
+    sorted(
+        (
+            "请打开",
+            "请查看",
+            "请查询",
+            "请读取",
+            "打开",
+            "查看",
+            "查询",
+            "读取",
+            "使用",
+            "关于",
+            "工作簿",
+            "文件",
+            "这份",
+            "该份",
+            "在",
+            "从",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_EVENT_RESULT_NEUTRAL_PHRASES: Final = tuple(
+    sorted(
+        (
+            "是否出现过",
+            "是否发生过",
+            "是否存在",
+            "是否包含",
+            "有没有",
+            "是否有",
+            "考勤记录",
+            "考勤数据",
+            "打卡记录",
+            "打卡数据",
+            "通行记录",
+            "门禁记录",
+            "事件记录",
+            "异常记录",
+            "出现过",
+            "发生过",
+            "这份",
+            "该份",
+            "当前",
+            "本次",
+            "这张",
+            "该张",
+            "考勤表",
+            "工作表",
+            "工作簿",
+            "帮我查一下",
+            "请帮我",
+            "请问",
+            "有无",
+            "存在",
+            "包含",
+            "出现",
+            "发生",
+            "或者",
+            "以及",
+            "记录",
+            "数据",
+            "打卡",
+            "考勤",
+            "通行",
+            "门禁",
+            "事件",
+            "结果",
+            "状态",
+            "表格",
+            "文件",
+            "核验",
+            "检查",
+            "确认",
+            "查询",
+            "是否",
+            "中的",
+            "里面",
+            "当中",
+            "请",
+            "在",
+            "中",
+            "里",
+            "内",
+            "有",
+            "或",
+            "和",
+            "与",
+            "的",
+            "吗",
+            "么",
+            "呢",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_EVENT_RESULT_RESIDUAL_PATTERN: Final = re.compile(
+    r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
+)
 
 _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
     "employee_id": {
@@ -85,6 +233,16 @@ _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
         "门名称": 1,
         "考勤点": 2,
         "位置": 2,
+    },
+    "event_result": {
+        "事件结果": 0,
+        "事件详情": 0,
+        "认证结果": 0,
+        "验证结果": 0,
+        "通行结果": 0,
+        "刷卡结果": 0,
+        "处理结果": 1,
+        "结果": 2,
     },
 }
 
@@ -178,11 +336,24 @@ class _Record:
 
 
 @dataclass(frozen=True, slots=True)
+class _EventResultCoverage:
+    entry: _EntrySource
+    sheet: str
+    column: str
+    first_row: int
+    last_row: int
+    scanned_rows: int
+    counts: tuple[tuple[str, int], ...]
+    matched_rows: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _QuestionIntent:
     latest_record: bool
     time_range: bool
     employee_field: str | None
     department_employees: bool
+    event_result_existence: bool
 
     @property
     def applicable(self) -> bool:
@@ -192,6 +363,7 @@ class _QuestionIntent:
                 self.time_range,
                 self.employee_field,
                 self.department_employees,
+                self.event_result_existence,
             )
         )
 
@@ -245,6 +417,8 @@ async def answer_spreadsheet_query(
     if not sheets:
         return None
 
+    if intent.event_result_existence:
+        return _answer_event_result_existence(sheets, normalized_question)
     if intent.latest_record:
         return _answer_latest_record(sheets, normalized_question)
     if intent.time_range:
@@ -293,6 +467,7 @@ def _question_intent(question: str) -> _QuestionIntent:
         time_range=_is_time_range_question(question),
         employee_field=employee_field,
         department_employees=department_employees,
+        event_result_existence=_is_event_result_existence_question(question),
     )
 
 
@@ -309,6 +484,144 @@ def _has_employee_field_lookup_shape(question: str) -> bool:
     generic_subjects = {"公司", "本公司", "企业", "部门", "项目", "系统", "平台", "员工", "人员"}
     subjects = re.findall(r"([A-Za-z0-9一-鿿·_-]{2,40})的", question)
     return any(subject not in generic_subjects for subject in subjects)
+
+
+def _is_event_result_existence_question(question: str) -> bool:
+    has_spreadsheet_reference = _has_spreadsheet_filename_mention(question)
+    semantic_question = _strip_spreadsheet_filename_mentions(question)
+    if any(token in semantic_question for token in _EVENT_RESULT_POLICY_TERMS):
+        return False
+    existence_query = any(
+        token in semantic_question
+        for token in (
+            "有没有",
+            "是否有",
+            "有无",
+            "是否存在",
+            "是否包含",
+            "是否出现",
+            "是否发生",
+        )
+    ) or bool(
+        re.search(
+            r"(?:记录|数据).{0,12}(?:里|中)?(?:有|存在|包含|出现|发生).{0,40}[吗么?？]",
+            semantic_question,
+        )
+        or re.search(
+            r"(?:有|存在|包含|出现|发生).{0,40}(?:记录|事件).{0,3}[吗么?？]",
+            semantic_question,
+        )
+    )
+    attendance_records = any(
+        token in semantic_question
+        for token in ("考勤", "打卡", "通行记录", "门禁记录", "考勤数据", "打卡数据")
+    ) or (has_spreadsheet_reference and "记录" in semantic_question)
+    result_condition = bool(_event_result_terms(semantic_question)) or any(
+        token in semantic_question
+        for token in ("事件结果", "认证结果", "验证结果", "通行结果", "刷卡结果")
+    )
+    return existence_query and attendance_records and result_condition
+
+
+def _strip_spreadsheet_filename_mentions(question: str) -> str:
+    without_quoted_files = _QUOTED_TERM_PATTERN.sub(_quoted_filename_replacement, question)
+    return _SPREADSHEET_REFERENCE_PATTERN.sub("", without_quoted_files)
+
+
+def _has_spreadsheet_filename_mention(question: str) -> bool:
+    return bool(_mentioned_spreadsheet_filename_candidates(question))
+
+
+def _mentioned_spreadsheet_filename_candidates(
+    question: str,
+) -> tuple[frozenset[str], ...]:
+    normalized = unicodedata.normalize("NFKC", question)
+    mentions: list[frozenset[str]] = []
+    for match in _SPREADSHEET_REFERENCE_PATTERN.finditer(normalized):
+        raw_name = re.split(r"[/\\]", match.group(0))[-1].strip().casefold()
+        candidates = {raw_name}
+        candidate = raw_name
+        stripped_prefix = True
+        while stripped_prefix:
+            stripped_prefix = False
+            for prefix in _SPREADSHEET_REFERENCE_PREFIXES:
+                normalized_prefix = unicodedata.normalize("NFKC", prefix).casefold()
+                if candidate.startswith(normalized_prefix) and len(candidate) > len(
+                    normalized_prefix
+                ):
+                    candidate = candidate[len(normalized_prefix) :]
+                    candidates.add(candidate)
+                    stripped_prefix = True
+                    break
+        mentions.append(frozenset(candidates))
+    return tuple(mentions)
+
+
+def _quoted_filename_replacement(match: re.Match[str]) -> str:
+    value = unicodedata.normalize("NFKC", match.group(1)).strip()
+    return "" if _SPREADSHEET_FILENAME_PATTERN.search(value) is not None else value
+
+
+def _event_result_terms(question: str) -> tuple[str, ...]:
+    quoted = tuple(
+        value
+        for match in _QUOTED_TERM_PATTERN.finditer(question)
+        if (value := unicodedata.normalize("NFKC", match.group(1)).strip())
+        and any(marker in value for marker in _EVENT_RESULT_TERM_MARKERS)
+        and _SPREADSHEET_FILENAME_PATTERN.search(value) is None
+        and not value.endswith(("文件", "工作簿", "考勤表", "数据表"))
+        and not any(token in value for token in ("有没有", "是否", "有无", "或", "和", "与", "、"))
+    )
+    discovery_question = _QUOTED_TERM_PATTERN.sub(_quoted_discovery_text, question)
+    discovered = tuple(term for term in _EVENT_RESULT_QUERY_TERMS if term in discovery_question)
+    candidates = (*quoted, *discovered)
+    ordered = tuple(
+        sorted(
+            candidates,
+            key=lambda term: (
+                question.find(term) if term in question else len(question),
+                -len(term),
+            ),
+        )
+    )
+    return _deduplicate_terms(ordered)
+
+
+def _quoted_discovery_text(match: re.Match[str]) -> str:
+    value = unicodedata.normalize("NFKC", match.group(1)).strip()
+    if _SPREADSHEET_FILENAME_PATTERN.search(value) is not None or value.endswith(
+        ("文件", "工作簿", "考勤表", "数据表")
+    ):
+        return ""
+    return value
+
+
+def _deduplicate_terms(terms: tuple[str, ...]) -> tuple[str, ...]:
+    selected: list[str] = []
+    for term in terms:
+        if (
+            len(term) > _MAX_LABEL_CHARACTERS
+            or term in selected
+            or any(term in existing for existing in selected)
+        ):
+            continue
+        selected = [existing for existing in selected if existing not in term]
+        selected.append(term)
+    return tuple(selected)
+
+
+def _event_result_matches(value: str, term: str) -> bool:
+    normalized_value = unicodedata.normalize("NFKC", value).casefold().strip()
+    normalized_term = unicodedata.normalize("NFKC", term).casefold().strip()
+    if not normalized_value or not normalized_term:
+        return False
+    if normalized_value == normalized_term or normalized_value.startswith(normalized_term):
+        return True
+    return any(
+        segment.startswith(normalized_term)
+        for segment in _EVENT_RESULT_SEGMENT_PATTERN.split(normalized_value)
+        if segment
+    )
 
 
 async def _load_sources(
@@ -420,6 +733,13 @@ async def _load_sources(
 def _select_sources(
     sources: tuple[_EntrySource, ...], question: str
 ) -> tuple[_EntrySource, ...] | None:
+    explicit_mentions = _mentioned_spreadsheet_filename_candidates(question)
+    if explicit_mentions:
+        source_filenames = {
+            filename for source in sources for filename in _source_spreadsheet_filenames(source)
+        }
+        if any(source_filenames.isdisjoint(mention) for mention in explicit_mentions):
+            return None
     if len(sources) == 1:
         return sources
     mentioned: list[tuple[int, _EntrySource]] = []
@@ -435,6 +755,15 @@ def _select_sources(
         return (best[0],) if len(best) == 1 else None
     fingerprints = {_source_fingerprint(source) for source in sources}
     return (sources[0],) if len(fingerprints) == 1 else None
+
+
+def _source_spreadsheet_filenames(source: _EntrySource) -> frozenset[str]:
+    title = unicodedata.normalize("NFKC", source.title).strip().casefold()
+    if not title:
+        return frozenset()
+    if _SPREADSHEET_FILENAME_PATTERN.search(title) is not None:
+        return frozenset((title,))
+    return frozenset((f"{title}.xlsx", f"{title}.xls"))
 
 
 def _source_fingerprint(source: _EntrySource) -> bytes:
@@ -560,6 +889,127 @@ def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
         columns=columns,
         ambiguous=header_ambiguities,
     )
+
+
+def _answer_event_result_existence(
+    sheets: tuple[_Sheet, ...], question: str
+) -> SpreadsheetAnswer | None:
+    semantic_question = _strip_spreadsheet_filename_mentions(question)
+    terms = _event_result_terms(semantic_question)
+    if not terms or len(terms) > _MAX_TABLE_ROWS:
+        return None
+
+    total_counts = {term: 0 for term in terms}
+    coverages: list[_EventResultCoverage] = []
+    total_scanned = 0
+    total_matches = 0
+    attendance_sheets: list[_Sheet] = []
+    for sheet in sheets:
+        result_column = sheet.columns.get("event_result")
+        timestamp_signal = (
+            sheet.columns.get("timestamp") is not None and "timestamp" not in sheet.ambiguous
+        )
+        device_signal = sheet.columns.get("device") is not None and "device" not in sheet.ambiguous
+        identity_signal = any(
+            sheet.columns.get(kind) is not None and kind not in sheet.ambiguous
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+        )
+        attendance_signal = timestamp_signal and device_signal and identity_signal
+        if result_column is None or "event_result" in sheet.ambiguous:
+            if attendance_signal:
+                return None
+            continue
+        if not attendance_signal:
+            continue
+        attendance_sheets.append(sheet)
+    if not attendance_sheets or _has_unsupported_event_result_scope(semantic_question, terms):
+        return None
+
+    for sheet in attendance_sheets:
+        result_column = sheet.columns.get("event_result")
+        if (
+            result_column is None
+            or "event_result" in sheet.ambiguous
+            or not sheet.rows
+            or any(not row.entry.integrity_metadata for row in sheet.rows)
+        ):
+            return None
+        sheet_counts = {term: 0 for term in terms}
+        matched_rows: list[int] = []
+        for row in sheet.rows:
+            raw_result = row.value(result_column)
+            if raw_result is None or not raw_result.strip():
+                return None
+            row_matched = False
+            for term in terms:
+                if _event_result_matches(raw_result, term):
+                    sheet_counts[term] += 1
+                    total_counts[term] += 1
+                    row_matched = True
+            if row_matched:
+                matched_rows.append(row.number)
+        coverages.append(
+            _EventResultCoverage(
+                entry=sheet.rows[0].entry,
+                sheet=sheet.rows[0].sheet,
+                column=result_column,
+                first_row=sheet.rows[0].number,
+                last_row=sheet.rows[-1].number,
+                scanned_rows=len(sheet.rows),
+                counts=tuple((term, sheet_counts[term]) for term in terms),
+                matched_rows=tuple(matched_rows),
+            )
+        )
+        total_scanned += len(sheet.rows)
+        total_matches += len(matched_rows)
+
+    if not coverages or total_scanned <= 0:
+        return None
+    hits = _build_event_result_hits(coverages)
+    if hits is None or not hits:
+        return None
+    citation = _citation_marker(hits)
+    titles = {coverage.entry.title for coverage in coverages}
+    title = next(iter(titles)) if len(titles) == 1 else "选定考勤工作簿"
+    requested = "或".join(f"“{term}”" for term in terms)
+    count_summary = "、".join(f"“{term}”{total_counts[term]} 条" for term in terms)
+    if total_matches:
+        answer = (
+            f"有。在《{title}》中已完整扫描 {total_scanned} 条打卡记录，"
+            f"共发现 {total_matches} 条符合{requested}条件的记录；"
+            f"其中{count_summary}。{citation}"
+        )
+    else:
+        answer = (
+            f"没有。在《{title}》中已完整扫描 {total_scanned} 条打卡记录，"
+            f"未发现{requested}记录，共 0 条；其中{count_summary}。{citation}"
+        )
+    return SpreadsheetAnswer(
+        answer=answer,
+        table=SpreadsheetTable(
+            title="异常打卡记录核验",
+            columns=("检查条件", "匹配数量", "结论"),
+            rows=tuple(
+                (
+                    term,
+                    f"{total_counts[term]} 条",
+                    "已发现" if total_counts[term] else "未发现",
+                )
+                for term in terms
+            ),
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
+    )
+
+
+def _has_unsupported_event_result_scope(question: str, terms: tuple[str, ...]) -> bool:
+    residual = question
+    for term in sorted(terms, key=len, reverse=True):
+        residual = residual.replace(term, "")
+    for phrase in _EVENT_RESULT_NEUTRAL_PHRASES:
+        residual = residual.replace(phrase, "")
+    return bool(_EVENT_RESULT_RESIDUAL_PATTERN.sub("", residual))
 
 
 def _answer_employee_field(
@@ -803,6 +1253,55 @@ def _timestamp_records(
     return records, invalid
 
 
+def _build_event_result_hits(
+    coverages: list[_EventResultCoverage],
+) -> tuple[KnowledgeSearchHit, ...] | None:
+    hits: list[KnowledgeSearchHit] = []
+    evidence_characters = 0
+    grouped: dict[UUID, list[_EventResultCoverage]] = {}
+    for coverage in coverages:
+        grouped.setdefault(coverage.entry.id, []).append(coverage)
+    for entry_coverages in grouped.values():
+        entry = entry_coverages[0].entry
+        anchors: list[str] = []
+        summaries: list[str] = []
+        for coverage in entry_coverages:
+            anchor = _column_range(
+                coverage.sheet,
+                coverage.column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            anchors.append(anchor)
+            counts = "、".join(f"“{term}”{count} 条" for term, count in coverage.counts)
+            matched_rows = ""
+            if coverage.matched_rows:
+                displayed = "、".join(str(row) for row in coverage.matched_rows[:50])
+                omitted = len(coverage.matched_rows) - 50
+                suffix = f"，另有 {omitted} 行" if omitted > 0 else ""
+                matched_rows = f"；命中行：{displayed}{suffix}"
+            summaries.append(
+                f"确定性全量统计 [{anchor}]：完整扫描 {coverage.scanned_rows} 条打卡记录；"
+                f"{counts}{matched_rows}。"
+            )
+        excerpt = "\n".join(summaries)
+        evidence_characters += len(excerpt)
+        if evidence_characters > _MAX_EVIDENCE_CHARACTERS:
+            return None
+        combined_anchor = _combined_coverage_anchor(anchors)
+        hits.append(
+            KnowledgeSearchHit(
+                entry_id=entry.id,
+                source_file_id=entry.source_file_id,
+                title=entry.title,
+                excerpt=excerpt,
+                source_path=_anchored_source_path(entry.source_path, combined_anchor),
+                format_version=entry.format_version,
+            )
+        )
+    return tuple(hits)
+
+
 def _build_hits(rows: list[_Row]) -> tuple[KnowledgeSearchHit, ...] | None:
     unique_rows = {(row.entry.id, row.sheet, row.number): row for row in rows}
     grouped: dict[UUID, list[_Row]] = {}
@@ -845,6 +1344,32 @@ def _evidence_source_path(base_path: str | None, rows: list[_Row]) -> str:
         return evidence_path[:_MAX_SOURCE_PATH_CHARACTERS]
     base_budget = max(0, _MAX_SOURCE_PATH_CHARACTERS - len(evidence_path) - 1)
     return f"{base_path[:base_budget]}#{evidence_path}"
+
+
+def _column_range(sheet: str, column: str, first_row: int, last_row: int) -> str:
+    start = f"{column}{first_row}"
+    end = f"{column}{last_row}"
+    cell_range = start if start == end else f"{start}:{end}"
+    return f"worksheet:{sheet}!{cell_range}"
+
+
+def _anchored_source_path(base_path: str | None, anchor: str) -> str:
+    if not base_path:
+        return anchor[:_MAX_SOURCE_PATH_CHARACTERS]
+    base_budget = max(0, _MAX_SOURCE_PATH_CHARACTERS - len(anchor) - 1)
+    return f"{base_path[:base_budget]}#{anchor}"
+
+
+def _combined_coverage_anchor(anchors: list[str]) -> str:
+    selected: list[str] = []
+    for anchor in anchors:
+        candidate = ",".join((*selected, anchor))
+        if len(candidate) > _MAX_SOURCE_PATH_CHARACTERS // 2:
+            break
+        selected.append(anchor)
+    omitted = len(anchors) - len(selected)
+    suffix = f",...(+{omitted} sheets)" if omitted else ""
+    return f"{','.join(selected)}{suffix}"
 
 
 def _row_range(row: _Row) -> str:
