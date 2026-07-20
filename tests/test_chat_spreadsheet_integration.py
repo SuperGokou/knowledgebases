@@ -632,6 +632,112 @@ async def test_device_frequency_short_circuits_retrieval_and_llm(
 
 
 @pytest.mark.asyncio
+async def test_sequential_event_and_department_queries_do_not_reuse_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            content = "\n\n".join(
+                (
+                    "[worksheet:Sheet1!A1] 姓名",
+                    "[worksheet:Sheet1!B1] 部门",
+                    "[worksheet:Sheet1!C1] 时间",
+                    "[worksheet:Sheet1!D1] 设备",
+                    "[worksheet:Sheet1!E1] 事件结果",
+                    "[worksheet:Sheet1!A2] 甲",
+                    "[worksheet:Sheet1!B2] 工程部",
+                    "[worksheet:Sheet1!C2] 2026-07-17 08:00:00",
+                    "[worksheet:Sheet1!D2] 东门",
+                    "[worksheet:Sheet1!E2] 认证成功(白名单验证)",
+                    "[worksheet:Sheet1!A3] 乙",
+                    "[worksheet:Sheet1!B3] 研发部",
+                    "[worksheet:Sheet1!C3] 2026-07-17 08:05:00",
+                    "[worksheet:Sheet1!D3] 西门",
+                    "[worksheet:Sheet1!E3] 认证成功(白名单验证)",
+                )
+            )
+            session.add(
+                KnowledgeEntry(
+                    knowledge_base_id=knowledge_base.id,
+                    entry_type="document",
+                    title="测试.xlsx",
+                    content=content,
+                    source_path="generated/attendance.md",
+                    format_version="okf/0.1",
+                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+                    custom_metadata=_trusted_spreadsheet_metadata(content),
+                )
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("structured queries must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            event_response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message="这份考勤数据中，有没有‘认证失败’或‘黑名单拦截’的打卡记录？",
+            )
+            department_response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message="这份考勤记录中，一共包含了多少个不同的部门？请列出名称。",
+            )
+
+            assert event_response.answer.startswith("没有。")
+            assert department_response.mode == "structured"
+            assert department_response.provider is None and department_response.model is None
+            assert "共包含 2 个不同部门：工程部、研发部" in department_response.answer
+            assert "认证失败" not in department_response.answer
+            assert "黑名单拦截" not in department_response.answer
+            assert "模型未提供有效引用" not in department_response.answer
+            assert department_response.table is not None
+            assert department_response.table.model_dump() == {
+                "title": "考勤部门统计",
+                "columns": ["部门名称"],
+                "rows": [["工程部"], ["研发部"]],
+                "citation_numbers": [1],
+            }
+            assert department_response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert department_response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+            assert department_response.citations[0].source_path == (
+                "generated/attendance.md#worksheet:Sheet1!B2:B3"
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_conflicting_published_workbooks_reject_without_search_or_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

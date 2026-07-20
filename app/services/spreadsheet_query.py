@@ -90,6 +90,10 @@ _SPREADSHEET_REFERENCE_PREFIXES: Final = tuple(
         (
             "请打开",
             "请查看",
+            "查询",
+            "根据",
+            "基于",
+            "参照",
             "请查询",
             "请读取",
             "打开",
@@ -135,6 +139,7 @@ _EVENT_RESULT_NEUTRAL_PHRASES: Final = tuple(
             "这张",
             "该张",
             "考勤表",
+            "考勤明细",
             "工作表",
             "工作簿",
             "帮我查一下",
@@ -335,6 +340,228 @@ _MISSING_DEVICE_LABELS: Final = frozenset(
         "未分配",
     )
 )
+_DEPARTMENT_SUMMARY_ATTENDANCE_TERMS: Final = (
+    "考勤记录",
+    "考勤数据",
+    "考勤表",
+    "考勤明细",
+    "打卡记录",
+    "打卡数据",
+    "打卡表",
+    "门禁记录",
+    "通行记录",
+)
+_DEPARTMENT_SUMMARY_REQUEST_TERMS: Final = (
+    "多少个不同",
+    "几个不同",
+    "多少个部门",
+    "几个部门",
+    "哪些部门",
+    "部门有哪些",
+    "所有部门",
+    "全部部门",
+    "部门名称",
+    "部门名单",
+    "部门清单",
+    "部门列表",
+    "每个部门",
+    "各部门",
+    "部门排名",
+    "部门排行",
+    "部门总数",
+    "部门数量",
+    "部门种类",
+    "部门分布",
+    "多少种",
+    "几种",
+    "去重",
+    "汇总",
+    "统计",
+)
+_DEPARTMENT_SUMMARY_NEUTRAL_PHRASES: Final = tuple(
+    sorted(
+        (
+            "请列出部门名称",
+            "请列出名称",
+            "请全部列出",
+            "请查看",
+            "查询",
+            "根据",
+            "基于",
+            "参照",
+            "请汇总",
+            "请说明",
+            "请解释",
+            "告诉我",
+            "说明",
+            "解释",
+            "员工考勤记录",
+            "人员考勤记录",
+            "员工考勤数据",
+            "人员考勤数据",
+            "部门去重后有多少",
+            "部门总数是多少",
+            "部门数量和名称是什么",
+            "包含多少种部门",
+            "多少种不同部门",
+            "多少种部门",
+            "几种不同部门",
+            "几种部门",
+            "部门种类有哪些",
+            "多少个组织部门",
+            "多少个独立部门",
+            "几个组织部门",
+            "几个独立部门",
+            "包含哪些部门名称",
+            "多少个部门",
+            "几个部门",
+            "分别是什么",
+            "多少个不同的部门",
+            "多少个不同部门",
+            "几个不同的部门",
+            "几个不同部门",
+            "所有部门有哪些",
+            "全部部门有哪些",
+            "有哪些部门",
+            "部门有哪些",
+            "请列出",
+            "一共包含了",
+            "一共包含",
+            "总共包含了",
+            "总共包含",
+            "考勤记录",
+            "考勤数据",
+            "考勤表",
+            "考勤明细",
+            "打卡记录",
+            "打卡数据",
+            "打卡表",
+            "门禁记录",
+            "通行记录",
+            "部门名称",
+            "部门名单",
+            "部门清单",
+            "部门列表",
+            "部门总数",
+            "部门数量",
+            "部门种类",
+            "组织部门",
+            "所属部门",
+            "独立部门",
+            "所有部门",
+            "全部部门",
+            "去重后有多少",
+            "去重后",
+            "去重",
+            "汇总",
+            "统计",
+            "是多少",
+            "是什么",
+            "分别",
+            "和名称",
+            "名称",
+            "数量",
+            "并",
+            "哪些",
+            "不同",
+            "叫什么",
+            "都",
+            "多少种",
+            "几种",
+            "多少",
+            "几个",
+            "涉及的",
+            "涉及",
+            "这份",
+            "该份",
+            "当前",
+            "请问",
+            "麻烦",
+            "帮我",
+            "列出",
+            "部门",
+            "一共",
+            "总共",
+            "共有",
+            "包含",
+            "里有",
+            "中有",
+            "中的",
+            "中",
+            "里",
+            "内",
+            "请",
+            "的",
+            "了",
+            "有",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_DEPARTMENT_SUMMARY_RESIDUAL_PATTERN: Final = re.compile(
+    r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
+)
+_DEPARTMENT_SUMMARY_UNSUPPORTED_TERMS: Final = (
+    "每个部门",
+    "各部门",
+    "多少人",
+    "几个人",
+    "人数",
+    "姓名",
+    "工号",
+    "卡号",
+    "排名",
+    "排行",
+    "top",
+    "排除",
+    "剔除",
+    "不包括",
+    "除了",
+    "设备",
+    "闸机",
+    "门禁机",
+    "考勤机",
+    "认证",
+    "验证",
+    "成功",
+    "失败",
+    "异常",
+    "黑名单",
+    "白名单",
+    "次数",
+    "频率",
+    "占比",
+    "比例",
+    "分布",
+    "分组",
+)
+_DEPARTMENT_SUMMARY_PROSE_TERMS: Final = (
+    "制度",
+    "流程",
+    "规范",
+    "定义",
+    "职责",
+    "政策",
+    "手册",
+    "部门说明",
+    "字段说明",
+    "数据说明",
+)
+_MISSING_SPREADSHEET_VALUE_LABELS: Final = frozenset(
+    (
+        *_MISSING_DEVICE_LABELS,
+        "#ref!",
+        "#value!",
+        "#div/0!",
+        "#name?",
+        "#num!",
+        "#null!",
+        "#spill!",
+        "#calc!",
+    )
+)
+_MISSING_DEPARTMENT_LABELS: Final = _MISSING_SPREADSHEET_VALUE_LABELS
 
 _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
     "employee_id": {
@@ -511,11 +738,23 @@ class _DeviceFrequencyCoverage:
 
 
 @dataclass(frozen=True, slots=True)
+class _DepartmentSummaryCoverage:
+    entry: _EntrySource
+    sheet: str
+    column: str
+    first_row: int
+    last_row: int
+    scanned_rows: int
+    departments: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _QuestionIntent:
     latest_record: bool
     time_range: bool
     employee_field: str | None
     department_employees: bool
+    department_summary: bool
     event_result_existence: bool
     device_frequency: bool
 
@@ -527,6 +766,7 @@ class _QuestionIntent:
                 self.time_range,
                 self.employee_field,
                 self.department_employees,
+                self.department_summary,
                 self.event_result_existence,
                 self.device_frequency,
             )
@@ -584,6 +824,11 @@ async def answer_spreadsheet_query(
 
     if intent.device_frequency:
         return _answer_device_frequency(sheets, normalized_question)
+    if intent.department_summary:
+        return _answer_department_summary(
+            sheets,
+            _strip_selected_source_filename_mentions(normalized_question, sources),
+        )
     if intent.event_result_existence:
         return _answer_event_result_existence(sheets, normalized_question)
     if intent.latest_record:
@@ -622,18 +867,26 @@ def _question_intent(question: str) -> _QuestionIntent:
         if asks_card_number
         else None
     )
-    department_employees = (
-        "部" in question
-        and any(token in question for token in ("员工", "人员"))
-        and any(
-            token in question for token in ("哪几位", "有谁", "哪些", "名单", "多少位", "总共有")
-        )
+    employee_list_request = any(
+        token in question for token in ("哪几位", "有谁", "哪些", "名单", "多少位", "总共有")
+    ) or (
+        any(token in question for token in ("列出", "列举"))
+        and re.search(r"部门.{0,4}(?:员工|人员)", question) is not None
     )
+    department_employee_scope = (
+        re.search(
+            r"部(?:门)?.{0,12}(?:员工|人员)",
+            question,
+        )
+        is not None
+    )
+    department_employees = department_employee_scope and employee_list_request
     return _QuestionIntent(
         latest_record=_is_latest_record_question(question),
         time_range=_is_time_range_question(question),
         employee_field=employee_field,
         department_employees=department_employees,
+        department_summary=(_is_department_summary_question(question) and not department_employees),
         event_result_existence=_is_event_result_existence_question(question),
         device_frequency=_is_device_frequency_question(question),
     )
@@ -652,6 +905,39 @@ def _has_employee_field_lookup_shape(question: str) -> bool:
     generic_subjects = {"公司", "本公司", "企业", "部门", "项目", "系统", "平台", "员工", "人员"}
     subjects = re.findall(r"([A-Za-z0-9一-鿿·_-]{2,40})的", question)
     return any(subject not in generic_subjects for subject in subjects)
+
+
+def _is_department_summary_question(question: str) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    if any(term in semantic_question for term in _DEPARTMENT_SUMMARY_PROSE_TERMS):
+        return False
+    attendance_context = any(
+        term in semantic_question for term in _DEPARTMENT_SUMMARY_ATTENDANCE_TERMS
+    )
+    department_context = "部门" in semantic_question
+    summary_request = any(
+        term in semantic_question for term in _DEPARTMENT_SUMMARY_REQUEST_TERMS
+    ) or any(term in semantic_question for term in ("多少", "几个", "哪些", "叫什么"))
+    list_request = (
+        re.search(
+            r"(?:列出|列举).{0,24}部门|部门.{0,24}(?:列出|列举)",
+            semantic_question,
+        )
+        is not None
+    )
+    return attendance_context and department_context and (summary_request or list_request)
+
+
+def _has_unsupported_department_summary_scope(question: str) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    if _question_date(semantic_question) is not None:
+        return True
+    if any(term in semantic_question for term in _DEPARTMENT_SUMMARY_UNSUPPORTED_TERMS):
+        return True
+    residual = semantic_question
+    for phrase in _DEPARTMENT_SUMMARY_NEUTRAL_PHRASES:
+        residual = residual.replace(phrase, "")
+    return bool(_DEPARTMENT_SUMMARY_RESIDUAL_PATTERN.sub("", residual))
 
 
 def _is_device_frequency_question(question: str) -> bool:
@@ -918,6 +1204,41 @@ async def _load_sources(
 def _select_sources(
     sources: tuple[_EntrySource, ...], question: str
 ) -> tuple[_EntrySource, ...] | None:
+    normalized_question = unicodedata.normalize("NFKC", question).casefold()
+    direct_matches: list[tuple[int, int, _EntrySource]] = []
+    for source in sources:
+        for filename in _source_spreadsheet_filenames(source):
+            if not any(character.isspace() for character in filename):
+                continue
+            start = normalized_question.find(filename)
+            while start >= 0:
+                prefix_text = normalized_question[:start]
+                has_boundary = start == 0 or normalized_question[start - 1] in (
+                    " \t\r\n，。？！?：:；;、/\\\"'“”‘’《》【】()（）"
+                )
+                has_known_prefix = any(
+                    prefix_text.endswith(unicodedata.normalize("NFKC", prefix).casefold())
+                    for prefix in _SPREADSHEET_REFERENCE_PREFIXES
+                )
+                if has_boundary or has_known_prefix:
+                    direct_matches.append((start, start + len(filename), source))
+                start = normalized_question.find(filename, start + 1)
+    if direct_matches:
+        visible_matches = tuple(
+            match
+            for match in direct_matches
+            if not any(
+                other_start <= match[0]
+                and match[1] <= other_end
+                and (other_start, other_end) != match[:2]
+                for other_start, other_end, _ in direct_matches
+            )
+        )
+        directly_selected = {match[2].id: match[2] for match in visible_matches}
+        if len(directly_selected) != 1:
+            return None
+        return (next(iter(directly_selected.values())),)
+
     explicit_mentions = _mentioned_spreadsheet_filename_candidates(question)
     if explicit_mentions:
         explicitly_selected: dict[UUID, _EntrySource] = {}
@@ -946,6 +1267,21 @@ def _source_spreadsheet_filenames(source: _EntrySource) -> frozenset[str]:
     if _SPREADSHEET_FILENAME_PATTERN.search(title) is not None:
         return frozenset((title,))
     return frozenset((f"{title}.xlsx", f"{title}.xls"))
+
+
+def _strip_selected_source_filename_mentions(
+    question: str,
+    sources: tuple[_EntrySource, ...],
+) -> str:
+    stripped = unicodedata.normalize("NFKC", question)
+    filenames = sorted(
+        (filename for source in sources for filename in _source_spreadsheet_filenames(source)),
+        key=len,
+        reverse=True,
+    )
+    for filename in filenames:
+        stripped = re.sub(re.escape(filename), "", stripped, flags=re.IGNORECASE)
+    return stripped
 
 
 def _source_fingerprint(source: _EntrySource) -> bytes:
@@ -1071,6 +1407,179 @@ def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
         columns=columns,
         ambiguous=header_ambiguities,
     )
+
+
+def _answer_department_summary(
+    sheets: tuple[_Sheet, ...], question: str
+) -> SpreadsheetAnswer | None:
+    if _has_unsupported_department_summary_scope(question):
+        return None
+
+    attendance_sheets: list[_Sheet] = []
+    for sheet in sheets:
+        timestamp_shape = "timestamp" in sheet.columns
+        device_shape = "device" in sheet.columns
+        identity_shape = any(
+            kind in sheet.columns for kind in ("employee_id", "card_number", "employee_name")
+        )
+        if not (timestamp_shape and device_shape and identity_shape):
+            continue
+        if not sheet.rows:
+            continue
+        if not _valid_coverage_sheet_name(sheet.rows[0].sheet):
+            return None
+        timestamp_signal = (
+            sheet.columns.get("timestamp") is not None and "timestamp" not in sheet.ambiguous
+        )
+        device_signal = sheet.columns.get("device") is not None and "device" not in sheet.ambiguous
+        identity_signal = any(
+            sheet.columns.get(kind) is not None and kind not in sheet.ambiguous
+            for kind in ("employee_id", "card_number", "employee_name")
+        )
+        department_column = sheet.columns.get("department")
+        if (
+            not timestamp_signal
+            or not device_signal
+            or not identity_signal
+            or "department" not in sheet.columns
+            or department_column is None
+            or "department" in sheet.ambiguous
+        ):
+            return None
+        attendance_sheets.append(sheet)
+    if not attendance_sheets:
+        return None
+
+    display_labels: dict[str, str] = {}
+    coverages: list[_DepartmentSummaryCoverage] = []
+    total_scanned = 0
+    for sheet in attendance_sheets:
+        department_column = sheet.columns.get("department")
+        timestamp_column = sheet.columns.get("timestamp")
+        device_column = sheet.columns.get("device")
+        identity_columns = tuple(
+            column
+            for kind in ("employee_id", "card_number", "employee_name")
+            if kind not in sheet.ambiguous and (column := sheet.columns.get(kind)) is not None
+        )
+        if (
+            department_column is None
+            or timestamp_column is None
+            or device_column is None
+            or not identity_columns
+            or not sheet.rows
+            or any(not row.entry.integrity_metadata for row in sheet.rows)
+        ):
+            return None
+
+        sheet_department_keys: dict[str, None] = {}
+        for row in sheet.rows:
+            raw_timestamp = row.value(timestamp_column)
+            raw_device = row.value(device_column)
+            raw_department = row.value(department_column)
+            if (
+                raw_timestamp is None
+                or _parse_datetime(raw_timestamp) is None
+                or raw_device is None
+                or _normalized_device_label(raw_device) is None
+                or not any(
+                    _normalized_identity_label(row.value(column) or "") is not None
+                    for column in identity_columns
+                )
+                or raw_department is None
+            ):
+                return None
+            normalized_department = _normalized_department_label(raw_department)
+            if normalized_department is None:
+                return None
+            department_key, display_label = normalized_department
+            display_labels.setdefault(department_key, display_label)
+            sheet_department_keys.setdefault(department_key, None)
+            if len(display_labels) > _MAX_TABLE_ROWS:
+                return None
+
+        coverages.append(
+            _DepartmentSummaryCoverage(
+                entry=sheet.rows[0].entry,
+                sheet=sheet.rows[0].sheet,
+                column=department_column,
+                first_row=sheet.rows[0].number,
+                last_row=sheet.rows[-1].number,
+                scanned_rows=len(sheet.rows),
+                departments=tuple(display_labels[key] for key in sheet_department_keys),
+            )
+        )
+        total_scanned += len(sheet.rows)
+
+    if not display_labels or total_scanned <= 0:
+        return None
+    hits = _build_department_summary_hits(coverages)
+    if hits is None or not hits:
+        return None
+
+    departments = tuple(display_labels.values())
+    safe_departments = "、".join(_citation_safe_text(label) for label in departments)
+    titles = {coverage.entry.title for coverage in coverages}
+    title = next(iter(titles)) if len(titles) == 1 else "选定考勤工作簿"
+    answer = (
+        f"在《{_citation_safe_text(title)}》中已完整扫描 {total_scanned} 条考勤记录，"
+        f"共包含 {len(departments)} 个不同部门：{safe_departments}。{_citation_marker(hits)}"
+    )
+    return SpreadsheetAnswer(
+        answer=answer,
+        table=SpreadsheetTable(
+            title="考勤部门统计",
+            columns=("部门名称",),
+            rows=tuple((department,) for department in departments),
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
+    )
+
+
+def _normalized_department_label(value: str) -> tuple[str, str] | None:
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    display_label = re.sub(r"\s+", " ", normalized).strip()
+    department_key = display_label.casefold()
+    compact_key = re.sub(r"\s+", "", department_key)
+    if (
+        not display_label
+        or len(display_label) > _MAX_LABEL_CHARACTERS
+        or compact_key in _MISSING_DEPARTMENT_LABELS
+        or not any(character.isalnum() for character in display_label)
+    ):
+        return None
+    return department_key, display_label
+
+
+def _valid_coverage_sheet_name(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value)
+    return bool(
+        normalized
+        and len(normalized) <= 31
+        and not any(
+            unicodedata.category(character).startswith("C") or character in ",#![]\r\n"
+            for character in normalized
+        )
+    )
+
+
+def _normalized_identity_label(value: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    display_label = re.sub(r"\s+", " ", normalized).strip()
+    compact_key = re.sub(r"\s+", "", display_label.casefold())
+    if (
+        not display_label
+        or len(display_label) > _MAX_LABEL_CHARACTERS
+        or compact_key in _MISSING_SPREADSHEET_VALUE_LABELS
+        or not any(character.isalnum() for character in display_label)
+    ):
+        return None
+    return display_label
 
 
 def _answer_device_frequency(sheets: tuple[_Sheet, ...], question: str) -> SpreadsheetAnswer | None:
@@ -1226,11 +1735,18 @@ def _normalized_device_label(value: str) -> tuple[str, str] | None:
 
 
 def _citation_safe_text(value: str) -> str:
-    single_line = " ".join(value.split())
-    return _CITATION_LIKE_PATTERN.sub(
+    normalized = unicodedata.normalize("NFKC", value)
+    without_controls = "".join(
+        " " if character.isspace() else character
+        for character in normalized
+        if character.isspace() or not unicodedata.category(character).startswith("C")
+    )
+    single_line = " ".join(without_controls.split())
+    numeric_markers_sanitized = _CITATION_LIKE_PATTERN.sub(
         lambda match: f"［{match.group(0)[1:-1].strip()}］",
         single_line,
     )
+    return numeric_markers_sanitized.replace("[", "［").replace("]", "］")
 
 
 def _answer_event_result_existence(
@@ -1686,6 +2202,53 @@ def _build_device_frequency_hits(
                 entry_id=entry.id,
                 source_file_id=entry.source_file_id,
                 title=entry.title,
+                excerpt=excerpt,
+                source_path=_anchored_source_path(
+                    entry.source_path,
+                    _combined_coverage_anchor(anchors),
+                ),
+                format_version=entry.format_version,
+            )
+        )
+    return tuple(hits)
+
+
+def _build_department_summary_hits(
+    coverages: list[_DepartmentSummaryCoverage],
+) -> tuple[KnowledgeSearchHit, ...] | None:
+    hits: list[KnowledgeSearchHit] = []
+    evidence_characters = 0
+    grouped: dict[UUID, list[_DepartmentSummaryCoverage]] = {}
+    for coverage in coverages:
+        grouped.setdefault(coverage.entry.id, []).append(coverage)
+    for entry_coverages in grouped.values():
+        entry = entry_coverages[0].entry
+        anchors: list[str] = []
+        summaries: list[str] = []
+        for coverage in entry_coverages:
+            anchor = _column_range(
+                coverage.sheet,
+                coverage.column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            anchors.append(anchor)
+            departments = "、".join(
+                _citation_safe_text(department) for department in coverage.departments
+            )
+            summaries.append(
+                f"确定性全量去重 [{anchor}]：完整扫描 {coverage.scanned_rows} 条考勤记录；"
+                f"识别出 {len(coverage.departments)} 个不同部门：{departments}。"
+            )
+        excerpt = "\n".join(summaries)
+        evidence_characters += len(excerpt)
+        if evidence_characters > _MAX_EVIDENCE_CHARACTERS:
+            return None
+        hits.append(
+            KnowledgeSearchHit(
+                entry_id=entry.id,
+                source_file_id=entry.source_file_id,
+                title=_citation_safe_text(entry.title),
                 excerpt=excerpt,
                 source_path=_anchored_source_path(
                     entry.source_path,
