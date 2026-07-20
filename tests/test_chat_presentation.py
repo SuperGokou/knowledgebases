@@ -80,18 +80,26 @@ def test_chat_citation_removes_unicode_controls_without_changing_worksheet_ancho
     citation = ChatCitation(
         entry_id=uuid4(),
         source_file_id=uuid4(),
-        title="Attendance",
+        title="Attendance\u202e report",
         excerpt="Verified evidence",
         source_path="generated/attendance\u202e.md#worksheet:Sheet1!A2:K2\x00",
-        format_version="okf/0.1",
+        format_version="okf/\u202e0.1",
         citation_number=1,
         marker="[1]",
     )
 
+    assert citation.title == "Attendance report"
     assert citation.source_path == "generated/attendance.md#worksheet:Sheet1!A2:K2"
+    assert citation.format_version == "okf/0.1"
     assert "worksheet:Sheet1!A2:K2" in citation.source_path
     assert all(
-        not unicodedata.category(character).startswith("C") for character in citation.source_path
+        not unicodedata.category(character).startswith("C")
+        for value in (
+            citation.title,
+            citation.source_path,
+            citation.format_version,
+        )
+        for character in value
     )
 
 
@@ -108,6 +116,7 @@ def test_retrieval_footer_removes_unicode_controls_from_untrusted_metadata() -> 
     citations = _as_chat_citations([hit])
     answer, _table = _retrieval_presentation("Show attendance", citations)
 
+    assert citations[0].title == "Attendance report"
     assert citations[0].source_path == ("generated/attendance.md#worksheet:Sheet1!A2:K2")
     source_line = answer.splitlines()[-1]
     assert "Attendance report" in source_line
