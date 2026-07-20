@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -245,7 +246,10 @@ def _rejected_spreadsheet_response(
 def _single_line(value: str) -> str:
     """Prevent user-managed titles and paths from breaking the source-list format."""
 
-    single_line = " ".join(value.split())
+    without_controls = "".join(
+        character for character in value if not unicodedata.category(character).startswith("C")
+    )
+    single_line = " ".join(without_controls.split())
     return _CITATION_PATTERN.sub(lambda match: f"［{match.group(1)}］", single_line)
 
 

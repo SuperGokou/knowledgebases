@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import uuid4
 
 import pytest
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.models import (
+    AuditLog,
+    AuditResult,
+    File,
+    FileStatus,
     KnowledgeBase,
     KnowledgeBaseAccessLevel,
     KnowledgeEntry,
     KnowledgeEntryPublicationStatus,
+    KnowledgeIngestionStatus,
+    MalwareScanStatus,
+    OkfConversionJob,
+    OkfConversionStatus,
     User,
 )
 from app.schemas.chat import ChatQueryResponse
@@ -71,6 +80,68 @@ def _trusted_spreadsheet_metadata(content: str) -> dict[str, object]:
         "source_text_sha256": sha256(content.encode("utf-8")).hexdigest(),
         "source_locations_sha256": sha256("\n".join(locations).encode("utf-8")).hexdigest(),
     }
+
+
+async def _persist_trusted_spreadsheet_entry(
+    session: AsyncSession,
+    *,
+    user: User,
+    knowledge_base: KnowledgeBase,
+    title: str,
+    content: str,
+    source_path: str = "generated/attendance.md",
+) -> KnowledgeEntry:
+    source_file = File(
+        owner_id=user.id,
+        knowledge_base_id=knowledge_base.id,
+        bucket="kb",
+        object_key=f"objects/chat-spreadsheet/{uuid4()}.xlsx",
+        original_name=title,
+        extension=".xlsx",
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        size_bytes=len(content.encode("utf-8")),
+        status=FileStatus.AVAILABLE,
+        knowledge_status=KnowledgeIngestionStatus.INDEXED,
+        malware_scan_status=MalwareScanStatus.CLEAN,
+        available_at=datetime.now(UTC),
+    )
+    session.add(source_file)
+    await session.flush()
+    entry = KnowledgeEntry(
+        knowledge_base_id=knowledge_base.id,
+        source_file_id=source_file.id,
+        entry_type="document",
+        title=title,
+        content=content,
+        source_path=source_path,
+        format_version="okf/0.1",
+        publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+        custom_metadata=_trusted_spreadsheet_metadata(content),
+    )
+    session.add(entry)
+    await session.flush()
+    session.add_all(
+        (
+            OkfConversionJob(
+                file_id=source_file.id,
+                knowledge_base_id=knowledge_base.id,
+                file_version=source_file.version,
+                status=OkfConversionStatus.SUCCEEDED,
+                prompt_version="okf-v1",
+                output_entry_id=entry.id,
+                completed_at=datetime.now(UTC),
+            ),
+            AuditLog(
+                actor_id=user.id,
+                action="file.approved",
+                result=AuditResult.SUCCESS,
+                resource_type="file",
+                resource_id=str(source_file.id),
+            ),
+        )
+    )
+    await session.flush()
+    return entry
 
 
 async def _query(
@@ -399,17 +470,12 @@ async def test_published_spreadsheet_flows_through_real_acl_query_and_chat_contr
                     "[worksheet:Sheet1!C2] 熊小强",
                 )
             )
-            session.add(
-                KnowledgeEntry(
-                    knowledge_base_id=knowledge_base.id,
-                    entry_type="document",
-                    title="10级以上考勤.xlsx",
-                    content=content,
-                    source_path="generated/attendance.md",
-                    format_version="okf/0.1",
-                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
-                    custom_metadata=_trusted_spreadsheet_metadata(content),
-                )
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="10级以上考勤.xlsx",
+                content=content,
             )
             await session.commit()
             access = AccessContext(
@@ -465,17 +531,12 @@ async def test_event_result_existence_short_circuits_retrieval_and_llm(
                     "[worksheet:Sheet1!F2] 认证成功(白名单验证)",
                 )
             )
-            session.add(
-                KnowledgeEntry(
-                    knowledge_base_id=knowledge_base.id,
-                    entry_type="document",
-                    title="测试.xlsx",
-                    content=content,
-                    source_path="generated/attendance.md",
-                    format_version="okf/0.1",
-                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
-                    custom_metadata=_trusted_spreadsheet_metadata(content),
-                )
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="测试.xlsx",
+                content=content,
             )
             await session.commit()
             access = AccessContext(
@@ -567,17 +628,12 @@ async def test_device_frequency_short_circuits_retrieval_and_llm(
                     "[worksheet:Sheet1!E4] 西门",
                 )
             )
-            session.add(
-                KnowledgeEntry(
-                    knowledge_base_id=knowledge_base.id,
-                    entry_type="document",
-                    title="测试.xlsx",
-                    content=content,
-                    source_path="generated/attendance.md",
-                    format_version="okf/0.1",
-                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
-                    custom_metadata=_trusted_spreadsheet_metadata(content),
-                )
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="测试.xlsx",
+                content=content,
             )
             await session.commit()
             access = AccessContext(
@@ -666,17 +722,12 @@ async def test_sequential_event_and_department_queries_do_not_reuse_answers(
                     "[worksheet:Sheet1!E3] 认证成功(白名单验证)",
                 )
             )
-            session.add(
-                KnowledgeEntry(
-                    knowledge_base_id=knowledge_base.id,
-                    entry_type="document",
-                    title="测试.xlsx",
-                    content=content,
-                    source_path="generated/attendance.md",
-                    format_version="okf/0.1",
-                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
-                    custom_metadata=_trusted_spreadsheet_metadata(content),
-                )
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="测试.xlsx",
+                content=content,
             )
             await session.commit()
             access = AccessContext(
@@ -768,17 +819,13 @@ async def test_conflicting_published_workbooks_reject_without_search_or_llm(
                         "[worksheet:Sheet1!C2] 熊小强",
                     )
                 )
-                session.add(
-                    KnowledgeEntry(
-                        knowledge_base_id=knowledge_base.id,
-                        entry_type="document",
-                        title=title,
-                        content=content,
-                        source_path=f"generated/{title}.md",
-                        format_version="okf/0.1",
-                        publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
-                        custom_metadata=_trusted_spreadsheet_metadata(content),
-                    )
+                await _persist_trusted_spreadsheet_entry(
+                    session,
+                    user=user,
+                    knowledge_base=knowledge_base,
+                    title=title,
+                    content=content,
+                    source_path=f"generated/{title}.md",
                 )
             await session.commit()
             access = AccessContext(
@@ -812,5 +859,97 @@ async def test_conflicting_published_workbooks_reject_without_search_or_llm(
             }
             assert response.answer.startswith("当前表格证据不足或存在歧义")
             assert response.answer.endswith("答案来源：当前知识库未检索到可引用内容。")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_department_record_count_short_circuits_retrieval_and_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            content = "\n\n".join(
+                (
+                    "[worksheet:Sheet1!A1] 姓名",
+                    "[worksheet:Sheet1!B1] 部门",
+                    "[worksheet:Sheet1!C1] 时间",
+                    "[worksheet:Sheet1!D1] 设备",
+                    "[worksheet:Sheet1!A2] 甲",
+                    "[worksheet:Sheet1!B2] 品质部",
+                    "[worksheet:Sheet1!C2] 2026-07-05 08:00:00",
+                    "[worksheet:Sheet1!D2] 东门",
+                    "[worksheet:Sheet1!A3] 乙",
+                    "[worksheet:Sheet1!B3] 品质部",
+                    "[worksheet:Sheet1!C3] 2026-07-05 08:05:00",
+                    "[worksheet:Sheet1!D3] 西门",
+                    "[worksheet:Sheet1!A4] 丙",
+                    "[worksheet:Sheet1!B4] 工程部",
+                    "[worksheet:Sheet1!C4] 2026-07-05 08:10:00",
+                    "[worksheet:Sheet1!D4] 南门",
+                )
+            )
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="测试.xlsx",
+                content=content,
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("department count must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message="“品质部”在这段时间内一共有多少条打卡记录？",
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert "品质部”共有 2 条打卡记录" in response.answer
+            assert response.table is not None
+            assert response.table.model_dump() == {
+                "title": "部门打卡记录统计",
+                "columns": ["部门名称", "打卡记录数"],
+                "rows": [["品质部", "2 条"]],
+                "citation_numbers": [1],
+            }
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+            assert response.citations[0].source_path == (
+                "generated/attendance.md#worksheet:Sheet1!B2:B4,worksheet:Sheet1!C2:C4"
+            )
     finally:
         await engine.dispose()

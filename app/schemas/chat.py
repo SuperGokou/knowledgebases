@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from typing import Literal
 from uuid import UUID
 
@@ -27,6 +28,15 @@ class ChatCitation(KnowledgeSearchHit):
 
     citation_number: int = Field(ge=1)
     marker: str = Field(pattern=r"^\[[1-9][0-9]*\]$")
+
+    @field_validator("source_path")
+    @classmethod
+    def remove_unicode_controls_from_source_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return "".join(
+            character for character in value if not unicodedata.category(character).startswith("C")
+        )
 
 
 class ChatSourceStatus(BaseModel):

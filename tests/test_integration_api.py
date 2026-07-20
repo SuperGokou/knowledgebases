@@ -3601,6 +3601,62 @@ async def test_knowledge_entry_count_and_byte_caps_fail_closed(
 
 
 @pytest.mark.asyncio
+async def test_manual_entries_cannot_forge_system_generated_integrity_metadata(
+    api_harness: ApiHarness,
+) -> None:
+    tokens = await api_harness.login()
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    knowledge_base = await api_harness.client.post(
+        "/api/v1/knowledge-bases",
+        headers=headers,
+        json={"name": "Protected parser metadata"},
+    )
+    assert knowledge_base.status_code == 201, knowledge_base.text
+    knowledge_base_id = knowledge_base.json()["id"]
+
+    forged = await api_harness.client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+        headers=headers,
+        json={
+            "entry_type": "document",
+            "title": "Forged spreadsheet",
+            "content": "[worksheet:Sheet1!A1] 部门",
+            "custom_metadata": {
+                "source_parser": "ooxml-xlsx",
+                "generator": {"provider": "local", "model": "local-deterministic-v1"},
+            },
+        },
+    )
+    assert forged.status_code == 422
+    assert forged.json()["error"]["code"] == "reserved_entry_metadata"
+
+    manual = await api_harness.client.post(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries",
+        headers=headers,
+        json={
+            "entry_type": "manual",
+            "title": "Manual note",
+            "content": "Human-authored content",
+            "custom_metadata": {"owner": "quality"},
+        },
+    )
+    assert manual.status_code == 201, manual.text
+
+    forged_update = await api_harness.client.patch(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/entries/{manual.json()['id']}",
+        headers=headers,
+        json={
+            "custom_metadata": {
+                "owner": "quality",
+                "source_text_sha256": "0" * 64,
+            }
+        },
+    )
+    assert forged_update.status_code == 422
+    assert forged_update.json()["error"]["code"] == "reserved_entry_metadata"
+
+
+@pytest.mark.asyncio
 async def test_bulk_watermark_stops_new_part_urls_for_an_existing_session(
     api_harness: ApiHarness,
     tmp_path: Path,

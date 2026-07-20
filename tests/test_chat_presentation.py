@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import unicodedata
 from uuid import uuid4
 
 from app.schemas.chat import ChatCitation
-from app.services.chat import _parse_generated_response, _retrieval_presentation
+from app.schemas.knowledge_bases import KnowledgeSearchHit
+from app.services.chat import (
+    _as_chat_citations,
+    _parse_generated_response,
+    _retrieval_presentation,
+)
 
 
 def _citation(excerpt: str) -> ChatCitation:
@@ -68,3 +74,42 @@ def test_generated_response_rejects_invalid_table_shape_or_unknown_source() -> N
 
     assert _parse_generated_response(bad_shape, citations) is None
     assert _parse_generated_response(bad_source, citations) is None
+
+
+def test_chat_citation_removes_unicode_controls_without_changing_worksheet_anchor() -> None:
+    citation = ChatCitation(
+        entry_id=uuid4(),
+        source_file_id=uuid4(),
+        title="Attendance",
+        excerpt="Verified evidence",
+        source_path="generated/attendance\u202e.md#worksheet:Sheet1!A2:K2\x00",
+        format_version="okf/0.1",
+        citation_number=1,
+        marker="[1]",
+    )
+
+    assert citation.source_path == "generated/attendance.md#worksheet:Sheet1!A2:K2"
+    assert "worksheet:Sheet1!A2:K2" in citation.source_path
+    assert all(
+        not unicodedata.category(character).startswith("C") for character in citation.source_path
+    )
+
+
+def test_retrieval_footer_removes_unicode_controls_from_untrusted_metadata() -> None:
+    hit = KnowledgeSearchHit(
+        entry_id=uuid4(),
+        source_file_id=None,
+        title="Attendance\u202e report\x00",
+        excerpt="Verified evidence.",
+        source_path="generated/attendance\u2066.md#worksheet:Sheet1!A2:K2\x1f",
+        format_version="okf/0.1",
+    )
+
+    citations = _as_chat_citations([hit])
+    answer, _table = _retrieval_presentation("Show attendance", citations)
+
+    assert citations[0].source_path == ("generated/attendance.md#worksheet:Sheet1!A2:K2")
+    source_line = answer.splitlines()[-1]
+    assert "Attendance report" in source_line
+    assert "worksheet:Sheet1!A2:K2" in source_line
+    assert all(not unicodedata.category(character).startswith("C") for character in source_line)
