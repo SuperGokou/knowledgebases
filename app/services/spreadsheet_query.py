@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -343,6 +344,148 @@ _DEVICE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
 )
 _DEVICE_FREQUENCY_RESIDUAL_PATTERN: Final = re.compile(
     r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
+)
+_EMPLOYEE_FREQUENCY_ATTENDANCE_TERMS: Final = (
+    "打卡",
+    "考勤",
+    "刷卡",
+    "门禁记录",
+    "通行记录",
+)
+_EMPLOYEE_FREQUENCY_EMPLOYEE_TERMS: Final = (
+    "哪位员工",
+    "哪名员工",
+    "哪个员工",
+    "每位员工",
+    "每名员工",
+    "每个员工",
+    "员工",
+    "人员",
+    "谁",
+)
+_EMPLOYEE_FREQUENCY_REQUEST_TERMS: Final = (
+    "打卡总次数最多",
+    "打卡次数最多",
+    "考勤次数最多",
+    "刷卡次数最多",
+    "打卡记录最多",
+    "考勤记录最多",
+    "记录次数最多",
+    "出现次数最多",
+    "打卡最多",
+    "考勤最多",
+    "次数最多",
+    "频次最高",
+    "频率最高",
+    "打卡次数最少",
+    "考勤次数最少",
+    "记录最少",
+    "次数最少",
+    "每位员工",
+    "每名员工",
+    "每个员工",
+)
+_EMPLOYEE_FREQUENCY_UNSUPPORTED_TERMS: Final = (
+    "最少",
+    "最低",
+    "排行榜",
+    "排行",
+    "排名",
+    "每位员工",
+    "每名员工",
+    "每个员工",
+    "分别",
+    "占比",
+    "比例",
+    "趋势",
+    "分组",
+)
+_EMPLOYEE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
+    sorted(
+        (
+            "整个数据集中",
+            "整个数据集里",
+            "整个数据集",
+            "全部数据中",
+            "全部数据里",
+            "全体员工中",
+            "所有员工中",
+            "这份考勤数据中",
+            "这份考勤记录中",
+            "这份考勤数据",
+            "这份考勤记录",
+            "打卡总次数最多",
+            "打卡次数最多",
+            "考勤次数最多",
+            "刷卡次数最多",
+            "打卡记录最多",
+            "考勤记录最多",
+            "记录次数最多",
+            "出现次数最多",
+            "打卡最多",
+            "考勤最多",
+            "次数最多",
+            "频次最高",
+            "频率最高",
+            "总共打卡了多少次",
+            "总共打卡多少次",
+            "一共打卡了多少次",
+            "一共打卡多少次",
+            "共打卡了多少次",
+            "共打卡多少次",
+            "总共记录了多少次",
+            "总共记录多少次",
+            "一共记录了多少次",
+            "一共记录多少次",
+            "总共多少次",
+            "一共多少次",
+            "共多少次",
+            "是哪一位员工",
+            "是哪位员工",
+            "是哪名员工",
+            "是哪个员工",
+            "哪一位员工",
+            "哪位员工",
+            "哪名员工",
+            "哪个员工",
+            "员工是谁",
+            "人员是谁",
+            "谁",
+            "打卡记录",
+            "考勤记录",
+            "刷卡记录",
+            "门禁记录",
+            "通行记录",
+            "打卡",
+            "考勤",
+            "刷卡",
+            "员工",
+            "人员",
+            "全部",
+            "所有",
+            "其中",
+            "请问",
+            "请",
+            "总共",
+            "一共",
+            "共",
+            "是",
+            "的",
+            "了",
+            "在",
+            "中",
+            "里",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_EMPLOYEE_FREQUENCY_RESIDUAL_PATTERN: Final = re.compile(
+    r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
+)
+_EMPLOYEE_FREQUENCY_TOP_N_PATTERN: Final = re.compile(
+    r"(?:前\s*\d+|top\s*\d+)",
+    flags=re.IGNORECASE,
 )
 _MISSING_DEVICE_LABELS: Final = frozenset(
     (
@@ -941,6 +1084,19 @@ class _DeviceFrequencyCoverage:
 
 
 @dataclass(frozen=True, slots=True)
+class _EmployeeFrequencyCoverage:
+    entry: _EntrySource
+    sheet: str
+    identifier_column: str
+    name_column: str
+    timestamp_column: str
+    first_row: int
+    last_row: int
+    scanned_rows: int
+    counts: tuple[tuple[str, str, str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _DepartmentSummaryCoverage:
     entry: _EntrySource
     sheet: str
@@ -972,6 +1128,7 @@ class _QuestionIntent:
     department_record_count: bool
     department_summary: bool
     event_result_existence: bool
+    employee_frequency: bool
     device_frequency: bool
 
     @property
@@ -985,6 +1142,7 @@ class _QuestionIntent:
                 self.department_record_count,
                 self.department_summary,
                 self.event_result_existence,
+                self.employee_frequency,
                 self.device_frequency,
             )
         )
@@ -1045,6 +1203,10 @@ async def answer_spreadsheet_query(
     ):
         return None
 
+    if intent.employee_frequency:
+        if not _all_source_sheets_reconstructed(sources, sheets):
+            return None
+        return _answer_employee_frequency(sheets, normalized_question)
     if intent.device_frequency:
         if not _all_source_sheets_reconstructed(sources, sheets):
             return None
@@ -1117,12 +1279,14 @@ def _question_intent(question: str) -> _QuestionIntent:
     time_range = _is_time_range_question(question)
     department_summary = _is_department_summary_question(question) and not department_employees
     event_result_existence = _is_event_result_existence_question(question)
+    employee_frequency = _is_employee_frequency_question(question)
     device_frequency = _is_device_frequency_question(question)
     department_record_count = (
         _is_department_record_count_question(question)
         and not department_employees
         and not department_summary
         and not event_result_existence
+        and not employee_frequency
         and not device_frequency
         and not latest_record
         and not time_range
@@ -1135,6 +1299,7 @@ def _question_intent(question: str) -> _QuestionIntent:
         department_record_count=department_record_count,
         department_summary=department_summary,
         event_result_existence=event_result_existence,
+        employee_frequency=employee_frequency,
         device_frequency=device_frequency,
     )
 
@@ -1213,6 +1378,30 @@ def _has_unsupported_department_summary_scope(question: str) -> bool:
     for phrase in _DEPARTMENT_SUMMARY_NEUTRAL_PHRASES:
         residual = residual.replace(phrase, "")
     return bool(_DEPARTMENT_SUMMARY_RESIDUAL_PATTERN.sub("", residual))
+
+
+def _is_employee_frequency_question(question: str) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    attendance_context = any(
+        term in semantic_question for term in _EMPLOYEE_FREQUENCY_ATTENDANCE_TERMS
+    )
+    employee_context = any(term in semantic_question for term in _EMPLOYEE_FREQUENCY_EMPLOYEE_TERMS)
+    aggregate_request = any(term in semantic_question for term in _EMPLOYEE_FREQUENCY_REQUEST_TERMS)
+    return attendance_context and employee_context and aggregate_request
+
+
+def _has_unsupported_employee_frequency_scope(question: str) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    if _question_date(semantic_question) is not None:
+        return True
+    if any(term in semantic_question for term in _EMPLOYEE_FREQUENCY_UNSUPPORTED_TERMS):
+        return True
+    if _EMPLOYEE_FREQUENCY_TOP_N_PATTERN.search(semantic_question):
+        return True
+    residual = semantic_question
+    for phrase in _EMPLOYEE_FREQUENCY_NEUTRAL_PHRASES:
+        residual = residual.replace(phrase, "")
+    return bool(_EMPLOYEE_FREQUENCY_RESIDUAL_PATTERN.sub("", residual))
 
 
 def _is_device_frequency_question(question: str) -> bool:
@@ -2070,6 +2259,205 @@ def _normalized_identity_label(value: str) -> str | None:
     return display_label
 
 
+def _answer_employee_frequency(
+    sheets: tuple[_Sheet, ...],
+    question: str,
+) -> SpreadsheetAnswer | None:
+    if _has_unsupported_employee_frequency_scope(question):
+        return None
+
+    attendance_sheets: list[_Sheet] = []
+    for sheet in sheets:
+        timestamp_shape = "timestamp" in sheet.columns
+        device_shape = "device" in sheet.columns
+        name_shape = "employee_name" in sheet.columns
+        stable_identity_shape = any(
+            kind in sheet.columns for kind in ("employee_id", "card_number")
+        )
+        attendance_shape_signals = sum(
+            (timestamp_shape, device_shape, name_shape, stable_identity_shape)
+        )
+        partial_attendance_shape = (
+            timestamp_shape or device_shape
+        ) and attendance_shape_signals >= 2
+        if not partial_attendance_shape:
+            continue
+        if not (
+            timestamp_shape and device_shape and name_shape and stable_identity_shape and sheet.rows
+        ):
+            return None
+        if any(
+            sheet.columns.get(kind) is None or kind in sheet.ambiguous
+            for kind in ("timestamp", "device", "employee_name")
+        ):
+            return None
+        attendance_sheets.append(sheet)
+    if not attendance_sheets:
+        return None
+
+    identifier_kind = next(
+        (
+            kind
+            for kind in ("employee_id", "card_number")
+            if all(
+                sheet.columns.get(kind) is not None and kind not in sheet.ambiguous
+                for sheet in attendance_sheets
+            )
+        ),
+        None,
+    )
+    if identifier_kind is None:
+        return None
+
+    total_counts: dict[str, int] = {}
+    identifier_labels: dict[str, str] = {}
+    employee_names: dict[str, str] = {}
+    identifier_to_name: dict[str, str] = {}
+    name_to_identifier: dict[str, str] = {}
+    sheet_counts: list[tuple[_Sheet, str, str, str, dict[str, int]]] = []
+    total_scanned = 0
+
+    for sheet in attendance_sheets:
+        identifier_column = sheet.columns.get(identifier_kind)
+        name_column = sheet.columns.get("employee_name")
+        timestamp_column = sheet.columns.get("timestamp")
+        device_column = sheet.columns.get("device")
+        if (
+            identifier_column is None
+            or name_column is None
+            or timestamp_column is None
+            or device_column is None
+            or any(not row.entry.integrity_metadata for row in sheet.rows)
+        ):
+            return None
+
+        counts: dict[str, int] = {}
+        for row in sheet.rows:
+            raw_identifier = row.value(identifier_column)
+            raw_name = row.value(name_column)
+            raw_timestamp = row.value(timestamp_column)
+            raw_device = row.value(device_column)
+            identifier_label = _normalized_identity_label(raw_identifier or "")
+            employee_name = _normalized_identity_label(raw_name or "")
+            if (
+                identifier_label is None
+                or employee_name is None
+                or raw_timestamp is None
+                or _parse_datetime(raw_timestamp) is None
+                or raw_device is None
+                or _normalized_device_label(raw_device) is None
+            ):
+                return None
+
+            identifier_key = re.sub(r"\s+", "", identifier_label.casefold())
+            name_key = re.sub(r"\s+", "", employee_name.casefold())
+            previous_name = identifier_to_name.setdefault(identifier_key, name_key)
+            previous_identifier = name_to_identifier.setdefault(name_key, identifier_key)
+            if previous_name != name_key or previous_identifier != identifier_key:
+                return None
+
+            identifier_labels.setdefault(identifier_key, identifier_label)
+            employee_names.setdefault(identifier_key, employee_name)
+            counts[identifier_key] = counts.get(identifier_key, 0) + 1
+            total_counts[identifier_key] = total_counts.get(identifier_key, 0) + 1
+
+        sheet_counts.append((sheet, identifier_column, name_column, timestamp_column, counts))
+        total_scanned += len(sheet.rows)
+
+    if not total_counts or total_scanned <= 0:
+        return None
+    highest_count = max(total_counts.values())
+    winner_keys = tuple(
+        sorted(
+            (key for key, count in total_counts.items() if count == highest_count),
+            key=lambda key: (
+                re.sub(r"\s+", "", employee_names[key].casefold()),
+                key,
+            ),
+        )
+    )
+    if not winner_keys or len(winner_keys) > _MAX_TABLE_ROWS:
+        return None
+
+    coverages = [
+        _EmployeeFrequencyCoverage(
+            entry=sheet.rows[0].entry,
+            sheet=sheet.rows[0].sheet,
+            identifier_column=identifier_column,
+            name_column=name_column,
+            timestamp_column=timestamp_column,
+            first_row=sheet.rows[0].number,
+            last_row=sheet.rows[-1].number,
+            scanned_rows=len(sheet.rows),
+            counts=tuple(
+                (
+                    key,
+                    identifier_labels[key],
+                    employee_names[key],
+                    count,
+                )
+                for key, count in sorted(
+                    counts.items(),
+                    key=lambda item: (
+                        re.sub(r"\s+", "", employee_names[item[0]].casefold()),
+                        item[0],
+                    ),
+                )
+            ),
+        )
+        for sheet, identifier_column, name_column, timestamp_column, counts in sheet_counts
+    ]
+    hits = _build_employee_frequency_hits(
+        coverages,
+        frozenset(winner_keys),
+        total_employee_count=len(total_counts),
+    )
+    if hits is None or not hits:
+        return None
+
+    titles = {coverage.entry.title for coverage in coverages}
+    title = next(iter(titles)) if len(titles) == 1 else "选定考勤工作簿"
+    safe_title = _citation_safe_text(title)
+    identifier_label = "人员工号" if identifier_kind == "employee_id" else "卡号"
+    citation = _citation_marker(hits)
+    if len(winner_keys) == 1:
+        winner_key = winner_keys[0]
+        answer = (
+            f"在《{safe_title}》中已完整扫描 {total_scanned} 条打卡记录，"
+            f"打卡总次数最多的员工是“{_citation_safe_text(employee_names[winner_key])}”，"
+            f"共打卡 {highest_count} 次。{citation}"
+        )
+    else:
+        displayed_winners = "、".join(
+            f"“{_citation_safe_text(employee_names[key])}”"
+            f"（{identifier_label}：{_citation_safe_text(identifier_labels[key])}）"
+            for key in winner_keys
+        )
+        answer = (
+            f"在《{safe_title}》中已完整扫描 {total_scanned} 条打卡记录，"
+            f"打卡总次数最多的员工有 {len(winner_keys)} 位，并列第一："
+            f"{displayed_winners}，各打卡 {highest_count} 次。{citation}"
+        )
+
+    return SpreadsheetAnswer(
+        answer=answer,
+        table=SpreadsheetTable(
+            title="员工打卡频次",
+            columns=(identifier_label, "员工姓名", "打卡次数"),
+            rows=tuple(
+                (
+                    _citation_safe_text(identifier_labels[key]),
+                    _citation_safe_text(employee_names[key]),
+                    f"{highest_count} 次",
+                )
+                for key in winner_keys
+            ),
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
+    )
+
+
 def _answer_device_frequency(sheets: tuple[_Sheet, ...], question: str) -> SpreadsheetAnswer | None:
     if _has_unsupported_device_frequency_scope(question):
         return None
@@ -2713,6 +3101,89 @@ def _build_device_frequency_hits(
     return tuple(hits)
 
 
+def _build_employee_frequency_hits(
+    coverages: list[_EmployeeFrequencyCoverage],
+    winner_keys: frozenset[str],
+    *,
+    total_employee_count: int,
+) -> tuple[KnowledgeSearchHit, ...] | None:
+    hits: list[KnowledgeSearchHit] = []
+    evidence_characters = 0
+    grouped: dict[UUID, list[_EmployeeFrequencyCoverage]] = {}
+    for coverage in coverages:
+        grouped.setdefault(coverage.entry.id, []).append(coverage)
+    for entry_coverages in grouped.values():
+        entry = entry_coverages[0].entry
+        anchor_groups: list[tuple[str, ...]] = []
+        winner_counts: dict[str, int] = {}
+        winner_identifiers: dict[str, str] = {}
+        winner_names: dict[str, str] = {}
+        scanned_rows = 0
+        for coverage in entry_coverages:
+            identifier_anchor = _column_range(
+                coverage.sheet,
+                coverage.identifier_column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            name_anchor = _column_range(
+                coverage.sheet,
+                coverage.name_column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            timestamp_anchor = _column_range(
+                coverage.sheet,
+                coverage.timestamp_column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            anchor_groups.append((identifier_anchor, name_anchor, timestamp_anchor))
+            scanned_rows += coverage.scanned_rows
+            for key, identifier, name, count in coverage.counts:
+                if key not in winner_keys:
+                    continue
+                winner_counts[key] = winner_counts.get(key, 0) + count
+                winner_identifiers.setdefault(key, identifier)
+                winner_names.setdefault(key, name)
+
+        displayed_counts = "、".join(
+            f"“{_citation_safe_text(winner_names[key])}”"
+            f"（{_citation_safe_text(winner_identifiers[key])}）{winner_counts[key]} 条"
+            for key in sorted(
+                winner_counts,
+                key=lambda item: (
+                    re.sub(r"\s+", "", winner_names[item].casefold()),
+                    item,
+                ),
+            )
+        )
+        if not displayed_counts:
+            displayed_counts = "本来源无全局最高频员工记录"
+        combined_anchor = _combined_grouped_coverage_anchor(anchor_groups)
+        excerpt = (
+            f"确定性全量聚合 [{combined_anchor}]：完整扫描 {scanned_rows} 条打卡记录；"
+            f"共 {total_employee_count} 位员工；全局最高频员工在本来源的记录数："
+            f"{displayed_counts}。"
+        )
+        evidence_characters += len(excerpt)
+        if evidence_characters > _MAX_EVIDENCE_CHARACTERS:
+            return None
+        hits.append(
+            KnowledgeSearchHit(
+                entry_id=entry.id,
+                source_file_id=entry.source_file_id,
+                title=_citation_safe_text(entry.title),
+                excerpt=excerpt,
+                source_path=_anchored_source_path(entry.source_path, combined_anchor),
+                format_version=(
+                    _citation_safe_text(entry.format_version) if entry.format_version else None
+                ),
+            )
+        )
+    return tuple(hits)
+
+
 def _build_department_summary_hits(
     coverages: list[_DepartmentSummaryCoverage],
 ) -> tuple[KnowledgeSearchHit, ...] | None:
@@ -2901,7 +3372,7 @@ def _combined_coverage_anchor(anchors: list[str]) -> str:
 
 
 def _combined_grouped_coverage_anchor(
-    anchor_groups: list[tuple[str, str]],
+    anchor_groups: Sequence[Sequence[str]],
 ) -> str:
     selected: list[str] = []
     for anchor_group in anchor_groups:

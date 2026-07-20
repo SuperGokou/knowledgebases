@@ -688,6 +688,101 @@ async def test_device_frequency_short_circuits_retrieval_and_llm(
 
 
 @pytest.mark.asyncio
+async def test_employee_frequency_short_circuits_retrieval_and_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            content = "\n\n".join(
+                (
+                    "[worksheet:Sheet1!A1] 人员工号",
+                    "[worksheet:Sheet1!B1] 姓名",
+                    "[worksheet:Sheet1!C1] 时间",
+                    "[worksheet:Sheet1!D1] 设备",
+                    "[worksheet:Sheet1!A2] E001",
+                    "[worksheet:Sheet1!B2] 熊小强",
+                    "[worksheet:Sheet1!C2] 2026-07-17 08:00:00",
+                    "[worksheet:Sheet1!D2] 东门",
+                    "[worksheet:Sheet1!A3] E001",
+                    "[worksheet:Sheet1!B3] 熊小强",
+                    "[worksheet:Sheet1!C3] 2026-07-17 09:00:00",
+                    "[worksheet:Sheet1!D3] 西门",
+                    "[worksheet:Sheet1!A4] E002",
+                    "[worksheet:Sheet1!B4] 彭楚亮",
+                    "[worksheet:Sheet1!C4] 2026-07-17 10:00:00",
+                    "[worksheet:Sheet1!D4] 南门",
+                )
+            )
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="测试.xlsx",
+                content=content,
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("employee aggregate must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message=("整个数据集中，打卡总次数最多的是哪位员工？总共打卡了多少次？"),
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert "打卡总次数最多的员工是“熊小强”，共打卡 2 次" in response.answer
+            assert "当前知识库中没有检索到足够相关的内容" not in response.answer
+            assert "模型未提供有效引用" not in response.answer
+            assert response.table is not None
+            assert response.table.model_dump() == {
+                "title": "员工打卡频次",
+                "columns": ["人员工号", "员工姓名", "打卡次数"],
+                "rows": [["E001", "熊小强", "2 次"]],
+                "citation_numbers": [1],
+            }
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+            assert response.citations[0].source_path == (
+                "generated/attendance.md#worksheet:Sheet1!A2:A4,"
+                "worksheet:Sheet1!B2:B4,worksheet:Sheet1!C2:C4"
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_sequential_event_and_department_queries_do_not_reuse_answers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
