@@ -418,6 +418,442 @@ async def test_event_detail_header_supports_production_attendance_exports(
 
 
 @pytest.mark.asyncio
+async def test_device_frequency_scans_the_complete_device_column(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),
+                (3, _record("工程部", "E002", "乙", "2", "2026-07-17 08:05:00", "西门")),
+                (4, _record("工程部", "E003", "丙", "3", "2026-07-17 08:10:00", "东门")),
+                (5, _record("工程部", "E004", "丁", "4", "2026-07-17 08:15:00", "东门")),
+                (6, _record("工程部", "E005", "戊", "5", "2026-07-17 08:20:00", "西门")),
+            )
+        ),
+        title="测试.xlsx",
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "在所有闸机设备中，打卡记录最多（使用最频繁）的设备名称是什么？共记录了多少次？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None and result.answer.table is not None
+    assert result.answer.answer == (
+        "在《测试.xlsx》中已完整扫描 5 条打卡记录，使用最频繁的设备是“东门”，共记录 3 次。[1]"
+    )
+    assert result.answer.table.title == "闸机设备使用频率"
+    assert result.answer.table.columns == ("设备名称", "打卡次数")
+    assert result.answer.table.rows == (("东门", "3 次"),)
+    assert "完整扫描 5 条打卡记录" in result.answer.hits[0].excerpt
+    assert "共 2 个设备" in result.answer.hits[0].excerpt
+    assert "“东门”3 条" in result.answer.hits[0].excerpt
+    assert result.answer.hits[0].source_path is not None
+    assert result.answer.hits[0].source_path.endswith("#worksheet:Sheet1!G2:G6")
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_returns_all_tied_winners(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),
+                (3, _record("工程部", "E002", "乙", "2", "2026-07-17 08:05:00", "西门")),
+                (4, _record("工程部", "E003", "丙", "3", "2026-07-17 08:10:00", "东门")),
+                (5, _record("工程部", "E004", "丁", "4", "2026-07-17 08:15:00", "西门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    answer = await answer_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "哪台门禁设备的打卡次数最多？",
+    )
+
+    assert answer is not None and answer.table is not None
+    assert "并列第一：“东门”、“西门”，各记录 2 次" in answer.answer
+    assert answer.table.rows == (("东门", "2 次"), ("西门", "2 次"))
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_normalizes_equivalent_device_labels(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东 门")),
+                (3, _record("工程部", "E002", "乙", "2", "2026-07-17 08:05:00", " 东  门 ")),
+                (4, _record("工程部", "E003", "丙", "3", "2026-07-17 08:10:00", "西门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    answer = await answer_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "考勤设备使用频率最高的是哪一个，共几次？",
+    )
+
+    assert answer is not None and answer.table is not None
+    assert answer.table.rows == (("东 门", "2 次"),)
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_rejects_incomplete_rows_instead_of_under_counting(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    incomplete = list(_record("工程部", "E002", "乙", "2", "2026-07-17 08:05:00", "西门"))
+    incomplete[6] = ""
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),
+                (3, tuple(incomplete)),  # type: ignore[arg-type]
+            )
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "所有闸机设备中打卡记录最多的是哪个设备？共多少次？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.parametrize("placeholder", ("N/A", "#N/A", "NaN", "未设置", "未分配"))
+@pytest.mark.asyncio
+async def test_device_frequency_rejects_missing_value_placeholders(
+    knowledge_session: tuple[AsyncSession, UUID],
+    placeholder: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", placeholder)),
+                (3, _record("工程部", "E002", "乙", "2", "2026-07-17 08:05:00", "东门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "哪台闸机打卡次数最多？共多少次？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_uses_rows_beyond_truncated_metadata_locator_list(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    rows = tuple(
+        (
+            row_number,
+            _record(
+                "工程部",
+                f"E{row_number:04d}",
+                f"员工{row_number:04d}",
+                str(row_number),
+                f"2026-07-17 {((row_number - 2) // 60) % 24:02d}:{(row_number - 2) % 60:02d}:00",
+                "后段高频闸机" if row_number >= 202 else f"设备{row_number:04d}",
+            ),
+        )
+        for row_number in range(2, 252)
+    )
+    entry = await _add_entry(session, knowledge_base_id, _content(rows), title="大表.xlsx")
+    await session.commit()
+
+    assert entry.custom_metadata["source_locations_truncated"] is True
+    answer = await answer_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "在所有闸机设备中，打卡记录最多的设备名称是什么？共记录了多少次？",
+    )
+
+    assert answer is not None and answer.table is not None
+    assert answer.table.rows == (("后段高频闸机", "50 次"),)
+    assert answer.hits[0].source_path is not None
+    assert answer.hits[0].source_path.endswith("#worksheet:Sheet1!G2:G251")
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "在所有闸机设备中，打卡记录最多（使用最频繁）的设备名称是什么？共记录了多少次？",
+        "哪台门禁设备的打卡次数最多？",
+        "哪台闸机打卡次数最多？共多少次？",
+        "考勤设备使用频率最高的是哪一个，共几次？",
+        "使用频率最高的门禁设备是哪个？",
+    ),
+)
+def test_device_frequency_recognizes_supported_question_variants(question: str) -> None:
+    assert is_spreadsheet_query_intent(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "公司最常使用的生产设备是什么？",
+        "目前设备使用频率如何？",
+        "闸机设备维护制度是什么？",
+    ),
+)
+def test_generic_device_questions_do_not_trigger_spreadsheet_scan(question: str) -> None:
+    assert is_spreadsheet_query_intent(question) is False
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "研发部打卡记录最多的闸机设备是什么？",
+        "2026年7月17日打卡次数最多的设备是什么？",
+        "打卡记录最多的前3台闸机设备是什么？",
+        "打卡最多的前5台设备有哪些？",
+        "闸机设备打卡次数排名是什么？",
+        "打卡记录最少的闸机设备是什么？",
+        "每台闸机设备分别有多少打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_device_frequency_rejects_unimplemented_filters_and_rankings(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(((2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),)),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_aggregates_all_attendance_sheets_in_one_workbook(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    content = "\n\n".join(
+        (
+            "[worksheet:白班!A1] 姓名",
+            "[worksheet:白班!B1] 时间",
+            "[worksheet:白班!C1] 设备",
+            "[worksheet:白班!A2] 甲",
+            "[worksheet:白班!B2] 2026-07-17 08:00:00",
+            "[worksheet:白班!C2] 东门",
+            "[worksheet:白班!A3] 乙",
+            "[worksheet:白班!B3] 2026-07-17 08:05:00",
+            "[worksheet:白班!C3] 西门",
+            "[worksheet:夜班!A1] 姓名",
+            "[worksheet:夜班!B1] 时间",
+            "[worksheet:夜班!C1] 设备",
+            "[worksheet:夜班!A2] 丙",
+            "[worksheet:夜班!B2] 2026-07-17 20:00:00",
+            "[worksheet:夜班!C2] 东门",
+            "[worksheet:夜班!A3] 丁",
+            "[worksheet:夜班!B3] 2026-07-17 20:05:00",
+            "[worksheet:夜班!C3] 东门",
+        )
+    )
+    await _add_entry(session, knowledge_base_id, content, title="多班次.xlsx")
+    await session.commit()
+
+    answer = await answer_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "哪台闸机打卡次数最多？共多少次？",
+    )
+
+    assert answer is not None and answer.table is not None
+    assert answer.table.rows == (("东门", "3 次"),)
+    assert "完整扫描 4 条打卡记录" in answer.answer
+    assert len(answer.hits) == 1
+    assert answer.hits[0].source_path is not None
+    assert "worksheet:白班!C2:C3" in answer.hits[0].source_path
+    assert "worksheet:夜班!C2:C3" in answer.hits[0].source_path
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_rejects_an_ambiguous_attendance_sheet_in_workbook(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    content = "\n\n".join(
+        (
+            "[worksheet:正常!A1] 姓名",
+            "[worksheet:正常!B1] 时间",
+            "[worksheet:正常!C1] 设备",
+            "[worksheet:正常!A2] 甲",
+            "[worksheet:正常!B2] 2026-07-17 08:00:00",
+            "[worksheet:正常!C2] 东门",
+            "[worksheet:歧义!A1] 姓名",
+            "[worksheet:歧义!B1] 时间",
+            "[worksheet:歧义!C1] 打卡时间",
+            "[worksheet:歧义!D1] 设备",
+            "[worksheet:歧义!A2] 乙",
+            "[worksheet:歧义!B2] 2026-07-17 08:05:00",
+            "[worksheet:歧义!C2] 2026-07-17 08:05:00",
+            "[worksheet:歧义!D2] 西门",
+        )
+    )
+    await _add_entry(session, knowledge_base_id, content, title="混合.xlsx")
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "哪台闸机打卡次数最多？共多少次？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.parametrize(
+    ("unsafe_marker", "safe_marker"),
+    (("[2]", "［2］"), ("[ 2 ]", "［2］"), ("[0]", "［0］"), ("[-1]", "［-1］")),
+)
+@pytest.mark.asyncio
+async def test_device_frequency_escapes_citation_like_dynamic_labels(
+    knowledge_session: tuple[AsyncSession, UUID],
+    unsafe_marker: str,
+    safe_marker: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (
+                    2,
+                    _record(
+                        "工程部",
+                        "E001",
+                        "甲",
+                        "1",
+                        "2026-07-17 08:00:00",
+                        f"东门{unsafe_marker}",
+                    ),
+                ),
+            )
+        ),
+        title=f"测试{unsafe_marker}\n第二行.xlsx",
+    )
+    await session.commit()
+
+    answer = await answer_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "哪台闸机打卡次数最多？共多少次？",
+    )
+
+    assert answer is not None and answer.table is not None
+    assert f"《测试{safe_marker} 第二行.xlsx》" in answer.answer
+    assert f"“东门{safe_marker}”" in answer.answer
+    assert answer.answer.count("[1]") == 1
+    assert unsafe_marker not in answer.answer
+    assert answer.table.rows == ((f"东门{unsafe_marker}", "1 次"),)
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_rejects_multiple_explicit_workbooks(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(((2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),)),
+        title="一月考勤.xlsx",
+    )
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(((2, _record("工程部", "E002", "乙", "2", "2026-07-18 08:00:00", "西门")),)),
+        title="二月考勤.xlsx",
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "一月考勤.xlsx 和 二月考勤.xlsx 中哪台闸机打卡次数最多？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_common_title_word_does_not_silently_select_one_of_multiple_workbooks(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(((2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),)),
+        title="测试.xlsx",
+    )
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(((2, _record("工程部", "E002", "乙", "2", "2026-07-18 08:00:00", "西门")),)),
+        title="设备.xlsx",
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "在所有闸机设备中，打卡记录最多的设备是什么？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
 async def test_event_result_existence_uses_or_semantics(
     knowledge_session: tuple[AsyncSession, UUID],
 ) -> None:
