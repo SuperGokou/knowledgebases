@@ -796,6 +796,16 @@ def _offline_runtime_document(
     return document
 
 
+def _test_protected_regular_file(path: Path, *, maximum_bytes: int) -> bool:
+    """Model the regular-file boundary without requiring root-owned CI fixtures."""
+
+    return (
+        path.is_file()
+        and not path.is_symlink()
+        and 0 < path.stat().st_size <= maximum_bytes
+    )
+
+
 def test_offline_runtime_evidence_requires_real_target_bound_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -809,6 +819,9 @@ def test_offline_runtime_evidence_requires_real_target_bound_chain(
     monkeypatch.setattr("scripts.acceptance.platform.system", lambda: "Linux")
     monkeypatch.setattr(
         "scripts.acceptance._offline_runtime_host_fingerprint", lambda: "a" * 64
+    )
+    monkeypatch.setattr(
+        "scripts.acceptance._protected_regular_file", _test_protected_regular_file
     )
 
     accepted, summary = verify_offline_runtime_evidence(evidence, repository)
@@ -851,6 +864,9 @@ def test_offline_runtime_evidence_blocks_windows_and_tampered_artifacts(
     monkeypatch.setattr("scripts.acceptance.platform.system", lambda: "Linux")
     monkeypatch.setattr(
         "scripts.acceptance._offline_runtime_host_fingerprint", lambda: "a" * 64
+    )
+    monkeypatch.setattr(
+        "scripts.acceptance._protected_regular_file", _test_protected_regular_file
     )
     (evidence_dir / "raw/000-runtime.json").write_text("tampered\n", encoding="utf-8")
     assert verify_offline_runtime_evidence(evidence, repository)[0] is False
