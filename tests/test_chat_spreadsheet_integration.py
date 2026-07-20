@@ -410,6 +410,100 @@ async def test_published_spreadsheet_flows_through_real_acl_query_and_chat_contr
 
 
 @pytest.mark.asyncio
+async def test_event_result_existence_short_circuits_retrieval_and_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            content = "\n\n".join(
+                (
+                    "[worksheet:Sheet1!A1] 部门",
+                    "[worksheet:Sheet1!B1] 人员工号",
+                    "[worksheet:Sheet1!C1] 姓名",
+                    "[worksheet:Sheet1!D1] 时间",
+                    "[worksheet:Sheet1!E1] 设备",
+                    "[worksheet:Sheet1!F1] 事件结果",
+                    "[worksheet:Sheet1!A2] 工程部",
+                    "[worksheet:Sheet1!B2] EFD2411027",
+                    "[worksheet:Sheet1!C2] 刘春耀",
+                    "[worksheet:Sheet1!D2] 2026-07-17 08:00:00",
+                    "[worksheet:Sheet1!E2] 1#2F人行道闸出口3",
+                    "[worksheet:Sheet1!F2] 认证成功(白名单验证)",
+                )
+            )
+            session.add(
+                KnowledgeEntry(
+                    knowledge_base_id=knowledge_base.id,
+                    entry_type="document",
+                    title="测试.xlsx",
+                    content=content,
+                    source_path="generated/attendance.md",
+                    format_version="okf/0.1",
+                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+                    custom_metadata=_trusted_spreadsheet_metadata(content),
+                )
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("existence query must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message="这份考勤数据中，有没有‘认证失败’或‘黑名单拦截’的打卡记录？",
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert response.answer.startswith("没有。")
+            assert "已完整扫描 1 条打卡记录" in response.answer
+            assert "认证成功" not in response.answer
+            assert response.table is not None
+            assert response.table.rows == [
+                ["认证失败", "0 条", "未发现"],
+                ["黑名单拦截", "0 条", "未发现"],
+            ]
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+            assert "完整扫描 1 条打卡记录" in response.citations[0].excerpt
+            assert response.citations[0].source_path == (
+                "generated/attendance.md#worksheet:Sheet1!F2"
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_conflicting_published_workbooks_reject_without_search_or_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
