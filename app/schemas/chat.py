@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import unicodedata
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.knowledge_bases import KnowledgeSearchHit
+
+
+def _remove_unicode_controls(value: str) -> str:
+    return "".join(
+        character
+        for character in value
+        if not unicodedata.category(character).startswith("C")
+    )
 
 
 class ChatQueryRequest(BaseModel):
@@ -27,6 +36,18 @@ class ChatCitation(KnowledgeSearchHit):
 
     citation_number: int = Field(ge=1)
     marker: str = Field(pattern=r"^\[[1-9][0-9]*\]$")
+
+    @field_validator("title")
+    @classmethod
+    def remove_unicode_controls_from_title(cls, value: str) -> str:
+        return _remove_unicode_controls(value)
+
+    @field_validator("source_path", "format_version")
+    @classmethod
+    def remove_unicode_controls_from_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _remove_unicode_controls(value)
 
 
 class ChatSourceStatus(BaseModel):

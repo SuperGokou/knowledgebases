@@ -12,7 +12,15 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import KnowledgeEntry, KnowledgeEntryPublicationStatus
+from app.db.models import (
+    AuditLog,
+    AuditResult,
+    File,
+    KnowledgeEntry,
+    KnowledgeEntryPublicationStatus,
+    OkfConversionJob,
+    OkfConversionStatus,
+)
 from app.schemas.knowledge_bases import KnowledgeSearchHit
 
 _MAX_ENTRIES: Final = 20
@@ -216,8 +224,12 @@ _DEVICE_FREQUENCY_DEVICE_TERMS: Final = (
 _DEVICE_FREQUENCY_AGGREGATE_TERMS: Final = (
     "使用频率最高",
     "使用最频繁",
+    "使用得最频繁",
     "出现次数最多",
     "打卡次数最多",
+    "打卡次数最高",
+    "打卡量最大",
+    "打卡量最多",
     "记录次数最多",
     "记录最多",
     "次数最多",
@@ -255,21 +267,31 @@ _DEVICE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
             "哪一个考勤设备",
             "打卡记录最多",
             "打卡次数最多",
+            "打卡最多",
             "考勤记录最多",
             "通行记录最多",
             "记录次数最多",
             "出现次数最多",
             "使用频率最高",
             "使用最频繁",
+            "使用得最频繁",
+            "打卡次数最高",
+            "打卡量最大",
+            "打卡量最多",
             "频率最高",
             "频次最高",
             "使用最多",
             "最常使用",
             "最常用",
+            "请汇总",
+            "汇总",
+            "以及次数",
+            "以及",
             "共记录了多少次",
             "共记录多少次",
             "一共记录了多少次",
             "一共记录多少次",
+            "一共多少次",
             "共计多少次",
             "总共多少次",
             "共多少次",
@@ -282,6 +304,7 @@ _DEVICE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
             "是哪个",
             "是什么",
             "哪个设备",
+            "哪个",
             "哪台设备",
             "设备名称",
             "闸机设备",
@@ -303,6 +326,7 @@ _DEVICE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
             "考勤机",
             "所有",
             "全部",
+            "这份",
             "其中",
             "请问",
             "请",
@@ -548,6 +572,183 @@ _DEPARTMENT_SUMMARY_PROSE_TERMS: Final = (
     "字段说明",
     "数据说明",
 )
+_DEPARTMENT_RECORD_COUNT_ATTENDANCE_TERMS: Final = (
+    "打卡记录",
+    "考勤记录",
+    "刷卡记录",
+    "门禁记录",
+    "通行记录",
+    "打卡",
+    "考勤",
+    "刷卡",
+    "门禁",
+    "通行",
+)
+_DEPARTMENT_RECORD_COUNT_REQUEST_TERMS: Final = (
+    "一共有多少条",
+    "共有多少条",
+    "共计多少条",
+    "总共多少条",
+    "有多少条",
+    "多少条",
+    "一共有几条",
+    "共有几条",
+    "共计几条",
+    "总共几条",
+    "有几条",
+    "几条",
+    "打卡次数",
+    "考勤次数",
+    "刷卡次数",
+    "门禁次数",
+    "通行次数",
+    "记录数",
+    "总数",
+    "数量",
+    "合计",
+    "总量",
+    "累计",
+    "有多少",
+    "多少次",
+    "几次",
+)
+_DEPARTMENT_RECORD_COUNT_NEUTRAL_PHRASES: Final = tuple(
+    sorted(
+        (
+            "在这段时间内",
+            "在该时间段内",
+            "这段时间内",
+            "该时间段内",
+            "在这段时间",
+            "在该时间段",
+            "这段时间",
+            "该时间段",
+            "一共有多少条",
+            "共有多少条",
+            "共计多少条",
+            "总共多少条",
+            "有多少条",
+            "多少条",
+            "一共有几条",
+            "共有几条",
+            "共计几条",
+            "总共几条",
+            "有几条",
+            "几条",
+            "一共记录了多少次",
+            "一共记录多少次",
+            "共记录了多少次",
+            "共记录多少次",
+            "共计多少次",
+            "总共多少次",
+            "有多少次",
+            "多少次",
+            "有几次",
+            "几次",
+            "打卡记录",
+            "考勤记录",
+            "刷卡记录",
+            "门禁记录",
+            "通行记录",
+            "打卡次数",
+            "考勤次数",
+            "刷卡次数",
+            "门禁次数",
+            "通行次数",
+            "记录数",
+            "总数是多少",
+            "总数",
+            "数量是多少",
+            "数量",
+            "合计是多少",
+            "合计",
+            "总量是多少",
+            "总量",
+            "有多少",
+            "总计",
+            "累计",
+            "请统计",
+            "帮我统计",
+            "统计一下",
+            "统计",
+            "请问一下",
+            "问一下",
+            "能否",
+            "可以",
+            "帮忙",
+            "麻烦",
+            "一下",
+            "请问",
+            "请",
+            "一共",
+            "总共",
+            "共计",
+            "共有",
+            "打卡",
+            "考勤",
+            "刷卡",
+            "门禁",
+            "通行",
+            "记录",
+            "次数",
+            "了",
+            "的",
+            "有",
+            "吗",
+            "呢",
+            "么",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_DEPARTMENT_RECORD_COUNT_UNSUPPORTED_TERMS: Final = (
+    "今天",
+    "昨日",
+    "昨天",
+    "前天",
+    "本周",
+    "上周",
+    "本月",
+    "上月",
+    "今年",
+    "去年",
+    "上午",
+    "下午",
+    "设备",
+    "闸机",
+    "考勤机",
+    "认证",
+    "验证",
+    "成功",
+    "失败",
+    "异常",
+    "黑名单",
+    "白名单",
+    "每位员工",
+    "每个员工",
+    "每名员工",
+    "分别",
+    "姓名",
+    "工号",
+    "卡号",
+    "每个部门",
+    "各部门",
+    "排名",
+    "排行",
+    "top",
+    "占比",
+    "比例",
+    "分布",
+    "分组",
+    "排除",
+    "剔除",
+    "不包括",
+    "除了",
+)
+_DEPARTMENT_RECORD_COUNT_RESIDUAL_PATTERN: Final = re.compile(
+    r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
+)
 _MISSING_SPREADSHEET_VALUE_LABELS: Final = frozenset(
     (
         *_MISSING_DEVICE_LABELS,
@@ -705,6 +906,7 @@ class _Sheet:
     rows: tuple[_Row, ...]
     columns: dict[str, str | None]
     ambiguous: frozenset[str]
+    multiple_attendance_headers: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,11 +951,24 @@ class _DepartmentSummaryCoverage:
 
 
 @dataclass(frozen=True, slots=True)
+class _DepartmentRecordCountCoverage:
+    entry: _EntrySource
+    sheet: str
+    department_column: str
+    timestamp_column: str
+    first_row: int
+    last_row: int
+    scanned_rows: int
+    matched_rows: int
+
+
+@dataclass(frozen=True, slots=True)
 class _QuestionIntent:
     latest_record: bool
     time_range: bool
     employee_field: str | None
     department_employees: bool
+    department_record_count: bool
     department_summary: bool
     event_result_existence: bool
     device_frequency: bool
@@ -766,6 +981,7 @@ class _QuestionIntent:
                 self.time_range,
                 self.employee_field,
                 self.department_employees,
+                self.department_record_count,
                 self.department_summary,
                 self.event_result_existence,
                 self.device_frequency,
@@ -819,11 +1035,26 @@ async def answer_spreadsheet_query(
     if sources is None:
         return None
     sheets = _reconstruct_sheets(sources)
-    if not sheets:
+    if (
+        not sheets
+        or any(sheet.multiple_attendance_headers for sheet in sheets)
+        or any(
+            sheet.rows and not _valid_coverage_sheet_name(sheet.rows[0].sheet) for sheet in sheets
+        )
+    ):
         return None
 
     if intent.device_frequency:
+        if not _all_source_sheets_reconstructed(sources, sheets):
+            return None
         return _answer_device_frequency(sheets, normalized_question)
+    if intent.department_record_count:
+        if not _all_source_sheets_reconstructed(sources, sheets):
+            return None
+        return _answer_department_record_count(
+            sheets,
+            _strip_selected_source_filename_mentions(normalized_question, sources),
+        )
     if intent.department_summary:
         return _answer_department_summary(
             sheets,
@@ -881,14 +1112,29 @@ def _question_intent(question: str) -> _QuestionIntent:
         is not None
     )
     department_employees = department_employee_scope and employee_list_request
+    latest_record = _is_latest_record_question(question)
+    time_range = _is_time_range_question(question)
+    department_summary = _is_department_summary_question(question) and not department_employees
+    event_result_existence = _is_event_result_existence_question(question)
+    device_frequency = _is_device_frequency_question(question)
+    department_record_count = (
+        _is_department_record_count_question(question)
+        and not department_employees
+        and not department_summary
+        and not event_result_existence
+        and not device_frequency
+        and not latest_record
+        and not time_range
+    )
     return _QuestionIntent(
-        latest_record=_is_latest_record_question(question),
-        time_range=_is_time_range_question(question),
+        latest_record=latest_record,
+        time_range=time_range,
         employee_field=employee_field,
         department_employees=department_employees,
-        department_summary=(_is_department_summary_question(question) and not department_employees),
-        event_result_existence=_is_event_result_existence_question(question),
-        device_frequency=_is_device_frequency_question(question),
+        department_record_count=department_record_count,
+        department_summary=department_summary,
+        event_result_existence=event_result_existence,
+        device_frequency=device_frequency,
     )
 
 
@@ -928,6 +1174,34 @@ def _is_department_summary_question(question: str) -> bool:
     return attendance_context and department_context and (summary_request or list_request)
 
 
+def _is_department_record_count_question(question: str) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    attendance_context = any(
+        term in semantic_question for term in _DEPARTMENT_RECORD_COUNT_ATTENDANCE_TERMS
+    )
+    count_request = any(
+        term in semantic_question for term in _DEPARTMENT_RECORD_COUNT_REQUEST_TERMS
+    )
+    return attendance_context and count_request
+
+
+def _has_unsupported_department_record_count_scope(
+    question: str,
+    department: str,
+) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    department_key = unicodedata.normalize("NFKC", department).casefold()
+    semantic_question = semantic_question.replace(department_key, "")
+    if _question_date(semantic_question) is not None:
+        return True
+    if any(term in semantic_question for term in _DEPARTMENT_RECORD_COUNT_UNSUPPORTED_TERMS):
+        return True
+    residual = semantic_question
+    for phrase in _DEPARTMENT_RECORD_COUNT_NEUTRAL_PHRASES:
+        residual = residual.replace(phrase, "")
+    return bool(_DEPARTMENT_RECORD_COUNT_RESIDUAL_PATTERN.sub("", residual))
+
+
 def _has_unsupported_department_summary_scope(question: str) -> bool:
     semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
     if _question_date(semantic_question) is not None:
@@ -947,7 +1221,12 @@ def _is_device_frequency_question(question: str) -> bool:
     )
     device_context = any(term in semantic_question for term in _DEVICE_FREQUENCY_DEVICE_TERMS)
     aggregate_request = any(term in semantic_question for term in _DEVICE_FREQUENCY_AGGREGATE_TERMS)
-    return attendance_context and device_context and aggregate_request
+    attendance_device_context = any(
+        term in semantic_question for term in ("闸机", "门禁机", "考勤机")
+    )
+    return (
+        (attendance_context or attendance_device_context) and device_context and aggregate_request
+    )
 
 
 def _has_unsupported_device_frequency_scope(question: str) -> bool:
@@ -1099,7 +1378,19 @@ async def _load_sources(
     session: AsyncSession, knowledge_base_id: UUID
 ) -> tuple[_EntrySource, ...] | None:
     statement = (
-        select(KnowledgeEntry)
+        select(KnowledgeEntry, File.id, OkfConversionJob.id)
+        .outerjoin(
+            File,
+            (File.id == KnowledgeEntry.source_file_id)
+            & (File.knowledge_base_id == KnowledgeEntry.knowledge_base_id),
+        )
+        .outerjoin(
+            OkfConversionJob,
+            (OkfConversionJob.output_entry_id == KnowledgeEntry.id)
+            & (OkfConversionJob.file_id == KnowledgeEntry.source_file_id)
+            & (OkfConversionJob.knowledge_base_id == KnowledgeEntry.knowledge_base_id)
+            & (OkfConversionJob.status == OkfConversionStatus.SUCCEEDED),
+        )
         .where(
             KnowledgeEntry.knowledge_base_id == knowledge_base_id,
             KnowledgeEntry.deleted_at.is_(None),
@@ -1109,8 +1400,29 @@ async def _load_sources(
         .order_by(KnowledgeEntry.title, KnowledgeEntry.id)
         .limit(_MAX_ENTRIES + 1)
     )
-    entries = tuple((await session.scalars(statement)).all())
-    if not entries or len(entries) > _MAX_ENTRIES:
+    rows = tuple((await session.execute(statement)).all())
+    if not rows or len(rows) > _MAX_ENTRIES:
+        return None
+    # Parser metadata and hashes live beside the parsed text and can therefore be
+    # self-signed by a historical API write. Trust only entries linked back to the
+    # immutable source file by the successful conversion job that produced them.
+    if any(
+        source_file_id is None or conversion_job_id is None
+        for _, source_file_id, conversion_job_id in rows
+    ):
+        return None
+    entries = tuple(entry for entry, _, _ in rows)
+    updated_entry_audit = await session.scalar(
+        select(AuditLog.id)
+        .where(
+            AuditLog.action == "knowledge_entry.updated",
+            AuditLog.result == AuditResult.SUCCESS,
+            AuditLog.resource_type == "knowledge_entry",
+            AuditLog.resource_id.in_(tuple(str(entry.id) for entry in entries)),
+        )
+        .limit(1)
+    )
+    if updated_entry_audit is not None:
         return None
     if sum(len(entry.content) for entry in entries) > _MAX_TOTAL_CHARACTERS:
         return None
@@ -1366,6 +1678,21 @@ def _reconstruct_sheets(sources: tuple[_EntrySource, ...]) -> tuple[_Sheet, ...]
     return tuple(reconstructed)
 
 
+def _all_source_sheets_reconstructed(
+    sources: tuple[_EntrySource, ...],
+    sheets: tuple[_Sheet, ...],
+) -> bool:
+    source_sheet_keys = {
+        (source.id, match.group("sheet"))
+        for source in sources
+        for match in _CELL_PATTERN.finditer(source.source_text)
+    }
+    reconstructed_sheet_keys = {
+        (sheet.rows[0].entry.id, sheet.rows[0].sheet) for sheet in sheets if sheet.rows
+    }
+    return bool(source_sheet_keys) and source_sheet_keys == reconstructed_sheet_keys
+
+
 def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
     candidates: list[tuple[int, int, int, _Row, dict[str, str | None], frozenset[str]]] = []
     for row in rows[:50]:
@@ -1399,6 +1726,18 @@ def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
         )
     if not candidates:
         return None
+    attendance_header_count = sum(
+        1
+        for _, _, _, _, resolved, ambiguities in candidates
+        if resolved.get("timestamp") is not None
+        and "timestamp" not in ambiguities
+        and resolved.get("device") is not None
+        and "device" not in ambiguities
+        and any(
+            resolved.get(kind) is not None and kind not in ambiguities
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+        )
+    )
     _, _, _, header, columns, header_ambiguities = max(candidates, key=lambda item: item[:3])
     if len(columns) < 2:
         return None
@@ -1406,6 +1745,154 @@ def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
         rows=tuple(row for row in rows if row.number > header.number),
         columns=columns,
         ambiguous=header_ambiguities,
+        multiple_attendance_headers=attendance_header_count > 1,
+    )
+
+
+def _answer_department_record_count(
+    sheets: tuple[_Sheet, ...], question: str
+) -> SpreadsheetAnswer | None:
+    attendance_sheets: list[_Sheet] = []
+    for sheet in sheets:
+        timestamp_shape = "timestamp" in sheet.columns
+        device_shape = "device" in sheet.columns
+        department_shape = "department" in sheet.columns
+        identity_shape = any(
+            kind in sheet.columns for kind in ("employee_id", "card_number", "employee_name")
+        )
+        attendance_shape_signals = sum(
+            (timestamp_shape, device_shape, department_shape, identity_shape)
+        )
+        partial_attendance_shape = (
+            timestamp_shape or device_shape
+        ) and attendance_shape_signals >= 2
+        if not partial_attendance_shape:
+            continue
+        if not (timestamp_shape and device_shape and department_shape and identity_shape):
+            return None
+        if not sheet.rows or not _valid_coverage_sheet_name(sheet.rows[0].sheet):
+            return None
+        department_column = sheet.columns.get("department")
+        timestamp_column = sheet.columns.get("timestamp")
+        device_column = sheet.columns.get("device")
+        identity_columns = tuple(
+            column
+            for kind in ("employee_id", "card_number", "employee_name")
+            if kind not in sheet.ambiguous and (column := sheet.columns.get(kind)) is not None
+        )
+        if (
+            department_column is None
+            or timestamp_column is None
+            or device_column is None
+            or not identity_columns
+            or "department" in sheet.ambiguous
+            or "timestamp" in sheet.ambiguous
+            or "device" in sheet.ambiguous
+        ):
+            return None
+        attendance_sheets.append(sheet)
+    if not attendance_sheets:
+        return None
+
+    display_labels: dict[str, str] = {}
+    total_counts: dict[str, int] = {}
+    sheet_counts: list[tuple[_Sheet, str, str, dict[str, int]]] = []
+    total_scanned = 0
+    for sheet in attendance_sheets:
+        department_column = sheet.columns.get("department")
+        timestamp_column = sheet.columns.get("timestamp")
+        device_column = sheet.columns.get("device")
+        identity_columns = tuple(
+            column
+            for kind in ("employee_id", "card_number", "employee_name")
+            if kind not in sheet.ambiguous and (column := sheet.columns.get(kind)) is not None
+        )
+        if (
+            department_column is None
+            or timestamp_column is None
+            or device_column is None
+            or not identity_columns
+            or not sheet.rows
+            or any(not row.entry.integrity_metadata for row in sheet.rows)
+        ):
+            return None
+
+        counts: dict[str, int] = {}
+        for row in sheet.rows:
+            raw_department = row.value(department_column)
+            raw_timestamp = row.value(timestamp_column)
+            raw_device = row.value(device_column)
+            if (
+                raw_department is None
+                or raw_timestamp is None
+                or _parse_datetime(raw_timestamp) is None
+                or raw_device is None
+                or _normalized_device_label(raw_device) is None
+                or not any(
+                    _normalized_identity_label(row.value(column) or "") is not None
+                    for column in identity_columns
+                )
+            ):
+                return None
+            normalized_department = _normalized_department_label(raw_department)
+            if normalized_department is None:
+                return None
+            department_key, display_label = normalized_department
+            display_labels.setdefault(department_key, display_label)
+            counts[department_key] = counts.get(department_key, 0) + 1
+            total_counts[department_key] = total_counts.get(department_key, 0) + 1
+
+        sheet_counts.append((sheet, department_column, timestamp_column, counts))
+        total_scanned += len(sheet.rows)
+
+    normalized_question = unicodedata.normalize("NFKC", question).casefold()
+    target_keys = tuple(key for key in display_labels if key in normalized_question)
+    if not target_keys:
+        return None
+    longest_length = max(len(key) for key in target_keys)
+    longest_keys = tuple(key for key in target_keys if len(key) == longest_length)
+    if len(longest_keys) != 1:
+        return None
+    target_key = longest_keys[0]
+    target_display = display_labels[target_key]
+    if _has_unsupported_department_record_count_scope(question, target_display):
+        return None
+
+    coverages = [
+        _DepartmentRecordCountCoverage(
+            entry=sheet.rows[0].entry,
+            sheet=sheet.rows[0].sheet,
+            department_column=department_column,
+            timestamp_column=timestamp_column,
+            first_row=sheet.rows[0].number,
+            last_row=sheet.rows[-1].number,
+            scanned_rows=len(sheet.rows),
+            matched_rows=counts.get(target_key, 0),
+        )
+        for sheet, department_column, timestamp_column, counts in sheet_counts
+    ]
+    matched_count = total_counts.get(target_key, 0)
+    hits = _build_department_record_count_hits(coverages, target_display)
+    if hits is None or not hits or total_scanned <= 0:
+        return None
+
+    titles = {coverage.entry.title for coverage in coverages}
+    title = next(iter(titles)) if len(titles) == 1 else "选定考勤工作簿"
+    safe_title = _citation_safe_text(title)
+    safe_department = _citation_safe_text(target_display)
+    return SpreadsheetAnswer(
+        answer=(
+            f"在《{safe_title}》的完整考勤时间范围内，“{safe_department}”共有 "
+            f"{matched_count} 条打卡记录（已完整扫描 {total_scanned} 条记录）。"
+            f"{_citation_marker(hits)}"
+        ),
+        table=SpreadsheetTable(
+            title="部门打卡记录统计",
+            columns=("部门名称", "打卡记录数"),
+            rows=((safe_department, f"{matched_count} 条"),),
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
     )
 
 
@@ -1594,6 +2081,14 @@ def _answer_device_frequency(sheets: tuple[_Sheet, ...], question: str) -> Sprea
             kind in sheet.columns
             for kind in ("employee_id", "card_number", "employee_name", "department")
         )
+        attendance_shape_signals = sum((timestamp_shape, device_shape, identity_shape))
+        partial_attendance_shape = (
+            timestamp_shape or device_shape
+        ) and attendance_shape_signals >= 2
+        if not partial_attendance_shape:
+            continue
+        if not (timestamp_shape and device_shape and identity_shape):
+            return None
         timestamp_signal = (
             sheet.columns.get("timestamp") is not None and "timestamp" not in sheet.ambiguous
         )
@@ -2151,10 +2646,12 @@ def _build_event_result_hits(
             KnowledgeSearchHit(
                 entry_id=entry.id,
                 source_file_id=entry.source_file_id,
-                title=entry.title,
+                title=_citation_safe_text(entry.title),
                 excerpt=excerpt,
                 source_path=_anchored_source_path(entry.source_path, combined_anchor),
-                format_version=entry.format_version,
+                format_version=(
+                    _citation_safe_text(entry.format_version) if entry.format_version else None
+                ),
             )
         )
     return tuple(hits)
@@ -2201,13 +2698,15 @@ def _build_device_frequency_hits(
             KnowledgeSearchHit(
                 entry_id=entry.id,
                 source_file_id=entry.source_file_id,
-                title=entry.title,
+                title=_citation_safe_text(entry.title),
                 excerpt=excerpt,
                 source_path=_anchored_source_path(
                     entry.source_path,
                     _combined_coverage_anchor(anchors),
                 ),
-                format_version=entry.format_version,
+                format_version=(
+                    _citation_safe_text(entry.format_version) if entry.format_version else None
+                ),
             )
         )
     return tuple(hits)
@@ -2260,6 +2759,61 @@ def _build_department_summary_hits(
     return tuple(hits)
 
 
+def _build_department_record_count_hits(
+    coverages: list[_DepartmentRecordCountCoverage],
+    target_department: str,
+) -> tuple[KnowledgeSearchHit, ...] | None:
+    hits: list[KnowledgeSearchHit] = []
+    evidence_characters = 0
+    grouped: dict[UUID, list[_DepartmentRecordCountCoverage]] = {}
+    for coverage in coverages:
+        grouped.setdefault(coverage.entry.id, []).append(coverage)
+    safe_department = _citation_safe_text(target_department)
+    for entry_coverages in grouped.values():
+        entry = entry_coverages[0].entry
+        anchor_groups: list[tuple[str, str]] = []
+        summaries: list[str] = []
+        for coverage in entry_coverages:
+            department_anchor = _column_range(
+                coverage.sheet,
+                coverage.department_column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            timestamp_anchor = _column_range(
+                coverage.sheet,
+                coverage.timestamp_column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            anchor_groups.append((department_anchor, timestamp_anchor))
+            summaries.append(
+                f"确定性全量筛选 [{department_anchor}, {timestamp_anchor}]："
+                f"完整扫描 {coverage.scanned_rows} 条考勤记录；"
+                f"“{safe_department}”命中 {coverage.matched_rows} 条。"
+            )
+        excerpt = "\n".join(summaries)
+        evidence_characters += len(excerpt)
+        if evidence_characters > _MAX_EVIDENCE_CHARACTERS:
+            return None
+        hits.append(
+            KnowledgeSearchHit(
+                entry_id=entry.id,
+                source_file_id=entry.source_file_id,
+                title=_citation_safe_text(entry.title),
+                excerpt=excerpt,
+                source_path=_anchored_source_path(
+                    entry.source_path,
+                    _combined_grouped_coverage_anchor(anchor_groups),
+                ),
+                format_version=(
+                    _citation_safe_text(entry.format_version) if entry.format_version else None
+                ),
+            )
+        )
+    return tuple(hits)
+
+
 def _build_hits(rows: list[_Row]) -> tuple[KnowledgeSearchHit, ...] | None:
     unique_rows = {(row.entry.id, row.sheet, row.number): row for row in rows}
     grouped: dict[UUID, list[_Row]] = {}
@@ -2300,6 +2854,7 @@ def _evidence_source_path(base_path: str | None, rows: list[_Row]) -> str:
     evidence_path = f"{','.join(selected)}{suffix}"
     if not base_path:
         return evidence_path[:_MAX_SOURCE_PATH_CHARACTERS]
+    base_path = _safe_source_path_base(base_path)
     base_budget = max(0, _MAX_SOURCE_PATH_CHARACTERS - len(evidence_path) - 1)
     return f"{base_path[:base_budget]}#{evidence_path}"
 
@@ -2314,8 +2869,22 @@ def _column_range(sheet: str, column: str, first_row: int, last_row: int) -> str
 def _anchored_source_path(base_path: str | None, anchor: str) -> str:
     if not base_path:
         return anchor[:_MAX_SOURCE_PATH_CHARACTERS]
+    base_path = _safe_source_path_base(base_path)
     base_budget = max(0, _MAX_SOURCE_PATH_CHARACTERS - len(anchor) - 1)
     return f"{base_path[:base_budget]}#{anchor}"
+
+
+def _safe_source_path_base(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    without_controls = "".join(
+        character for character in normalized if not unicodedata.category(character).startswith("C")
+    )
+    return (
+        without_controls.replace("%", "%25")
+        .replace("#", "%23")
+        .replace("[", "%5B")
+        .replace("]", "%5D")
+    )
 
 
 def _combined_coverage_anchor(anchors: list[str]) -> str:
@@ -2326,6 +2895,21 @@ def _combined_coverage_anchor(anchors: list[str]) -> str:
             break
         selected.append(anchor)
     omitted = len(anchors) - len(selected)
+    suffix = f",...(+{omitted} sheets)" if omitted else ""
+    return f"{','.join(selected)}{suffix}"
+
+
+def _combined_grouped_coverage_anchor(
+    anchor_groups: list[tuple[str, str]],
+) -> str:
+    selected: list[str] = []
+    for anchor_group in anchor_groups:
+        grouped_anchor = ",".join(anchor_group)
+        candidate = ",".join((*selected, grouped_anchor))
+        if len(candidate) > _MAX_SOURCE_PATH_CHARACTERS // 2:
+            break
+        selected.append(grouped_anchor)
+    omitted = len(anchor_groups) - len(selected)
     suffix = f",...(+{omitted} sheets)" if omitted else ""
     return f"{','.join(selected)}{suffix}"
 

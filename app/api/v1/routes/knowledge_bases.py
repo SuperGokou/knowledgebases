@@ -49,6 +49,19 @@ from app.services.knowledge_bases import (
 
 router = APIRouter()
 
+_SYSTEM_GENERATED_ENTRY_METADATA_KEYS = frozenset(
+    {
+        "generator",
+        "source_parser",
+        "source_locations",
+        "source_location_count",
+        "source_locations_truncated",
+        "source_text_length",
+        "source_text_sha256",
+        "source_locations_sha256",
+    }
+)
+
 
 def _locked_roles_for_grants_statement(role_ids: set[UUID]) -> Select[tuple[Role]]:
     # Grant replacement locks KnowledgeBase first, then roles. KEY SHARE blocks
@@ -67,6 +80,17 @@ def _ensure_metadata_size(value: dict[str, object]) -> None:
             status_code=422,
             code="metadata_too_large",
             message="Custom metadata must not exceed 16 KiB",
+        )
+
+
+def _ensure_metadata_is_user_managed(value: dict[str, object]) -> None:
+    reserved = sorted(_SYSTEM_GENERATED_ENTRY_METADATA_KEYS.intersection(value))
+    if reserved:
+        raise ApiError(
+            status_code=422,
+            code="reserved_entry_metadata",
+            message="Parser, generator, and integrity metadata are managed by the system",
+            details={"fields": reserved},
         )
 
 
@@ -502,6 +526,7 @@ async def create_entry(
         lock=True,
     )
     _ensure_metadata_size(payload.custom_metadata)
+    _ensure_metadata_is_user_managed(payload.custom_metadata)
     current_count, current_bytes = await _knowledge_entry_usage(
         session,
         knowledge_base_id=knowledge_base_id,
@@ -595,6 +620,7 @@ async def update_entry(
     changes = payload.model_dump(exclude_unset=True)
     if "custom_metadata" in changes:
         _ensure_metadata_size(changes["custom_metadata"])
+        _ensure_metadata_is_user_managed(changes["custom_metadata"])
     if "content" in changes:
         current_count, current_bytes = await _knowledge_entry_usage(
             session,
