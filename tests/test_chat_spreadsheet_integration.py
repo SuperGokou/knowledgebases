@@ -351,6 +351,30 @@ def test_invalid_structured_table_is_rejected_without_crashing_chat() -> None:
     assert chat_service._structured_spreadsheet_response(knowledge_base_id, result) is None
 
 
+def test_structured_source_footer_neutralizes_untrusted_citation_like_metadata() -> None:
+    knowledge_base_id = uuid4()
+    hit = KnowledgeSearchHit(
+        entry_id=uuid4(),
+        source_file_id=uuid4(),
+        title="测试 [ 2 ]",
+        excerpt="完整扫描 1 条打卡记录",
+        source_path="generated/[0]/attendance.md",
+        format_version="okf/0.1",
+    )
+    result = SpreadsheetAnswer(
+        answer="已完成确定性统计。[1]",
+        hits=(hit,),
+        table=None,
+    )
+
+    response = chat_service._structured_spreadsheet_response(knowledge_base_id, result)
+
+    assert response is not None
+    assert "[1] 测试 ［2］" in response.answer
+    assert "generated/［0］/attendance.md" in response.answer
+    assert "[ 2 ]" not in response.answer
+
+
 @pytest.mark.asyncio
 async def test_published_spreadsheet_flows_through_real_acl_query_and_chat_contract() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
@@ -498,6 +522,110 @@ async def test_event_result_existence_short_circuits_retrieval_and_llm(
             assert "完整扫描 1 条打卡记录" in response.citations[0].excerpt
             assert response.citations[0].source_path == (
                 "generated/attendance.md#worksheet:Sheet1!F2"
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_short_circuits_retrieval_and_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            content = "\n\n".join(
+                (
+                    "[worksheet:Sheet1!A1] 部门",
+                    "[worksheet:Sheet1!B1] 人员工号",
+                    "[worksheet:Sheet1!C1] 姓名",
+                    "[worksheet:Sheet1!D1] 时间",
+                    "[worksheet:Sheet1!E1] 设备",
+                    "[worksheet:Sheet1!A2] 工程部",
+                    "[worksheet:Sheet1!B2] E001",
+                    "[worksheet:Sheet1!C2] 甲",
+                    "[worksheet:Sheet1!D2] 2026-07-17 08:00:00",
+                    "[worksheet:Sheet1!E2] 东门",
+                    "[worksheet:Sheet1!A3] 工程部",
+                    "[worksheet:Sheet1!B3] E002",
+                    "[worksheet:Sheet1!C3] 乙",
+                    "[worksheet:Sheet1!D3] 2026-07-17 08:05:00",
+                    "[worksheet:Sheet1!E3] 东门",
+                    "[worksheet:Sheet1!A4] 工程部",
+                    "[worksheet:Sheet1!B4] E003",
+                    "[worksheet:Sheet1!C4] 丙",
+                    "[worksheet:Sheet1!D4] 2026-07-17 08:10:00",
+                    "[worksheet:Sheet1!E4] 西门",
+                )
+            )
+            session.add(
+                KnowledgeEntry(
+                    knowledge_base_id=knowledge_base.id,
+                    entry_type="document",
+                    title="测试.xlsx",
+                    content=content,
+                    source_path="generated/attendance.md",
+                    format_version="okf/0.1",
+                    publication_status=KnowledgeEntryPublicationStatus.PUBLISHED,
+                    custom_metadata=_trusted_spreadsheet_metadata(content),
+                )
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("device aggregate must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message=(
+                    "在所有闸机设备中，打卡记录最多（使用最频繁）的设备名称是什么？共记录了多少次？"
+                ),
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert "使用最频繁的设备是“东门”，共记录 2 次" in response.answer
+            assert "模型未提供有效引用" not in response.answer
+            assert response.table is not None
+            assert response.table.model_dump() == {
+                "title": "闸机设备使用频率",
+                "columns": ["设备名称", "打卡次数"],
+                "rows": [["东门", "2 次"]],
+                "citation_numbers": [1],
+            }
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+            assert response.citations[0].source_path == (
+                "generated/attendance.md#worksheet:Sheet1!E2:E4"
             )
     finally:
         await engine.dispose()

@@ -245,7 +245,8 @@ def _rejected_spreadsheet_response(
 def _single_line(value: str) -> str:
     """Prevent user-managed titles and paths from breaking the source-list format."""
 
-    return " ".join(value.split())
+    single_line = " ".join(value.split())
+    return _CITATION_PATTERN.sub(lambda match: f"［{match.group(1)}］", single_line)
 
 
 def _with_source_footer(answer: str, citations: list[ChatCitation]) -> str:

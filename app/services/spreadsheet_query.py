@@ -84,6 +84,7 @@ _SPREADSHEET_FILENAME_PATTERN: Final = re.compile(r"\.(?:xlsx?|csv)\Z", re.IGNOR
 _SPREADSHEET_REFERENCE_PATTERN: Final = re.compile(
     r"[^\s，。？！?\"'“”‘’]{1,200}\.(?:xlsx?|csv)", re.IGNORECASE
 )
+_CITATION_LIKE_PATTERN: Final = re.compile(r"\[\s*-?\d+\s*\]")
 _SPREADSHEET_REFERENCE_PREFIXES: Final = tuple(
     sorted(
         (
@@ -186,6 +187,154 @@ _EVENT_RESULT_NEUTRAL_PHRASES: Final = tuple(
 _EVENT_RESULT_RESIDUAL_PATTERN: Final = re.compile(
     r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
 )
+_DEVICE_FREQUENCY_ATTENDANCE_TERMS: Final = (
+    "打卡",
+    "考勤",
+    "刷卡",
+    "门禁记录",
+    "通行记录",
+    "门禁设备",
+    "闸机设备",
+    "考勤设备",
+)
+_DEVICE_FREQUENCY_DEVICE_TERMS: Final = (
+    "闸机设备",
+    "门禁设备",
+    "考勤设备",
+    "打卡设备",
+    "闸机",
+    "门禁机",
+    "考勤机",
+    "设备名称",
+    "设备",
+)
+_DEVICE_FREQUENCY_AGGREGATE_TERMS: Final = (
+    "使用频率最高",
+    "使用最频繁",
+    "出现次数最多",
+    "打卡次数最多",
+    "记录次数最多",
+    "记录最多",
+    "次数最多",
+    "使用最多",
+    "频率最高",
+    "频次最高",
+    "最常使用",
+    "最常用",
+    "记录最少",
+    "次数最少",
+    "使用最少",
+    "频率最低",
+    "频次最低",
+    "最不常用",
+    "打卡最多",
+    "考勤最多",
+    "通行最多",
+    "排行榜",
+    "排行",
+    "排名",
+    "top",
+    "分别有多少",
+    "各有多少",
+    "每台",
+)
+_DEVICE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
+    sorted(
+        (
+            "在所有闸机设备中",
+            "所有闸机设备中",
+            "所有闸机设备",
+            "哪台门禁设备",
+            "哪台闸机",
+            "哪个闸机",
+            "哪一个考勤设备",
+            "打卡记录最多",
+            "打卡次数最多",
+            "考勤记录最多",
+            "通行记录最多",
+            "记录次数最多",
+            "出现次数最多",
+            "使用频率最高",
+            "使用最频繁",
+            "频率最高",
+            "频次最高",
+            "使用最多",
+            "最常使用",
+            "最常用",
+            "共记录了多少次",
+            "共记录多少次",
+            "一共记录了多少次",
+            "一共记录多少次",
+            "共计多少次",
+            "总共多少次",
+            "共多少次",
+            "共几次",
+            "有多少次",
+            "多少次",
+            "是哪一个",
+            "是哪一台",
+            "是哪台",
+            "是哪个",
+            "是什么",
+            "哪个设备",
+            "哪台设备",
+            "设备名称",
+            "闸机设备",
+            "门禁设备",
+            "考勤设备",
+            "打卡设备",
+            "打卡记录",
+            "考勤记录",
+            "刷卡记录",
+            "通行记录",
+            "门禁记录",
+            "记录",
+            "打卡",
+            "考勤",
+            "刷卡",
+            "设备",
+            "闸机",
+            "门禁机",
+            "考勤机",
+            "所有",
+            "全部",
+            "其中",
+            "请问",
+            "请",
+            "在",
+            "中",
+            "里",
+            "的",
+            "了",
+            "共",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_DEVICE_FREQUENCY_RESIDUAL_PATTERN: Final = re.compile(
+    r"[\s,，。？！?!、；;：:/\"'“”‘’()（）《》【】\[\]]+"
+)
+_MISSING_DEVICE_LABELS: Final = frozenset(
+    (
+        "-",
+        "--",
+        "—",
+        "n/a",
+        "#n/a",
+        "na",
+        "nan",
+        "null",
+        "none",
+        "unknown",
+        "未知",
+        "无",
+        "不详",
+        "未填写",
+        "未设置",
+        "未分配",
+    )
+)
 
 _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
     "employee_id": {
@@ -224,6 +373,9 @@ _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
     "device": {
         "设备": 0,
         "设备名称": 0,
+        "闸机": 0,
+        "闸机名称": 0,
+        "门禁闸机名称": 0,
         "通行设备": 0,
         "打卡设备": 0,
         "考勤设备": 0,
@@ -348,12 +500,24 @@ class _EventResultCoverage:
 
 
 @dataclass(frozen=True, slots=True)
+class _DeviceFrequencyCoverage:
+    entry: _EntrySource
+    sheet: str
+    column: str
+    first_row: int
+    last_row: int
+    scanned_rows: int
+    counts: tuple[tuple[str, str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _QuestionIntent:
     latest_record: bool
     time_range: bool
     employee_field: str | None
     department_employees: bool
     event_result_existence: bool
+    device_frequency: bool
 
     @property
     def applicable(self) -> bool:
@@ -364,6 +528,7 @@ class _QuestionIntent:
                 self.employee_field,
                 self.department_employees,
                 self.event_result_existence,
+                self.device_frequency,
             )
         )
 
@@ -417,6 +582,8 @@ async def answer_spreadsheet_query(
     if not sheets:
         return None
 
+    if intent.device_frequency:
+        return _answer_device_frequency(sheets, normalized_question)
     if intent.event_result_existence:
         return _answer_event_result_existence(sheets, normalized_question)
     if intent.latest_record:
@@ -468,6 +635,7 @@ def _question_intent(question: str) -> _QuestionIntent:
         employee_field=employee_field,
         department_employees=department_employees,
         event_result_existence=_is_event_result_existence_question(question),
+        device_frequency=_is_device_frequency_question(question),
     )
 
 
@@ -484,6 +652,23 @@ def _has_employee_field_lookup_shape(question: str) -> bool:
     generic_subjects = {"公司", "本公司", "企业", "部门", "项目", "系统", "平台", "员工", "人员"}
     subjects = re.findall(r"([A-Za-z0-9一-鿿·_-]{2,40})的", question)
     return any(subject not in generic_subjects for subject in subjects)
+
+
+def _is_device_frequency_question(question: str) -> bool:
+    semantic_question = _strip_spreadsheet_filename_mentions(question).casefold()
+    attendance_context = any(
+        term in semantic_question for term in _DEVICE_FREQUENCY_ATTENDANCE_TERMS
+    )
+    device_context = any(term in semantic_question for term in _DEVICE_FREQUENCY_DEVICE_TERMS)
+    aggregate_request = any(term in semantic_question for term in _DEVICE_FREQUENCY_AGGREGATE_TERMS)
+    return attendance_context and device_context and aggregate_request
+
+
+def _has_unsupported_device_frequency_scope(question: str) -> bool:
+    residual = _strip_spreadsheet_filename_mentions(question)
+    for phrase in _DEVICE_FREQUENCY_NEUTRAL_PHRASES:
+        residual = residual.replace(phrase, "")
+    return bool(_DEVICE_FREQUENCY_RESIDUAL_PATTERN.sub("", residual))
 
 
 def _is_event_result_existence_question(question: str) -> bool:
@@ -735,24 +920,21 @@ def _select_sources(
 ) -> tuple[_EntrySource, ...] | None:
     explicit_mentions = _mentioned_spreadsheet_filename_candidates(question)
     if explicit_mentions:
-        source_filenames = {
-            filename for source in sources for filename in _source_spreadsheet_filenames(source)
-        }
-        if any(source_filenames.isdisjoint(mention) for mention in explicit_mentions):
+        explicitly_selected: dict[UUID, _EntrySource] = {}
+        for mention in explicit_mentions:
+            matches = [
+                source
+                for source in sources
+                if not _source_spreadsheet_filenames(source).isdisjoint(mention)
+            ]
+            if len(matches) != 1:
+                return None
+            explicitly_selected[matches[0].id] = matches[0]
+        if len(explicitly_selected) != 1:
             return None
+        return (next(iter(explicitly_selected.values())),)
     if len(sources) == 1:
         return sources
-    mentioned: list[tuple[int, _EntrySource]] = []
-    for source in sources:
-        stem = source.title.rsplit(".", maxsplit=1)[0].strip()
-        if source.title in question:
-            mentioned.append((len(source.title) + 1_000, source))
-        elif len(stem) >= 2 and stem in question:
-            mentioned.append((len(stem), source))
-    if mentioned:
-        best_score = max(score for score, _ in mentioned)
-        best = [source for score, source in mentioned if score == best_score]
-        return (best[0],) if len(best) == 1 else None
     fingerprints = {_source_fingerprint(source) for source in sources}
     return (sources[0],) if len(fingerprints) == 1 else None
 
@@ -888,6 +1070,166 @@ def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
         rows=tuple(row for row in rows if row.number > header.number),
         columns=columns,
         ambiguous=header_ambiguities,
+    )
+
+
+def _answer_device_frequency(sheets: tuple[_Sheet, ...], question: str) -> SpreadsheetAnswer | None:
+    if _has_unsupported_device_frequency_scope(question):
+        return None
+
+    attendance_sheets: list[_Sheet] = []
+    for sheet in sheets:
+        timestamp_shape = "timestamp" in sheet.columns
+        device_shape = "device" in sheet.columns
+        identity_shape = any(
+            kind in sheet.columns
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+        )
+        timestamp_signal = (
+            sheet.columns.get("timestamp") is not None and "timestamp" not in sheet.ambiguous
+        )
+        identity_signal = any(
+            sheet.columns.get(kind) is not None and kind not in sheet.ambiguous
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+        )
+        if timestamp_shape and identity_shape and not (timestamp_signal and identity_signal):
+            return None
+        if not (timestamp_signal and identity_signal):
+            continue
+        device_column = sheet.columns.get("device")
+        if not device_shape or device_column is None or "device" in sheet.ambiguous:
+            return None
+        attendance_sheets.append(sheet)
+    if not attendance_sheets:
+        return None
+
+    total_counts: dict[str, int] = {}
+    display_labels: dict[str, str] = {}
+    coverages: list[_DeviceFrequencyCoverage] = []
+    total_scanned = 0
+    for sheet in attendance_sheets:
+        device_column = sheet.columns.get("device")
+        timestamp_column = sheet.columns.get("timestamp")
+        identity_columns = tuple(
+            column
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+            if kind not in sheet.ambiguous and (column := sheet.columns.get(kind)) is not None
+        )
+        if (
+            device_column is None
+            or timestamp_column is None
+            or not identity_columns
+            or not sheet.rows
+            or any(not row.entry.integrity_metadata for row in sheet.rows)
+        ):
+            return None
+
+        sheet_counts: dict[str, int] = {}
+        for row in sheet.rows:
+            raw_timestamp = row.value(timestamp_column)
+            raw_device = row.value(device_column)
+            if (
+                raw_timestamp is None
+                or _parse_datetime(raw_timestamp) is None
+                or raw_device is None
+                or not any((row.value(column) or "").strip() for column in identity_columns)
+            ):
+                return None
+            normalized_device = _normalized_device_label(raw_device)
+            if normalized_device is None:
+                return None
+            device_key, display_label = normalized_device
+            display_labels.setdefault(device_key, display_label)
+            sheet_counts[device_key] = sheet_counts.get(device_key, 0) + 1
+            total_counts[device_key] = total_counts.get(device_key, 0) + 1
+
+        coverages.append(
+            _DeviceFrequencyCoverage(
+                entry=sheet.rows[0].entry,
+                sheet=sheet.rows[0].sheet,
+                column=device_column,
+                first_row=sheet.rows[0].number,
+                last_row=sheet.rows[-1].number,
+                scanned_rows=len(sheet.rows),
+                counts=tuple(
+                    (key, display_labels[key], count)
+                    for key, count in sorted(
+                        sheet_counts.items(),
+                        key=lambda item: (
+                            display_labels[item[0]].casefold(),
+                            display_labels[item[0]],
+                        ),
+                    )
+                ),
+            )
+        )
+        total_scanned += len(sheet.rows)
+
+    if not total_counts or total_scanned <= 0:
+        return None
+    highest_count = max(total_counts.values())
+    winner_keys = tuple(
+        sorted(
+            (key for key, count in total_counts.items() if count == highest_count),
+            key=lambda key: (display_labels[key].casefold(), display_labels[key]),
+        )
+    )
+    if not winner_keys or len(winner_keys) > _MAX_TABLE_ROWS:
+        return None
+    hits = _build_device_frequency_hits(coverages, frozenset(winner_keys))
+    if hits is None or not hits:
+        return None
+
+    citation = _citation_marker(hits)
+    titles = {coverage.entry.title for coverage in coverages}
+    title = next(iter(titles)) if len(titles) == 1 else "选定考勤工作簿"
+    safe_title = _citation_safe_text(title)
+    winner_labels = tuple(display_labels[key] for key in winner_keys)
+    if len(winner_labels) == 1:
+        answer = (
+            f"在《{safe_title}》中已完整扫描 {total_scanned} 条打卡记录，"
+            f"使用最频繁的设备是“{_citation_safe_text(winner_labels[0])}”，"
+            f"共记录 {highest_count} 次。{citation}"
+        )
+    else:
+        displayed_winners = "、".join(f"“{_citation_safe_text(label)}”" for label in winner_labels)
+        answer = (
+            f"在《{safe_title}》中已完整扫描 {total_scanned} 条打卡记录，"
+            f"使用最频繁的设备有 {len(winner_labels)} 个，并列第一：{displayed_winners}，"
+            f"各记录 {highest_count} 次。{citation}"
+        )
+    return SpreadsheetAnswer(
+        answer=answer,
+        table=SpreadsheetTable(
+            title="闸机设备使用频率",
+            columns=("设备名称", "打卡次数"),
+            rows=tuple((display_labels[key], f"{highest_count} 次") for key in winner_keys),
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
+    )
+
+
+def _normalized_device_label(value: str) -> tuple[str, str] | None:
+    normalized = unicodedata.normalize("NFKC", value)
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    display_label = re.sub(r"\s+", " ", normalized).strip()
+    device_key = display_label.casefold()
+    if (
+        not display_label
+        or len(display_label) > _MAX_LABEL_CHARACTERS
+        or device_key in _MISSING_DEVICE_LABELS
+    ):
+        return None
+    return device_key, display_label
+
+
+def _citation_safe_text(value: str) -> str:
+    single_line = " ".join(value.split())
+    return _CITATION_LIKE_PATTERN.sub(
+        lambda match: f"［{match.group(0)[1:-1].strip()}］",
+        single_line,
     )
 
 
@@ -1296,6 +1638,59 @@ def _build_event_result_hits(
                 title=entry.title,
                 excerpt=excerpt,
                 source_path=_anchored_source_path(entry.source_path, combined_anchor),
+                format_version=entry.format_version,
+            )
+        )
+    return tuple(hits)
+
+
+def _build_device_frequency_hits(
+    coverages: list[_DeviceFrequencyCoverage],
+    winner_keys: frozenset[str],
+) -> tuple[KnowledgeSearchHit, ...] | None:
+    hits: list[KnowledgeSearchHit] = []
+    evidence_characters = 0
+    grouped: dict[UUID, list[_DeviceFrequencyCoverage]] = {}
+    for coverage in coverages:
+        grouped.setdefault(coverage.entry.id, []).append(coverage)
+    for entry_coverages in grouped.values():
+        entry = entry_coverages[0].entry
+        anchors: list[str] = []
+        summaries: list[str] = []
+        for coverage in entry_coverages:
+            anchor = _column_range(
+                coverage.sheet,
+                coverage.column,
+                coverage.first_row,
+                coverage.last_row,
+            )
+            anchors.append(anchor)
+            winner_counts = "、".join(
+                f"“{display_label}”{count} 条"
+                for key, display_label, count in coverage.counts
+                if key in winner_keys
+            )
+            if not winner_counts:
+                winner_counts = "本工作表无最高频设备记录"
+            summaries.append(
+                f"确定性全量聚合 [{anchor}]：完整扫描 {coverage.scanned_rows} 条打卡记录；"
+                f"共 {len(coverage.counts)} 个设备；全局最高频设备在本表的记录数："
+                f"{winner_counts}。"
+            )
+        excerpt = "\n".join(summaries)
+        evidence_characters += len(excerpt)
+        if evidence_characters > _MAX_EVIDENCE_CHARACTERS:
+            return None
+        hits.append(
+            KnowledgeSearchHit(
+                entry_id=entry.id,
+                source_file_id=entry.source_file_id,
+                title=entry.title,
+                excerpt=excerpt,
+                source_path=_anchored_source_path(
+                    entry.source_path,
+                    _combined_coverage_anchor(anchors),
+                ),
                 format_version=entry.format_version,
             )
         )
