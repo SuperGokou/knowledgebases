@@ -754,7 +754,7 @@ async def test_sequential_event_and_department_queries_do_not_reuse_answers(
                 knowledge_base,
                 access,
                 session,
-                message="这份考勤记录中，一共包含了多少个不同的部门？请列出名称。",
+                message="这份考勤记录中，一共包含了多少个不同的部门？请列出这些部门的名称。",
             )
 
             assert event_response.answer.startswith("没有。")

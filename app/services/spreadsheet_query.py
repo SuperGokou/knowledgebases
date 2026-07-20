@@ -405,6 +405,7 @@ _DEPARTMENT_SUMMARY_REQUEST_TERMS: Final = (
 _DEPARTMENT_SUMMARY_NEUTRAL_PHRASES: Final = tuple(
     sorted(
         (
+            "请列出这些部门的名称",
             "请列出部门名称",
             "请列出名称",
             "请全部列出",
