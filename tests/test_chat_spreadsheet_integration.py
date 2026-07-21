@@ -1048,3 +1048,338 @@ async def test_department_record_count_short_circuits_retrieval_and_llm(
             )
     finally:
         await engine.dispose()
+
+
+def _natural_language_acceptance_content() -> str:
+    return "\n\n".join(
+        (
+            "[worksheet:Sheet1!A1] 人员工号",
+            "[worksheet:Sheet1!B1] 姓名",
+            "[worksheet:Sheet1!C1] 部门",
+            "[worksheet:Sheet1!D1] 时间",
+            "[worksheet:Sheet1!E1] 设备",
+            "[worksheet:Sheet1!F1] 事件结果",
+            "[worksheet:Sheet1!A2] E001",
+            "[worksheet:Sheet1!B2] 熊小强",
+            "[worksheet:Sheet1!C2] 品质部",
+            "[worksheet:Sheet1!D2] 2026-07-16 08:00:00",
+            "[worksheet:Sheet1!E2] 东门",
+            "[worksheet:Sheet1!F2] 认证成功(白名单验证)",
+            "[worksheet:Sheet1!A3] E001",
+            "[worksheet:Sheet1!B3] 熊小强",
+            "[worksheet:Sheet1!C3] 品质部",
+            "[worksheet:Sheet1!D3] 2026-07-17 09:00:00",
+            "[worksheet:Sheet1!E3] 东门",
+            "[worksheet:Sheet1!F3] 认证失败",
+            "[worksheet:Sheet1!A4] E001",
+            "[worksheet:Sheet1!B4] 熊小强",
+            "[worksheet:Sheet1!C4] 研发部",
+            "[worksheet:Sheet1!D4] 2026-07-17 10:00:00",
+            "[worksheet:Sheet1!E4] 东门",
+            "[worksheet:Sheet1!F4] 黑名单拦截",
+            "[worksheet:Sheet1!A5] E002",
+            "[worksheet:Sheet1!B5] 彭楚亮",
+            "[worksheet:Sheet1!C5] 工程部",
+            "[worksheet:Sheet1!D5] 2026-07-17 23:54:05",
+            "[worksheet:Sheet1!E5] 西门",
+            "[worksheet:Sheet1!F5] 认证成功(白名单验证)",
+            "[worksheet:Sheet1!A6] E002",
+            "[worksheet:Sheet1!B6] 彭楚亮",
+            "[worksheet:Sheet1!C6] 工程部",
+            "[worksheet:Sheet1!D6] 2026-07-18 00:01:00",
+            "[worksheet:Sheet1!E6] 西门",
+            "[worksheet:Sheet1!F6] 认证成功(白名单验证)",
+            "[worksheet:Sheet1!A7] E003",
+            "[worksheet:Sheet1!B7] 张三",
+            "[worksheet:Sheet1!C7] 研发部",
+            "[worksheet:Sheet1!D7] 2026-07-16 09:00:00",
+            "[worksheet:Sheet1!E7] 南门",
+            "[worksheet:Sheet1!F7] 认证成功(白名单验证)",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_answer_fragment"),
+    (
+        ("考勤里有几个部门，分别叫什么？", "共包含 3 个不同部门"),
+        ("品质部共打卡多少次？", "“品质部”共有 2 条打卡记录"),
+        ("哪台闸机的打卡次数最多？有几次？", "使用最频繁的设备是“东门”，共记录 3 次"),
+        ("谁打卡次数最多？有几次？", "打卡总次数最多的员工是“熊小强”，共打卡 3 次"),
+        ("这份考勤记录最早和最晚的日期分别是什么？", "2026年7月16日至2026年7月18日"),
+        ("2026年7月17日当天，最迟打卡的是谁？", "彭楚亮，于23时54分通过“西门”"),
+        ("考勤中出现过认证失败吗？", "“认证失败”1 条"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_natural_spreadsheet_questions_stay_on_the_verified_chat_path(
+    monkeypatch: pytest.MonkeyPatch,
+    question: str,
+    expected_answer_fragment: str,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="自然问法测试.xlsx",
+                content=_natural_language_acceptance_content(),
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("natural table aggregate must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message=question,
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert expected_answer_fragment in response.answer
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+    finally:
+        await engine.dispose()
+
+
+def _extended_attendance_aggregate_content() -> str:
+    headers = ("人员工号", "姓名", "部门", "时间", "设备", "事件结果")
+    rows = (
+        ("E001", "熊小强", "品质部", "2026-07-16 08:00:00", "东门", "认证成功"),
+        ("E001", "熊小强", "品质部", "2026-07-17 08:00:00", "东门", "认证成功"),
+        ("E001", "熊小强", "品质部", "2026-07-17 09:00:00", "东门", "认证失败"),
+        ("E001", "熊小强", "品质部", "2026-07-17 10:00:00", "东门", "黑名单拦截"),
+        ("E001", "熊小强", "品质部", "2026-07-18 08:00:00", "东门", "认证成功"),
+        ("E002", "彭楚亮", "研发部", "2026-07-17 11:00:00", "西门", "认证成功"),
+        ("E002", "彭楚亮", "研发部", "2026-07-17 23:54:05", "西门", "认证成功"),
+        ("E002", "彭楚亮", "研发部", "2026-07-18 12:00:00", "西门", "认证成功"),
+        ("E003", "张三", "工程部", "2026-07-17 13:00:00", "南门", "认证成功"),
+        ("E003", "张三", "工程部", "2026-07-17 14:00:00", "南门", "认证成功"),
+        ("E003", "张三", "工程部", "2026-07-18 09:00:00", "南门", "认证成功"),
+        ("E004", "李四", "仓储部", "2026-07-16 09:00:00", "北门", "认证成功"),
+    )
+    lines = [
+        f"[worksheet:Sheet1!{column}1] {header}"
+        for column, header in zip("ABCDEF", headers, strict=True)
+    ]
+    for row_number, values in enumerate(rows, start=2):
+        lines.extend(
+            f"[worksheet:Sheet1!{column}{row_number}] {value}"
+            for column, value in zip("ABCDEF", values, strict=True)
+        )
+    return "\n\n".join(lines)
+
+
+def _assert_chat_table_row_count(
+    response: ChatQueryResponse,
+    label: str,
+    count: int,
+) -> None:
+    assert response.table is not None
+    matching_rows = [row for row in response.table.rows if any(label in cell for cell in row)]
+    assert matching_rows, f"missing aggregate row for {label!r}: {response.table.rows!r}"
+    count_pattern = re.compile(rf"{count}\s*(?:条(?:记录)?|次|个|位|台)?")
+    assert any(count_pattern.fullmatch(cell.strip()) for row in matching_rows for cell in row), (
+        f"missing count {count} beside {label!r}: {matching_rows!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_rows", "expected_count"),
+    (
+        ("这份考勤一共有多少条打卡记录？", (), 12),
+        ("2026年7月17日考勤记录总数是多少？", (), 7),
+        (
+            "整个数据集中，打卡总次数最多的是哪位员工？总共打卡了多少次？",
+            (("熊小强", 5),),
+            None,
+        ),
+        (
+            "请按部门汇总考勤次数。",
+            (("品质部", 5), ("研发部", 3), ("工程部", 3), ("仓储部", 1)),
+            None,
+        ),
+        (
+            "打卡次数最多的前2位员工是谁？",
+            (("熊小强", 5), ("彭楚亮", 3), ("张三", 3)),
+            None,
+        ),
+        (
+            "打卡记录最多的前2台闸机设备是什么？",
+            (("东门", 5), ("西门", 3), ("南门", 3)),
+            None,
+        ),
+        ("打卡次数最少的是哪位员工？", (("李四", 1),), None),
+        ("员工“熊小强”一共有多少条打卡记录？", (("熊小强", 5),), None),
+    ),
+)
+@pytest.mark.asyncio
+async def test_attendance_aggregates_never_reach_retrieval_or_an_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    question: str,
+    expected_rows: tuple[tuple[str, int], ...],
+    expected_count: int | None,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="聚合能力验收.xlsx",
+                content=_extended_attendance_aggregate_content(),
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError(
+                    "verified attendance aggregate must not reach retrieval or an LLM"
+                )
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message=question,
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+            if expected_count is not None:
+                table_text = " ".join(
+                    cell for row in (response.table.rows if response.table else ()) for cell in row
+                )
+                assert re.search(
+                    rf"(?<!\d){expected_count}\s*(?:条(?:记录)?|次)?(?!\d)",
+                    f"{response.answer} {table_text}",
+                )
+            for label, count in expected_rows:
+                _assert_chat_table_row_count(response, label, count)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_empty_ranked_aggregate_is_verified_without_using_an_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with factory() as session:
+            user = User(email=f"owner-{uuid4()}@example.com", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            knowledge_base = KnowledgeBase(owner_id=user.id, name="Infra")
+            session.add(knowledge_base)
+            await session.flush()
+            await _persist_trusted_spreadsheet_entry(
+                session,
+                user=user,
+                knowledge_base=knowledge_base,
+                title="聚合能力验收.xlsx",
+                content=_extended_attendance_aggregate_content(),
+            )
+            await session.commit()
+            access = AccessContext(
+                user=user,
+                permissions=frozenset({"chat:query"}),
+                limits={},
+                role_ids=frozenset(),
+                max_role_priority=0,
+            )
+
+            async def must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("empty aggregate must not reach retrieval or an LLM")
+
+            monkeypatch.setattr(chat_service, "search_knowledge_entries", must_not_run)
+            monkeypatch.setattr(chat_service, "resolve_provider_client", must_not_run)
+
+            response = await _query(
+                knowledge_base,
+                access,
+                session,
+                message="2026年7月19日打卡次数最多的前2位员工是谁？",
+            )
+
+            assert response.mode == "structured"
+            assert response.provider is None and response.model is None
+            assert "无符合条件记录" in response.answer
+            assert response.table is None or response.table.rows == []
+            assert response.answer_review.model_dump() == {
+                "status": "passed",
+                "reason": "deterministic_verified",
+            }
+            assert response.source_status.model_dump() == {
+                "status": "grounded",
+                "strategy": "structured",
+                "reason": "structured_query",
+                "citation_count": 1,
+            }
+    finally:
+        await engine.dispose()

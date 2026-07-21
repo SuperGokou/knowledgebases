@@ -30,7 +30,10 @@ from app.db.models import (
     User,
 )
 from app.services.spreadsheet_query import (
+    SpreadsheetAnswer,
+    SpreadsheetQueryResult,
     SpreadsheetQueryStatus,
+    _question_intent,
     answer_spreadsheet_query,
     evaluate_spreadsheet_query,
     is_spreadsheet_query_intent,
@@ -298,6 +301,7 @@ def _record(
     timestamp: str,
     device: str,
     *,
+    event_type: str = "普通消息",
     event_result: str = "认证成功(白名单验证)",
 ) -> RowValues:
     return (
@@ -310,7 +314,7 @@ def _record(
         device,
         "1",
         device,
-        "普通消息",
+        event_type,
         event_result,
     )
 
@@ -746,33 +750,40 @@ async def test_employee_frequency_rejects_invalid_employee_names(
 
 
 @pytest.mark.parametrize(
-    "question",
+    ("question", "expected_name"),
     (
-        "研发部打卡次数最多的是哪位员工？",
-        "2026年7月17日打卡次数最多的是哪位员工？",
-        "东门打卡次数最多的是哪位员工？",
-        "打卡最多的前3位员工是谁？",
-        "打卡次数最少的是哪位员工？",
-        "每位员工分别打卡多少次？",
+        ("研发部打卡次数最多的是哪位员工？", "熊小强"),
+        ("东门打卡次数最多的是哪位员工？", "熊小强"),
     ),
 )
 @pytest.mark.asyncio
-async def test_employee_frequency_rejects_filters_rankings_and_other_aggregates(
+async def test_employee_frequency_applies_department_and_device_filters(
     knowledge_session: tuple[AsyncSession, UUID],
     question: str,
+    expected_name: str,
 ) -> None:
     session, knowledge_base_id = knowledge_session
     await _add_entry(
         session,
         knowledge_base_id,
-        _content(((2, _record("工程部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),)),
+        _content(
+            (
+                (2, _record("研发部", "E001", "熊小强", "1", "2026-07-17 08:00:00", "东门")),
+                (3, _record("研发部", "E001", "熊小强", "1", "2026-07-17 09:00:00", "东门")),
+                (4, _record("工程部", "E002", "彭楚亮", "2", "2026-07-17 10:00:00", "西门")),
+                (5, _record("工程部", "E002", "彭楚亮", "2", "2026-07-17 11:00:00", "西门")),
+                (6, _record("工程部", "E002", "彭楚亮", "2", "2026-07-17 12:00:00", "西门")),
+            )
+        ),
     )
     await session.commit()
 
     result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
 
-    assert result.status is SpreadsheetQueryStatus.REJECTED
-    assert result.answer is None
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None and result.answer.table is not None
+    assert result.answer.table.rows == (("E001", expected_name, "2 次"),)
+    assert "彭楚亮" not in result.answer.answer
 
 
 @pytest.mark.asyncio
@@ -1281,22 +1292,42 @@ def test_generic_device_questions_do_not_trigger_spreadsheet_scan(question: str)
     assert is_spreadsheet_query_intent(question) is False
 
 
-@pytest.mark.parametrize(
-    "question",
-    (
-        "研发部打卡记录最多的闸机设备是什么？",
-        "2026年7月17日打卡次数最多的设备是什么？",
-        "打卡记录最多的前3台闸机设备是什么？",
-        "打卡最多的前5台设备有哪些？",
-        "闸机设备打卡次数排名是什么？",
-        "打卡记录最少的闸机设备是什么？",
-        "每台闸机设备分别有多少打卡记录？",
-    ),
-)
 @pytest.mark.asyncio
-async def test_device_frequency_rejects_unimplemented_filters_and_rankings(
+async def test_device_frequency_applies_the_department_filter(
     knowledge_session: tuple[AsyncSession, UUID],
-    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("研发部", "E001", "甲", "1", "2026-07-17 08:00:00", "东门")),
+                (3, _record("研发部", "E001", "甲", "1", "2026-07-17 09:00:00", "东门")),
+                (4, _record("研发部", "E002", "乙", "2", "2026-07-17 10:00:00", "西门")),
+                (5, _record("工程部", "E003", "丙", "3", "2026-07-17 11:00:00", "南门")),
+                (6, _record("工程部", "E003", "丙", "3", "2026-07-17 12:00:00", "南门")),
+                (7, _record("工程部", "E003", "丙", "3", "2026-07-17 13:00:00", "南门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "研发部打卡记录最多的闸机设备是什么？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None and result.answer.table is not None
+    assert result.answer.table.rows == (("东门", "2 次"),)
+    assert "南门" not in result.answer.answer
+
+
+@pytest.mark.asyncio
+async def test_device_frequency_rejects_an_unbounded_ranking(
+    knowledge_session: tuple[AsyncSession, UUID],
 ) -> None:
     session, knowledge_base_id = knowledge_session
     await _add_entry(
@@ -1306,7 +1337,11 @@ async def test_device_frequency_rejects_unimplemented_filters_and_rankings(
     )
     await session.commit()
 
-    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "闸机设备打卡次数排名是什么？",
+    )
 
     assert result.status is SpreadsheetQueryStatus.REJECTED
     assert result.answer is None
@@ -1865,14 +1900,11 @@ def test_department_summary_recognizes_supported_variants(question: str) -> None
 @pytest.mark.parametrize(
     "question",
     (
-        "2026年7月17日考勤记录中有多少个不同部门？",
         "认证成功的考勤记录涉及哪些部门？",
         "考勤记录中每个部门有多少人？",
         "考勤记录中的部门排名是什么？",
         "排除研发部后，考勤记录中有哪些部门？",
         "东门设备的考勤记录涉及哪些部门？",
-        "请统计这份考勤记录的部门分布。",
-        "2026年7月17日的考勤记录包含多少个不同部门？请列出这些部门的名称。",
         "这份考勤记录包含多少个不同部门？请列出这些部门的名称，但排除研发部。",
         "东门设备的考勤记录包含多少个不同部门？请列出这些部门的名称。",
     ),
@@ -2557,11 +2589,8 @@ async def test_department_record_count_handles_organization_names_with_prose_ter
 @pytest.mark.parametrize(
     "question",
     (
-        "2026年7月5日品质部有多少条打卡记录？",
         "今天品质部有多少条打卡记录？",
-        "品质部在东门设备有多少条打卡记录？",
         "品质部有多少条认证成功的打卡记录？",
-        "品质部每位员工分别有多少条打卡记录？",
     ),
 )
 @pytest.mark.asyncio
@@ -2574,6 +2603,109 @@ async def test_department_record_count_rejects_unsupported_filters(
         session,
         knowledge_base_id,
         _content(((2, _record("品质部", "E001", "甲", "1", "2026-07-05 08:00:00", "东门")),)),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_department_record_count_applies_department_and_device_filters(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("品质部", "E001", "甲", "1", "2026-07-05 08:00:00", "东门")),
+                (3, _record("品质部", "E001", "甲", "1", "2026-07-05 08:05:00", "东门")),
+                (4, _record("品质部", "E002", "乙", "2", "2026-07-05 09:00:00", "西门")),
+                (5, _record("品质部", "E002", "乙", "2", "2026-07-05 09:05:00", "西门")),
+                (6, _record("工程部", "E003", "丙", "3", "2026-07-05 10:00:00", "东门")),
+                (7, _record("工程部", "E003", "丙", "3", "2026-07-05 10:05:00", "东门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "品质部在东门设备有多少条打卡记录？",
+    )
+
+    answer = _require_answer(result)
+    _assert_answer_mentions_count(answer, 2)
+
+
+@pytest.mark.asyncio
+async def test_employee_group_count_applies_the_department_filter(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("品质部", "E001", "熊小强", "1", "2026-07-05 08:00:00", "东门")),
+                (3, _record("品质部", "E001", "熊小强", "1", "2026-07-05 08:05:00", "东门")),
+                (4, _record("品质部", "E002", "张三", "2", "2026-07-05 09:00:00", "西门")),
+                (5, _record("工程部", "E003", "彭楚亮", "3", "2026-07-05 10:00:00", "南门")),
+                (6, _record("工程部", "E003", "彭楚亮", "3", "2026-07-05 10:05:00", "南门")),
+                (7, _record("工程部", "E003", "彭楚亮", "3", "2026-07-05 10:10:00", "南门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(
+            session,
+            knowledge_base_id,
+            "品质部每位员工分别有多少条打卡记录？",
+        )
+    )
+
+    _assert_table_row_count(answer, "熊小强", 2)
+    _assert_table_row_count(answer, "张三", 1)
+    assert answer.table is not None
+    assert all("彭楚亮" not in cell for row in answer.table.rows for cell in row)
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "研发部打卡次数最多的是哪位员工？",
+        "东门打卡次数最多的是哪位员工？",
+        "研发部打卡记录最多的闸机设备是什么？",
+        "品质部在东门设备有多少条打卡记录？",
+        "品质部每位员工分别有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_dimension_filters_with_unknown_values_fail_closed(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    """An unknown filter value must never degrade into an unfiltered aggregate."""
+
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("工程部", "E001", "甲", "1", "2026-07-05 08:00:00", "西门")),
+                (3, _record("工程部", "E001", "甲", "1", "2026-07-05 08:05:00", "西门")),
+                (4, _record("工程部", "E002", "乙", "2", "2026-07-05 09:00:00", "南门")),
+            )
+        ),
     )
     await session.commit()
 
@@ -4078,3 +4210,806 @@ async def test_citation_source_path_remains_within_database_schema_limit(
     assert result.hits[0].source_path is not None
     assert len(result.hits[0].source_path) <= 1_000
     assert result.hits[0].source_path.endswith("#worksheet:Sheet1!A2:K2")
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_intent"),
+    (
+        ("考勤里有几个部门，分别叫什么？", "department_summary"),
+        ("请统计该考勤表的部门数量，并把名称都列出来。", "department_summary"),
+        ("品质部共打卡多少次？", "department_record_count"),
+        ("帮我算一下品质部的打卡记录有几条。", "department_record_count"),
+        ("哪台闸机的打卡次数最多？有几次？", "device_frequency"),
+        ("打卡最频繁的是哪个设备？", "device_frequency"),
+        ("谁打卡次数最多？有几次？", "employee_frequency"),
+        ("打卡最频繁的员工是谁？", "employee_frequency"),
+        ("所有员工里打卡次数最高的人是谁？次数是多少？", "employee_frequency"),
+        ("这份考勤记录最早和最晚的日期分别是什么？", "time_range"),
+        ("考勤数据从什么时候到什么时候？", "time_range"),
+        ("当天最迟打卡的是谁？", "latest_record"),
+        ("最后一次打卡是谁？", "latest_record"),
+        ("考勤中出现过认证失败吗？", "event_result_existence"),
+        ("这份考勤有没有认证不通过？", "event_result_existence"),
+    ),
+)
+def test_natural_spreadsheet_questions_route_to_the_expected_intent(
+    question: str,
+    expected_intent: str,
+) -> None:
+    intent = _question_intent(question)
+
+    assert is_spreadsheet_query_intent(question) is True
+    assert getattr(intent, expected_intent) is True
+
+
+async def _add_natural_language_acceptance_workbook(
+    session: AsyncSession,
+    knowledge_base_id: UUID,
+) -> None:
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (
+                    2,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-16 08:00:00",
+                        "东门",
+                    ),
+                ),
+                (
+                    3,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 09:00:00",
+                        "东门",
+                        event_result="认证失败",
+                    ),
+                ),
+                (
+                    4,
+                    _record(
+                        "研发部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 10:00:00",
+                        "东门",
+                        event_result="黑名单拦截",
+                    ),
+                ),
+                (
+                    5,
+                    _record(
+                        "工程部",
+                        "E002",
+                        "彭楚亮",
+                        "135267",
+                        "2026-07-17 23:54:05",
+                        "西门",
+                    ),
+                ),
+                (
+                    6,
+                    _record(
+                        "工程部",
+                        "E002",
+                        "彭楚亮",
+                        "135267",
+                        "2026-07-18 00:01:00",
+                        "西门",
+                    ),
+                ),
+                (
+                    7,
+                    _record(
+                        "研发部",
+                        "E003",
+                        "张三",
+                        "135268",
+                        "2026-07-16 09:00:00",
+                        "南门",
+                    ),
+                ),
+            )
+        ),
+        title="自然问法测试.xlsx",
+    )
+    await session.commit()
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_answer_fragment"),
+    (
+        ("考勤里有几个部门，分别叫什么？", "共包含 3 个不同部门"),
+        ("品质部共打卡多少次？", "“品质部”共有 2 条打卡记录"),
+        ("哪台闸机的打卡次数最多？有几次？", "使用最频繁的设备是“东门”，共记录 3 次"),
+        ("谁打卡次数最多？有几次？", "打卡总次数最多的员工是“熊小强”，共打卡 3 次"),
+        ("这份考勤记录最早和最晚的日期分别是什么？", "2026年7月16日至2026年7月18日"),
+        ("2026年7月17日当天，最迟打卡的是谁？", "彭楚亮，于23时54分通过“西门”"),
+        ("考勤中出现过认证失败吗？", "“认证失败”1 条"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_natural_spreadsheet_questions_answer_from_a_trusted_workbook(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected_answer_fragment: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_natural_language_acceptance_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None
+    assert expected_answer_fragment in result.answer.answer
+
+
+@pytest.mark.asyncio
+async def test_employee_frequency_applies_the_event_result_filter_before_ranking(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_natural_language_acceptance_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "认证成功的记录中谁打卡最多？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None and result.answer.table is not None
+    assert result.answer.table.rows == (("E002", "彭楚亮", "2 次"),)
+    assert "熊小强" not in result.answer.answer
+    assert "张三" not in result.answer.answer
+
+
+@pytest.mark.asyncio
+async def test_department_employee_query_consumes_department_and_date_filters(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_natural_language_acceptance_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(
+        session,
+        knowledge_base_id,
+        "研发部有哪些员工在2026年7月17日有打卡？",
+    )
+
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    assert result.answer is not None and result.answer.table is not None
+    table_text = " ".join(cell for row in result.answer.table.rows for cell in row)
+    assert "熊小强" in table_text
+    assert "彭楚亮" not in table_text
+    assert "张三" not in table_text
+    assert len(result.answer.table.rows) == 1
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "品质部的考勤记录时间范围是什么？",
+        "2026年7月17日品质部最晚一条打卡记录是谁？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_structured_queries_reject_unconsumed_filters_instead_of_using_full_workbook(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_natural_language_acceptance_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+    assert result.rejection_message == "当前表格证据不足或存在歧义，无法安全计算答案。"
+
+
+async def _add_extended_attendance_aggregate_workbook(
+    session: AsyncSession,
+    knowledge_base_id: UUID,
+) -> None:
+    """Persist a small but discriminating aggregate-acceptance workbook.
+
+    The fixture deliberately includes a boundary tie at rank 2 for both the
+    employee and device dimensions.  A correct TOP-N implementation therefore
+    has to return three rows for TOP 2 instead of silently dropping a tie.
+    """
+
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("品质部", "E001", "熊小强", "135265", "2026-07-16 08:00:00", "东门")),
+                (3, _record("品质部", "E001", "熊小强", "135265", "2026-07-17 08:00:00", "东门")),
+                (
+                    4,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 09:00:00",
+                        "东门",
+                        event_result="认证失败",
+                    ),
+                ),
+                (
+                    5,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 10:00:00",
+                        "东门",
+                        event_result="黑名单拦截",
+                    ),
+                ),
+                (6, _record("品质部", "E001", "熊小强", "135265", "2026-07-18 08:00:00", "东门")),
+                (7, _record("研发部", "E002", "彭楚亮", "135267", "2026-07-17 11:00:00", "西门")),
+                (8, _record("研发部", "E002", "彭楚亮", "135267", "2026-07-17 23:54:05", "西门")),
+                (9, _record("研发部", "E002", "彭楚亮", "135267", "2026-07-18 12:00:00", "西门")),
+                (10, _record("工程部", "E003", "张三", "135268", "2026-07-17 13:00:00", "南门")),
+                (11, _record("工程部", "E003", "张三", "135268", "2026-07-17 14:00:00", "南门")),
+                (12, _record("工程部", "E003", "张三", "135268", "2026-07-18 09:00:00", "南门")),
+                (13, _record("仓储部", "E004", "李四", "135269", "2026-07-16 09:00:00", "北门")),
+            )
+        ),
+        title="聚合能力验收.xlsx",
+    )
+    await session.commit()
+
+
+def _require_answer(result: SpreadsheetQueryResult) -> SpreadsheetAnswer:
+    assert result.status is SpreadsheetQueryStatus.ANSWERED
+    answer = result.answer
+    assert isinstance(answer, SpreadsheetAnswer)
+    assert answer.hits
+    return answer
+
+
+def _assert_answer_mentions_count(answer: SpreadsheetAnswer, count: int) -> None:
+    pattern = rf"(?<!\d){count}\s*(?:条(?:记录)?|次|个|位|台)?(?!\d)"
+    table_text = " ".join(
+        cell for row in (answer.table.rows if answer.table else ()) for cell in row
+    )
+    assert re.search(pattern, f"{answer.answer} {table_text}")
+
+
+def _assert_table_row_count(answer: SpreadsheetAnswer, label: str, count: int) -> None:
+    assert answer.table is not None
+    matching_rows = [row for row in answer.table.rows if any(label in cell for cell in row)]
+    assert matching_rows, f"missing aggregate row for {label!r}: {answer.table.rows!r}"
+    count_pattern = re.compile(rf"{count}\s*(?:条(?:记录)?|次|个|位|台)?")
+    assert any(count_pattern.fullmatch(cell.strip()) for row in matching_rows for cell in row), (
+        f"missing count {count} beside {label!r}: {matching_rows!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "2026年7月17日打卡次数最多的是哪位员工？",
+        "打卡最多的前3位员工是谁？",
+        "打卡次数最少的是哪位员工？",
+        "每位员工分别打卡多少次？",
+        "2026年7月17日打卡次数最多的设备是什么？",
+        "打卡记录最多的前3台闸机设备是什么？",
+        "打卡最多的前5台设备有哪些？",
+        "打卡记录最少的闸机设备是什么？",
+        "每台闸机设备分别有多少打卡记录？",
+        "2026年7月17日考勤记录中有多少个不同部门？",
+        "请统计这份考勤记录的部门分布。",
+        "2026年7月17日的考勤记录包含多少个不同部门？请列出这些部门的名称。",
+        "2026年7月5日品质部有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_newly_supported_aggregate_questions_are_answered(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    """Queries intentionally rejected before the aggregate executor now work."""
+
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    _require_answer(result)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_count"),
+    (
+        ("这份考勤一共有多少条打卡记录？", 12),
+        ("2026年7月17日考勤记录总数是多少？", 7),
+        ("2026年7月19日考勤记录总数是多少？", 0),
+    ),
+)
+@pytest.mark.asyncio
+async def test_total_attendance_counts_include_zero_result_date_filters(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected_count: int,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    _assert_answer_mentions_count(answer, expected_count)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_departments"),
+    (
+        (
+            "这份考勤记录中，一共包含多少个不同的部门？请列出名称。",
+            ("品质部", "研发部", "工程部", "仓储部"),
+        ),
+        (
+            "2026年7月17日考勤记录中有多少个不同部门？请列出名称。",
+            ("品质部", "研发部", "工程部"),
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_distinct_departments_are_complete_and_date_scoped(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected_departments: tuple[str, ...],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    assert answer.table is not None
+    table_text = " ".join(cell for row in answer.table.rows for cell in row)
+    assert all(department in table_text for department in expected_departments)
+    _assert_answer_mentions_count(answer, len(expected_departments))
+
+
+@pytest.mark.asyncio
+async def test_distinct_departments_with_no_matching_rows_is_a_grounded_zero_result(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(
+            session,
+            knowledge_base_id,
+            "2026年7月19日考勤记录中有多少个不同部门？请列出名称。",
+        )
+    )
+
+    _assert_answer_mentions_count(answer, 0)
+    assert answer.table is None or answer.table.rows == ()
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    (
+        ("请按部门汇总考勤次数。", (("品质部", 5), ("研发部", 3), ("工程部", 3), ("仓储部", 1))),
+        ("每位员工分别打卡多少次？", (("熊小强", 5), ("彭楚亮", 3), ("张三", 3), ("李四", 1))),
+        ("每台闸机设备分别有多少打卡记录？", (("东门", 5), ("西门", 3), ("南门", 3), ("北门", 1))),
+    ),
+)
+@pytest.mark.asyncio
+async def test_grouped_attendance_counts_are_complete(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected: tuple[tuple[str, int], ...],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    for label, count in expected:
+        _assert_table_row_count(answer, label, count)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_label"),
+    (
+        ("打卡次数最少的是哪位员工？", "李四"),
+        ("打卡记录最少的闸机设备是什么？", "北门"),
+        ("哪个部门的考勤次数最少？", "仓储部"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_minimum_group_aggregates_return_the_true_minimum(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected_label: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    _assert_table_row_count(answer, expected_label, 1)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    (
+        ("打卡次数最多的前2位员工是谁？", (("熊小强", 5), ("彭楚亮", 3), ("张三", 3))),
+        ("打卡记录最多的前2台闸机设备是什么？", (("东门", 5), ("西门", 3), ("南门", 3))),
+    ),
+)
+@pytest.mark.asyncio
+async def test_top_n_includes_every_boundary_tie(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected: tuple[tuple[str, int], ...],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    assert answer.table is not None
+    assert len(answer.table.rows) == len(expected)
+    for label, count in expected:
+        _assert_table_row_count(answer, label, count)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    (
+        ("2026年7月17日打卡次数最多的是哪位员工？", (("熊小强", 3),)),
+        ("2026年7月17日打卡次数最多的设备是什么？", (("东门", 3),)),
+    ),
+)
+@pytest.mark.asyncio
+async def test_absolute_date_filters_are_applied_before_ranking(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected: tuple[tuple[str, int], ...],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    for label, count in expected:
+        _assert_table_row_count(answer, label, count)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_label", "expected_count"),
+    (
+        ("员工“熊小强”一共有多少条打卡记录？", "熊小强", 5),
+        ("品质部一共有多少条打卡记录？", "品质部", 5),
+        ("东门设备一共有多少条打卡记录？", "东门", 5),
+        ("2026年7月17日品质部有多少条打卡记录？", "品质部", 3),
+    ),
+)
+@pytest.mark.asyncio
+async def test_exact_dimension_counts_are_filtered_before_counting(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+    expected_label: str,
+    expected_count: int,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(await evaluate_spreadsheet_query(session, knowledge_base_id, question))
+
+    assert expected_label in answer.answer or (
+        answer.table is not None
+        and any(expected_label in cell for row in answer.table.rows for cell in row)
+    )
+    _assert_answer_mentions_count(answer, expected_count)
+
+
+@pytest.mark.asyncio
+async def test_ranked_query_with_no_matching_rows_returns_a_grounded_empty_result(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(
+            session,
+            knowledge_base_id,
+            "2026年7月19日打卡次数最多的前2位员工是谁？",
+        )
+    )
+
+    assert "无符合条件记录" in answer.answer
+    assert answer.table is None or answer.table.rows == ()
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "品质部和研发部一共有多少条打卡记录？",
+        "熊小强和彭楚亮一共有多少条打卡记录？",
+        "东门和西门设备一共有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_ambiguous_exact_dimension_filters_fail_closed(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "王五一共有多少条打卡记录？",
+        "帮我查王五一共有多少条打卡记录？",
+        "请统计王五的打卡记录总数。",
+        "王五打卡多少次？",
+        "王五有多少次打卡？",
+        "员工王五打卡多少次？",
+        "人员王五有多少次打卡？",
+        "查询员工王五打卡总数。",
+        "王五刷卡记录共有几条？",
+        "请统计王五在东门的打卡次数。",
+        "考勤中认证超时记录有多少条？",
+        "认证超时有多少次打卡？",
+        "请统计认证超时打卡次数。",
+        "报警消息有多少条打卡记录？",
+        "报警消息打卡次数是多少？",
+        "告警事件有多少条打卡记录？",
+        "告警类型有多少条打卡记录？",
+        "告警类别有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_unresolved_attendance_filters_never_degrade_to_global_totals(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "打卡一共有多少条记录？",
+        "门禁一共有多少条记录？",
+        "刷卡一共有多少条记录？",
+        "通行一共有多少条记录？",
+        "全员一共有多少条打卡记录？",
+        "本表一共有多少条打卡记录？",
+        "该表一共有多少条打卡记录？",
+        "本次一共有多少条打卡记录？",
+        "大家一共有多少条打卡记录？",
+        "所有人一共有多少条打卡记录？",
+        "本文件一共有多少条打卡记录？",
+        "表格一共有多少条打卡记录？",
+        "整表一共有多少条打卡记录？",
+        "整体一共有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_global_attendance_terms_are_not_misread_as_employee_filters(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+    )
+
+    _assert_answer_mentions_count(answer, 12)
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "普通消息事件类型一共有多少条打卡记录？",
+        "普通消息有多少条打卡记录？",
+        "普通消息打卡次数是多少？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_known_event_type_filters_are_applied_before_counting(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (
+                    2,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 08:00:00",
+                        "东门",
+                        event_type="普通消息",
+                    ),
+                ),
+                (
+                    3,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 09:00:00",
+                        "东门",
+                        event_type="报警消息",
+                    ),
+                ),
+            )
+        ),
+    )
+    await session.commit()
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+    )
+
+    assert "普通消息" in answer.answer
+    _assert_answer_mentions_count(answer, 1)
+    assert answer.table is not None and answer.table.rows == (("事件类型普通消息", "1 条"),)
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "这份考勤一共有多少条打卡记录？",
+        "打卡总次数最多的是哪位员工？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_cross_sheet_duplicate_attendance_rows_fail_closed(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    duplicate = _record(
+        "品质部",
+        "E001",
+        "熊小强",
+        "135265",
+        "2026-07-17 08:00:00",
+        "东门",
+    )
+    sheet1 = _content(((2, duplicate),), sheet="Sheet1")
+    sheet2 = _content(((2, duplicate),), sheet="Sheet2")
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        f"{sheet1}\n\n{sheet2[sheet2.index('[worksheet:'):]}",
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_total_aggregate_rejects_a_malformed_attendance_row(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("品质部", "E001", "熊小强", "135265", "", "东门")),
+                (3, _record("研发部", "E002", "彭楚亮", "135267", "2026-07-17 09:00:00", "西门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session, knowledge_base_id, "这份考勤一共有多少条打卡记录？"
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_employee_aggregate_rejects_an_identity_conflict(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (2, _record("品质部", "E001", "熊小强", "135265", "2026-07-17 08:00:00", "东门")),
+                (3, _record("品质部", "E001", "彭楚亮", "135265", "2026-07-17 09:00:00", "东门")),
+            )
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session, knowledge_base_id, "打卡次数最多的员工是谁？"
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_employee_aggregate_rejects_missing_identity_columns(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    headers = (
+        "组织",
+        "部门",
+        "字段一",
+        "字段二",
+        "字段三",
+        "时间",
+        "设备",
+        "门编号",
+        "设备描述",
+        "事件类型",
+        "事件结果",
+    )
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            ((2, _record("品质部", "E001", "熊小强", "135265", "2026-07-17 08:00:00", "东门")),),
+            headers=headers,
+        ),
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(
+        session, knowledge_base_id, "打卡次数最多的前2位员工是谁？"
+    )
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None

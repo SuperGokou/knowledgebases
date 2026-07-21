@@ -23,6 +23,15 @@ from app.db.models import (
     OkfConversionStatus,
 )
 from app.schemas.knowledge_bases import KnowledgeSearchHit
+from app.services.attendance_query_plan import (
+    AttendanceAggregateDimension,
+    AttendanceAggregateMode,
+    AttendanceAggregateSelection,
+    AttendanceAggregationPlan,
+    AttendanceQueryPlanParseResult,
+    AttendanceQueryPlanStatus,
+    parse_attendance_query_plan,
+)
 
 _MAX_ENTRIES: Final = 20
 _MAX_TOTAL_CHARACTERS: Final = 8_000_000
@@ -65,6 +74,13 @@ _EVENT_RESULT_QUERY_TERMS: Final = (
     "黑名单",
     "白名单",
     "异常",
+)
+_EVENT_RESULT_QUERY_ALIASES: Final = (
+    ("认证不通过", "认证失败"),
+    ("认证未通过", "认证失败"),
+    ("验证不通过", "验证失败"),
+    ("验证未通过", "验证失败"),
+    ("无法通行", "通行失败"),
 )
 _EVENT_RESULT_TERM_MARKERS: Final = (
     "失败",
@@ -149,6 +165,7 @@ _EVENT_RESULT_NEUTRAL_PHRASES: Final = tuple(
             "该张",
             "考勤表",
             "考勤明细",
+            "考勤",
             "工作表",
             "工作簿",
             "帮我查一下",
@@ -245,6 +262,7 @@ _DEVICE_FREQUENCY_AGGREGATE_TERMS: Final = (
     "频率最低",
     "频次最低",
     "最不常用",
+    "最频繁",
     "打卡最多",
     "考勤最多",
     "通行最多",
@@ -297,6 +315,7 @@ _DEVICE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
             "总共多少次",
             "共多少次",
             "共几次",
+            "有几次",
             "有多少次",
             "多少次",
             "是哪一个",
@@ -377,6 +396,11 @@ _EMPLOYEE_FREQUENCY_REQUEST_TERMS: Final = (
     "次数最多",
     "频次最高",
     "频率最高",
+    "打卡次数最高",
+    "考勤次数最高",
+    "打卡量最大",
+    "考勤量最大",
+    "最频繁",
     "打卡次数最少",
     "考勤次数最少",
     "记录最少",
@@ -427,6 +451,11 @@ _EMPLOYEE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
             "次数最多",
             "频次最高",
             "频率最高",
+            "打卡次数最高",
+            "考勤次数最高",
+            "打卡量最大",
+            "考勤量最大",
+            "最频繁",
             "总共打卡了多少次",
             "总共打卡多少次",
             "一共打卡了多少次",
@@ -440,6 +469,8 @@ _EMPLOYEE_FREQUENCY_NEUTRAL_PHRASES: Final = tuple(
             "总共多少次",
             "一共多少次",
             "共多少次",
+            "有几次",
+            "次数是多少",
             "是哪一位员工",
             "是哪位员工",
             "是哪名员工",
@@ -517,6 +548,8 @@ _DEPARTMENT_SUMMARY_ATTENDANCE_TERMS: Final = (
     "打卡表",
     "门禁记录",
     "通行记录",
+    "考勤",
+    "打卡",
 )
 _DEPARTMENT_SUMMARY_REQUEST_TERMS: Final = (
     "多少个不同",
@@ -584,6 +617,7 @@ _DEPARTMENT_SUMMARY_NEUTRAL_PHRASES: Final = tuple(
             "多少个部门",
             "几个部门",
             "分别是什么",
+            "分别叫什么",
             "多少个不同的部门",
             "多少个不同部门",
             "几个不同的部门",
@@ -601,6 +635,7 @@ _DEPARTMENT_SUMMARY_NEUTRAL_PHRASES: Final = tuple(
             "考勤数据",
             "考勤表",
             "考勤明细",
+            "考勤",
             "打卡记录",
             "打卡数据",
             "打卡表",
@@ -783,6 +818,8 @@ _DEPARTMENT_RECORD_COUNT_NEUTRAL_PHRASES: Final = tuple(
             "一共记录多少次",
             "共记录了多少次",
             "共记录多少次",
+            "共打卡多少次",
+            "共打卡了多少次",
             "共计多少次",
             "总共多少次",
             "有多少次",
@@ -815,6 +852,8 @@ _DEPARTMENT_RECORD_COUNT_NEUTRAL_PHRASES: Final = tuple(
             "帮我统计",
             "统计一下",
             "统计",
+            "帮我算一下",
+            "算一下",
             "请问一下",
             "问一下",
             "能否",
@@ -957,6 +996,11 @@ _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
         "门名称": 1,
         "考勤点": 2,
         "位置": 2,
+    },
+    "event_type": {
+        "事件类型": 0,
+        "消息类型": 1,
+        "事件类别": 1,
     },
     "event_result": {
         "事件结果": 0,
@@ -1120,7 +1164,55 @@ class _DepartmentRecordCountCoverage:
 
 
 @dataclass(frozen=True, slots=True)
+class _AttendanceAggregateRecord:
+    row: _Row
+    timestamp: datetime
+    employee_key: str | None
+    employee_identifier: str | None
+    employee_name: str | None
+    department_key: str | None
+    department_label: str | None
+    device_key: str
+    device_label: str
+    event_type_key: str | None
+    event_type_label: str | None
+    event_result_key: str | None
+    event_result_label: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AttendanceAggregateCoverage:
+    entry: _EntrySource
+    sheet: str
+    columns: tuple[str, ...]
+    first_row: int
+    last_row: int
+    scanned_rows: int
+    matched_rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class _AttendanceAggregateFilters:
+    employee_keys: frozenset[str] = frozenset()
+    department_keys: frozenset[str] = frozenset()
+    device_keys: frozenset[str] = frozenset()
+    event_type_keys: frozenset[str] = frozenset()
+    event_result_terms: tuple[str, ...] = ()
+
+    @property
+    def active(self) -> bool:
+        return bool(
+            self.employee_keys
+            or self.department_keys
+            or self.device_keys
+            or self.event_type_keys
+            or self.event_result_terms
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _QuestionIntent:
+    aggregate_parse: AttendanceQueryPlanParseResult
     latest_record: bool
     time_range: bool
     employee_field: str | None
@@ -1136,6 +1228,7 @@ class _QuestionIntent:
         return any(
             (
                 self.latest_record,
+                self.aggregate_parse.applicable,
                 self.time_range,
                 self.employee_field,
                 self.department_employees,
@@ -1203,6 +1296,41 @@ async def answer_spreadsheet_query(
     ):
         return None
 
+    aggregate_parse = intent.aggregate_parse
+    if (
+        aggregate_parse.status is AttendanceQueryPlanStatus.COMPILED
+        and _has_cross_sheet_duplicate_attendance_rows(sheets)
+    ):
+        return None
+    if intent.department_employees and (
+        aggregate_parse.plan is None or aggregate_parse.plan.date_range is None
+    ):
+        return _answer_department_employees(sheets, normalized_question)
+    if intent.department_record_count and _question_date(normalized_question) is None:
+        if not _all_source_sheets_reconstructed(sources, sheets):
+            return None
+        legacy_department_count = _answer_department_record_count(
+            sheets,
+            _strip_selected_source_filename_mentions(normalized_question, sources),
+        )
+        if legacy_department_count is not None:
+            return legacy_department_count
+    if (
+        aggregate_parse.status is AttendanceQueryPlanStatus.COMPILED
+        and aggregate_parse.plan is not None
+        and _should_use_generic_attendance_aggregate(
+            aggregate_parse.plan,
+            normalized_question,
+        )
+    ):
+        if not _all_source_sheets_reconstructed(sources, sheets):
+            return None
+        return _answer_attendance_aggregate(
+            sheets,
+            aggregate_parse.plan,
+            normalized_question,
+        )
+
     if intent.employee_frequency:
         if not _all_source_sheets_reconstructed(sources, sheets):
             return None
@@ -1228,7 +1356,7 @@ async def answer_spreadsheet_query(
     if intent.latest_record:
         return _answer_latest_record(sheets, normalized_question)
     if intent.time_range:
-        return _answer_time_range(sheets)
+        return _answer_time_range(sheets, normalized_question)
     if intent.employee_field == "employee_id":
         return _answer_employee_field(
             sheets,
@@ -1245,10 +1373,13 @@ async def answer_spreadsheet_query(
         )
     if intent.department_employees:
         return _answer_department_employees(sheets, normalized_question)
+    if aggregate_parse.status is AttendanceQueryPlanStatus.REJECTED:
+        return None
     return None
 
 
 def _question_intent(question: str) -> _QuestionIntent:
+    aggregate_parse = parse_attendance_query_plan(question)
     employee_lookup = _has_employee_field_lookup_shape(question)
     asks_employee_id = employee_lookup and "工号" in question
     asks_card_number = employee_lookup and "卡号" in question
@@ -1275,8 +1406,8 @@ def _question_intent(question: str) -> _QuestionIntent:
         is not None
     )
     department_employees = department_employee_scope and employee_list_request
-    latest_record = _is_latest_record_question(question)
     time_range = _is_time_range_question(question)
+    latest_record = _is_latest_record_question(question) and not time_range
     department_summary = _is_department_summary_question(question) and not department_employees
     event_result_existence = _is_event_result_existence_question(question)
     employee_frequency = _is_employee_frequency_question(question)
@@ -1292,6 +1423,7 @@ def _question_intent(question: str) -> _QuestionIntent:
         and not time_range
     )
     return _QuestionIntent(
+        aggregate_parse=aggregate_parse,
         latest_record=latest_record,
         time_range=time_range,
         employee_field=employee_field,
@@ -1428,7 +1560,9 @@ def _has_unsupported_device_frequency_scope(question: str) -> bool:
 
 def _is_event_result_existence_question(question: str) -> bool:
     has_spreadsheet_reference = _has_spreadsheet_filename_mention(question)
-    semantic_question = _strip_spreadsheet_filename_mentions(question)
+    semantic_question = _normalize_event_result_query_aliases(
+        _strip_spreadsheet_filename_mentions(question)
+    )
     if any(token in semantic_question for token in _EVENT_RESULT_POLICY_TERMS):
         return False
     existence_query = any(
@@ -1441,6 +1575,8 @@ def _is_event_result_existence_question(question: str) -> bool:
             "是否包含",
             "是否出现",
             "是否发生",
+            "出现过",
+            "发生过",
         )
     ) or bool(
         re.search(
@@ -1466,6 +1602,13 @@ def _is_event_result_existence_question(question: str) -> bool:
 def _strip_spreadsheet_filename_mentions(question: str) -> str:
     without_quoted_files = _QUOTED_TERM_PATTERN.sub(_quoted_filename_replacement, question)
     return _SPREADSHEET_REFERENCE_PATTERN.sub("", without_quoted_files)
+
+
+def _normalize_event_result_query_aliases(question: str) -> str:
+    normalized = unicodedata.normalize("NFKC", question)
+    for alias, canonical in _EVENT_RESULT_QUERY_ALIASES:
+        normalized = normalized.replace(alias, canonical)
+    return normalized
 
 
 def _has_spreadsheet_filename_mention(question: str) -> bool:
@@ -1937,6 +2080,953 @@ def _infer_sheet(rows: tuple[_Row, ...]) -> _Sheet | None:
         ambiguous=header_ambiguities,
         multiple_attendance_headers=attendance_header_count > 1,
     )
+
+
+def _should_use_generic_attendance_aggregate(
+    plan: AttendanceAggregationPlan,
+    question: str,
+) -> bool:
+    """Keep the mature unfiltered legacy answers while extending all new plans."""
+
+    if plan.date_range is not None:
+        return True
+    semantic = _normalize_event_result_query_aliases(_strip_spreadsheet_filename_mentions(question))
+    if _event_result_terms(semantic):
+        return True
+    if _QUOTED_TERM_PATTERN.search(semantic) is not None:
+        return True
+    if (
+        plan.mode is AttendanceAggregateMode.DISTINCT
+        and plan.dimension is AttendanceAggregateDimension.DEPARTMENT
+    ):
+        return False
+    if re.search(r"[A-Za-z0-9一-鿿·_-]{1,30}(?:部|科|中心)", semantic):
+        return True
+    if re.search(r"[A-Za-z0-9一-鿿#_-]{1,30}(?:门|入口|出口)(?:设备|闸机)?", semantic):
+        return True
+    return not (
+        plan.mode is AttendanceAggregateMode.GROUP_COUNT
+        and plan.selection is AttendanceAggregateSelection.MAX
+        and plan.dimension
+        in (AttendanceAggregateDimension.EMPLOYEE, AttendanceAggregateDimension.DEVICE)
+    )
+
+
+def _answer_attendance_aggregate(
+    sheets: tuple[_Sheet, ...],
+    plan: AttendanceAggregationPlan,
+    question: str,
+) -> SpreadsheetAnswer | None:
+    """Evaluate a verified attendance aggregate without retrieval or an LLM."""
+
+    attendance_sheets = _attendance_sheets_for_aggregate(sheets)
+    if attendance_sheets is None or not attendance_sheets:
+        return None
+
+    dimension = plan.dimension
+    requires_employee = dimension is AttendanceAggregateDimension.EMPLOYEE
+    requires_department = dimension is AttendanceAggregateDimension.DEPARTMENT
+    event_terms = _event_result_terms(
+        _normalize_event_result_query_aliases(_strip_spreadsheet_filename_mentions(question))
+    )
+    requires_event_result = dimension is AttendanceAggregateDimension.EVENT_RESULT or bool(
+        event_terms
+    )
+    identifier_kind = next(
+        (
+            kind
+            for kind in ("employee_id", "card_number")
+            if all(
+                sheet.columns.get(kind) is not None and kind not in sheet.ambiguous
+                for sheet in attendance_sheets
+            )
+        ),
+        None,
+    )
+    has_common_employee_name = all(
+        sheet.columns.get("employee_name") is not None and "employee_name" not in sheet.ambiguous
+        for sheet in attendance_sheets
+    )
+    if requires_employee and (identifier_kind is None or not has_common_employee_name):
+        return None
+    if requires_department and any(
+        sheet.columns.get("department") is None or "department" in sheet.ambiguous
+        for sheet in attendance_sheets
+    ):
+        return None
+    if requires_event_result and any(
+        sheet.columns.get("event_result") is None or "event_result" in sheet.ambiguous
+        for sheet in attendance_sheets
+    ):
+        return None
+
+    records: list[_AttendanceAggregateRecord] = []
+    records_by_sheet: list[tuple[_Sheet, tuple[_AttendanceAggregateRecord, ...]]] = []
+    identifier_labels: dict[str, str] = {}
+    employee_names: dict[str, str] = {}
+    identifier_to_name: dict[str, str] = {}
+    name_to_identifier: dict[str, str] = {}
+    row_origins: dict[tuple[tuple[str, str], ...], tuple[UUID, str]] = {}
+
+    for sheet in attendance_sheets:
+        timestamp_column = sheet.columns.get("timestamp")
+        device_column = sheet.columns.get("device")
+        department_column = sheet.columns.get("department")
+        event_type_column = sheet.columns.get("event_type")
+        event_result_column = sheet.columns.get("event_result")
+        name_column = sheet.columns.get("employee_name")
+        identifier_column = sheet.columns.get(identifier_kind) if identifier_kind else None
+        identity_columns = tuple(
+            column
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+            if kind not in sheet.ambiguous and (column := sheet.columns.get(kind)) is not None
+        )
+        if timestamp_column is None or device_column is None or not identity_columns:
+            return None
+        sheet_records: list[_AttendanceAggregateRecord] = []
+        for row in sheet.rows:
+            if not row.entry.integrity_metadata:
+                return None
+            # Attendance worksheets must be proven disjoint before their rows
+            # can be combined.  An exact row repeated in another worksheet is
+            # evidence of an overlapping export/backup sheet; counting both
+            # would silently inflate every aggregate.  Duplicates inside one
+            # worksheet remain valid because two identical access events can
+            # legitimately be emitted by the source system.
+            row_fingerprint = tuple(
+                (
+                    cell.column,
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        unicodedata.normalize("NFKC", cell.value).strip(),
+                    ),
+                )
+                for cell in row.cells
+            )
+            row_origin = (row.entry.id, row.sheet)
+            previous_origin = row_origins.setdefault(row_fingerprint, row_origin)
+            if previous_origin != row_origin:
+                return None
+            raw_timestamp = row.value(timestamp_column)
+            timestamp = _parse_datetime(raw_timestamp or "")
+            normalized_device = _normalized_device_label(row.value(device_column) or "")
+            if timestamp is None or normalized_device is None:
+                return None
+            if not any(
+                _normalized_identity_label(row.value(column) or "") is not None
+                for column in identity_columns
+            ):
+                return None
+
+            employee_key: str | None = None
+            employee_identifier: str | None = None
+            employee_name: str | None = None
+            if identifier_column is not None and name_column is not None:
+                employee_identifier = _normalized_identity_label(row.value(identifier_column) or "")
+                employee_name = _normalized_identity_label(row.value(name_column) or "")
+                if employee_identifier is None or employee_name is None:
+                    return None
+                employee_key = re.sub(r"\s+", "", employee_identifier.casefold())
+                name_key = re.sub(r"\s+", "", employee_name.casefold())
+                if (
+                    identifier_to_name.setdefault(employee_key, name_key) != name_key
+                    or name_to_identifier.setdefault(name_key, employee_key) != employee_key
+                ):
+                    return None
+                identifier_labels.setdefault(employee_key, employee_identifier)
+                employee_names.setdefault(employee_key, employee_name)
+            elif requires_employee:
+                return None
+
+            department_key: str | None = None
+            department_label: str | None = None
+            if department_column is not None and "department" not in sheet.ambiguous:
+                normalized_department = _normalized_department_label(
+                    row.value(department_column) or ""
+                )
+                if normalized_department is None:
+                    if requires_department:
+                        return None
+                else:
+                    department_key, department_label = normalized_department
+            elif requires_department:
+                return None
+
+            event_result_key: str | None = None
+            event_result_label: str | None = None
+            if event_result_column is not None and "event_result" not in sheet.ambiguous:
+                event_result_label = _normalized_identity_label(
+                    row.value(event_result_column) or ""
+                )
+                if event_result_label is None:
+                    if requires_event_result:
+                        return None
+                else:
+                    event_result_key = event_result_label.casefold()
+            elif requires_event_result:
+                return None
+
+            device_key, device_label = normalized_device
+            event_type_key: str | None = None
+            event_type_label: str | None = None
+            if event_type_column is not None and "event_type" not in sheet.ambiguous:
+                event_type_label = _normalized_identity_label(row.value(event_type_column) or "")
+                if event_type_label is not None:
+                    event_type_key = event_type_label.casefold()
+            record = _AttendanceAggregateRecord(
+                row=row,
+                timestamp=timestamp,
+                employee_key=employee_key,
+                employee_identifier=employee_identifier,
+                employee_name=employee_name,
+                department_key=department_key,
+                department_label=department_label,
+                device_key=device_key,
+                device_label=device_label,
+                event_type_key=event_type_key,
+                event_type_label=event_type_label,
+                event_result_key=event_result_key,
+                event_result_label=event_result_label,
+            )
+            records.append(record)
+            sheet_records.append(record)
+        records_by_sheet.append((sheet, tuple(sheet_records)))
+
+    if not records:
+        return None
+    filters = _resolve_attendance_aggregate_filters(records, question, event_terms)
+    if filters is None:
+        return None
+    if filters.employee_keys and (identifier_kind is None or not has_common_employee_name):
+        return None
+    if filters.department_keys and any(record.department_key is None for record in records):
+        return None
+    if filters.event_type_keys and any(record.event_type_key is None for record in records):
+        return None
+    if filters.event_result_terms and any(record.event_result_label is None for record in records):
+        return None
+
+    matched_by_sheet: list[tuple[_Sheet, tuple[_AttendanceAggregateRecord, ...]]] = []
+    matched_records: list[_AttendanceAggregateRecord] = []
+    for sheet, sheet_record_group in records_by_sheet:
+        matching = tuple(
+            record
+            for record in sheet_record_group
+            if _attendance_record_matches(record, plan, filters)
+        )
+        matched_by_sheet.append((sheet, matching))
+        matched_records.extend(matching)
+
+    coverages = _attendance_aggregate_coverages(
+        matched_by_sheet,
+        dimension=dimension,
+        filters=filters,
+        identifier_kind=identifier_kind,
+    )
+    hits = _build_attendance_aggregate_hits(coverages)
+    if hits is None or not hits:
+        return None
+    return _render_attendance_aggregate(
+        plan,
+        records,
+        matched_records,
+        filters,
+        identifier_kind,
+        identifier_labels,
+        employee_names,
+        hits,
+    )
+
+
+def _attendance_sheets_for_aggregate(
+    sheets: tuple[_Sheet, ...],
+) -> tuple[_Sheet, ...] | None:
+    selected: list[_Sheet] = []
+    for sheet in sheets:
+        timestamp_shape = "timestamp" in sheet.columns
+        device_shape = "device" in sheet.columns
+        identity_shape = any(
+            kind in sheet.columns
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+        )
+        signals = sum((timestamp_shape, device_shape, identity_shape))
+        if not ((timestamp_shape or device_shape) and signals >= 2):
+            continue
+        if not (timestamp_shape and device_shape and identity_shape and sheet.rows):
+            return None
+        if any(
+            sheet.columns.get(kind) is None or kind in sheet.ambiguous
+            for kind in ("timestamp", "device")
+        ):
+            return None
+        if not any(
+            sheet.columns.get(kind) is not None and kind not in sheet.ambiguous
+            for kind in ("employee_id", "card_number", "employee_name", "department")
+        ):
+            return None
+        if not _valid_coverage_sheet_name(sheet.rows[0].sheet):
+            return None
+        selected.append(sheet)
+    return tuple(selected)
+
+
+def _has_cross_sheet_duplicate_attendance_rows(sheets: tuple[_Sheet, ...]) -> bool:
+    """Return whether attendance worksheets have an exact overlapping row."""
+
+    attendance_sheets = _attendance_sheets_for_aggregate(sheets)
+    if attendance_sheets is None:
+        return False
+    origins: dict[tuple[tuple[str, str], ...], tuple[UUID, str]] = {}
+    for sheet in attendance_sheets:
+        for row in sheet.rows:
+            fingerprint = tuple(
+                (
+                    cell.column,
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        unicodedata.normalize("NFKC", cell.value).strip(),
+                    ),
+                )
+                for cell in row.cells
+            )
+            origin = (row.entry.id, row.sheet)
+            previous_origin = origins.setdefault(fingerprint, origin)
+            if previous_origin != origin:
+                return True
+    return False
+
+
+def _resolve_attendance_aggregate_filters(
+    records: list[_AttendanceAggregateRecord],
+    question: str,
+    event_terms: tuple[str, ...],
+) -> _AttendanceAggregateFilters | None:
+    semantic = unicodedata.normalize(
+        "NFKC", _strip_spreadsheet_filename_mentions(question)
+    ).casefold()
+    employee_keys = {
+        record.employee_key
+        for record in records
+        if record.employee_key is not None
+        and any(
+            label is not None
+            and len(re.sub(r"\s+", "", label)) >= 2
+            and label.casefold() in semantic
+            for label in (record.employee_name, record.employee_identifier)
+        )
+    }
+    department_keys = {
+        record.department_key
+        for record in records
+        if record.department_key is not None
+        and record.department_label is not None
+        and record.department_label.casefold() in semantic
+    }
+    device_keys = {
+        record.device_key
+        for record in records
+        if len(re.sub(r"\s+", "", record.device_label)) >= 2
+        and record.device_label.casefold() in semantic
+    }
+    event_type_keys = {
+        record.event_type_key
+        for record in records
+        if record.event_type_key is not None
+        and record.event_type_label is not None
+        and record.event_type_label.casefold() in semantic
+    }
+    # Multiple values of the same field are deliberately rejected: natural
+    # language conjunction/exclusion semantics are otherwise easy to misread.
+    if any(
+        len(values) > 1
+        for values in (employee_keys, department_keys, device_keys, event_type_keys)
+    ):
+        return None
+    resolved_labels = {
+        label.casefold()
+        for record in records
+        for label in (
+            record.employee_name,
+            record.employee_identifier,
+            record.department_label,
+            record.device_label,
+            record.event_type_label,
+        )
+        if label is not None and label.casefold() in semantic
+    }
+    for match in _QUOTED_TERM_PATTERN.finditer(semantic):
+        quoted = match.group(1).strip().casefold()
+        if (
+            quoted
+            and _SPREADSHEET_FILENAME_PATTERN.search(quoted) is None
+            and quoted not in resolved_labels
+            and not any(quoted == term.casefold() for term in event_terms)
+        ):
+            return None
+    if _has_unresolved_attendance_filter(
+        semantic,
+        employee_keys=frozenset(key for key in employee_keys if key is not None),
+        department_keys=frozenset(key for key in department_keys if key is not None),
+        device_keys=frozenset(device_keys),
+        event_type_keys=frozenset(key for key in event_type_keys if key is not None),
+        event_result_terms=event_terms,
+        resolved_labels=frozenset(resolved_labels),
+    ):
+        return None
+    return _AttendanceAggregateFilters(
+        employee_keys=frozenset(key for key in employee_keys if key is not None),
+        department_keys=frozenset(key for key in department_keys if key is not None),
+        device_keys=frozenset(device_keys),
+        event_type_keys=frozenset(key for key in event_type_keys if key is not None),
+        event_result_terms=event_terms,
+    )
+
+
+def _has_unresolved_attendance_filter(
+    question: str,
+    *,
+    employee_keys: frozenset[str],
+    department_keys: frozenset[str],
+    device_keys: frozenset[str],
+    event_type_keys: frozenset[str],
+    event_result_terms: tuple[str, ...],
+    resolved_labels: frozenset[str],
+) -> bool:
+    """Detect a syntactic exact scope that matched no trusted table value."""
+
+    # Event type is a separate business field from the whitelisted event
+    # result/status dimension.  Until it has its own typed plan, treating a
+    # qualifier such as "普通消息事件类型" as a result filter would be wrong.
+    if "事件类型" in question and not event_type_keys:
+        return True
+
+    if re.search(r"[A-Za-z0-9一-鿿·_-]{1,16}消息", question) and not event_type_keys:
+        return True
+
+    named_event_type = re.search(
+        r"(?P<label>[A-Za-z0-9一-鿿·_-]{1,16}?)(?:事件|类型|类别)"
+        r"(?=(?:有多少|有几|一共|总共|共计|多少|几条|打卡|记录|次数))",
+        question,
+    )
+    if named_event_type is not None and not event_type_keys:
+        event_label = named_event_type.group("label")
+        if not any(term.casefold() in event_label for term in event_result_terms):
+            return True
+
+    # A status-looking qualifier that was not compiled by
+    # ``_event_result_terms`` must never disappear into a global count.
+    unknown_event_scope = re.search(
+        r"(?:认证|验证)(?P<qualifier>[A-Za-z0-9一-鿿·_-]{1,16}?)"
+        r"(?=(?:有多少|有几|一共|总共|共计|打卡|刷卡|通行|记录|结果|状态|次数))",
+        question,
+    )
+    if not event_result_terms and unknown_event_scope is not None:
+        qualifier = unknown_event_scope.group("qualifier")
+        aggregate_language = ("多少", "几条", "总数", "数量", "一共", "总共", "共计", "全部")
+        if not any(term in qualifier for term in aggregate_language):
+            return True
+
+    named_organization = re.search(
+        r"[A-Za-z0-9一-鿿·_-]{1,30}(?:部(?!门)|科(?!室)|课|中心|车间)",
+        question,
+    )
+    if named_organization is not None and not department_keys:
+        return True
+    named_device = re.search(
+        r"[A-Za-z0-9一-鿿#_-]{1,30}(?<!部)门(?!禁)(?:设备|闸机)?",
+        question,
+    )
+    if named_device is not None and not device_keys:
+        return True
+    global_scope_terms = (
+        "考勤",
+        "记录",
+        "数据",
+        "全体",
+        "全部",
+        "公司",
+        "整个",
+        "这份",
+        "其中",
+        "部门",
+        "设备",
+        "闸机",
+        "打卡",
+        "门禁",
+        "刷卡",
+        "通行",
+        "全员",
+        "人员",
+        "员工",
+        "职工",
+        "本表",
+        "该表",
+        "本次",
+        "大家",
+        "所有人",
+        "本文件",
+        "表格",
+        "整表",
+        "整体",
+        "所有员工",
+        "全体员工",
+        "分别",
+        "每位",
+        "每个",
+        "各位",
+        "哪位",
+        "哪台",
+        "哪个",
+        "哪种",
+        "哪些",
+        "什么",
+        "名单",
+    )
+    explicit_employee = re.search(
+        r"(?:员工|人员)\s*[“\"'‘]?"
+        r"(?P<label>[一-鿿·]{2,4}|[A-Za-z][A-Za-z0-9._-]{1,29}|"
+        r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]{1,29})[”\"'’]?\s*"
+        r"(?:(?:一共|总共|累计|共)(?:有)?|有多少|有几|的?"
+        r"(?:打卡|考勤|门禁|通行)|打卡总数)",
+        question,
+    )
+    if explicit_employee is not None and not employee_keys:
+        candidate = explicit_employee.group("label")
+        if not any(term in candidate for term in global_scope_terms):
+            return True
+
+    # Chinese questions commonly omit the word "员工" (for example,
+    # "王五一共有多少条打卡记录").  Only a short leading person-like token
+    # is recognized here, and global dataset nouns are excluded explicitly.
+    bare_employee = re.search(
+        r"(?:^|帮我查|请帮我查|请查|请统计|查询|统计|查一下)\s*"
+        r"[“\"'‘]?(?P<label>[一-鿿·]{2,6}?)[”\"'’]?\s*"
+        r"(?:(?:一共|总共|累计|共有|共计|共)(?:有)?|"
+        r"(?:在[^，。？！?]{1,20})?的?(?:打卡|考勤|门禁|通行|刷卡)"
+        r"(?:记录)?(?:(?:一共|总共|累计|共有|共计|共)(?:有)?)?"
+        r"(?:多少|几|总数|次数)?|(?:有)?(?:多少|几)(?:条|次|个)?"
+        r"(?:打卡|考勤|门禁|通行))",
+        question,
+    )
+    if bare_employee is None or employee_keys or event_type_keys:
+        return False
+    candidate = bare_employee.group("label")
+    candidate_key = candidate.casefold()
+    if any(
+        candidate_key == label
+        or candidate_key in label
+        or label in candidate_key
+        for label in resolved_labels
+    ):
+        return False
+    return not any(term in candidate for term in global_scope_terms)
+
+
+def _attendance_record_matches(
+    record: _AttendanceAggregateRecord,
+    plan: AttendanceAggregationPlan,
+    filters: _AttendanceAggregateFilters,
+) -> bool:
+    date_range = plan.date_range
+    if date_range is not None and not (
+        date_range.start <= record.timestamp.date() <= date_range.end
+    ):
+        return False
+    if filters.employee_keys and record.employee_key not in filters.employee_keys:
+        return False
+    if filters.department_keys and record.department_key not in filters.department_keys:
+        return False
+    if filters.device_keys and record.device_key not in filters.device_keys:
+        return False
+    if filters.event_type_keys and record.event_type_key not in filters.event_type_keys:
+        return False
+    return not filters.event_result_terms or any(
+        _event_result_matches(record.event_result_label or "", term)
+        for term in filters.event_result_terms
+    )
+
+
+def _attendance_aggregate_coverages(
+    records_by_sheet: list[tuple[_Sheet, tuple[_AttendanceAggregateRecord, ...]]],
+    *,
+    dimension: AttendanceAggregateDimension | None,
+    filters: _AttendanceAggregateFilters,
+    identifier_kind: str | None,
+) -> list[_AttendanceAggregateCoverage]:
+    coverages: list[_AttendanceAggregateCoverage] = []
+    for sheet, matching in records_by_sheet:
+        columns = {
+            sheet.columns["timestamp"],
+            sheet.columns["device"],
+        }
+        for kind in (identifier_kind, "employee_name"):
+            if kind and (column := sheet.columns.get(kind)) is not None:
+                columns.add(column)
+        if (dimension is AttendanceAggregateDimension.DEPARTMENT or filters.department_keys) and (
+            column := sheet.columns.get("department")
+        ) is not None:
+            columns.add(column)
+        if (
+            dimension is AttendanceAggregateDimension.EVENT_RESULT or filters.event_result_terms
+        ) and (column := sheet.columns.get("event_result")) is not None:
+            columns.add(column)
+        if filters.event_type_keys and (column := sheet.columns.get("event_type")) is not None:
+            columns.add(column)
+        if filters.employee_keys:
+            for kind in (identifier_kind, "employee_name"):
+                if kind and (column := sheet.columns.get(kind)) is not None:
+                    columns.add(column)
+        coverages.append(
+            _AttendanceAggregateCoverage(
+                entry=sheet.rows[0].entry,
+                sheet=sheet.rows[0].sheet,
+                columns=tuple(sorted((column for column in columns if column), key=_column_number)),
+                first_row=sheet.rows[0].number,
+                last_row=sheet.rows[-1].number,
+                scanned_rows=len(sheet.rows),
+                matched_rows=len(matching),
+            )
+        )
+    return coverages
+
+
+def _build_attendance_aggregate_hits(
+    coverages: list[_AttendanceAggregateCoverage],
+) -> tuple[KnowledgeSearchHit, ...] | None:
+    grouped: dict[UUID, list[_AttendanceAggregateCoverage]] = {}
+    for coverage in coverages:
+        grouped.setdefault(coverage.entry.id, []).append(coverage)
+    hits: list[KnowledgeSearchHit] = []
+    evidence_characters = 0
+    for entry_coverages in grouped.values():
+        entry = entry_coverages[0].entry
+        anchor_groups: list[tuple[str, ...]] = []
+        summaries: list[str] = []
+        for coverage in entry_coverages:
+            anchors = tuple(
+                _column_range(
+                    coverage.sheet,
+                    column,
+                    coverage.first_row,
+                    coverage.last_row,
+                )
+                for column in coverage.columns
+            )
+            anchor_groups.append(anchors)
+            summaries.append(
+                f"确定性全量聚合 [{', '.join(anchors)}]：完整扫描 "
+                f"{coverage.scanned_rows} 条考勤记录；筛选后 {coverage.matched_rows} 条。"
+            )
+        excerpt = "\n".join(summaries)
+        evidence_characters += len(excerpt)
+        if evidence_characters > _MAX_EVIDENCE_CHARACTERS:
+            return None
+        anchor = _combined_grouped_coverage_anchor(anchor_groups)
+        hits.append(
+            KnowledgeSearchHit(
+                entry_id=entry.id,
+                source_file_id=entry.source_file_id,
+                title=_citation_safe_text(entry.title),
+                excerpt=excerpt,
+                source_path=_anchored_source_path(entry.source_path, anchor),
+                format_version=(
+                    _citation_safe_text(entry.format_version) if entry.format_version else None
+                ),
+            )
+        )
+    return tuple(hits)
+
+
+def _render_attendance_aggregate(
+    plan: AttendanceAggregationPlan,
+    scanned_records: list[_AttendanceAggregateRecord],
+    matched_records: list[_AttendanceAggregateRecord],
+    filters: _AttendanceAggregateFilters,
+    identifier_kind: str | None,
+    identifier_labels: dict[str, str],
+    employee_names: dict[str, str],
+    hits: tuple[KnowledgeSearchHit, ...],
+) -> SpreadsheetAnswer | None:
+    title_values = {record.row.entry.title for record in scanned_records}
+    title = next(iter(title_values)) if len(title_values) == 1 else "选定考勤工作簿"
+    safe_title = _citation_safe_text(title)
+    citation = _citation_marker(hits)
+    scanned_count = len(scanned_records)
+    matched_count = len(matched_records)
+    scope = _attendance_filter_scope(scanned_records, plan, filters)
+
+    if plan.mode is AttendanceAggregateMode.TOTAL:
+        if scope:
+            answer = (
+                f"在《{safe_title}》中已完整扫描 {scanned_count} 条有效考勤记录，"
+                f"{scope}共有 {matched_count} 条打卡记录。{citation}"
+            )
+        else:
+            answer = (
+                f"在《{safe_title}》中已完整扫描 {scanned_count} 条有效考勤记录，"
+                f"共有 {matched_count} 条打卡记录。{citation}"
+            )
+        return SpreadsheetAnswer(
+            answer=answer,
+            table=SpreadsheetTable(
+                title="考勤记录总数",
+                columns=("统计范围", "记录数"),
+                rows=(
+                    (
+                        (scope or "全部考勤记录").replace("“", "").replace("”", ""),
+                        f"{matched_count} 条",
+                    ),
+                ),
+                citation_numbers=tuple(range(1, len(hits) + 1)),
+            ),
+            hits=hits,
+        )
+
+    dimension = plan.dimension
+    if dimension is None:
+        return None
+    values: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for record in matched_records:
+        value = _attendance_dimension_value(record, dimension)
+        if value is None:
+            return None
+        key, label = value
+        values.setdefault(key, label)
+        counts[key] = counts.get(key, 0) + 1
+
+    dimension_name = _attendance_dimension_name(dimension)
+    if plan.mode is AttendanceAggregateMode.DISTINCT:
+        if len(values) > _MAX_TABLE_ROWS:
+            return None
+        if not values:
+            return SpreadsheetAnswer(
+                answer=(
+                    f"在《{safe_title}》中已完整扫描 {scanned_count} 条有效考勤记录，"
+                    f"筛选后无符合条件记录，共包含 0 个不同{dimension_name}。{citation}"
+                ),
+                table=None,
+                hits=hits,
+            )
+        keys = tuple(values)
+        labels = tuple(_citation_safe_text(values[key]) for key in keys)
+        answer = (
+            f"在《{safe_title}》中已完整扫描 {scanned_count} 条有效考勤记录，"
+            f"共包含 {len(keys)} 个不同{dimension_name}：{'、'.join(labels)}。{citation}"
+        )
+        distinct_rows: tuple[tuple[str, ...], ...]
+        distinct_columns: tuple[str, ...]
+        if dimension is AttendanceAggregateDimension.EMPLOYEE:
+            identifier_label = "人员工号" if identifier_kind == "employee_id" else "卡号"
+            distinct_rows = tuple(
+                (
+                    _citation_safe_text(identifier_labels[key]),
+                    _citation_safe_text(employee_names[key]),
+                )
+                for key in keys
+            )
+            distinct_columns = (identifier_label, "员工姓名")
+        else:
+            distinct_rows = tuple((label,) for label in labels)
+            distinct_columns = (f"{dimension_name}名称",)
+        return SpreadsheetAnswer(
+            answer=answer,
+            table=SpreadsheetTable(
+                title=f"考勤{dimension_name}去重统计",
+                columns=distinct_columns,
+                rows=distinct_rows,
+                citation_numbers=tuple(range(1, len(hits) + 1)),
+            ),
+            hits=hits,
+        )
+
+    if not counts:
+        return SpreadsheetAnswer(
+            answer=(
+                f"在《{safe_title}》中已完整扫描 {scanned_count} 条有效考勤记录，"
+                f"筛选后无符合条件记录。{citation}"
+            ),
+            table=None,
+            hits=hits,
+        )
+    ranked = tuple(
+        sorted(
+            counts,
+            key=lambda key: (-counts[key], values[key].casefold(), values[key], key),
+        )
+    )
+    selected: tuple[str, ...]
+    if plan.selection is AttendanceAggregateSelection.ALL:
+        selected = ranked
+    elif plan.selection is AttendanceAggregateSelection.MAX:
+        highest = counts[ranked[0]]
+        selected = tuple(key for key in ranked if counts[key] == highest)
+    elif plan.selection is AttendanceAggregateSelection.MIN:
+        lowest = min(counts.values())
+        selected = tuple(key for key in ranked if counts[key] == lowest)
+    else:
+        top_n = plan.top_n
+        if top_n is None:
+            return None
+        boundary = counts[ranked[min(top_n, len(ranked)) - 1]]
+        selected = tuple(key for key in ranked if counts[key] >= boundary)
+    if len(selected) > _MAX_TABLE_ROWS:
+        return None
+
+    safe_labels = tuple(_citation_safe_text(values[key]) for key in selected)
+    if plan.selection is AttendanceAggregateSelection.MAX:
+        if dimension is AttendanceAggregateDimension.EMPLOYEE:
+            if len(selected) == 1:
+                answer = (
+                    f"在《{safe_title}》中已完整扫描 {scanned_count} 条打卡记录，"
+                    f"打卡总次数最多的员工是“{safe_labels[0]}”，"
+                    f"共打卡 {counts[selected[0]]} 次。{citation}"
+                )
+            else:
+                answer = (
+                    f"打卡总次数最多的员工有 {len(selected)} 位，并列第一："
+                    f"{'、'.join(f'“{label}”' for label in safe_labels)}，"
+                    f"各打卡 {counts[selected[0]]} 次。{citation}"
+                )
+        elif dimension is AttendanceAggregateDimension.DEVICE:
+            if len(selected) == 1:
+                answer = (
+                    f"在《{safe_title}》中已完整扫描 {scanned_count} 条打卡记录，"
+                    f"使用最频繁的设备是“{safe_labels[0]}”，"
+                    f"共记录 {counts[selected[0]]} 次。{citation}"
+                )
+            else:
+                answer = (
+                    f"使用最频繁的设备有 {len(selected)} 个，并列第一："
+                    f"{'、'.join(f'“{label}”' for label in safe_labels)}，"
+                    f"各记录 {counts[selected[0]]} 次。{citation}"
+                )
+        else:
+            answer = (
+                f"{dimension_name}打卡次数最多的是"
+                f"{'、'.join(f'“{label}”' for label in safe_labels)}，"
+                f"共 {counts[selected[0]]} 次。{citation}"
+            )
+    elif plan.selection is AttendanceAggregateSelection.MIN:
+        answer = (
+            f"{dimension_name}打卡次数最少的是"
+            f"{'、'.join(f'“{label}”' for label in safe_labels)}，"
+            f"共 {counts[selected[0]]} 次。{citation}"
+        )
+    elif plan.selection is AttendanceAggregateSelection.TOP_N:
+        answer = (
+            f"{dimension_name}打卡次数前 {plan.top_n} 名如下；"
+            f"若第 {plan.top_n} 名并列，已完整保留边界并列项。{citation}"
+        )
+    else:
+        answer = (
+            f"在《{safe_title}》中已按{dimension_name}完成全量汇总，"
+            f"共 {len(selected)} 个分组。{citation}"
+        )
+
+    identifier_label = "人员工号" if identifier_kind == "employee_id" else "卡号"
+    grouped_columns: tuple[str, ...]
+    grouped_rows: tuple[tuple[str, ...], ...]
+    if dimension is AttendanceAggregateDimension.EMPLOYEE:
+        grouped_columns = (identifier_label, "员工姓名", "打卡次数")
+        grouped_rows = tuple(
+            (
+                _citation_safe_text(identifier_labels[key]),
+                _citation_safe_text(employee_names[key]),
+                f"{counts[key]} 次",
+            )
+            for key in selected
+        )
+    else:
+        grouped_columns = (f"{dimension_name}名称", "打卡次数")
+        grouped_rows = tuple(
+            (_citation_safe_text(values[key]), f"{counts[key]} 次") for key in selected
+        )
+    return SpreadsheetAnswer(
+        answer=answer,
+        table=SpreadsheetTable(
+            title=f"{dimension_name}打卡频次",
+            columns=grouped_columns,
+            rows=grouped_rows,
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
+    )
+
+
+def _attendance_dimension_value(
+    record: _AttendanceAggregateRecord,
+    dimension: AttendanceAggregateDimension,
+) -> tuple[str, str] | None:
+    if dimension is AttendanceAggregateDimension.EMPLOYEE:
+        if record.employee_key is None or record.employee_name is None:
+            return None
+        return record.employee_key, record.employee_name
+    if dimension is AttendanceAggregateDimension.DEPARTMENT:
+        if record.department_key is None or record.department_label is None:
+            return None
+        return record.department_key, record.department_label
+    if dimension is AttendanceAggregateDimension.DEVICE:
+        return record.device_key, record.device_label
+    if record.event_result_key is None or record.event_result_label is None:
+        return None
+    return record.event_result_key, record.event_result_label
+
+
+def _attendance_dimension_name(dimension: AttendanceAggregateDimension) -> str:
+    return {
+        AttendanceAggregateDimension.EMPLOYEE: "员工",
+        AttendanceAggregateDimension.DEPARTMENT: "部门",
+        AttendanceAggregateDimension.DEVICE: "设备",
+        AttendanceAggregateDimension.EVENT_RESULT: "事件结果",
+    }[dimension]
+
+
+def _attendance_filter_scope(
+    records: list[_AttendanceAggregateRecord],
+    plan: AttendanceAggregationPlan,
+    filters: _AttendanceAggregateFilters,
+) -> str:
+    parts: list[str] = []
+    if plan.date_range is not None:
+        if plan.date_range.start == plan.date_range.end:
+            parts.append(_format_date(plan.date_range.start))
+        else:
+            parts.append(
+                f"{_format_date(plan.date_range.start)}至{_format_date(plan.date_range.end)}"
+            )
+    if filters.employee_keys:
+        labels = {
+            record.employee_name
+            for record in records
+            if record.employee_key in filters.employee_keys and record.employee_name is not None
+        }
+        parts.extend(f"员工“{_citation_safe_text(label)}”" for label in sorted(labels))
+    if filters.department_keys:
+        labels = {
+            record.department_label
+            for record in records
+            if record.department_key in filters.department_keys
+            and record.department_label is not None
+        }
+        parts.extend(f"“{_citation_safe_text(label)}”" for label in sorted(labels))
+    if filters.device_keys:
+        labels = {
+            record.device_label for record in records if record.device_key in filters.device_keys
+        }
+        parts.extend(f"设备“{_citation_safe_text(label)}”" for label in sorted(labels))
+    if filters.event_type_keys:
+        labels = {
+            record.event_type_label
+            for record in records
+            if record.event_type_key in filters.event_type_keys
+            and record.event_type_label is not None
+        }
+        parts.extend(f"事件类型“{_citation_safe_text(label)}”" for label in sorted(labels))
+    parts.extend(f"事件结果“{_citation_safe_text(term)}”" for term in filters.event_result_terms)
+    return "、".join(parts)
 
 
 def _answer_department_record_count(
@@ -2636,7 +3726,9 @@ def _citation_safe_text(value: str) -> str:
 def _answer_event_result_existence(
     sheets: tuple[_Sheet, ...], question: str
 ) -> SpreadsheetAnswer | None:
-    semantic_question = _strip_spreadsheet_filename_mentions(question)
+    semantic_question = _normalize_event_result_query_aliases(
+        _strip_spreadsheet_filename_mentions(question)
+    )
     terms = _event_result_terms(semantic_question)
     if not terms or len(terms) > _MAX_TABLE_ROWS:
         return None
@@ -2810,6 +3902,12 @@ def _answer_employee_field(
 def _answer_department_employees(
     sheets: tuple[_Sheet, ...], question: str
 ) -> SpreadsheetAnswer | None:
+    if _question_date(question) is not None or _has_unconsumed_attendance_scope(
+        sheets,
+        question,
+        allowed_fields=frozenset({"department"}),
+    ):
+        return None
     departments = {
         value
         for sheet in sheets
@@ -2889,7 +3987,13 @@ def _answer_department_employees(
     )
 
 
-def _answer_time_range(sheets: tuple[_Sheet, ...]) -> SpreadsheetAnswer | None:
+def _answer_time_range(sheets: tuple[_Sheet, ...], question: str) -> SpreadsheetAnswer | None:
+    if (
+        _question_date(question) is not None
+        or _has_relative_time_scope(question)
+        or _has_unconsumed_attendance_scope(sheets, question)
+    ):
+        return None
     records, invalid = _timestamp_records(sheets)
     if invalid or not records:
         return None
@@ -2923,11 +4027,17 @@ def _answer_time_range(sheets: tuple[_Sheet, ...]) -> SpreadsheetAnswer | None:
 
 def _answer_latest_record(sheets: tuple[_Sheet, ...], question: str) -> SpreadsheetAnswer | None:
     target_date = _question_date(question)
-    if target_date is None:
+    if _has_unconsumed_attendance_scope(sheets, question):
         return None
     records, invalid = _timestamp_records(sheets, target_date=target_date)
     if invalid or not records:
         return None
+    if target_date is None and _has_relative_time_scope(question):
+        record_dates = {
+            record.timestamp.date() for record in records if record.timestamp is not None
+        }
+        if len(record_dates) != 1:
+            return None
     latest_time = max(record.timestamp for record in records if record.timestamp is not None)
     latest = [record for record in records if record.timestamp == latest_time]
     resolved: list[tuple[str, str, _Row]] = []
@@ -2960,7 +4070,8 @@ def _answer_latest_record(sheets: tuple[_Sheet, ...], question: str) -> Spreadsh
     citations = _citation_marker(hits)
     assert latest_time is not None
     time_text = latest_time.strftime("%H时%M分")
-    date_text = _format_date(target_date)
+    resolved_date = target_date or latest_time.date()
+    date_text = _format_date(resolved_date)
     return SpreadsheetAnswer(
         answer=f"{date_text}当天最晚一条打卡记录是{name}，于{time_text}通过“{device}”。{citations}",
         table=SpreadsheetTable(
@@ -3402,6 +4513,78 @@ def _mentioned_value(values: set[str], question: str) -> str | None:
     return next(iter(best)) if len(best) == 1 else None
 
 
+def _has_unconsumed_attendance_scope(
+    sheets: tuple[_Sheet, ...],
+    question: str,
+    *,
+    allowed_fields: frozenset[str] = frozenset(),
+) -> bool:
+    """Reject exact data filters that an executor did not explicitly consume.
+
+    A deterministic answer is unsafe when a department, employee, device, or
+    result value appears in the question but the selected executor would scan
+    the whole workbook.  Values are resolved from the trusted workbook instead
+    of a hard-coded organization dictionary.
+    """
+
+    semantic_question = unicodedata.normalize(
+        "NFKC", _strip_spreadsheet_filename_mentions(question)
+    ).casefold()
+    fields = (
+        "department",
+        "employee_name",
+        "employee_id",
+        "card_number",
+        "device",
+        "event_result",
+    )
+    for field in fields:
+        if field in allowed_fields:
+            continue
+        for sheet in sheets:
+            column = sheet.columns.get(field)
+            if column is None or field in sheet.ambiguous:
+                continue
+            for row in sheet.rows:
+                raw_value = row.value(column)
+                normalized_value = _normalized_identity_label(raw_value or "")
+                if normalized_value is None:
+                    continue
+                value_key = normalized_value.casefold()
+                compact_key = re.sub(r"\s+", "", value_key)
+                if len(compact_key) >= 2 and value_key in semantic_question:
+                    return True
+    return "event_result" not in allowed_fields and any(
+        term in semantic_question for term in _EVENT_RESULT_QUERY_TERMS
+    )
+
+
+def _has_relative_time_scope(question: str) -> bool:
+    semantic_question = unicodedata.normalize("NFKC", question).casefold()
+    return any(
+        term in semantic_question
+        for term in (
+            "今天",
+            "今日",
+            "昨天",
+            "昨日",
+            "前天",
+            "当天",
+            "当日",
+            "本周",
+            "上周",
+            "本月",
+            "上月",
+            "今年",
+            "去年",
+            "上午",
+            "下午",
+            "白班",
+            "夜班",
+        )
+    )
+
+
 def _normalize_header(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold()
     return re.sub(r"[\s:：_\-()/（）]+", "", normalized)
@@ -3468,15 +4651,45 @@ def _question_date(question: str) -> date | None:
 
 
 def _is_latest_record_question(question: str) -> bool:
-    return any(token in question for token in ("最晚", "最后一条", "最后的")) and any(
-        token in question for token in ("打卡", "考勤", "通行")
-    )
+    return any(
+        token in question
+        for token in (
+            "最晚",
+            "最迟",
+            "最后一条",
+            "最后一笔",
+            "最后一次",
+            "最后的",
+            "最新一条",
+        )
+    ) and any(token in question for token in ("打卡", "考勤", "通行", "刷卡"))
 
 
 def _is_time_range_question(question: str) -> bool:
-    return any(token in question for token in ("考勤", "打卡", "通行")) and any(
-        token in question for token in ("时间范围", "日期范围", "从哪一天到哪一天", "起止时间")
+    semantic_question = unicodedata.normalize("NFKC", question).casefold()
+    attendance_context = any(
+        token in semantic_question for token in ("考勤", "打卡", "通行", "刷卡", "数据")
     )
+    range_context = any(
+        token in semantic_question
+        for token in (
+            "时间范围",
+            "日期范围",
+            "日期区间",
+            "时间区间",
+            "从哪一天到哪一天",
+            "从什么时候到什么时候",
+            "起止时间",
+            "起始时间",
+            "起始日期",
+            "截止时间",
+            "截止日期",
+        )
+    ) or (
+        any(token in semantic_question for token in ("最早", "开始", "起始"))
+        and any(token in semantic_question for token in ("最晚", "结束", "截止"))
+    )
+    return attendance_context and range_context
 
 
 def _citation_marker(hits: tuple[KnowledgeSearchHit, ...]) -> str:
