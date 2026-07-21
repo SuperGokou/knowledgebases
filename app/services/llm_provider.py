@@ -315,9 +315,20 @@ class OpenAICompatibleClient:
                     if len(content) + len(chunk) > self._max_response_bytes:
                         raise self._response_too_large()
                     content.extend(chunk)
+                # ``aiter_bytes`` yields decoded bytes. Reusing the upstream content
+                # encoding header would make the synthetic response decode the same
+                # body a second time (Qwen commonly returns gzip), which raises a
+                # spurious transport error. Content-Length and Transfer-Encoding also
+                # describe the upstream wire representation, not this decoded body.
+                decoded_headers = [
+                    (name, value)
+                    for name, value in response.headers.multi_items()
+                    if name.lower()
+                    not in {"content-encoding", "content-length", "transfer-encoding"}
+                ]
                 return httpx.Response(
                     response.status_code,
-                    headers=response.headers,
+                    headers=decoded_headers,
                     content=bytes(content),
                     request=response.request,
                 )
