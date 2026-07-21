@@ -214,14 +214,19 @@ class OpenAICompatibleClient:
                 retryable=True,
                 metering_outcome=MeteringOutcome.NOT_STARTED,
             )
-        envelope = await self._request(
-            {
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": min(max_tokens or self._max_tokens, self._max_tokens),
-                "temperature": temperature,
-            }
-        )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "max_tokens": min(max_tokens or self._max_tokens, self._max_tokens),
+            "temperature": temperature,
+        }
+        if self.provider == "deepseek":
+            # DeepSeek V4 defaults to thinking mode. These chat calls require a bounded,
+            # strict JSON answer, so disable hidden reasoning to avoid consuming the
+            # reviewer's entire output budget before a verdict is emitted.
+            payload["thinking"] = {"type": "disabled"}
+        envelope = await self._request(payload, retry_without_response_format=True)
         content, model, usage = self._parse_envelope(envelope)
         return LlmChatResult(
             content=content,
@@ -311,11 +316,24 @@ class OpenAICompatibleClient:
         except LlmProviderError:
             raise
         except httpx.RequestError as error:
+            metering_outcome = (
+                MeteringOutcome.NOT_STARTED
+                if isinstance(
+                    error,
+                    (
+                        httpx.ConnectError,
+                        httpx.ConnectTimeout,
+                        httpx.PoolTimeout,
+                        httpx.ProxyError,
+                    ),
+                )
+                else MeteringOutcome.UNKNOWN
+            )
             raise LlmProviderError(
                 "llm_transport_error",
                 provider=self.provider,
                 retryable=True,
-                metering_outcome=MeteringOutcome.UNKNOWN,
+                metering_outcome=metering_outcome,
             ) from error
 
     def _response_too_large(self) -> LlmProviderError:

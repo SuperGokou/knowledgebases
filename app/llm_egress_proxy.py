@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -109,12 +110,20 @@ class ProxyRequestError(Exception):
 
 
 def parse_extra_hosts(raw_value: str | None) -> frozenset[str]:
-    """Parse exact MaaS hosts; wildcards, whitespace and sibling domains are rejected."""
+    """Parse a JSON list of exact MaaS hosts from the shared application policy."""
 
     if raw_value is None or raw_value == "":
         return frozenset()
+    try:
+        raw_hosts = json.loads(raw_value)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("extra hosts must be a JSON string array") from error
+    if not isinstance(raw_hosts, list) or len(raw_hosts) > 32:
+        raise ValueError("extra hosts must be a JSON string array with at most 32 entries")
     hosts: set[str] = set()
-    for value in raw_value.split(","):
+    for value in raw_hosts:
+        if not isinstance(value, str) or not value:
+            raise ValueError("extra hosts must contain non-empty DNS names")
         if value != value.strip() or value != value.lower():
             raise ValueError("extra hosts must be lowercase without surrounding whitespace")
         host = _validate_hostname(value)

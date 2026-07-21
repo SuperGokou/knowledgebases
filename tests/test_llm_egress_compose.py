@@ -21,7 +21,11 @@ GENERIC_PROXY_KEYS = {
 }
 
 
-def _config(*compose_files: Path, include_llm_env: bool = False) -> dict[str, Any]:
+def _config(
+    *compose_files: Path,
+    include_llm_env: bool = False,
+    llm_env: Path = LLM_ENV,
+) -> dict[str, Any]:
     command = [
         "docker",
         "compose",
@@ -31,7 +35,7 @@ def _config(*compose_files: Path, include_llm_env: bool = False) -> dict[str, An
         str(BASE_ENV),
     ]
     if include_llm_env:
-        command.extend(["--env-file", str(LLM_ENV)])
+        command.extend(["--env-file", str(llm_env)])
     for compose_file in compose_files:
         command.extend(["--file", str(compose_file)])
     command.extend(["--profile", "ops", "config", "--format", "json", "--no-path-resolution"])
@@ -47,6 +51,27 @@ def _config(*compose_files: Path, include_llm_env: bool = False) -> dict[str, An
     payload = json.loads(completed.stdout)
     assert isinstance(payload, dict)
     return payload
+
+
+def _verify(llm_env: Path = LLM_ENV) -> subprocess.CompletedProcess[str]:
+    verifier = REPOSITORY / "deploy/tencent/verify-llm-egress-compose.py"
+    return subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(verifier),
+            "heyi-kb-offline",
+            str(BASE_ENV),
+            str(llm_env),
+            str(BASE_COMPOSE),
+            str(EGRESS_COMPOSE),
+        ],
+        cwd=REPOSITORY,
+        capture_output=True,
+        check=False,
+        shell=False,
+        text=True,
+        timeout=30,
+    )
 
 
 def test_llm_egress_override_preserves_private_data_networks() -> None:
@@ -102,6 +127,7 @@ def test_llm_egress_override_preserves_private_data_networks() -> None:
     assert proxy["environment"] == {
         "KB_LLM_EGRESS_PROXY_BIND_HOST": "0.0.0.0",
         "KB_LLM_EGRESS_PROXY_BIND_PORT": "8080",
+        "LLM_EGRESS_PROXY_EXTRA_HOSTS": "[]",
     }
     assert GENERIC_PROXY_KEYS.isdisjoint(proxy["environment"])
 
@@ -114,8 +140,15 @@ def test_llm_egress_override_changes_only_the_two_runtime_services() -> None:
         "KB_EXTERNAL_LLM_ENABLED",
         "KB_LLM_DEFAULT_PROVIDER",
         "KB_DEEPSEEK_API_KEY",
+        "KB_DEEPSEEK_BASE_URL",
+        "KB_DEEPSEEK_MODEL",
         "KB_QWEN_API_KEY",
+        "KB_QWEN_BASE_URL",
+        "KB_QWEN_MODEL",
+        "KB_QWEN_ALLOWED_WORKSPACE_HOSTS",
         "KB_MINIMAX_API_KEY",
+        "KB_MINIMAX_BASE_URL",
+        "KB_MINIMAX_MODEL",
         "KB_LLM_HTTPS_PROXY",
     }
 
@@ -149,25 +182,77 @@ def test_llm_egress_override_changes_only_the_two_runtime_services() -> None:
             assert "llm-client" not in merged_service.get("networks", {})
 
 
-def test_llm_egress_static_verifier_accepts_the_approved_boundary() -> None:
-    verifier = REPOSITORY / "deploy/tencent/verify-llm-egress-compose.py"
-    completed = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            str(verifier),
-            "heyi-kb-offline",
-            str(BASE_ENV),
-            str(LLM_ENV),
-            str(BASE_COMPOSE),
-            str(EGRESS_COMPOSE),
-        ],
-        cwd=REPOSITORY,
-        capture_output=True,
-        check=False,
-        shell=False,
-        text=True,
-        timeout=30,
+def test_qwen_workspace_host_policy_is_shared_with_the_proxy(tmp_path: Path) -> None:
+    workspace_policy = '["tenant.maas.aliyuncs.com"]'
+    custom_env = tmp_path / "llm-egress.env"
+    custom_env.write_text(
+        LLM_ENV.read_text(encoding="utf-8")
+        .replace(
+            "KB_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "KB_QWEN_BASE_URL=https://tenant.maas.aliyuncs.com/compatible-mode/v1",
+        )
+        .replace(
+            "KB_QWEN_ALLOWED_WORKSPACE_HOSTS=[]",
+            f"KB_QWEN_ALLOWED_WORKSPACE_HOSTS={workspace_policy}",
+        ),
+        encoding="utf-8",
     )
+
+    merged = _config(
+        BASE_COMPOSE,
+        EGRESS_COMPOSE,
+        include_llm_env=True,
+        llm_env=custom_env,
+    )
+
+    assert merged["services"]["api"]["environment"][
+        "KB_QWEN_ALLOWED_WORKSPACE_HOSTS"
+    ] == workspace_policy
+    assert merged["services"]["llm-egress-proxy"]["environment"][
+        "LLM_EGRESS_PROXY_EXTRA_HOSTS"
+    ] == workspace_policy
+    assert _verify(custom_env).returncode == 0
+
+
+def test_qwen_workspace_base_url_requires_matching_proxy_policy(tmp_path: Path) -> None:
+    custom_env = tmp_path / "llm-egress.env"
+    custom_env.write_text(
+        LLM_ENV.read_text(encoding="utf-8").replace(
+            "KB_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "KB_QWEN_BASE_URL=https://tenant.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _verify(custom_env)
+
+    assert completed.returncode != 0
+    assert "Qwen base URL must use an approved HTTPS host" in completed.stderr
+
+
+def test_qwen_workspace_base_url_rejects_trailing_dot(tmp_path: Path) -> None:
+    custom_env = tmp_path / "llm-egress.env"
+    custom_env.write_text(
+        LLM_ENV.read_text(encoding="utf-8")
+        .replace(
+            "KB_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "KB_QWEN_BASE_URL=https://tenant.maas.aliyuncs.com./compatible-mode/v1",
+        )
+        .replace(
+            "KB_QWEN_ALLOWED_WORKSPACE_HOSTS=[]",
+            'KB_QWEN_ALLOWED_WORKSPACE_HOSTS=["tenant.maas.aliyuncs.com"]',
+        ),
+        encoding="utf-8",
+    )
+
+    completed = _verify(custom_env)
+
+    assert completed.returncode != 0
+    assert "Qwen base URL must use an approved HTTPS host" in completed.stderr
+
+
+def test_llm_egress_static_verifier_accepts_the_approved_boundary() -> None:
+    completed = _verify()
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "llm-egress-compose: rendered boundary is valid"

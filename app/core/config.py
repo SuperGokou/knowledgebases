@@ -217,9 +217,12 @@ class Settings(BaseSettings):
     def normalize_qwen_workspace_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         normalized: set[str] = set()
         for item in value:
-            hostname = item.strip().lower().rstrip(".")
+            hostname = item
             if (
                 not hostname
+                or hostname != hostname.strip()
+                or hostname != hostname.lower()
+                or hostname.endswith(".")
                 or "*" in hostname
                 or "://" in hostname
                 or "/" in hostname

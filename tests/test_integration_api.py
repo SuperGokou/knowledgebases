@@ -2854,6 +2854,10 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         def __init__(self, provider: str, model: str) -> None:
             self.provider = provider
             self.model = model
+            self.close_count = 0
+
+        async def aclose(self) -> None:
+            self.close_count += 1
 
         async def complete_chat(
             self,
@@ -2882,6 +2886,7 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
             )
 
     generation_client = FakeClient("qwen", "qwen-plus")
+    unbillable_review_client = FakeClient("deepseek", "deepseek-v4-flash")
     review_client = FakeClient("minimax", "MiniMax-M2.7")
 
     async def fake_resolve(
@@ -2889,7 +2894,11 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         provider: str | None = None,
         **_kwargs: object,
     ) -> FakeClient:
-        return review_client if provider == "minimax" else generation_client
+        if provider == "deepseek":
+            return unbillable_review_client
+        if provider == "minimax":
+            return review_client
+        return generation_client
 
     monkeypatch.setattr("app.services.chat.resolve_provider_client", fake_resolve)
     payload = {"knowledge_base_id": knowledge_base_id, "message": "travel approval"}
@@ -2955,6 +2964,9 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         "reason": "semantic_verified",
     }
     assert len(calls) == 2
+    assert generation_client.close_count == 1
+    assert unbillable_review_client.close_count == 1
+    assert review_client.close_count == 1
     async with api_harness.session_factory() as session:
         usage_rows = list(
             (
@@ -3005,7 +3017,10 @@ async def test_chat_generation_requires_kb_opt_in_and_reports_selected_model(
         )
         assert rejected.status_code == 200, rejected.text
         assert rejected.json()["mode"] == "retrieval"
-        assert rejected.json()["answer_review"]["status"] == "fallback"
+        assert rejected.json()["answer_review"] == {
+            "status": "fallback",
+            "reason": expected_reason,
+        }
         assert rejected.json()["source_status"] == {
             "status": "grounded",
             "strategy": "retrieval_fallback",

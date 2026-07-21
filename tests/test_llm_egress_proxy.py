@@ -110,7 +110,9 @@ def test_connect_rejects_non_connect_non_443_and_non_exact_hosts(
 
 
 def test_extra_maas_hosts_are_exact_and_added_to_allowlist() -> None:
-    extras = parse_extra_hosts("tenant.maas.aliyuncs.com,team.production.maas.aliyuncs.com")
+    extras = parse_extra_hosts(
+        '["tenant.maas.aliyuncs.com","team.production.maas.aliyuncs.com"]'
+    )
 
     assert extras == {
         "tenant.maas.aliyuncs.com",
@@ -122,18 +124,25 @@ def test_extra_maas_hosts_are_exact_and_added_to_allowlist() -> None:
     assert target.host == "tenant.maas.aliyuncs.com"
 
 
+def test_empty_json_workspace_host_policy_uses_only_default_hosts() -> None:
+    assert parse_extra_hosts("[]") == frozenset()
+
+
 @pytest.mark.parametrize(
     "raw_value",
     [
-        "*.maas.aliyuncs.com",
-        "maas.aliyuncs.com",
-        "evilmaas.aliyuncs.com",
-        "Tenant.maas.aliyuncs.com",
-        " tenant.maas.aliyuncs.com",
-        "tenant.maas.aliyuncs.com ",
-        "https://tenant.maas.aliyuncs.com",
-        "127.0.0.1",
-        "tenant.maas.aliyuncs.com,",
+        '"tenant.maas.aliyuncs.com"',
+        '["*.maas.aliyuncs.com"]',
+        '["maas.aliyuncs.com"]',
+        '["evilmaas.aliyuncs.com"]',
+        '["Tenant.maas.aliyuncs.com"]',
+        '[" tenant.maas.aliyuncs.com"]',
+        '["tenant.maas.aliyuncs.com "]',
+        '["https://tenant.maas.aliyuncs.com"]',
+        '["127.0.0.1"]',
+        '[""]',
+        "[1]",
+        "not-json",
     ],
 )
 def test_extra_hosts_reject_wildcards_non_subdomains_and_noncanonical_values(
@@ -148,6 +157,7 @@ def test_production_bind_environment_uses_compose_contract() -> None:
         {
             LISTEN_HOST_ENV: "0.0.0.0",
             LISTEN_PORT_ENV: "8080",
+            "LLM_EGRESS_PROXY_EXTRA_HOSTS": '["tenant.maas.aliyuncs.com"]',
         }
     )
 
@@ -155,6 +165,7 @@ def test_production_bind_environment_uses_compose_contract() -> None:
     assert LISTEN_PORT_ENV == "KB_LLM_EGRESS_PROXY_BIND_PORT"
     assert config.listen_host == "0.0.0.0"
     assert config.listen_port == 8080
+    assert "tenant.maas.aliyuncs.com" in config.allowed_hosts
 
 
 @pytest.mark.asyncio

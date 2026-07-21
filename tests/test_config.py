@@ -414,11 +414,10 @@ def test_existing_qwen_and_minimax_environment_names_are_supported(
     assert settings.minimax_model == "MiniMax-M2.7"
 
 
-def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
+def test_qwen_workspace_hosts_are_exact_and_canonical() -> None:
     settings = Settings(
         environment="test",
         qwen_allowed_workspace_hosts=(
-            "Tenant.US-East-1.maas.aliyuncs.com.",
             "tenant.us-east-1.maas.aliyuncs.com",
         ),
     )
@@ -426,11 +425,16 @@ def test_qwen_workspace_hosts_are_exact_and_normalized() -> None:
         "tenant.us-east-1.maas.aliyuncs.com",
     )
 
-    with pytest.raises(ValidationError):
-        Settings(
-            environment="test",
-            qwen_allowed_workspace_hosts=("*.maas.aliyuncs.com",),
-        )
+    for invalid_host in (
+        "*.maas.aliyuncs.com",
+        "Tenant.US-East-1.maas.aliyuncs.com",
+        "tenant.us-east-1.maas.aliyuncs.com.",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(
+                environment="test",
+                qwen_allowed_workspace_hosts=(invalid_host,),
+            )
 
 
 def test_trusted_proxy_networks_must_be_narrow_private_cidrs() -> None:

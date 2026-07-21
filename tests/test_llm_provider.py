@@ -196,6 +196,96 @@ async def test_openai_adapter_uses_only_the_explicit_https_proxy(
 
 
 @pytest.mark.asyncio
+async def test_deepseek_chat_disables_thinking_for_bounded_json_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    response = _response(
+        200,
+        {
+            "model": "deepseek-v4-flash",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"verdict":"pass","unsupported_claims":[]}'},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        },
+    )
+    stub = StubAsyncClient([response], calls)
+    monkeypatch.setattr(
+        "app.services.llm_provider.httpx.AsyncClient",
+        lambda **_kwargs: stub,
+    )
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="deepseek",
+            api_key="server-secret",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            timeout_seconds=10,
+            max_tokens=1_024,
+        )
+    )
+
+    result = await client.complete_chat(
+        [{"role": "user", "content": "audit"}],
+        temperature=0,
+        max_tokens=1_024,
+    )
+
+    assert result.content == '{"verdict":"pass","unsupported_claims":[]}'
+    assert calls[0][2]["response_format"] == {"type": "json_object"}
+    assert calls[0][2]["thinking"] == {"type": "disabled"}
+    await client.aclose()
+    assert stub.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ProxyError])
+async def test_openai_adapter_marks_pre_egress_transport_failures_as_not_started(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.RequestError],
+) -> None:
+    class ConnectFailingClient:
+        closed = False
+
+        def stream(self, *_args: object, **_kwargs: object) -> StubResponseStream:
+            raise error_type(
+                "connection unavailable",
+                request=httpx.Request("POST", "https://api.deepseek.com/chat/completions"),
+            )
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stub = ConnectFailingClient()
+    monkeypatch.setattr(
+        "app.services.llm_provider.httpx.AsyncClient",
+        lambda **_kwargs: stub,
+    )
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="deepseek",
+            api_key="server-secret",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-flash",
+            timeout_seconds=10,
+            max_tokens=1_024,
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as caught:
+        await client.complete_chat([{"role": "user", "content": "audit"}])
+
+    assert caught.value.code == "llm_transport_error"
+    assert caught.value.metering_outcome is MeteringOutcome.NOT_STARTED
+    await client.aclose()
+    assert stub.closed is True
+
+
+@pytest.mark.asyncio
 async def test_openai_adapter_reports_upstream_failure_without_response_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -412,6 +502,7 @@ def test_provider_base_url_allowlist(provider: str, url: str) -> None:
         "https://user:password@api.deepseek.com/v1",
         "https://api.deepseek.com:444/v1",
         "https://api.deepseek.com/v1?redirect=https://attacker.example",
+        "https://api.deepseek.com./v1",
     ],
 )
 def test_provider_base_url_rejects_ssrf_shapes(url: str) -> None:

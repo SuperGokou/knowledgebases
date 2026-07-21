@@ -92,6 +92,53 @@ function isAnswerReview(value: unknown): boolean {
   ]).has(String(value.reason));
 }
 
+const REVIEW_FALLBACK_REASONS = new Set([
+  "answer_review_rejected",
+  "answer_review_unavailable",
+  "answer_review_invalid",
+]);
+
+function isConsistentChatState(value: Record<string, unknown>): boolean {
+  if (!isRecord(value.answer_review) || !isRecord(value.source_status)) return false;
+  const review = value.answer_review;
+  const source = value.source_status;
+
+  if (source.status === "no_results" && source.citation_count !== 0) return false;
+  if (source.status === "grounded" && source.citation_count === 0) return false;
+
+  if (value.mode === "rag") {
+    return (
+      review.status === "passed" &&
+      review.reason === "semantic_verified" &&
+      source.status === "grounded" &&
+      source.strategy === "rag" &&
+      source.reason === "llm_generated"
+    );
+  }
+
+  if (value.mode === "structured") {
+    return (
+      review.status === "passed" &&
+      review.reason === "deterministic_verified" &&
+      source.strategy === "structured" &&
+      source.reason === "structured_query"
+    );
+  }
+
+  if (value.mode !== "retrieval" || !["retrieval", "retrieval_fallback"].includes(
+    String(source.strategy),
+  )) return false;
+
+  if (REVIEW_FALLBACK_REASONS.has(String(source.reason))) {
+    return (
+      source.strategy === "retrieval_fallback" &&
+      review.status === "fallback" &&
+      review.reason === source.reason
+    );
+  }
+  return review.status === "fallback" && review.reason === "retrieval_only";
+}
+
 /** Validate the BFF response before untrusted JSON reaches React render functions. */
 export function parseChatReply(value: unknown): ChatReply {
   const citations = isRecord(value) && Array.isArray(value.citations) ? value.citations : [];
@@ -112,7 +159,8 @@ export function parseChatReply(value: unknown): ChatReply {
     !(value.table === undefined || value.table === null || isChatTable(value.table, citationNumbers)) ||
     !isAnswerReview(value.answer_review) ||
     !isSourceStatus(value.source_status) ||
-    value.source_status.citation_count !== value.citations.length
+    value.source_status.citation_count !== value.citations.length ||
+    !isConsistentChatState(value)
   ) {
     throw new ApiClientError(
       "后台返回了无效的问答数据，请稍后重试。",

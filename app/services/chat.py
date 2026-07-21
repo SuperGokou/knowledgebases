@@ -31,6 +31,7 @@ from app.services.llm_egress_policy import external_llm_egress_allowed
 from app.services.llm_provider import (
     LlmChatResult,
     LlmProviderError,
+    MeteringOutcome,
 )
 from app.services.llm_settings import LlmConfigurationError, resolve_provider_client
 from app.services.llm_usage import (
@@ -113,6 +114,8 @@ ReviewReason = Literal[
     "answer_review_unavailable",
     "answer_review_invalid",
 ]
+
+ReviewGateReason = ReviewReason | Literal["independent_reviewer_unavailable"]
 
 _DATA_QUESTION_PATTERN = re.compile(
     r"(?:数据|表格|列表|列出|明细|统计|对比|比较|信息|联系人|联系方式|电话|邮箱|名单)",
@@ -409,6 +412,18 @@ def _retrieval_response(
     model: str | None = None,
 ) -> ChatQueryResponse:
     answer, table = _retrieval_presentation(question, citations)
+    review_reason: Literal[
+        "retrieval_only",
+        "answer_review_rejected",
+        "answer_review_unavailable",
+        "answer_review_invalid",
+    ] = "retrieval_only"
+    if reason == "answer_review_rejected":
+        review_reason = "answer_review_rejected"
+    elif reason == "answer_review_unavailable":
+        review_reason = "answer_review_unavailable"
+    elif reason == "answer_review_invalid":
+        review_reason = "answer_review_invalid"
     return ChatQueryResponse(
         knowledge_base_id=knowledge_base_id,
         answer=answer,
@@ -416,6 +431,7 @@ def _retrieval_response(
         provider=provider,
         model=model,
         table=table,
+        answer_review=ChatAnswerReview(status="fallback", reason=review_reason),
         citations=citations,
         source_status=ChatSourceStatus(
             status="grounded",
@@ -560,27 +576,238 @@ async def _external_processing_allowed_at_egress(
     )
 
 
-async def _resolve_independent_review_client(
+def _review_idempotency_key(parent: str, client: _ReviewClient) -> str:
+    reviewer_identity = hashlib.sha256(f"{client.provider}\0{client.model}".encode()).hexdigest()[
+        :16
+    ]
+    return _child_idempotency_key(parent, f"review-{reviewer_identity}")
+
+
+def _log_review_attempt_failure(
+    *,
+    knowledge_base_id: UUID,
+    client: _ReviewClient,
+    attempt: int,
+    error: Exception,
+) -> None:
+    metering_outcome = getattr(error, "metering_outcome", None)
+    _LOGGER.warning(
+        "An independent answer reviewer attempt failed",
+        extra={
+            "knowledge_base_id": str(knowledge_base_id),
+            "review_provider": client.provider,
+            "review_model": client.model,
+            "review_attempt": attempt,
+            "error_type": type(error).__name__,
+            "error_code": getattr(error, "code", None),
+            "upstream_status": getattr(error, "upstream_status", None),
+            "retryable": getattr(error, "retryable", None),
+            "metering_outcome": (
+                metering_outcome.value if isinstance(metering_outcome, MeteringOutcome) else None
+            ),
+        },
+        exc_info=error,
+    )
+
+
+async def _run_grounding_review(
     session: AsyncSession,
     settings: Settings,
-    generation_client: _ReviewClient,
-) -> _ReviewClient | None:
-    """Select a configured reviewer outside the generation provider failure domain."""
+    access: AccessContext,
+    *,
+    executor: GovernedLlmExecutor,
+    knowledge_base: object,
+    knowledge_base_id: UUID,
+    api_key_id: UUID | None,
+    generation_provider: str,
+    generation_model: str,
+    idempotency_key: str,
+    question: str,
+    generated: _GeneratedChatResponse,
+    citations: list[ChatCitation],
+) -> ReviewGateReason:
+    try:
+        review_clients = await _resolve_independent_review_clients(
+            session,
+            settings,
+            generation_provider=generation_provider,
+            generation_model=generation_model,
+        )
+    except Exception as error:
+        _LOGGER.warning(
+            "Failed to resolve independent answer reviewers",
+            extra={
+                "knowledge_base_id": str(knowledge_base_id),
+                "generation_provider": generation_provider,
+                "generation_model": generation_model,
+                "error_type": type(error).__name__,
+            },
+            exc_info=error,
+        )
+        return "answer_review_unavailable"
+    if not review_clients:
+        return "independent_reviewer_unavailable"
+
+    try:
+        review_messages = _review_messages(question, generated, citations)
+        last_reason: ReviewReason = "answer_review_unavailable"
+        for attempt, review_client in enumerate(review_clients, start=1):
+            review_dimensions = LlmUsageDimensions(
+                tenant_key=settings.llm_tenant_key,
+                user_id=access.user.id,
+                api_key_id=api_key_id,
+                knowledge_base_id=knowledge_base_id,
+                provider=review_client.provider,
+                model=review_client.model,
+                operation="chat.review",
+            )
+            try:
+                review_result = await executor.complete_chat(
+                    session,
+                    client=review_client,
+                    dimensions=review_dimensions,
+                    idempotency_key=_review_idempotency_key(idempotency_key, review_client),
+                    messages=review_messages,
+                    maximum_output_tokens=1_024,
+                    temperature=0,
+                    before_egress=lambda: _external_processing_allowed_at_egress(
+                        session,
+                        knowledge_base,
+                        access,
+                        api_key_id,
+                    ),
+                )
+            except LlmEgressDenied as error:
+                _log_review_attempt_failure(
+                    knowledge_base_id=knowledge_base_id,
+                    client=review_client,
+                    attempt=attempt,
+                    error=error,
+                )
+                return "answer_review_unavailable"
+            except (
+                LlmUsagePricingUnavailable,
+                LlmBudgetConfigurationUnavailable,
+                LlmBudgetExceeded,
+            ) as error:
+                _log_review_attempt_failure(
+                    knowledge_base_id=knowledge_base_id,
+                    client=review_client,
+                    attempt=attempt,
+                    error=error,
+                )
+                continue
+            except LlmProviderError as error:
+                _log_review_attempt_failure(
+                    knowledge_base_id=knowledge_base_id,
+                    client=review_client,
+                    attempt=attempt,
+                    error=error,
+                )
+                if error.metering_outcome in {
+                    MeteringOutcome.NOT_STARTED,
+                    MeteringOutcome.KNOWN,
+                }:
+                    continue
+                return "answer_review_unavailable"
+            except (LlmUsageUnmetered, LlmUsageMeteringMismatch, LlmUsageDuplicate) as error:
+                _log_review_attempt_failure(
+                    knowledge_base_id=knowledge_base_id,
+                    client=review_client,
+                    attempt=attempt,
+                    error=error,
+                )
+                return "answer_review_unavailable"
+            except Exception as error:
+                _log_review_attempt_failure(
+                    knowledge_base_id=knowledge_base_id,
+                    client=review_client,
+                    attempt=attempt,
+                    error=error,
+                )
+                return "answer_review_unavailable"
+
+            review_reason = _parse_review_result(review_result)
+            if review_reason == "answer_review_invalid":
+                last_reason = review_reason
+                _LOGGER.warning(
+                    "An independent answer reviewer returned an invalid verdict",
+                    extra={
+                        "knowledge_base_id": str(knowledge_base_id),
+                        "review_provider": review_client.provider,
+                        "review_model": review_client.model,
+                        "review_attempt": attempt,
+                    },
+                )
+                continue
+            # Never shop for a permissive reviewer after an explicit rejection.
+            return review_reason
+        return last_reason
+    finally:
+        for review_client in review_clients:
+            await _close_provider_client(review_client)
+
+
+async def _close_provider_client(client: object) -> None:
+    close = getattr(client, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as error:
+        _LOGGER.warning(
+            "Failed to close an LLM provider client",
+            extra={
+                "provider": getattr(client, "provider", None),
+                "model": getattr(client, "model", None),
+                "error_type": type(error).__name__,
+            },
+            exc_info=error,
+        )
+
+
+async def _resolve_independent_review_clients(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    generation_provider: str,
+    generation_model: str,
+) -> list[_ReviewClient]:
+    """Return every configured reviewer outside the generation failure domain."""
 
     providers: tuple[LlmProviderName, ...] = ("deepseek", "qwen", "minimax")
+    candidates: list[_ReviewClient] = []
+    identities: set[tuple[str, str]] = set()
     for provider in providers:
-        if provider == generation_client.provider:
+        if provider == generation_provider:
             continue
         try:
             candidate = await resolve_provider_client(session, settings, provider=provider)
-        except (LlmConfigurationError, ValueError):
+        except (LlmConfigurationError, ValueError) as error:
+            _LOGGER.warning(
+                "Skipped an invalid independent answer reviewer configuration",
+                extra={
+                    "review_provider_candidate": provider,
+                    "error_type": type(error).__name__,
+                    "error_code": str(error),
+                },
+            )
             continue
-        if candidate.configured and (
-            candidate.provider,
-            candidate.model,
-        ) != (generation_client.provider, generation_client.model):
-            return candidate
-    return None
+        except Exception:
+            for active_candidate in candidates:
+                await _close_provider_client(active_candidate)
+            raise
+        identity = (candidate.provider, candidate.model)
+        if (
+            not candidate.configured
+            or identity == (generation_provider, generation_model)
+            or identity in identities
+        ):
+            await _close_provider_client(candidate)
+            continue
+        identities.add(identity)
+        candidates.append(candidate)
+    return candidates
 
 
 def _model_response_error(content: str, citations: list[ChatCitation]) -> FallbackReason:
@@ -700,6 +927,7 @@ async def answer_knowledge_query(
             question=message,
         )
     if not client.configured:
+        await _close_provider_client(client)
         return _retrieval_response(
             knowledge_base_id=knowledge_base_id,
             citations=citations,
@@ -710,24 +938,24 @@ async def answer_knowledge_query(
             model=client.model,
         )
 
-    dimensions = LlmUsageDimensions(
-        tenant_key=settings.llm_tenant_key,
-        user_id=access.user.id,
-        api_key_id=api_key_id,
-        knowledge_base_id=knowledge_base_id,
-        provider=client.provider,
-        model=client.model,
-        operation="chat.answer",
-    )
-    executor = GovernedLlmExecutor()
-    generation_messages = [
-        {"role": "system", "content": _RAG_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": _model_user_payload(message, citations),
-        },
-    ]
     try:
+        dimensions = LlmUsageDimensions(
+            tenant_key=settings.llm_tenant_key,
+            user_id=access.user.id,
+            api_key_id=api_key_id,
+            knowledge_base_id=knowledge_base_id,
+            provider=client.provider,
+            model=client.model,
+            operation="chat.answer",
+        )
+        executor = GovernedLlmExecutor()
+        generation_messages = [
+            {"role": "system", "content": _RAG_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": _model_user_payload(message, citations),
+            },
+        ]
         result = await executor.complete_chat(
             session,
             client=client,
@@ -811,6 +1039,8 @@ async def answer_knowledge_query(
             provider=error.provider,
             model=client.model,
         )
+    finally:
+        await _close_provider_client(client)
 
     generated = _parse_generated_response(result.content, citations)
     if generated is None:
@@ -849,55 +1079,21 @@ async def answer_knowledge_query(
     referenced_citations = [
         item for item in citations if item.citation_number in referenced_numbers
     ]
-    review_client = await _resolve_independent_review_client(session, settings, client)
-    if review_client is None:
-        return _retrieval_response(
-            knowledge_base_id=knowledge_base_id,
-            citations=citations,
-            strategy="retrieval_fallback",
-            reason="independent_reviewer_unavailable",
-            question=message,
-            provider=result.provider,
-            model=result.model,
-        )
-    review_messages = _review_messages(message, generated, referenced_citations)
-    review_dimensions = LlmUsageDimensions(
-        tenant_key=settings.llm_tenant_key,
-        user_id=access.user.id,
-        api_key_id=api_key_id,
+    review_reason = await _run_grounding_review(
+        session,
+        settings,
+        access,
+        executor=executor,
+        knowledge_base=kb_access.knowledge_base,
         knowledge_base_id=knowledge_base_id,
-        provider=review_client.provider,
-        model=review_client.model,
-        operation="chat.review",
+        api_key_id=api_key_id,
+        generation_provider=result.provider,
+        generation_model=result.model,
+        idempotency_key=idempotency_key,
+        question=message,
+        generated=generated,
+        citations=referenced_citations,
     )
-    try:
-        review_result = await executor.complete_chat(
-            session,
-            client=review_client,
-            dimensions=review_dimensions,
-            idempotency_key=_child_idempotency_key(idempotency_key, "review"),
-            messages=review_messages,
-            maximum_output_tokens=1_024,
-            temperature=0,
-            before_egress=lambda: _external_processing_allowed_at_egress(
-                session,
-                kb_access.knowledge_base,
-                access,
-                api_key_id,
-            ),
-        )
-        review_reason = _parse_review_result(review_result)
-    except LlmEgressDenied:
-        review_reason = "answer_review_unavailable"
-    except (
-        LlmProviderError,
-        LlmUsageUnmetered,
-        LlmUsageMeteringMismatch,
-        LlmUsageDuplicate,
-    ):
-        review_reason = "answer_review_unavailable"
-    except (LlmBudgetExceeded, LlmUsagePricingUnavailable, LlmBudgetConfigurationUnavailable):
-        review_reason = "answer_review_unavailable"
     if review_reason != "semantic_verified":
         _LOGGER.warning(
             "Rejected a generated answer at the semantic review gate",
