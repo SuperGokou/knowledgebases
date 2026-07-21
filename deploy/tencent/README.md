@@ -63,7 +63,7 @@ sudo docker compose \
 - `dashscope-intl.aliyuncs.com:443`；
 - `api.minimax.io:443`。
 
-Qwen 专属工作空间域名必须单独评审，不得使用通配符。应用层仍会校验供应商 HTTPS 主机白名单。
+Qwen 专属工作空间域名必须单独评审，不得使用通配符。`KB_QWEN_ALLOWED_WORKSPACE_HOSTS` 使用 JSON 字符串数组；同一配置会同时注入应用层和出口代理，避免应用放行而代理误拒绝。
 
 ### 1. 只创建最小凭据文件
 
@@ -73,16 +73,23 @@ Qwen 专属工作空间域名必须单独评审，不得使用通配符。应用
 /srv/heyi-knowledgebases-offline/shared/llm-egress.env
 ```
 
-文件只能包含：
+文件只应包含模型出口所需的供应商、模型与凭据配置：
 
 ```dotenv
 KB_LLM_DEFAULT_PROVIDER=qwen
 KB_DEEPSEEK_API_KEY=<secret>
+KB_DEEPSEEK_BASE_URL=https://api.deepseek.com
+KB_DEEPSEEK_MODEL=deepseek-v4-flash
 KB_QWEN_API_KEY=<secret>
+KB_QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+KB_QWEN_MODEL=qwen-plus
+KB_QWEN_ALLOWED_WORKSPACE_HOSTS=[]
 KB_MINIMAX_API_KEY=
+KB_MINIMAX_BASE_URL=https://api.minimax.io/v1
+KB_MINIMAX_MODEL=MiniMax-M2.7
 ```
 
-由于生成答案必须经过不同供应商的独立审核，至少两个供应商 Key 必须非空。凭据文件必须为 root 所有，且权限为 `0600` 或 `0400`：
+由于生成答案必须经过不同供应商的独立审核，至少两个供应商 Key 必须非空；管理后台还必须为生成模型和至少一个独立审核模型配置有效价格，并设置能够匹配二者的 Token/成本预算。仅有 API Key 不代表审核链路已就绪。凭据文件必须为 root 所有，且权限为 `0600` 或 `0400`：
 
 ```bash
 sudo chown root:root /srv/heyi-knowledgebases-offline/shared/llm-egress.env

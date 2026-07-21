@@ -104,6 +104,59 @@ describe("parseChatReply", () => {
     expect(parseChatReply(fallbackReply)).toEqual(fallbackReply);
   });
 
+  it("accepts an ordinary local retrieval response", () => {
+    const retrievalReply = {
+      ...validReply,
+      mode: "retrieval",
+      answer_review: { status: "fallback", reason: "retrieval_only" },
+      source_status: {
+        ...validReply.source_status,
+        strategy: "retrieval",
+        reason: "external_processing_disabled",
+      },
+    };
+
+    expect(parseChatReply(retrievalReply)).toEqual(retrievalReply);
+  });
+
+  it("accepts a retrieval response with no matching content", () => {
+    const emptyReply = {
+      ...validReply,
+      mode: "retrieval",
+      table: null,
+      citations: [],
+      answer_review: { status: "fallback", reason: "retrieval_only" },
+      source_status: {
+        status: "no_results",
+        strategy: "retrieval",
+        reason: "no_matching_content",
+        citation_count: 0,
+      },
+    };
+
+    expect(parseChatReply(emptyReply)).toEqual(emptyReply);
+  });
+
+  it.each([
+    "answer_review_rejected",
+    "answer_review_unavailable",
+    "answer_review_invalid",
+  ] as const)("accepts a consistent fail-closed answer review state for %s", (reason) => {
+    const fallbackReply = {
+      ...validReply,
+      mode: "retrieval",
+      table: null,
+      answer_review: { status: "fallback", reason },
+      source_status: {
+        ...validReply.source_status,
+        strategy: "retrieval_fallback",
+        reason,
+      },
+    };
+
+    expect(parseChatReply(fallbackReply)).toEqual(fallbackReply);
+  });
+
   it.each([
     { ...validReply, citations: null },
     { ...validReply, provider: { name: "deepseek" } },
@@ -130,6 +183,31 @@ describe("parseChatReply", () => {
     {
       ...validReply,
       answer_review: { status: "unknown", reason: "semantic_verified" },
+    },
+    {
+      ...validReply,
+      mode: "retrieval",
+      table: null,
+      answer_review: { status: "fallback", reason: "answer_review_unavailable" },
+    },
+    {
+      ...validReply,
+      mode: "retrieval",
+      table: null,
+      answer_review: { status: "fallback", reason: "answer_review_unavailable" },
+      source_status: {
+        ...validReply.source_status,
+        strategy: "retrieval_fallback",
+        reason: "answer_review_invalid",
+      },
+    },
+    {
+      ...validReply,
+      source_status: {
+        ...validReply.source_status,
+        strategy: "retrieval_fallback",
+        reason: "answer_review_unavailable",
+      },
     },
   ])("rejects malformed successful JSON before React renders it", (payload) => {
     expect(() => parseChatReply(payload)).toThrowError(ApiClientError);

@@ -96,6 +96,21 @@ describe("chat answer sources", () => {
     );
   });
 
+  it.each([
+    ["answer_review_rejected", "回答内容未通过语义审核，已改用可验证的检索结果。"],
+    ["answer_review_unavailable", "回答审核服务不可用，已按安全策略改用检索结果。"],
+    ["answer_review_invalid", "回答审核结果无效，已按安全策略改用检索结果。"],
+  ] as const)("explains the fail-closed review reason %s", (reason, explanation) => {
+    const reviewStatus: ChatSourceStatus = {
+      status: "grounded",
+      strategy: "retrieval_fallback",
+      reason,
+      citation_count: 1,
+    };
+
+    expect(sourceSummary([citation], reviewStatus).detail).toBe(explanation);
+  });
+
   it("reports whether a citation has an associated source file", () => {
     expect(citationTraceLabel(citation)).toBe("源文件已关联");
     expect(citationTraceLabel({ ...citation, source_file_id: null })).toBe("知识条目可追溯");

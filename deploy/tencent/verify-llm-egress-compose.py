@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import urlparse
 
 CLIENT_NETWORK = "llm-client"
 CLIENT_SUBNET = "172.30.243.0/28"
@@ -24,7 +26,18 @@ PROVIDER_KEYS = frozenset(
         "KB_MINIMAX_API_KEY",
     }
 )
-MODEL_ENVIRONMENT_KEYS = PROVIDER_KEYS | {"KB_LLM_DEFAULT_PROVIDER"}
+PROVIDER_CONFIG_KEYS = frozenset(
+    {
+        "KB_DEEPSEEK_BASE_URL",
+        "KB_DEEPSEEK_MODEL",
+        "KB_QWEN_BASE_URL",
+        "KB_QWEN_MODEL",
+        "KB_QWEN_ALLOWED_WORKSPACE_HOSTS",
+        "KB_MINIMAX_BASE_URL",
+        "KB_MINIMAX_MODEL",
+    }
+)
+MODEL_ENVIRONMENT_KEYS = PROVIDER_KEYS | PROVIDER_CONFIG_KEYS | {"KB_LLM_DEFAULT_PROVIDER"}
 GENERIC_PROXY_KEYS = frozenset(
     {
         "HTTP_PROXY",
@@ -40,6 +53,9 @@ PROVIDER_TO_KEY = {
     "qwen": "KB_QWEN_API_KEY",
     "minimax": "KB_MINIMAX_API_KEY",
 }
+MAAS_HOST_PATTERN = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+maas\.aliyuncs\.com"
+)
 
 
 def fail(message: str) -> NoReturn:
@@ -216,11 +232,54 @@ def validate(config: dict[str, Any]) -> None:
     if proxy.get("ports"):
         fail("the LLM egress proxy must not publish host ports")
     proxy_environment = _mapping(proxy.get("environment", {}), "LLM egress proxy environment")
+    api_runtime_environment = _mapping(
+        _mapping(services["api"], "service api").get("environment"),
+        "service api environment",
+    )
+    workspace_host_policy = api_runtime_environment.get("KB_QWEN_ALLOWED_WORKSPACE_HOSTS")
     if proxy_environment != {
         "KB_LLM_EGRESS_PROXY_BIND_HOST": "0.0.0.0",
         "KB_LLM_EGRESS_PROXY_BIND_PORT": "8080",
+        "LLM_EGRESS_PROXY_EXTRA_HOSTS": workspace_host_policy,
     }:
         fail("the LLM egress proxy listener environment is invalid")
+    try:
+        workspace_hosts = json.loads(str(workspace_host_policy))
+    except (TypeError, ValueError) as error:
+        raise ValueError("llm-egress-compose: invalid Qwen workspace host JSON") from error
+    if (
+        not isinstance(workspace_hosts, list)
+        or len(workspace_hosts) > 32
+        or any(
+            not isinstance(host, str) or MAAS_HOST_PATTERN.fullmatch(host) is None
+            for host in workspace_hosts
+        )
+    ):
+        fail("Qwen workspace hosts must be exact canonical MaaS hostnames")
+    qwen_base_url = api_runtime_environment.get("KB_QWEN_BASE_URL")
+    try:
+        parsed_qwen_url = urlparse(str(qwen_base_url))
+        qwen_port = parsed_qwen_url.port
+    except ValueError as error:
+        raise ValueError("llm-egress-compose: invalid Qwen base URL") from error
+    qwen_hostname = (parsed_qwen_url.hostname or "").lower()
+    built_in_qwen_hosts = {
+        "dashscope.aliyuncs.com",
+        "dashscope-us.aliyuncs.com",
+        "dashscope-intl.aliyuncs.com",
+    }
+    if (
+        parsed_qwen_url.scheme.lower() != "https"
+        or not qwen_hostname
+        or qwen_hostname.endswith(".")
+        or parsed_qwen_url.username is not None
+        or parsed_qwen_url.password is not None
+        or qwen_port not in {None, 443}
+        or parsed_qwen_url.query
+        or parsed_qwen_url.fragment
+        or qwen_hostname not in built_in_qwen_hosts | set(workspace_hosts)
+    ):
+        fail("Qwen base URL must use an approved HTTPS host")
     if MODEL_ENVIRONMENT_KEYS.intersection(proxy_environment):
         fail("model credentials must never enter the egress proxy")
     if GENERIC_PROXY_KEYS.intersection(proxy_environment):

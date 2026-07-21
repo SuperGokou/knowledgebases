@@ -5,8 +5,15 @@ services:
       KB_EXTERNAL_LLM_ENABLED: "true"
       KB_LLM_DEFAULT_PROVIDER: ${KB_LLM_DEFAULT_PROVIDER:?required}
       KB_DEEPSEEK_API_KEY: ${KB_DEEPSEEK_API_KEY:-}
+      KB_DEEPSEEK_BASE_URL: ${KB_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      KB_DEEPSEEK_MODEL: ${KB_DEEPSEEK_MODEL:-deepseek-v4-flash}
       KB_QWEN_API_KEY: ${KB_QWEN_API_KEY:-}
+      KB_QWEN_BASE_URL: ${KB_QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      KB_QWEN_MODEL: ${KB_QWEN_MODEL:-qwen-plus}
+      KB_QWEN_ALLOWED_WORKSPACE_HOSTS: ${KB_QWEN_ALLOWED_WORKSPACE_HOSTS:-[]}
       KB_MINIMAX_API_KEY: ${KB_MINIMAX_API_KEY:-}
+      KB_MINIMAX_BASE_URL: ${KB_MINIMAX_BASE_URL:-https://api.minimax.io/v1}
+      KB_MINIMAX_MODEL: ${KB_MINIMAX_MODEL:-MiniMax-M2.7}
       KB_LLM_HTTPS_PROXY: http://llm-egress-proxy:8080
     depends_on:
       llm-egress-proxy:
@@ -22,8 +29,15 @@ services:
       KB_EXTERNAL_LLM_ENABLED: "true"
       KB_LLM_DEFAULT_PROVIDER: ${KB_LLM_DEFAULT_PROVIDER:?required}
       KB_DEEPSEEK_API_KEY: ${KB_DEEPSEEK_API_KEY:-}
+      KB_DEEPSEEK_BASE_URL: ${KB_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      KB_DEEPSEEK_MODEL: ${KB_DEEPSEEK_MODEL:-deepseek-v4-flash}
       KB_QWEN_API_KEY: ${KB_QWEN_API_KEY:-}
+      KB_QWEN_BASE_URL: ${KB_QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      KB_QWEN_MODEL: ${KB_QWEN_MODEL:-qwen-plus}
+      KB_QWEN_ALLOWED_WORKSPACE_HOSTS: ${KB_QWEN_ALLOWED_WORKSPACE_HOSTS:-[]}
       KB_MINIMAX_API_KEY: ${KB_MINIMAX_API_KEY:-}
+      KB_MINIMAX_BASE_URL: ${KB_MINIMAX_BASE_URL:-https://api.minimax.io/v1}
+      KB_MINIMAX_MODEL: ${KB_MINIMAX_MODEL:-MiniMax-M2.7}
       KB_LLM_HTTPS_PROXY: http://llm-egress-proxy:8080
     depends_on:
       llm-egress-proxy:
@@ -41,6 +55,7 @@ services:
     environment:
       KB_LLM_EGRESS_PROXY_BIND_HOST: 0.0.0.0
       KB_LLM_EGRESS_PROXY_BIND_PORT: "8080"
+      LLM_EGRESS_PROXY_EXTRA_HOSTS: ${KB_QWEN_ALLOWED_WORKSPACE_HOSTS:-[]}
     expose:
       - "8080"
     read_only: true

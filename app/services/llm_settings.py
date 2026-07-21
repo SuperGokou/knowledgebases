@@ -84,7 +84,7 @@ def validate_provider_base_url(
 ) -> str:
     normalized = value.strip().rstrip("/")
     parsed = urlparse(normalized)
-    hostname = (parsed.hostname or "").lower().rstrip(".")
+    hostname = (parsed.hostname or "").lower()
     try:
         port = parsed.port
     except ValueError as error:
@@ -92,6 +92,7 @@ def validate_provider_base_url(
     if (
         parsed.scheme.lower() != "https"
         or not hostname
+        or hostname.endswith(".")
         or parsed.username is not None
         or parsed.password is not None
         or port not in {None, 443}
