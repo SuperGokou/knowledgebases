@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from fractions import Fraction
 from hashlib import sha256
 from typing import Final
 from uuid import UUID
@@ -1214,6 +1215,7 @@ class _AttendanceAggregateFilters:
 class _QuestionIntent:
     aggregate_parse: AttendanceQueryPlanParseResult
     latest_record: bool
+    earliest_record: bool
     time_range: bool
     employee_field: str | None
     department_employees: bool
@@ -1228,6 +1230,7 @@ class _QuestionIntent:
         return any(
             (
                 self.latest_record,
+                self.earliest_record,
                 self.aggregate_parse.applicable,
                 self.time_range,
                 self.employee_field,
@@ -1303,7 +1306,11 @@ async def answer_spreadsheet_query(
     ):
         return None
     if intent.department_employees and (
-        aggregate_parse.plan is None or aggregate_parse.plan.date_range is None
+        aggregate_parse.plan is None
+        or (
+            aggregate_parse.plan.date_range is None
+            and aggregate_parse.plan.mode is not AttendanceAggregateMode.DEPARTMENT_PROFILE
+        )
     ):
         return _answer_department_employees(sheets, normalized_question)
     if intent.department_record_count and _question_date(normalized_question) is None:
@@ -1353,6 +1360,8 @@ async def answer_spreadsheet_query(
         )
     if intent.event_result_existence:
         return _answer_event_result_existence(sheets, normalized_question)
+    if intent.earliest_record:
+        return _answer_earliest_record(sheets, normalized_question)
     if intent.latest_record:
         return _answer_latest_record(sheets, normalized_question)
     if intent.time_range:
@@ -1408,6 +1417,7 @@ def _question_intent(question: str) -> _QuestionIntent:
     department_employees = department_employee_scope and employee_list_request
     time_range = _is_time_range_question(question)
     latest_record = _is_latest_record_question(question) and not time_range
+    earliest_record = _is_earliest_record_question(question) and not time_range
     department_summary = _is_department_summary_question(question) and not department_employees
     event_result_existence = _is_event_result_existence_question(question)
     employee_frequency = _is_employee_frequency_question(question)
@@ -1420,11 +1430,13 @@ def _question_intent(question: str) -> _QuestionIntent:
         and not employee_frequency
         and not device_frequency
         and not latest_record
+        and not earliest_record
         and not time_range
     )
     return _QuestionIntent(
         aggregate_parse=aggregate_parse,
         latest_record=latest_record,
+        earliest_record=earliest_record,
         time_range=time_range,
         employee_field=employee_field,
         department_employees=department_employees,
@@ -2124,8 +2136,22 @@ def _answer_attendance_aggregate(
         return None
 
     dimension = plan.dimension
-    requires_employee = dimension is AttendanceAggregateDimension.EMPLOYEE
-    requires_department = dimension is AttendanceAggregateDimension.DEPARTMENT
+    requires_employee = (
+        dimension is AttendanceAggregateDimension.EMPLOYEE
+        or plan.mode
+        in (
+            AttendanceAggregateMode.PER_CAPITA,
+            AttendanceAggregateMode.DEPARTMENT_PROFILE,
+        )
+    )
+    requires_department = (
+        dimension is AttendanceAggregateDimension.DEPARTMENT
+        or plan.mode
+        in (
+            AttendanceAggregateMode.PER_CAPITA,
+            AttendanceAggregateMode.DEPARTMENT_PROFILE,
+        )
+    )
     event_terms = _event_result_terms(
         _normalize_event_result_query_aliases(_strip_spreadsheet_filename_mentions(question))
     )
@@ -2295,7 +2321,7 @@ def _answer_attendance_aggregate(
 
     if not records:
         return None
-    filters = _resolve_attendance_aggregate_filters(records, question, event_terms)
+    filters = _resolve_attendance_aggregate_filters(records, plan, question, event_terms)
     if filters is None:
         return None
     if filters.employee_keys and (identifier_kind is None or not has_common_employee_name):
@@ -2400,6 +2426,7 @@ def _has_cross_sheet_duplicate_attendance_rows(sheets: tuple[_Sheet, ...]) -> bo
 
 def _resolve_attendance_aggregate_filters(
     records: list[_AttendanceAggregateRecord],
+    plan: AttendanceAggregationPlan,
     question: str,
     event_terms: tuple[str, ...],
 ) -> _AttendanceAggregateFilters | None:
@@ -2424,12 +2451,24 @@ def _resolve_attendance_aggregate_filters(
         and record.department_label is not None
         and record.department_label.casefold() in semantic
     }
-    device_keys = {
+    exact_device_keys = {
         record.device_key
         for record in records
         if len(re.sub(r"\s+", "", record.device_label)) >= 2
         and record.device_label.casefold() in semantic
     }
+    if exact_device_keys:
+        device_keys = exact_device_keys
+    elif plan.device_contains is not None:
+        device_keys = {
+            record.device_key
+            for record in records
+            if plan.device_contains in re.sub(r"\s+", "", record.device_label.casefold())
+        }
+        if not device_keys:
+            return None
+    else:
+        device_keys = set()
     event_type_keys = {
         record.event_type_key
         for record in records
@@ -2439,9 +2478,9 @@ def _resolve_attendance_aggregate_filters(
     }
     # Multiple values of the same field are deliberately rejected: natural
     # language conjunction/exclusion semantics are otherwise easy to misread.
-    if any(
-        len(values) > 1
-        for values in (employee_keys, department_keys, device_keys, event_type_keys)
+    if (
+        any(len(values) > 1 for values in (employee_keys, department_keys, event_type_keys))
+        or (len(device_keys) > 1 and plan.device_contains is None)
     ):
         return None
     resolved_labels = {
@@ -2462,6 +2501,11 @@ def _resolve_attendance_aggregate_filters(
             quoted
             and _SPREADSHEET_FILENAME_PATTERN.search(quoted) is None
             and quoted not in resolved_labels
+            and not _is_aggregate_presentation_quote(quoted)
+            and not (
+                plan.device_contains is not None
+                and plan.device_contains in re.sub(r"\s+", "", quoted)
+            )
             and not any(quoted == term.casefold() for term in event_terms)
         ):
             return None
@@ -2473,6 +2517,16 @@ def _resolve_attendance_aggregate_filters(
         event_type_keys=frozenset(key for key in event_type_keys if key is not None),
         event_result_terms=event_terms,
         resolved_labels=frozenset(resolved_labels),
+        suppress_bare_employee=(
+            plan.mode
+            in (
+                AttendanceAggregateMode.PER_CAPITA,
+                AttendanceAggregateMode.DEPARTMENT_PROFILE,
+            )
+            or plan.dimension is AttendanceAggregateDimension.DATE
+            or plan.selection is AttendanceAggregateSelection.COUNT_VALUES
+            or plan.device_contains is not None
+        ),
     ):
         return None
     return _AttendanceAggregateFilters(
@@ -2484,6 +2538,20 @@ def _resolve_attendance_aggregate_filters(
     )
 
 
+def _is_aggregate_presentation_quote(value: str) -> bool:
+    """Allow quoted metric wording while keeping unknown quoted filters fail-closed."""
+
+    compact = re.sub(r"\s+", "", value)
+    return compact in {
+        "人均打卡次数",
+        "人均考勤次数",
+        "最忙",
+        "记录总数最多",
+        "第一条",
+        "最早",
+    }
+
+
 def _has_unresolved_attendance_filter(
     question: str,
     *,
@@ -2493,6 +2561,7 @@ def _has_unresolved_attendance_filter(
     event_type_keys: frozenset[str],
     event_result_terms: tuple[str, ...],
     resolved_labels: frozenset[str],
+    suppress_bare_employee: bool,
 ) -> bool:
     """Detect a syntactic exact scope that matched no trusted table value."""
 
@@ -2600,6 +2669,8 @@ def _has_unresolved_attendance_filter(
     # Chinese questions commonly omit the word "员工" (for example,
     # "王五一共有多少条打卡记录").  Only a short leading person-like token
     # is recognized here, and global dataset nouns are excluded explicitly.
+    if suppress_bare_employee:
+        return False
     bare_employee = re.search(
         r"(?:^|帮我查|请帮我查|请查|请统计|查询|统计|查一下)\s*"
         r"[“\"'‘]?(?P<label>[一-鿿·]{2,6}?)[”\"'’]?\s*"
@@ -2787,6 +2858,121 @@ def _render_attendance_aggregate(
     dimension = plan.dimension
     if dimension is None:
         return None
+
+    if plan.mode is AttendanceAggregateMode.DEPARTMENT_PROFILE:
+        if len(filters.department_keys) != 1 or identifier_kind is None:
+            return None
+        employee_counts: dict[str, int] = {}
+        for record in matched_records:
+            if record.employee_key is None or record.employee_name is None:
+                return None
+            employee_counts[record.employee_key] = employee_counts.get(record.employee_key, 0) + 1
+        profile_department_labels = {
+            record.department_label
+            for record in matched_records
+            if record.department_label is not None
+        }
+        if len(profile_department_labels) != 1 or len(employee_counts) > _MAX_TABLE_ROWS:
+            return None
+        department_label = _citation_safe_text(next(iter(profile_department_labels)))
+        ordered_employees = tuple(
+            sorted(employee_counts, key=lambda key: (employee_names[key].casefold(), key))
+        )
+        safe_names = tuple(
+            _citation_safe_text(employee_names[key]) for key in ordered_employees
+        )
+        return SpreadsheetAnswer(
+            answer=(
+                f"“{department_label}”共有 {len(ordered_employees)} 位员工："
+                f"{'、'.join(safe_names)}；全表合计打卡 {matched_count} 次。{citation}"
+            ),
+            table=SpreadsheetTable(
+                title=f"{department_label}员工与打卡统计",
+                columns=(
+                    "人员工号" if identifier_kind == "employee_id" else "卡号",
+                    "员工姓名",
+                    "打卡次数",
+                ),
+                rows=tuple(
+                    (
+                        _citation_safe_text(identifier_labels[key]),
+                        _citation_safe_text(employee_names[key]),
+                        f"{employee_counts[key]} 次",
+                    )
+                    for key in ordered_employees
+                ),
+                citation_numbers=tuple(range(1, len(hits) + 1)),
+            ),
+            hits=hits,
+        )
+
+    if plan.mode is AttendanceAggregateMode.PER_CAPITA:
+        if identifier_kind is None:
+            return None
+        department_totals: dict[str, int] = {}
+        department_people: dict[str, set[str]] = {}
+        department_label_by_key: dict[str, str] = {}
+        for record in matched_records:
+            if (
+                record.department_key is None
+                or record.department_label is None
+                or record.employee_key is None
+            ):
+                return None
+            key = record.department_key
+            department_totals[key] = department_totals.get(key, 0) + 1
+            department_people.setdefault(key, set()).add(record.employee_key)
+            department_label_by_key.setdefault(key, record.department_label)
+        if not department_totals:
+            return None
+        averages = {
+            key: Fraction(department_totals[key], len(department_people[key]))
+            for key in department_totals
+            if department_people[key]
+        }
+        if not averages:
+            return None
+        average_boundary = (
+            max(averages.values())
+            if plan.selection is AttendanceAggregateSelection.MAX
+            else min(averages.values())
+        )
+        selected_departments = tuple(
+            sorted(
+                (key for key, value in averages.items() if value == average_boundary),
+                key=lambda key: (department_label_by_key[key].casefold(), key),
+            )
+        )
+        if len(selected_departments) > _MAX_TABLE_ROWS:
+            return None
+        rows = tuple(
+            (
+                _citation_safe_text(department_label_by_key[key]),
+                str(len(department_people[key])),
+                str(department_totals[key]),
+                f"{float(averages[key]):.1f}",
+            )
+            for key in selected_departments
+        )
+        direction = "最高" if plan.selection is AttendanceAggregateSelection.MAX else "最低"
+        per_capita_summaries = "；".join(
+            f"“{row[0]}”共 {row[1]} 人、{row[2]} 次打卡，人均 {row[3]} 次"
+            for row in rows
+        )
+        return SpreadsheetAnswer(
+            answer=(
+                f"人均打卡次数{direction}的部门统计如下："
+                f"{per_capita_summaries}。{citation}"
+            ),
+            table=SpreadsheetTable(
+                title="部门人均打卡统计",
+                columns=("部门", "员工人数", "总打卡次数", "人均打卡次数"),
+                rows=rows,
+                citation_numbers=tuple(range(1, len(hits) + 1)),
+            ),
+            hits=hits,
+        )
+
     values: dict[str, str] = {}
     counts: dict[str, int] = {}
     for record in matched_records:
@@ -2866,16 +3052,56 @@ def _render_attendance_aggregate(
     elif plan.selection is AttendanceAggregateSelection.MIN:
         lowest = min(counts.values())
         selected = tuple(key for key in ranked if counts[key] == lowest)
+    elif plan.selection is AttendanceAggregateSelection.COUNT_VALUES:
+        selected = tuple(key for key in ranked if counts[key] in plan.count_values)
     else:
         top_n = plan.top_n
         if top_n is None:
             return None
-        boundary = counts[ranked[min(top_n, len(ranked)) - 1]]
-        selected = tuple(key for key in ranked if counts[key] >= boundary)
+        count_boundary = counts[ranked[min(top_n, len(ranked)) - 1]]
+        selected = tuple(key for key in ranked if counts[key] >= count_boundary)
     if len(selected) > _MAX_TABLE_ROWS:
         return None
 
     safe_labels = tuple(_citation_safe_text(values[key]) for key in selected)
+    if (
+        plan.device_contains is not None
+        and dimension is AttendanceAggregateDimension.EMPLOYEE
+        and plan.selection is AttendanceAggregateSelection.ALL
+    ):
+        if not selected or len(matched_records) > _MAX_TABLE_ROWS:
+            return None
+        device_rows = tuple(
+            (
+                _citation_safe_text(record.employee_identifier or "—"),
+                _citation_safe_text(record.employee_name or "—"),
+                record.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                _citation_safe_text(record.device_label),
+            )
+            for record in sorted(
+                matched_records,
+                key=lambda record: (record.timestamp, _row_sort_key(record.row)),
+            )
+        )
+        return SpreadsheetAnswer(
+            answer=(
+                f"有，共 {len(selected)} 位员工通过包含“{plan.device_contains.upper()}”"
+                f"的闸机打卡：{'、'.join(safe_labels)}；共 {matched_count} 条记录。{citation}"
+            ),
+            table=SpreadsheetTable(
+                title=f"{plan.device_contains.upper()}闸机打卡明细",
+                columns=(
+                    "人员工号" if identifier_kind == "employee_id" else "卡号",
+                    "员工姓名",
+                    "时间",
+                    "设备",
+                ),
+                rows=device_rows,
+                citation_numbers=tuple(range(1, len(hits) + 1)),
+            ),
+            hits=hits,
+        )
+
     if plan.selection is AttendanceAggregateSelection.MAX:
         if dimension is AttendanceAggregateDimension.EMPLOYEE:
             if len(selected) == 1:
@@ -2903,6 +3129,13 @@ def _render_attendance_aggregate(
                     f"{'、'.join(f'“{label}”' for label in safe_labels)}，"
                     f"各记录 {counts[selected[0]]} 次。{citation}"
                 )
+        elif dimension is AttendanceAggregateDimension.DATE:
+            date_subject = (
+                f"日期是{safe_labels[0]}"
+                if len(safe_labels) == 1
+                else f"日期有 {'、'.join(safe_labels)}，并列第一"
+            )
+            answer = f"考勤打卡最忙的{date_subject}，共记录 {counts[selected[0]]} 次。{citation}"
         else:
             answer = (
                 f"{dimension_name}打卡次数最多的是"
@@ -2920,6 +3153,24 @@ def _render_attendance_aggregate(
             f"{dimension_name}打卡次数前 {plan.top_n} 名如下；"
             f"若第 {plan.top_n} 名并列，已完整保留边界并列项。{citation}"
         )
+    elif plan.selection is AttendanceAggregateSelection.COUNT_VALUES:
+        if not selected:
+            answer = f"没有员工的打卡次数属于 {list(plan.count_values)}。{citation}"
+        else:
+            grouped_by_count = {
+                value: tuple(
+                    _citation_safe_text(values[key])
+                    for key in selected
+                    if counts[key] == value
+                )
+                for value in plan.count_values
+            }
+            descriptions = tuple(
+                f"打卡 {value} 次的员工有 {len(labels)} 人：{'、'.join(labels)}"
+                for value, labels in grouped_by_count.items()
+                if labels
+            )
+            answer = f"{'；'.join(descriptions)}。{citation}"
     else:
         answer = (
             f"在《{safe_title}》中已按{dimension_name}完成全量汇总，"
@@ -2970,6 +3221,9 @@ def _attendance_dimension_value(
         return record.department_key, record.department_label
     if dimension is AttendanceAggregateDimension.DEVICE:
         return record.device_key, record.device_label
+    if dimension is AttendanceAggregateDimension.DATE:
+        value = record.timestamp.date().isoformat()
+        return value, value
     if record.event_result_key is None or record.event_result_label is None:
         return None
     return record.event_result_key, record.event_result_label
@@ -2981,6 +3235,7 @@ def _attendance_dimension_name(dimension: AttendanceAggregateDimension) -> str:
         AttendanceAggregateDimension.DEPARTMENT: "部门",
         AttendanceAggregateDimension.DEVICE: "设备",
         AttendanceAggregateDimension.EVENT_RESULT: "事件结果",
+        AttendanceAggregateDimension.DATE: "日期",
     }[dimension]
 
 
@@ -4025,6 +4280,65 @@ def _answer_time_range(sheets: tuple[_Sheet, ...], question: str) -> Spreadsheet
     )
 
 
+def _answer_earliest_record(
+    sheets: tuple[_Sheet, ...], question: str
+) -> SpreadsheetAnswer | None:
+    if _question_date(question) is not None or _has_unconsumed_attendance_scope(sheets, question):
+        return None
+    records, invalid = _timestamp_records(sheets)
+    if invalid or not records:
+        return None
+    earliest_time = min(record.timestamp for record in records if record.timestamp is not None)
+    earliest = [record for record in records if record.timestamp == earliest_time]
+    resolved: list[tuple[str, str, str | None, _Row]] = []
+    incomplete = False
+    for record in earliest:
+        name_column = record.sheet.columns.get("employee_name")
+        device_column = record.sheet.columns.get("device")
+        department_column = record.sheet.columns.get("department")
+        name = record.row.value(name_column)
+        device = record.row.value(device_column)
+        department = record.row.value(department_column)
+        if (
+            name_column is None
+            or device_column is None
+            or "employee_name" in record.sheet.ambiguous
+            or "device" in record.sheet.ambiguous
+            or not name
+            or not device
+            or len(name) > _MAX_LABEL_CHARACTERS
+        ):
+            incomplete = True
+            continue
+        resolved.append((name, device, department, record.row))
+    identities = {(name, device, department) for name, device, department, _ in resolved}
+    if incomplete or len(identities) != 1:
+        return None
+    name, device, department = next(iter(identities))
+    row = min((item[3] for item in resolved), key=_row_sort_key)
+    hits = _build_hits([row])
+    if hits is None:
+        return None
+    citations = _citation_marker(hits)
+    assert earliest_time is not None
+    timestamp_text = earliest_time.strftime("%Y-%m-%d %H:%M:%S")
+    department_text = f"（{_citation_safe_text(department)}）" if department else ""
+    return SpreadsheetAnswer(
+        answer=(
+            f"全表最早一条打卡记录发生于 {timestamp_text}，由"
+            f"{department_text}员工“{_citation_safe_text(name)}”通过"
+            f"“{_citation_safe_text(device)}”完成。{citations}"
+        ),
+        table=SpreadsheetTable(
+            title="全表最早打卡记录",
+            columns=("时间", "部门", "员工姓名", "设备"),
+            rows=((timestamp_text, department or "—", name, device),),
+            citation_numbers=tuple(range(1, len(hits) + 1)),
+        ),
+        hits=hits,
+    )
+
+
 def _answer_latest_record(sheets: tuple[_Sheet, ...], question: str) -> SpreadsheetAnswer | None:
     target_date = _question_date(question)
     if _has_unconsumed_attendance_scope(sheets, question):
@@ -4661,6 +4975,19 @@ def _is_latest_record_question(question: str) -> bool:
             "最后一次",
             "最后的",
             "最新一条",
+        )
+    ) and any(token in question for token in ("打卡", "考勤", "通行", "刷卡"))
+
+
+def _is_earliest_record_question(question: str) -> bool:
+    return any(
+        token in question
+        for token in (
+            "最早",
+            "第一条",
+            "第一笔",
+            "第一次",
+            "最先一条",
         )
     ) and any(token in question for token in ("打卡", "考勤", "通行", "刷卡"))
 
