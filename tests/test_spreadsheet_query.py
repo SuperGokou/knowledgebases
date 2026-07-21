@@ -319,6 +319,210 @@ def _record(
     )
 
 
+def _attendance_acceptance_rows() -> tuple[tuple[int, RowValues], ...]:
+    """Build the 1,388-row customer acceptance fixture with fixed ground truth."""
+
+    employee_counts = (
+        ("生产部", "E001", "熊小强", "100001", 102),
+        ("生产部", "E002", "王新建", "100002", 95),
+        ("生产部", "E003", "王一航", "100003", 37),
+        ("生产部", "E004", "生产甲", "100004", 80),
+        ("生产部", "E005", "生产乙", "100005", 67),
+        ("前工程科", "E006", "彭楚亮", "100006", 54),
+        ("前工程科", "E007", "前工甲", "100007", 55),
+        ("前工程科", "E008", "前工乙", "100008", 50),
+        ("前工程科", "E009", "前工丙", "100009", 50),
+        ("工程部", "E010", "沈发付", "100010", 1),
+        ("工程部", "E011", "刘春耀", "100011", 60),
+        ("工程部", "E012", "工程甲", "100012", 60),
+        ("工程部", "E013", "工程乙", "100013", 60),
+        ("工程部", "E014", "工程丙", "100014", 60),
+        ("工程部", "E015", "工程丁", "100015", 55),
+        ("工程部", "E016", "工程戊", "100016", 50),
+        ("工程部", "E017", "工程己", "100017", 50),
+        ("工程部", "E018", "工程庚", "100018", 50),
+        ("工程部", "E019", "工程辛", "100019", 50),
+        ("工程部", "E020", "工程壬", "100020", 50),
+        ("后工程科", "E021", "张桂芳", "100021", 39),
+        ("整合部", "E022", "姚乐向", "100022", 30),
+        ("整合部", "E023", "整合甲", "100023", 31),
+        ("整合部", "E024", "整合乙", "100024", 31),
+        ("整合部", "E025", "整合丙", "100025", 30),
+        ("电子工程科", "E026", "电子甲", "100026", 21),
+        ("电子工程科", "E027", "电子乙", "100027", 21),
+        ("研发部", "E028", "胡茂牛", "100028", 2),
+        ("研发部", "E029", "研发甲", "100029", 12),
+        ("研发部", "E030", "研发乙", "100030", 11),
+        ("研发部", "E031", "研发丙", "100031", 11),
+        ("研发部", "E032", "研发丁", "100032", 11),
+        ("品质部", "E033", "崔塔生", "100033", 2),
+    )
+    employees: list[tuple[str, str, str, str]] = [
+        (department, employee_id, name, card)
+        for department, employee_id, name, card, count in employee_counts
+        for _ in range(count)
+    ]
+    assert len(employees) == 1_388
+
+    def swap_employee(target: int, name: str) -> None:
+        source = next(index for index, value in enumerate(employees) if value[2] == name)
+        employees[target], employees[source] = employees[source], employees[target]
+
+    swap_employee(0, "刘春耀")
+    swap_employee(len(employees) - 1, "彭楚亮")
+    original_yao_indexes = [
+        index for index, value in enumerate(employees) if value[2] == "姚乐向"
+    ][:2]
+    employees[400], employees[original_yao_indexes[0]] = (
+        employees[original_yao_indexes[0]],
+        employees[400],
+    )
+    employees[401], employees[original_yao_indexes[1]] = (
+        employees[original_yao_indexes[1]],
+        employees[401],
+    )
+
+    date_counts = (
+        ("2026-07-03", 30),
+        ("2026-07-04", 65),
+        ("2026-07-05", 76),
+        ("2026-07-06", 143),
+        ("2026-07-07", 171),
+        ("2026-07-08", 131),
+        ("2026-07-09", 118),
+        ("2026-07-10", 131),
+        ("2026-07-11", 52),
+        ("2026-07-12", 55),
+        ("2026-07-13", 88),
+        ("2026-07-14", 73),
+        ("2026-07-15", 87),
+        ("2026-07-16", 78),
+        ("2026-07-17", 90),
+    )
+    timestamps: list[str] = []
+    for day, count in date_counts:
+        for offset in range(count):
+            second_of_day = 13 * 3600 + offset * 30
+            hour, remainder = divmod(second_of_day, 3600)
+            minute, second = divmod(remainder, 60)
+            timestamps.append(f"{day} {hour:02d}:{minute:02d}:{second:02d}")
+    timestamps[0] = "2026-07-03 12:37:57"
+    timestamps[-1] = "2026-07-17 23:54:05"
+    timestamps[400] = "2026-07-07 14:10:42"
+    timestamps[401] = "2026-07-07 14:13:59"
+
+    device_counts = (
+        ("1#2F人行道闸入口5", 375),
+        ("1#2F人行道闸入口6", 251),
+        ("1#2F人行道闸出口4", 224),
+        ("1#2F人行道闸出口6", 204),
+        ("1#2F人行道闸出口3", 120),
+        ("1#2F人行道闸出口5", 118),
+        ("1#2F人行道闸入口4", 60),
+        ("1#2F人行道闸出口2", 21),
+        ("1#2F人行道闸入口3", 8),
+        ("1#2F人行道闸入口1", 3),
+        ("1#2F人行道闸出口1", 2),
+        ("1#1F人行道闸出口3", 1),
+        ("1#1F人行道闸入口1", 1),
+    )
+    devices = [device for device, count in device_counts for _ in range(count)]
+    assert len(devices) == 1_388
+
+    def swap_device(target: int, device: str, *, forbidden: set[int] | None = None) -> None:
+        blocked = forbidden or set()
+        source = next(
+            index
+            for index, value in enumerate(devices)
+            if value == device and index not in blocked and index != target
+        )
+        devices[target], devices[source] = devices[source], devices[target]
+
+    swap_device(0, "1#2F人行道闸出口6")
+    swap_device(len(devices) - 1, "1#2F人行道闸出口3", forbidden={0})
+    yao_indexes = [index for index, value in enumerate(employees) if value[2] == "姚乐向"][:2]
+    swap_device(yao_indexes[0], "1#1F人行道闸入口1", forbidden={0, len(devices) - 1})
+    swap_device(
+        yao_indexes[1],
+        "1#1F人行道闸出口3",
+        forbidden={0, len(devices) - 1, yao_indexes[0]},
+    )
+
+    return tuple(
+        (
+            index + 2,
+            _record(
+                department,
+                employee_id,
+                name,
+                card,
+                timestamps[index],
+                devices[index],
+            ),
+        )
+        for index, (department, employee_id, name, card) in enumerate(employees)
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_1388_row_analytics_acceptance_suite(
+    knowledge_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(_attendance_acceptance_rows()),
+        title="10级以上考勤.xlsx",
+    )
+    await session.commit()
+
+    cases = (
+        (
+            "全表中“人均打卡次数”最高的是哪个部门？该部门人均打卡多少次？",
+            ("生产部", "381", "5", "76.2"),
+        ),
+        (
+            "“后工程科”有几位员工？他（们）一共打卡了多少次？",
+            ("张桂芳", "1 位", "39 次"),
+        ),
+        (
+            "在这1388条记录中，有哪几位员工在整个数据范围内仅仅只打卡了1次或2次？",
+            ("沈发付", "崔塔生", "胡茂牛", "1 次", "2 次"),
+        ),
+        (
+            "整张表中，有没有人通过“1楼（1#1F）”的闸机打过卡？如果有，是谁？",
+            ("姚乐向", "2026-07-07", "1#1F人行道闸入口1", "1#1F人行道闸出口3"),
+        ),
+        (
+            "在这个数据集中，考勤打卡“最忙”（记录总数最多）的是哪一天？"
+            "那天一共有多少人次打卡？",
+            ("2026-07-07", "171"),
+        ),
+        (
+            "在这份记录中，全厂“第一条（最早）”打卡记录发生什么时间？是谁打的卡？",
+            ("刘春耀", "2026-07-03 12:37:57"),
+        ),
+        (
+            "“生产部”里打卡次数最少的人是谁？打卡了多少次？",
+            ("王一航", "37 次"),
+        ),
+        (
+            "闸机设备中，名为“1#2F人行道闸入口1”的设备总共被使用了多少次？",
+            ("1#2F人行道闸入口1", "3 条"),
+        ),
+    )
+    for question, expected_values in cases:
+        result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+        assert result.status is SpreadsheetQueryStatus.ANSWERED, question
+        assert result.answer is not None
+        rendered = result.answer.answer
+        if result.answer.table is not None:
+            rendered += repr(result.answer.table.rows)
+        for expected in expected_values:
+            assert expected in rendered, (question, expected, rendered)
+
+
 @pytest.mark.asyncio
 async def test_answers_the_five_acceptance_questions_with_complete_row_evidence(
     knowledge_session: tuple[AsyncSession, UUID],

@@ -32,6 +32,8 @@ class AttendanceAggregateMode(StrEnum):
     TOTAL = "total"
     DISTINCT = "distinct"
     GROUP_COUNT = "group_count"
+    PER_CAPITA = "per_capita"
+    DEPARTMENT_PROFILE = "department_profile"
 
 
 class AttendanceAggregateDimension(StrEnum):
@@ -41,6 +43,7 @@ class AttendanceAggregateDimension(StrEnum):
     DEPARTMENT = "department"
     DEVICE = "device"
     EVENT_RESULT = "event_result"
+    DATE = "date"
 
 
 class AttendanceAggregateSelection(StrEnum):
@@ -50,6 +53,7 @@ class AttendanceAggregateSelection(StrEnum):
     MAX = "max"
     MIN = "min"
     TOP_N = "top_n"
+    COUNT_VALUES = "count_values"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +78,8 @@ class AttendanceAggregationPlan:
     top_n: int | None = None
     include_values: bool = False
     date_range: AttendanceDateRange | None = None
+    count_values: tuple[int, ...] = ()
+    device_contains: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode is AttendanceAggregateMode.TOTAL:
@@ -84,6 +90,21 @@ class AttendanceAggregationPlan:
         elif self.mode is AttendanceAggregateMode.DISTINCT:
             if self.dimension is None or self.selection is not AttendanceAggregateSelection.ALL:
                 raise ValueError("distinct aggregation requires one dimension and ALL selection")
+        elif self.mode is AttendanceAggregateMode.PER_CAPITA:
+            if self.dimension is not AttendanceAggregateDimension.DEPARTMENT:
+                raise ValueError("per-capita aggregation requires the department dimension")
+            if self.selection not in (
+                AttendanceAggregateSelection.ALL,
+                AttendanceAggregateSelection.MAX,
+                AttendanceAggregateSelection.MIN,
+            ):
+                raise ValueError("per-capita aggregation has an invalid selection")
+        elif self.mode is AttendanceAggregateMode.DEPARTMENT_PROFILE:
+            if (
+                self.dimension is not AttendanceAggregateDimension.DEPARTMENT
+                or self.selection is not AttendanceAggregateSelection.ALL
+            ):
+                raise ValueError("department profile requires department and ALL selection")
         elif self.dimension is None:
             raise ValueError("group-count aggregation requires one dimension")
 
@@ -92,6 +113,24 @@ class AttendanceAggregationPlan:
                 raise ValueError("top_n must be between 1 and 50")
         elif self.top_n is not None:
             raise ValueError("top_n is only valid for TOP_N selection")
+
+        if self.selection is AttendanceAggregateSelection.COUNT_VALUES:
+            if (
+                self.mode is not AttendanceAggregateMode.GROUP_COUNT
+                or self.dimension is not AttendanceAggregateDimension.EMPLOYEE
+                or not self.count_values
+                or len(self.count_values) > 10
+                or any(value < 1 or value > 1_000_000 for value in self.count_values)
+                or tuple(sorted(set(self.count_values))) != self.count_values
+            ):
+                raise ValueError("count_values must be a sorted employee frequency set")
+        elif self.count_values:
+            raise ValueError("count_values is only valid for COUNT_VALUES selection")
+
+        if self.device_contains is not None and not re.fullmatch(
+            r"[a-z0-9#._/-]{2,32}", self.device_contains
+        ):
+            raise ValueError("device_contains is not a safe device fragment")
 
 
 class AttendanceQueryPlanStatus(StrEnum):
@@ -197,6 +236,7 @@ _DIMENSION_TERMS: Final[dict[AttendanceAggregateDimension, tuple[str, ...]]] = {
         "认证状态",
         "验证状态",
     ),
+    AttendanceAggregateDimension.DATE: ("哪一天", "哪天", "日期", "每天", "每日"),
 }
 _COUNT_TERMS: Final = (
     "多少",
@@ -334,6 +374,12 @@ _UNSUPPORTED_SCOPE_TERMS: Final = (
 _PUNCTUATION_TRANSLATION: Final = str.maketrans(
     {character: " " for character in "，。？！?!、；;：:()（）《》【】“”‘’\"'"}
 )
+_COUNT_VALUE_SET_PATTERN: Final = re.compile(
+    r"(?P<first>\d{1,6}|[一二两三四五六七八九十]{1,3})\s*次\s*"
+    r"(?:或|或者|和|、|以及|至|到|[-~～])\s*"
+    r"(?P<second>\d{1,6}|[一二两三四五六七八九十]{1,3})\s*次"
+)
+_DEVICE_FRAGMENT_PATTERN: Final = re.compile(r"(?P<fragment>\d{1,3}#\d{1,3}f)", re.IGNORECASE)
 
 
 def parse_attendance_query_plan(question: str) -> AttendanceQueryPlanParseResult:
@@ -355,7 +401,25 @@ def parse_attendance_query_plan(question: str) -> AttendanceQueryPlanParseResult
         return _not_applicable()
 
     dimensions = _dimensions_in(compact)
-    aggregate_cue = _has_aggregate_cue(compact)
+    count_values, count_value_error = _count_value_set(compact)
+    if count_value_error is not None:
+        return _rejected(count_value_error)
+    device_contains = _device_fragment(semantic)
+    if (
+        device_contains is not None
+        and AttendanceAggregateDimension.EMPLOYEE in dimensions
+        and AttendanceAggregateDimension.DEVICE in dimensions
+    ):
+        dimensions = frozenset((AttendanceAggregateDimension.EMPLOYEE,))
+    aggregate_cue = (
+        _has_aggregate_cue(compact)
+        or count_values is not None
+        or (
+            device_contains is not None
+            and AttendanceAggregateDimension.EMPLOYEE in dimensions
+            and any(term in compact for term in ("谁", "哪位", "哪些人", "有没有人"))
+        )
+    )
     attendance_cue = any(term in compact for term in _ATTENDANCE_TERMS)
     domain_cue = (
         attendance_cue
@@ -398,6 +462,64 @@ def parse_attendance_query_plan(question: str) -> AttendanceQueryPlanParseResult
         return _rejected("ranking_requires_top_n")
 
     dimension = next(iter(dimensions), None)
+
+    if "人均" in compact:
+        if dimension is not AttendanceAggregateDimension.DEPARTMENT:
+            return _rejected("per_capita_requires_department")
+        if not (has_max or has_min):
+            return _rejected("per_capita_requires_selection")
+        return _compiled(
+            AttendanceAggregationPlan(
+                mode=AttendanceAggregateMode.PER_CAPITA,
+                dimension=dimension,
+                selection=(
+                    AttendanceAggregateSelection.MAX
+                    if has_max
+                    else AttendanceAggregateSelection.MIN
+                ),
+                date_range=date_range,
+            )
+        )
+
+    if count_values is not None:
+        if dimension is not AttendanceAggregateDimension.EMPLOYEE:
+            return _rejected("count_values_require_employee")
+        return _compiled(
+            AttendanceAggregationPlan(
+                mode=AttendanceAggregateMode.GROUP_COUNT,
+                dimension=dimension,
+                selection=AttendanceAggregateSelection.COUNT_VALUES,
+                count_values=count_values,
+                date_range=date_range,
+            )
+        )
+
+    if (
+        device_contains is not None
+        and dimension is AttendanceAggregateDimension.EMPLOYEE
+        and any(term in compact for term in ("谁", "哪位", "哪些人", "有没有人"))
+    ):
+        return _compiled(
+            AttendanceAggregationPlan(
+                mode=AttendanceAggregateMode.GROUP_COUNT,
+                dimension=dimension,
+                selection=AttendanceAggregateSelection.ALL,
+                date_range=date_range,
+                device_contains=device_contains,
+            )
+        )
+
+    if _is_department_profile_request(compact):
+        if date_range is not None:
+            return _rejected("department_profile_date_scope_not_supported")
+        return _compiled(
+            AttendanceAggregationPlan(
+                mode=AttendanceAggregateMode.DEPARTMENT_PROFILE,
+                dimension=AttendanceAggregateDimension.DEPARTMENT,
+                selection=AttendanceAggregateSelection.ALL,
+            )
+        )
+
     distinct = _is_distinct_request(compact, dimension)
     group_all = _is_group_all_request(compact, dimension)
     ranked = top_n is not None or has_max or has_min
@@ -441,6 +563,7 @@ def parse_attendance_query_plan(question: str) -> AttendanceQueryPlanParseResult
             selection=selection,
             top_n=top_n,
             date_range=date_range,
+            device_contains=device_contains,
         )
         return _compiled(plan)
 
@@ -461,8 +584,47 @@ def parse_attendance_query_plan(question: str) -> AttendanceQueryPlanParseResult
             dimension=None,
             selection=AttendanceAggregateSelection.ALL,
             date_range=date_range,
+            device_contains=device_contains,
         )
     )
+
+
+def _count_value_set(question: str) -> tuple[tuple[int, ...] | None, str | None]:
+    matches = tuple(_COUNT_VALUE_SET_PATTERN.finditer(question))
+    if not matches:
+        return None, None
+    if len(matches) != 1:
+        return None, "multiple_count_value_sets"
+    values = tuple(
+        _positive_integer(matches[0].group(name)) for name in ("first", "second")
+    )
+    if any(value is None or value < 1 or value > 1_000_000 for value in values):
+        return None, "invalid_count_value_set"
+    return tuple(sorted(set(value for value in values if value is not None))), None
+
+
+def _device_fragment(question: str) -> str | None:
+    matches = tuple(_DEVICE_FRAGMENT_PATTERN.finditer(question))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    suffix = question[match.end() :].lstrip()
+    # ``1#2F人行道闸入口1`` is an exact device label, not a partial 2F scope.
+    if suffix and re.match(r"[A-Za-z0-9一-鿿#._/-]", suffix):
+        return None
+    return match.group("fragment").casefold()
+
+
+def _is_department_profile_request(question: str) -> bool:
+    employee_count = re.search(
+        r"(?:有|共|一共|总共)?(?:几|多少)(?:位|名|个)?(?:员工|人员)",
+        question,
+    )
+    total_records = re.search(
+        r"(?:一共|总共|共计|累计).{0,12}(?:打卡|考勤).{0,8}(?:多少|几)(?:次|条)?",
+        question,
+    )
+    return employee_count is not None and total_records is not None
 
 
 def _normalize_question(question: str) -> str:
