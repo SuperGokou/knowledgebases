@@ -997,6 +997,11 @@ _HEADER_ALIASES: Final[dict[str, dict[str, int]]] = {
         "考勤点": 2,
         "位置": 2,
     },
+    "event_type": {
+        "事件类型": 0,
+        "消息类型": 1,
+        "事件类别": 1,
+    },
     "event_result": {
         "事件结果": 0,
         "事件详情": 0,
@@ -1169,6 +1174,8 @@ class _AttendanceAggregateRecord:
     department_label: str | None
     device_key: str
     device_label: str
+    event_type_key: str | None
+    event_type_label: str | None
     event_result_key: str | None
     event_result_label: str | None
 
@@ -1189,6 +1196,7 @@ class _AttendanceAggregateFilters:
     employee_keys: frozenset[str] = frozenset()
     department_keys: frozenset[str] = frozenset()
     device_keys: frozenset[str] = frozenset()
+    event_type_keys: frozenset[str] = frozenset()
     event_result_terms: tuple[str, ...] = ()
 
     @property
@@ -1197,6 +1205,7 @@ class _AttendanceAggregateFilters:
             self.employee_keys
             or self.department_keys
             or self.device_keys
+            or self.event_type_keys
             or self.event_result_terms
         )
 
@@ -2163,6 +2172,7 @@ def _answer_attendance_aggregate(
         timestamp_column = sheet.columns.get("timestamp")
         device_column = sheet.columns.get("device")
         department_column = sheet.columns.get("department")
+        event_type_column = sheet.columns.get("event_type")
         event_result_column = sheet.columns.get("event_result")
         name_column = sheet.columns.get("employee_name")
         identifier_column = sheet.columns.get(identifier_kind) if identifier_kind else None
@@ -2258,6 +2268,12 @@ def _answer_attendance_aggregate(
                 return None
 
             device_key, device_label = normalized_device
+            event_type_key: str | None = None
+            event_type_label: str | None = None
+            if event_type_column is not None and "event_type" not in sheet.ambiguous:
+                event_type_label = _normalized_identity_label(row.value(event_type_column) or "")
+                if event_type_label is not None:
+                    event_type_key = event_type_label.casefold()
             record = _AttendanceAggregateRecord(
                 row=row,
                 timestamp=timestamp,
@@ -2268,6 +2284,8 @@ def _answer_attendance_aggregate(
                 department_label=department_label,
                 device_key=device_key,
                 device_label=device_label,
+                event_type_key=event_type_key,
+                event_type_label=event_type_label,
                 event_result_key=event_result_key,
                 event_result_label=event_result_label,
             )
@@ -2283,6 +2301,8 @@ def _answer_attendance_aggregate(
     if filters.employee_keys and (identifier_kind is None or not has_common_employee_name):
         return None
     if filters.department_keys and any(record.department_key is None for record in records):
+        return None
+    if filters.event_type_keys and any(record.event_type_key is None for record in records):
         return None
     if filters.event_result_terms and any(record.event_result_label is None for record in records):
         return None
@@ -2410,9 +2430,19 @@ def _resolve_attendance_aggregate_filters(
         if len(re.sub(r"\s+", "", record.device_label)) >= 2
         and record.device_label.casefold() in semantic
     }
+    event_type_keys = {
+        record.event_type_key
+        for record in records
+        if record.event_type_key is not None
+        and record.event_type_label is not None
+        and record.event_type_label.casefold() in semantic
+    }
     # Multiple values of the same field are deliberately rejected: natural
     # language conjunction/exclusion semantics are otherwise easy to misread.
-    if any(len(values) > 1 for values in (employee_keys, department_keys, device_keys)):
+    if any(
+        len(values) > 1
+        for values in (employee_keys, department_keys, device_keys, event_type_keys)
+    ):
         return None
     resolved_labels = {
         label.casefold()
@@ -2422,6 +2452,7 @@ def _resolve_attendance_aggregate_filters(
             record.employee_identifier,
             record.department_label,
             record.device_label,
+            record.event_type_label,
         )
         if label is not None and label.casefold() in semantic
     }
@@ -2439,13 +2470,16 @@ def _resolve_attendance_aggregate_filters(
         employee_keys=frozenset(key for key in employee_keys if key is not None),
         department_keys=frozenset(key for key in department_keys if key is not None),
         device_keys=frozenset(device_keys),
+        event_type_keys=frozenset(key for key in event_type_keys if key is not None),
         event_result_terms=event_terms,
+        resolved_labels=frozenset(resolved_labels),
     ):
         return None
     return _AttendanceAggregateFilters(
         employee_keys=frozenset(key for key in employee_keys if key is not None),
         department_keys=frozenset(key for key in department_keys if key is not None),
         device_keys=frozenset(device_keys),
+        event_type_keys=frozenset(key for key in event_type_keys if key is not None),
         event_result_terms=event_terms,
     )
 
@@ -2456,23 +2490,43 @@ def _has_unresolved_attendance_filter(
     employee_keys: frozenset[str],
     department_keys: frozenset[str],
     device_keys: frozenset[str],
+    event_type_keys: frozenset[str],
     event_result_terms: tuple[str, ...],
+    resolved_labels: frozenset[str],
 ) -> bool:
     """Detect a syntactic exact scope that matched no trusted table value."""
 
     # Event type is a separate business field from the whitelisted event
     # result/status dimension.  Until it has its own typed plan, treating a
     # qualifier such as "普通消息事件类型" as a result filter would be wrong.
-    if "事件类型" in question:
+    if "事件类型" in question and not event_type_keys:
         return True
+
+    if re.search(r"[A-Za-z0-9一-鿿·_-]{1,16}消息", question) and not event_type_keys:
+        return True
+
+    named_event_type = re.search(
+        r"(?P<label>[A-Za-z0-9一-鿿·_-]{1,16}?)(?:事件|类型|类别)"
+        r"(?=(?:有多少|有几|一共|总共|共计|多少|几条|打卡|记录|次数))",
+        question,
+    )
+    if named_event_type is not None and not event_type_keys:
+        event_label = named_event_type.group("label")
+        if not any(term.casefold() in event_label for term in event_result_terms):
+            return True
 
     # A status-looking qualifier that was not compiled by
     # ``_event_result_terms`` must never disappear into a global count.
-    if not event_result_terms and re.search(
-        r"(?:认证|验证|通行|刷卡)[A-Za-z0-9一-鿿·_-]{1,16}(?:记录|结果|状态)",
+    unknown_event_scope = re.search(
+        r"(?:认证|验证)(?P<qualifier>[A-Za-z0-9一-鿿·_-]{1,16}?)"
+        r"(?=(?:有多少|有几|一共|总共|共计|打卡|刷卡|通行|记录|结果|状态|次数))",
         question,
-    ):
-        return True
+    )
+    if not event_result_terms and unknown_event_scope is not None:
+        qualifier = unknown_event_scope.group("qualifier")
+        aggregate_language = ("多少", "几条", "总数", "数量", "一共", "总共", "共计", "全部")
+        if not any(term in qualifier for term in aggregate_language):
+            return True
 
     named_organization = re.search(
         r"[A-Za-z0-9一-鿿·_-]{1,30}(?:部(?!门)|科(?!室)|课|中心|车间)",
@@ -2486,24 +2540,6 @@ def _has_unresolved_attendance_filter(
     )
     if named_device is not None and not device_keys:
         return True
-    explicit_employee = re.search(
-        r"(?:员工|人员)\s*[“\"'‘]?[A-Za-z0-9一-鿿·_-]{2,30}[”\"'’]?\s*(?:的|共|一共)",
-        question,
-    )
-    if explicit_employee is not None and not employee_keys:
-        return True
-
-    # Chinese questions commonly omit the word "员工" (for example,
-    # "王五一共有多少条打卡记录").  Only a short leading person-like token
-    # is recognized here, and global dataset nouns are excluded explicitly.
-    bare_employee = re.match(
-        r"\s*[“\"'‘]?(?P<label>[一-鿿·]{2,4})[”\"'’]?\s*"
-        r"(?:(?:一共|总共|累计|共)(?:有)?|的(?:打卡|考勤|门禁|通行))",
-        question,
-    )
-    if bare_employee is None or employee_keys:
-        return False
-    candidate = bare_employee.group("label")
     global_scope_terms = (
         "考勤",
         "记录",
@@ -2517,7 +2553,74 @@ def _has_unresolved_attendance_filter(
         "部门",
         "设备",
         "闸机",
+        "打卡",
+        "门禁",
+        "刷卡",
+        "通行",
+        "全员",
+        "人员",
+        "员工",
+        "职工",
+        "本表",
+        "该表",
+        "本次",
+        "大家",
+        "所有人",
+        "本文件",
+        "表格",
+        "整表",
+        "整体",
+        "所有员工",
+        "全体员工",
+        "分别",
+        "每位",
+        "每个",
+        "各位",
+        "哪位",
+        "哪台",
+        "哪个",
+        "哪种",
+        "哪些",
+        "什么",
+        "名单",
     )
+    explicit_employee = re.search(
+        r"(?:员工|人员)\s*[“\"'‘]?"
+        r"(?P<label>[一-鿿·]{2,4}|[A-Za-z][A-Za-z0-9._-]{1,29}|"
+        r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]{1,29})[”\"'’]?\s*"
+        r"(?:(?:一共|总共|累计|共)(?:有)?|有多少|有几|的?"
+        r"(?:打卡|考勤|门禁|通行)|打卡总数)",
+        question,
+    )
+    if explicit_employee is not None and not employee_keys:
+        candidate = explicit_employee.group("label")
+        if not any(term in candidate for term in global_scope_terms):
+            return True
+
+    # Chinese questions commonly omit the word "员工" (for example,
+    # "王五一共有多少条打卡记录").  Only a short leading person-like token
+    # is recognized here, and global dataset nouns are excluded explicitly.
+    bare_employee = re.search(
+        r"(?:^|帮我查|请帮我查|请查|请统计|查询|统计|查一下)\s*"
+        r"[“\"'‘]?(?P<label>[一-鿿·]{2,6}?)[”\"'’]?\s*"
+        r"(?:(?:一共|总共|累计|共有|共计|共)(?:有)?|"
+        r"(?:在[^，。？！?]{1,20})?的?(?:打卡|考勤|门禁|通行|刷卡)"
+        r"(?:记录)?(?:(?:一共|总共|累计|共有|共计|共)(?:有)?)?"
+        r"(?:多少|几|总数|次数)?|(?:有)?(?:多少|几)(?:条|次|个)?"
+        r"(?:打卡|考勤|门禁|通行))",
+        question,
+    )
+    if bare_employee is None or employee_keys or event_type_keys:
+        return False
+    candidate = bare_employee.group("label")
+    candidate_key = candidate.casefold()
+    if any(
+        candidate_key == label
+        or candidate_key in label
+        or label in candidate_key
+        for label in resolved_labels
+    ):
+        return False
     return not any(term in candidate for term in global_scope_terms)
 
 
@@ -2536,6 +2639,8 @@ def _attendance_record_matches(
     if filters.department_keys and record.department_key not in filters.department_keys:
         return False
     if filters.device_keys and record.device_key not in filters.device_keys:
+        return False
+    if filters.event_type_keys and record.event_type_key not in filters.event_type_keys:
         return False
     return not filters.event_result_terms or any(
         _event_result_matches(record.event_result_label or "", term)
@@ -2566,6 +2671,8 @@ def _attendance_aggregate_coverages(
         if (
             dimension is AttendanceAggregateDimension.EVENT_RESULT or filters.event_result_terms
         ) and (column := sheet.columns.get("event_result")) is not None:
+            columns.add(column)
+        if filters.event_type_keys and (column := sheet.columns.get("event_type")) is not None:
             columns.add(column)
         if filters.employee_keys:
             for kind in (identifier_kind, "employee_name"):
@@ -2910,6 +3017,14 @@ def _attendance_filter_scope(
             record.device_label for record in records if record.device_key in filters.device_keys
         }
         parts.extend(f"设备“{_citation_safe_text(label)}”" for label in sorted(labels))
+    if filters.event_type_keys:
+        labels = {
+            record.event_type_label
+            for record in records
+            if record.event_type_key in filters.event_type_keys
+            and record.event_type_label is not None
+        }
+        parts.extend(f"事件类型“{_citation_safe_text(label)}”" for label in sorted(labels))
     parts.extend(f"事件结果“{_citation_safe_text(term)}”" for term in filters.event_result_terms)
     return "、".join(parts)
 

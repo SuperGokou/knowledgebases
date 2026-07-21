@@ -301,6 +301,7 @@ def _record(
     timestamp: str,
     device: str,
     *,
+    event_type: str = "普通消息",
     event_result: str = "认证成功(白名单验证)",
 ) -> RowValues:
     return (
@@ -313,7 +314,7 @@ def _record(
         device,
         "1",
         device,
-        "普通消息",
+        event_type,
         event_result,
     )
 
@@ -4768,8 +4769,23 @@ async def test_ambiguous_exact_dimension_filters_fail_closed(
     "question",
     (
         "王五一共有多少条打卡记录？",
+        "帮我查王五一共有多少条打卡记录？",
+        "请统计王五的打卡记录总数。",
+        "王五打卡多少次？",
+        "王五有多少次打卡？",
+        "员工王五打卡多少次？",
+        "人员王五有多少次打卡？",
+        "查询员工王五打卡总数。",
+        "王五刷卡记录共有几条？",
+        "请统计王五在东门的打卡次数。",
         "考勤中认证超时记录有多少条？",
-        "普通消息事件类型一共有多少条打卡记录？",
+        "认证超时有多少次打卡？",
+        "请统计认证超时打卡次数。",
+        "报警消息有多少条打卡记录？",
+        "报警消息打卡次数是多少？",
+        "告警事件有多少条打卡记录？",
+        "告警类型有多少条打卡记录？",
+        "告警类别有多少条打卡记录？",
     ),
 )
 @pytest.mark.asyncio
@@ -4784,6 +4800,97 @@ async def test_unresolved_attendance_filters_never_degrade_to_global_totals(
 
     assert result.status is SpreadsheetQueryStatus.REJECTED
     assert result.answer is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "打卡一共有多少条记录？",
+        "门禁一共有多少条记录？",
+        "刷卡一共有多少条记录？",
+        "通行一共有多少条记录？",
+        "全员一共有多少条打卡记录？",
+        "本表一共有多少条打卡记录？",
+        "该表一共有多少条打卡记录？",
+        "本次一共有多少条打卡记录？",
+        "大家一共有多少条打卡记录？",
+        "所有人一共有多少条打卡记录？",
+        "本文件一共有多少条打卡记录？",
+        "表格一共有多少条打卡记录？",
+        "整表一共有多少条打卡记录？",
+        "整体一共有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_global_attendance_terms_are_not_misread_as_employee_filters(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+    )
+
+    _assert_answer_mentions_count(answer, 12)
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "普通消息事件类型一共有多少条打卡记录？",
+        "普通消息有多少条打卡记录？",
+        "普通消息打卡次数是多少？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_known_event_type_filters_are_applied_before_counting(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        _content(
+            (
+                (
+                    2,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 08:00:00",
+                        "东门",
+                        event_type="普通消息",
+                    ),
+                ),
+                (
+                    3,
+                    _record(
+                        "品质部",
+                        "E001",
+                        "熊小强",
+                        "135265",
+                        "2026-07-17 09:00:00",
+                        "东门",
+                        event_type="报警消息",
+                    ),
+                ),
+            )
+        ),
+    )
+    await session.commit()
+
+    answer = _require_answer(
+        await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+    )
+
+    assert "普通消息" in answer.answer
+    _assert_answer_mentions_count(answer, 1)
+    assert answer.table is not None and answer.table.rows == (("事件类型普通消息", "1 条"),)
 
 
 @pytest.mark.parametrize(
