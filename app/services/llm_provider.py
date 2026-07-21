@@ -170,6 +170,10 @@ class OpenAICompatibleClient:
             "max_tokens": self._max_tokens,
             "temperature": 0.1,
         }
+        if self.provider == "qwen":
+            # Qwen reasoning models can emit a separate reasoning stream. OKF compilation
+            # requires one bounded JSON object, so keep thinking disabled for this path.
+            payload["enable_thinking"] = False
         envelope = await self._request(payload, retry_without_response_format=True)
         content, model, usage = self._parse_envelope(envelope)
         try:
@@ -226,6 +230,10 @@ class OpenAICompatibleClient:
             # strict JSON answer, so disable hidden reasoning to avoid consuming the
             # reviewer's entire output budget before a verdict is emitted.
             payload["thinking"] = {"type": "disabled"}
+        elif self.provider == "qwen":
+            # Answer generation and review both consume strict JSON. Disable the optional
+            # reasoning stream so it cannot exhaust the output budget before the JSON body.
+            payload["enable_thinking"] = False
         envelope = await self._request(payload, retry_without_response_format=True)
         content, model, usage = self._parse_envelope(envelope)
         return LlmChatResult(

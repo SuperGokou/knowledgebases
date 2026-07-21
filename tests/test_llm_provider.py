@@ -243,6 +243,57 @@ async def test_deepseek_chat_disables_thinking_for_bounded_json_reviews(
 
 
 @pytest.mark.asyncio
+async def test_qwen_chat_disables_thinking_for_bounded_json_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    response = _response(
+        200,
+        {
+            "model": "qwen3.7-plus",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"verdict":"pass","unsupported_claims":[]}'},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        },
+    )
+    stub = StubAsyncClient([response], calls)
+    monkeypatch.setattr(
+        "app.services.llm_provider.httpx.AsyncClient",
+        lambda **_kwargs: stub,
+    )
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url=(
+                "https://llm-b68xeujmba7m1ygo.cn-beijing.maas.aliyuncs.com/"
+                "compatible-mode/v1"
+            ),
+            model="qwen3.7-plus",
+            timeout_seconds=10,
+            max_tokens=1_024,
+        )
+    )
+
+    result = await client.complete_chat(
+        [{"role": "user", "content": "audit"}],
+        temperature=0,
+        max_tokens=1_024,
+    )
+
+    assert result.model == "qwen3.7-plus"
+    assert calls[0][2]["response_format"] == {"type": "json_object"}
+    assert calls[0][2]["enable_thinking"] is False
+    assert "thinking" not in calls[0][2]
+    await client.aclose()
+    assert stub.closed is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ProxyError])
 async def test_openai_adapter_marks_pre_egress_transport_failures_as_not_started(
     monkeypatch: pytest.MonkeyPatch,
