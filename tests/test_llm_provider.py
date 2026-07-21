@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import json
 from types import TracebackType
 from typing import Any
 
@@ -89,6 +91,20 @@ def _response(status_code: int, body: dict[str, Any]) -> httpx.Response:
     return httpx.Response(
         status_code,
         json=body,
+        request=httpx.Request("POST", "https://provider.example/chat/completions"),
+    )
+
+
+def _gzip_response(status_code: int, body: dict[str, Any]) -> httpx.Response:
+    compressed = gzip.compress(json.dumps(body).encode("utf-8"))
+    return httpx.Response(
+        status_code,
+        content=compressed,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+            "Content-Length": str(len(compressed)),
+        },
         request=httpx.Request("POST", "https://provider.example/chat/completions"),
     )
 
@@ -289,6 +305,51 @@ async def test_qwen_chat_disables_thinking_for_bounded_json_reviews(
     assert calls[0][2]["response_format"] == {"type": "json_object"}
     assert calls[0][2]["enable_thinking"] is False
     assert "thinking" not in calls[0][2]
+    await client.aclose()
+    assert stub.closed is True
+
+
+@pytest.mark.asyncio
+async def test_qwen_chat_does_not_decode_gzip_response_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    response = _gzip_response(
+        200,
+        {
+            "model": "qwen3.7-plus",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"verdict":"pass","unsupported_claims":[]}'},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        },
+    )
+    stub = StubAsyncClient([response], calls)
+    monkeypatch.setattr(
+        "app.services.llm_provider.httpx.AsyncClient",
+        lambda **_kwargs: stub,
+    )
+    client = OpenAICompatibleClient(
+        OpenAICompatibleConfig(
+            provider="qwen",
+            api_key="server-secret",
+            base_url=(
+                "https://llm-b68xeujmba7m1ygo.cn-beijing.maas.aliyuncs.com/"
+                "compatible-mode/v1"
+            ),
+            model="qwen3.7-plus",
+            timeout_seconds=10,
+            max_tokens=1_024,
+        )
+    )
+
+    result = await client.complete_chat([{"role": "user", "content": "audit"}])
+
+    assert result.model == "qwen3.7-plus"
+    assert result.content == '{"verdict":"pass","unsupported_claims":[]}'
     await client.aclose()
     assert stub.closed is True
 
