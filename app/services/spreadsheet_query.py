@@ -1288,6 +1288,11 @@ async def answer_spreadsheet_query(
         return None
 
     aggregate_parse = intent.aggregate_parse
+    if (
+        aggregate_parse.status is AttendanceQueryPlanStatus.COMPILED
+        and _has_cross_sheet_duplicate_attendance_rows(sheets)
+    ):
+        return None
     if intent.department_employees and (
         aggregate_parse.plan is None or aggregate_parse.plan.date_range is None
     ):
@@ -2152,6 +2157,7 @@ def _answer_attendance_aggregate(
     employee_names: dict[str, str] = {}
     identifier_to_name: dict[str, str] = {}
     name_to_identifier: dict[str, str] = {}
+    row_origins: dict[tuple[tuple[str, str], ...], tuple[UUID, str]] = {}
 
     for sheet in attendance_sheets:
         timestamp_column = sheet.columns.get("timestamp")
@@ -2170,6 +2176,27 @@ def _answer_attendance_aggregate(
         sheet_records: list[_AttendanceAggregateRecord] = []
         for row in sheet.rows:
             if not row.entry.integrity_metadata:
+                return None
+            # Attendance worksheets must be proven disjoint before their rows
+            # can be combined.  An exact row repeated in another worksheet is
+            # evidence of an overlapping export/backup sheet; counting both
+            # would silently inflate every aggregate.  Duplicates inside one
+            # worksheet remain valid because two identical access events can
+            # legitimately be emitted by the source system.
+            row_fingerprint = tuple(
+                (
+                    cell.column,
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        unicodedata.normalize("NFKC", cell.value).strip(),
+                    ),
+                )
+                for cell in row.cells
+            )
+            row_origin = (row.entry.id, row.sheet)
+            previous_origin = row_origins.setdefault(row_fingerprint, row_origin)
+            if previous_origin != row_origin:
                 return None
             raw_timestamp = row.value(timestamp_column)
             timestamp = _parse_datetime(raw_timestamp or "")
@@ -2324,6 +2351,33 @@ def _attendance_sheets_for_aggregate(
     return tuple(selected)
 
 
+def _has_cross_sheet_duplicate_attendance_rows(sheets: tuple[_Sheet, ...]) -> bool:
+    """Return whether attendance worksheets have an exact overlapping row."""
+
+    attendance_sheets = _attendance_sheets_for_aggregate(sheets)
+    if attendance_sheets is None:
+        return False
+    origins: dict[tuple[tuple[str, str], ...], tuple[UUID, str]] = {}
+    for sheet in attendance_sheets:
+        for row in sheet.rows:
+            fingerprint = tuple(
+                (
+                    cell.column,
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        unicodedata.normalize("NFKC", cell.value).strip(),
+                    ),
+                )
+                for cell in row.cells
+            )
+            origin = (row.entry.id, row.sheet)
+            previous_origin = origins.setdefault(fingerprint, origin)
+            if previous_origin != origin:
+                return True
+    return False
+
+
 def _resolve_attendance_aggregate_filters(
     records: list[_AttendanceAggregateRecord],
     question: str,
@@ -2385,6 +2439,7 @@ def _resolve_attendance_aggregate_filters(
         employee_keys=frozenset(key for key in employee_keys if key is not None),
         department_keys=frozenset(key for key in department_keys if key is not None),
         device_keys=frozenset(device_keys),
+        event_result_terms=event_terms,
     ):
         return None
     return _AttendanceAggregateFilters(
@@ -2401,8 +2456,23 @@ def _has_unresolved_attendance_filter(
     employee_keys: frozenset[str],
     department_keys: frozenset[str],
     device_keys: frozenset[str],
+    event_result_terms: tuple[str, ...],
 ) -> bool:
     """Detect a syntactic exact scope that matched no trusted table value."""
+
+    # Event type is a separate business field from the whitelisted event
+    # result/status dimension.  Until it has its own typed plan, treating a
+    # qualifier such as "普通消息事件类型" as a result filter would be wrong.
+    if "事件类型" in question:
+        return True
+
+    # A status-looking qualifier that was not compiled by
+    # ``_event_result_terms`` must never disappear into a global count.
+    if not event_result_terms and re.search(
+        r"(?:认证|验证|通行|刷卡)[A-Za-z0-9一-鿿·_-]{1,16}(?:记录|结果|状态)",
+        question,
+    ):
+        return True
 
     named_organization = re.search(
         r"[A-Za-z0-9一-鿿·_-]{1,30}(?:部(?!门)|科(?!室)|课|中心|车间)",
@@ -2420,7 +2490,35 @@ def _has_unresolved_attendance_filter(
         r"(?:员工|人员)\s*[“\"'‘]?[A-Za-z0-9一-鿿·_-]{2,30}[”\"'’]?\s*(?:的|共|一共)",
         question,
     )
-    return explicit_employee is not None and not employee_keys
+    if explicit_employee is not None and not employee_keys:
+        return True
+
+    # Chinese questions commonly omit the word "员工" (for example,
+    # "王五一共有多少条打卡记录").  Only a short leading person-like token
+    # is recognized here, and global dataset nouns are excluded explicitly.
+    bare_employee = re.match(
+        r"\s*[“\"'‘]?(?P<label>[一-鿿·]{2,4})[”\"'’]?\s*"
+        r"(?:(?:一共|总共|累计|共)(?:有)?|的(?:打卡|考勤|门禁|通行))",
+        question,
+    )
+    if bare_employee is None or employee_keys:
+        return False
+    candidate = bare_employee.group("label")
+    global_scope_terms = (
+        "考勤",
+        "记录",
+        "数据",
+        "全体",
+        "全部",
+        "公司",
+        "整个",
+        "这份",
+        "其中",
+        "部门",
+        "设备",
+        "闸机",
+    )
+    return not any(term in candidate for term in global_scope_terms)
 
 
 def _attendance_record_matches(

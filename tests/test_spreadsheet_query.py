@@ -4764,6 +4764,64 @@ async def test_ambiguous_exact_dimension_filters_fail_closed(
     assert result.answer is None
 
 
+@pytest.mark.parametrize(
+    "question",
+    (
+        "王五一共有多少条打卡记录？",
+        "考勤中认证超时记录有多少条？",
+        "普通消息事件类型一共有多少条打卡记录？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_unresolved_attendance_filters_never_degrade_to_global_totals(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    await _add_extended_attendance_aggregate_workbook(session, knowledge_base_id)
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "这份考勤一共有多少条打卡记录？",
+        "打卡总次数最多的是哪位员工？",
+    ),
+)
+@pytest.mark.asyncio
+async def test_cross_sheet_duplicate_attendance_rows_fail_closed(
+    knowledge_session: tuple[AsyncSession, UUID],
+    question: str,
+) -> None:
+    session, knowledge_base_id = knowledge_session
+    duplicate = _record(
+        "品质部",
+        "E001",
+        "熊小强",
+        "135265",
+        "2026-07-17 08:00:00",
+        "东门",
+    )
+    sheet1 = _content(((2, duplicate),), sheet="Sheet1")
+    sheet2 = _content(((2, duplicate),), sheet="Sheet2")
+    await _add_entry(
+        session,
+        knowledge_base_id,
+        f"{sheet1}\n\n{sheet2[sheet2.index('[worksheet:'):]}",
+    )
+    await session.commit()
+
+    result = await evaluate_spreadsheet_query(session, knowledge_base_id, question)
+
+    assert result.status is SpreadsheetQueryStatus.REJECTED
+    assert result.answer is None
+
+
 @pytest.mark.asyncio
 async def test_total_aggregate_rejects_a_malformed_attendance_row(
     knowledge_session: tuple[AsyncSession, UUID],
